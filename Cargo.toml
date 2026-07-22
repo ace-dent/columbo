@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "columbo"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.73"
+description = "Structurally optimize existing Deflate streams without recompression"
+license = "MIT"
+readme = false
+
+# Local corpora and reverse-engineering tools are intentionally private.  An
+# allowlist protects them even while this new manifest has not yet been added
+# to Git and Cargo therefore cannot rely on the repository's ignore state.
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE",
+    "scripts/build-distribution.sh",
+    "scripts/sanitize-binary-paths.py",
+    "src/**",
+    "tests/public_api.rs",
+]
+
+[profile.release]
+# Distribution builds prioritize runtime performance. Full LTO was neutral to
+# slightly faster on the representative GZIP and ZIP benchmarks while also
+# removing code that cannot be reached.
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+overflow-checks = true
+panic = "unwind"
+strip = true

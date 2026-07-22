@@ -9,4 +9,7 @@ ehthumbs_vista.db
 ._*
 
 ### Project files ###
-/tests/
+/target/
+/tests/fixtures/
+/work/
+/benchmark-results/
