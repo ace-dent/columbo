@@ -3,7 +3,7 @@
 //! Internal, lossless representation of a parsed Deflate stream.
 //!
 //! Columbo is a structural optimizer: it keeps the compressor's LZ77 parse
-//! and searches for cheaper ways to serialize it.  The model therefore keeps
+//! and searches for cheaper ways to serialize it. The model therefore keeps
 //! both the decoded match values and the exact symbols/extras used on input.
 
 use std::sync::Arc;
@@ -109,9 +109,9 @@ pub(crate) struct OriginalBits {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedBlock {
-    /// Immutable payload buffers are shared by parsed blocks and plans. Most
-    /// planning choices only change representation metadata; sharing avoids
-    /// retaining several full copies of a near-limit decoded stream.
+    // Immutable payload buffers are shared by parsed blocks and plans. Most
+    // planning choices only change representation metadata; sharing avoids
+    // retaining several full copies of a near-limit decoded stream.
     pub(crate) tokens: Arc<Vec<Token>>,
     pub(crate) plain: Arc<Vec<u8>>,
     pub(crate) literal_frequencies: [u32; 286],

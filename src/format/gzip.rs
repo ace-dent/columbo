@@ -12,9 +12,9 @@ const FNAME: u8 = 0x08;
 const FCOMMENT: u8 = 0x10;
 const RESERVED_FLAGS: u8 = 0xe0;
 const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate GZIP output";
-// Concatenation is legitimate, but an empty member is only twenty bytes. A
-// dedicated cap prevents a small file from multiplying parser setup and
-// checksum work without consuming the decoded-byte budget.
+/// Concatenation is legitimate, but an empty member is only twenty bytes. A
+/// dedicated cap prevents a small file from multiplying parser setup and
+/// checksum work without consuming the decoded-byte budget.
 const MAX_GZIP_MEMBERS: usize = 16_384;
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
@@ -25,7 +25,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     let mut decoded_remaining = options.max_decoded_bytes;
     let mut timed_out = false;
 
-    // RFC 1952 explicitly permits concatenated members.  Each has an
+    // RFC 1952 explicitly permits concatenated members. Each has an
     // independently checksummed Deflate stream, so parse and optimize them in
     // order while sharing one file-wide expansion budget.
     while member_start < input.len() {
@@ -84,7 +84,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             &input[payload_start..],
             &call_options,
             decoded_remaining,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
         )?;
         if raw.info.size > decoded_remaining {
             return Err(Error::new(
@@ -111,7 +111,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         if options.strip_metadata && has_optional_metadata {
             let mut header = input[member_start..member_start + 10].to_vec();
             // FTEXT is a content hint rather than an optional variable-length
-            // field.  Keep it, and remove only fields whose bytes were dropped.
+            // field. Keep it, and remove only fields whose bytes were dropped.
             header[3] = flags & !(FEXTRA | FNAME | FCOMMENT | FHCRC);
             try_append_bytes(&mut output, &header, OUTPUT_ALLOCATION_ERROR)?;
         } else {

@@ -2,6 +2,7 @@
 
 mod bitstream;
 mod block;
+pub(crate) mod deft4j;
 mod header;
 mod huffman;
 mod model;

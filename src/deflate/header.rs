@@ -3,13 +3,60 @@
 //! Dynamic-header construction and exact bit accounting.
 
 use super::huffman::{
-    make_lengths, make_lengths_deflopt_heap, make_lengths_deflopt_heap_exact,
-    make_lengths_defluff_exact, make_lengths_defluff_package_merge, make_lengths_deft4j_java_heap,
-    make_lengths_order_heap, Huffman,
+    make_lengths, make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap,
+    make_lengths_defluff_exact, make_lengths_deft4j_java_heap, make_lengths_order_heap, Huffman,
 };
 use super::model::{token_extra_bits, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER};
 
 const INF: u64 = u64::MAX / 4;
+
+/// Which deft4j header spelling governs a source-state decision.
+///
+/// `Complete` is the full `addOptimisedRecoded` option grid. The deliberately
+/// narrower `DefaultRecode` spelling is used only while deciding whether
+/// deft4j's repeated individual-prune step reached a smaller fixed point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deft4jHeaderPolicy {
+    Complete,
+    DefaultRecode,
+}
+
+/// Switches used by deft4j's code-length run packer.
+///
+/// Keeping these as named fields makes the deft4j option grid readable
+/// without changing its insertion order or adding any dynamic dispatch.
+#[derive(Debug, Clone, Copy)]
+struct Deft4jPackOptions {
+    special_repeat: bool,
+    use_eight: bool,
+    use_seven: bool,
+    no_repeat: bool,
+    no_zero_repeat: bool,
+    no_long_zero_repeat: bool,
+    no_repeat_zeros: bool,
+}
+
+/// Header-level choices layered on top of a code-length packing strategy.
+#[derive(Debug, Clone, Copy)]
+struct Deft4jHeaderOptions {
+    pack: Deft4jPackOptions,
+    prune: bool,
+    optimize_header: bool,
+}
+
+const DEFT4J_DEFAULT_RECODE_OPTIONS: Deft4jHeaderOptions = Deft4jHeaderOptions {
+    pack: Deft4jPackOptions {
+        special_repeat: true,
+        use_eight: true,
+        use_seven: true,
+        no_repeat: false,
+        no_zero_repeat: false,
+        no_long_zero_repeat: false,
+        no_repeat_zeros: false,
+    },
+    prune: false,
+    optimize_header: false,
+};
 
 pub(crate) fn token_bits(
     tokens: &[Token],
@@ -164,9 +211,9 @@ pub(crate) fn best_dynamic_plan(
             .enumerate()
             .all(|(symbol, &frequency)| frequency == 0 || lengths[symbol] != 0)
     });
-    // The C planner preserves family/variant insertion order and keeps up to
-    // twenty unique trees per alphabet. Payload sorting is incorrect here:
-    // a slightly dearer tree can encode a much smaller dynamic header.
+    // The original Columbo C planner preserves family/variant insertion order
+    // and keeps up to twenty unique trees per alphabet. Payload sorting is
+    // incorrect here: a slightly dearer tree can encode a much smaller header.
     literal_candidates.truncate(20);
     distance_candidates.truncate(20);
 
@@ -193,11 +240,11 @@ pub(crate) fn best_dynamic_plan(
     }
 
     // Symbols with the same frequency may exchange code lengths without
-    // changing the payload cost or invalidating either Huffman tree.  Their
+    // changing the payload cost or invalidating either Huffman tree. Their
     // positions do affect the run-length encoded dynamic header, however.
-    // DeflOpt's max path tries the two stable, deterministic assignments
-    // below before its more expensive finished-tree searches.  Keeping this
-    // exhaustive-only avoids adding any work to the default path.
+    // Columbo's --max route tries these stable assignments before its more
+    // expensive finished-tree searches. DeflOpt 2.07 does not permute a
+    // finished tree, so this remains explicitly a Columbo extension.
     if exhaustive && !expired() {
         if let Some(seed) = best.clone() {
             let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
@@ -231,12 +278,10 @@ pub(crate) fn best_dynamic_plan(
         }
     }
 
-    // A Huffman tree's length histogram determines its payload cost, but the
-    // assignment of those lengths to equal-frequency symbols also changes the
-    // run-length encoding in the dynamic header. DeflOpt exploits that second
-    // degree of freedom with a bounded greedy swap search. It is particularly
-    // useful for small, literal-heavy blocks, where rearranging the tree can
-    // save a whole byte without changing a single decoded token.
+    // Columbo's greedy swap route explores the same finished-tree degree of
+    // freedom more locally. It is particularly useful for small, literal-heavy
+    // blocks, where rearranging the tree can save a whole byte without changing
+    // a single decoded token. This route is not part of DeflOpt 2.07.
     if exhaustive && tokens.len() <= 700 && !expired() {
         if let Some(seed) = best.clone() {
             improve_by_length_swaps(
@@ -263,7 +308,7 @@ fn pad_lengths<const N: usize>(lengths: &[u8]) -> [u8; N] {
 /// Reassign one tree's lengths within equal-frequency symbol groups.
 ///
 /// Sorting only the lengths (and retaining the symbol positions) preserves
-/// both the Kraft sum and the exact frequency-weighted payload cost.  The
+/// both the Kraft sum and the exact frequency-weighted payload cost. The
 /// stable symbol order makes this a cheap pair of useful header candidates
 /// instead of a factorial permutation search.
 fn arrange_equal_frequency_lengths<const N: usize>(
@@ -322,10 +367,10 @@ fn ensure_distance_symbols(frequencies: &mut [u32; 30], min_distance_codes: bool
 fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<Vec<u8>> {
     let mut candidates = Vec::new();
     // Family order is observable because equal complete plans retain the
-    // earlier candidate. The C default selector uses the mapped DeflOpt heap
-    // and its order-key sibling; the broader generic/Defluff families belong
-    // to max or terminal feedback routes. Keeping that separation cuts the
-    // ordinary cross product from roughly 200 tree pairs to at most 64.
+    // earlier candidate. The original Columbo C selector combines the mapped
+    // DeflOpt heap with Columbo's legacy order-key heap. Broader Columbo and
+    // exact Defluff families belong to max or terminal feedback routes.
+    // Keeping that separation caps the ordinary cross product at 64 pairs.
     for variant in 0..4 {
         push_unique(
             &mut candidates,
@@ -348,17 +393,13 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
         }
         push_unique(
             &mut candidates,
-            make_lengths_defluff_package_merge(frequencies, max_bits, 0),
+            make_lengths_columbo_defluff_limited(frequencies, max_bits, 0),
         );
         push_unique(
             &mut candidates,
             make_lengths_defluff_exact(frequencies, max_bits, 0),
         );
         for variant in 0..4 {
-            push_unique(
-                &mut candidates,
-                make_lengths_deflopt_heap_exact(frequencies, max_bits, variant),
-            );
             if variant == 0 {
                 push_unique(
                     &mut candidates,
@@ -455,6 +496,342 @@ pub(crate) fn plan_for_explicit_lengths_with_cost(
     )
 }
 
+/// Score a dynamic header with deft4j beta 17's ordered header grid.
+///
+/// Columbo's ordinary planner intentionally considers a wider family of
+/// headers. The deft4j-derived route cannot use that wider score to guide its
+/// state graph without changing which intermediate states the source ordering
+/// retains. This helper therefore keeps the data trees fixed and reproduces
+/// deft4j's option grid and insertion order after Columbo trims HLIT and HDIST.
+/// beta 17 can instead retain the source header's advertised spans for its
+/// source-dynamic base.
+pub(crate) fn plan_for_deft4j_lengths_with_cost(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    literal_lengths: &[u8; 286],
+    distance_lengths: &[u8; 30],
+    min_distance_codes: bool,
+    policy: Deft4jHeaderPolicy,
+) -> Option<DynamicPlan> {
+    let mut distance_lengths = *distance_lengths;
+    apply_min_distance_codes(
+        &mut distance_lengths,
+        distance_frequencies,
+        min_distance_codes,
+    );
+
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        literal_lengths,
+        &distance_lengths,
+        extra_bits,
+    )?;
+    let hlit = trim_literal(literal_lengths);
+    let hdist = trim_distance(&distance_lengths);
+    let literal = try_vec_from_slice(&literal_lengths[..hlit])?;
+    let distance = try_vec_from_slice(&distance_lengths[..hdist])?;
+    if Huffman::build(&literal).is_none() || Huffman::build(&distance).is_none() {
+        return None;
+    }
+
+    let mut combined = Vec::new();
+    combined
+        .try_reserve_exact(literal.len().checked_add(distance.len())?)
+        .ok()?;
+    combined.extend_from_slice(&literal);
+    combined.extend_from_slice(&distance);
+
+    if policy == Deft4jHeaderPolicy::DefaultRecode {
+        return build_deft4j_header(
+            data_bits,
+            &literal,
+            &distance,
+            &combined,
+            DEFT4J_DEFAULT_RECODE_OPTIONS,
+        );
+    }
+
+    let mut best = None;
+    // Keep deft4j's loop order. Equal-sized headers deliberately retain the
+    // first spelling because it becomes the block object used by later
+    // transformations and merges.
+    for no_repeat_zeros in [false, true] {
+        for prune in [false, true] {
+            for no_repeat in [false, true] {
+                if no_repeat_zeros && no_repeat {
+                    continue;
+                }
+                for no_zero_repeat in [false, true] {
+                    if no_repeat_zeros && !no_zero_repeat {
+                        continue;
+                    }
+                    for no_long_zero_repeat in [false, true] {
+                        for special_repeat in [true, false] {
+                            if special_repeat {
+                                if no_repeat {
+                                    continue;
+                                }
+                                for use_eight in [true, false] {
+                                    for use_seven in [true, false] {
+                                        if !use_eight && !use_seven {
+                                            continue;
+                                        }
+                                        if let Some(candidate) = build_deft4j_header(
+                                            data_bits,
+                                            &literal,
+                                            &distance,
+                                            &combined,
+                                            Deft4jHeaderOptions {
+                                                pack: Deft4jPackOptions {
+                                                    special_repeat: true,
+                                                    use_eight,
+                                                    use_seven,
+                                                    no_repeat,
+                                                    no_zero_repeat,
+                                                    no_long_zero_repeat,
+                                                    no_repeat_zeros,
+                                                },
+                                                prune,
+                                                optimize_header: true,
+                                            },
+                                        ) {
+                                            keep_better(&mut best, candidate);
+                                        }
+                                    }
+                                }
+                            } else if let Some(candidate) = build_deft4j_header(
+                                data_bits,
+                                &literal,
+                                &distance,
+                                &combined,
+                                Deft4jHeaderOptions {
+                                    pack: Deft4jPackOptions {
+                                        special_repeat: false,
+                                        use_eight: false,
+                                        use_seven: false,
+                                        no_repeat,
+                                        no_zero_repeat,
+                                        no_long_zero_repeat,
+                                        no_repeat_zeros,
+                                    },
+                                    prune,
+                                    optimize_header: true,
+                                },
+                            ) {
+                                keep_better(&mut best, candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+fn apply_min_distance_codes(lengths: &mut [u8; 30], frequencies: &[u32; 30], enabled: bool) {
+    if !enabled || lengths.iter().filter(|&&length| length != 0).count() >= 2 {
+        return;
+    }
+    let used = frequencies.iter().position(|&frequency| frequency != 0);
+    match used {
+        Some(symbol) => {
+            lengths[symbol] = 1;
+            lengths[usize::from(symbol == 0)] = 1;
+        }
+        None => {
+            lengths[0] = 1;
+            lengths[1] = 1;
+        }
+    }
+}
+
+fn build_deft4j_header(
+    data_bits: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    combined: &[u8],
+    options: Deft4jHeaderOptions,
+) -> Option<DynamicPlan> {
+    let mut rle = deft4j_pack_code_lengths(combined, options.pack)?;
+    let mut code_length_lengths = deft4j_code_length_tree(&rle)?;
+
+    if options.prune {
+        if let Some(pruned) = rewrite_rle_deft4j_literals(&rle, &code_length_lengths, true) {
+            rle = pruned;
+            code_length_lengths = deft4j_code_length_tree(&rle)?;
+        }
+    }
+
+    let mut plan = deft4j_dynamic_plan(
+        data_bits,
+        literal_lengths,
+        distance_lengths,
+        rle,
+        code_length_lengths,
+    )?;
+    if options.optimize_header {
+        if let Some(optimized) =
+            rewrite_rle_deft4j_literals(&plan.rle, &plan.code_length_lengths, false)
+        {
+            if let Some(candidate) = deft4j_dynamic_plan(
+                data_bits,
+                literal_lengths,
+                distance_lengths,
+                optimized,
+                plan.code_length_lengths,
+            ) {
+                if candidate.bits < plan.bits {
+                    plan = candidate;
+                }
+            }
+        }
+    }
+    Some(plan)
+}
+
+fn deft4j_code_length_tree(rle: &[RleToken]) -> Option<[u8; 19]> {
+    let frequencies = rle_frequencies(rle);
+    let lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
+    if lengths.len() != 19 || Huffman::build(&lengths).is_none() {
+        return None;
+    }
+    let mut result = [0_u8; 19];
+    result.copy_from_slice(&lengths);
+    rle.iter()
+        .all(|token| result[usize::from(token.symbol)] != 0)
+        .then_some(result)
+}
+
+fn deft4j_dynamic_plan(
+    data_bits: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    rle: Vec<RleToken>,
+    code_length_lengths: [u8; 19],
+) -> Option<DynamicPlan> {
+    let hclen = trim_code_lengths(&code_length_lengths);
+    let mut plan = DynamicPlan {
+        literal_lengths: try_vec_from_slice(literal_lengths)?,
+        distance_lengths: try_vec_from_slice(distance_lengths)?,
+        code_length_lengths,
+        rle,
+        hlit: literal_lengths.len(),
+        hdist: distance_lengths.len(),
+        hclen,
+        bits: 0,
+    };
+    plan.bits = dynamic_bits(data_bits, &plan)?;
+    Some(plan)
+}
+
+fn try_vec_from_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(source.len()).ok()?;
+    output.extend_from_slice(source);
+    Some(output)
+}
+
+fn deft4j_pack_code_lengths(lengths: &[u8], options: Deft4jPackOptions) -> Option<Vec<RleToken>> {
+    let mut output = Vec::new();
+    output.try_reserve_exact(316).ok()?;
+    let mut index = 0;
+    while index < lengths.len() {
+        let value = lengths[index];
+        let mut run = 1;
+        while index + run < lengths.len() && lengths[index + run] == value {
+            run += 1;
+        }
+        index += run;
+
+        if value == 0 {
+            if !options.no_long_zero_repeat {
+                let mut count = 138;
+                while count >= 11 {
+                    if run >= count {
+                        output.push(RleToken {
+                            symbol: 18,
+                            extra: (count - 11) as u8,
+                        });
+                        run -= count;
+                    } else {
+                        count -= 1;
+                    }
+                }
+            }
+            if !options.no_zero_repeat {
+                let mut count = 10;
+                while count >= 3 {
+                    if run >= count {
+                        output.push(RleToken {
+                            symbol: 17,
+                            extra: (count - 3) as u8,
+                        });
+                        run -= count;
+                    } else {
+                        count -= 1;
+                    }
+                }
+            }
+        }
+
+        if !options.no_repeat && run != 0 && (!options.no_repeat_zeros || value != 0) {
+            output.push(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            run -= 1;
+            let mut count = 6;
+            while count >= 3 {
+                if options.special_repeat && options.use_eight && run == 8 {
+                    output.push(RleToken {
+                        symbol: 16,
+                        extra: 1,
+                    });
+                    output.push(RleToken {
+                        symbol: 16,
+                        extra: 1,
+                    });
+                    run -= 8;
+                    break;
+                }
+                if options.special_repeat && options.use_seven && run == 7 {
+                    output.push(RleToken {
+                        symbol: 16,
+                        extra: 1,
+                    });
+                    output.push(RleToken {
+                        symbol: 16,
+                        extra: 0,
+                    });
+                    run -= 7;
+                    break;
+                }
+                if run >= count {
+                    output.push(RleToken {
+                        symbol: 16,
+                        extra: (count - 3) as u8,
+                    });
+                    run -= count;
+                } else {
+                    count -= 1;
+                }
+            }
+        }
+
+        output.extend(
+            std::iter::repeat(RleToken {
+                symbol: value,
+                extra: 0,
+            })
+            .take(run),
+        );
+    }
+    (output.len() <= 316).then_some(output)
+}
+
 fn plan_for_trimmed_lengths(
     literal_lengths: Vec<u8>,
     distance_lengths: Vec<u8>,
@@ -483,8 +860,8 @@ fn plan_for_trimmed_lengths(
         );
 
         // A greedy six-length repeat can leave one or two explicit lengths.
-        // DeflOpt/deft4j also try a balanced 4+3 or 4+4 split for those tails;
-        // it uses the same number of repeat tokens while avoiding literals.
+        // Columbo's additive packer generalizes deft4j's 4+3 and 4+4 OHH
+        // alternatives so those tails can use repeats instead of literals.
         if !no_16 {
             let balanced = balanced_repeat_rle(&concatenated, no_17, no_18);
             if balanced != rle {
@@ -546,9 +923,9 @@ fn improve_by_length_swaps(
     literal_lengths[..seed.literal_lengths.len()].copy_from_slice(&seed.literal_lengths);
     distance_lengths[..seed.distance_lengths.len()].copy_from_slice(&seed.distance_lengths);
 
-    // DeflOpt uses only the ordinary greedy RLE stream while deciding which
-    // swap to commit. After committing it, the complete RLE family is scored
-    // so a separately better header representation is retained.
+    // Columbo's greedy swap search uses only the ordinary RLE spelling while
+    // deciding which length exchange to commit. It then scores the complete
+    // header family. DeflOpt 2.07 has no finished-tree swap search.
     let Some(mut current) = plan_for_explicit_lengths_masked(
         tokens,
         &literal_lengths,
@@ -705,14 +1082,13 @@ fn consider_rle(
     decoded_lengths.extend_from_slice(literal_lengths);
     decoded_lengths.extend_from_slice(distance_lengths);
 
-    // DeflOpt has one small fixed-point route which is easy to miss when the
-    // more general header search is expressed as a collection of candidates:
-    // build its height-tied code-length tree, replace repeat tokens that are
-    // locally dearer than explicit lengths, rebuild the tree, and continue.
-    // Every rewrite strictly reduces the finite repeat rank, so this is a
-    // bounded structural header search rather than an open-ended retry loop.
+    // From each Columbo RLE-mask seed, price a DeflOpt-derived local candidate:
+    // build DeflOpt's height-tied code-length tree, replace repeat tokens that
+    // are locally dearer than explicit lengths, then rebuild. Every rewrite
+    // strictly reduces the finite repeat rank, so this remains bounded. It is
+    // not DeflOpt's complete state-feedback route.
     for variant in 0..4 {
-        consider_deflopt_rle_fixed_point(
+        consider_columbo_deflopt_local_rewrite(
             data_bits,
             literal_lengths,
             distance_lengths,
@@ -722,10 +1098,9 @@ fn consider_rle(
         );
     }
 
-    // The source planner follows local RLE rewrites to a fixed point in every
-    // mode. Four passes are enough for Deflate's at-most-316 input lengths and
-    // mirror Defluff's explicit feedback bound; --max broadens the candidate
-    // families, not this convergence requirement.
+    // This four-pass, best-intermediate loop is Columbo's composite header
+    // route. Its numeric bound is inspired by Defluff, but Defluff always emits
+    // its fourth pass and neither stops early nor retains earlier winners.
     let passes = 4;
     for pass in 0..passes {
         let frequencies = rle_frequencies(&rle);
@@ -736,28 +1111,27 @@ fn consider_rle(
                 &mut code_length_candidates,
                 make_lengths_order_heap(&frequencies, 7, variant),
             );
-            // deft4j's Java heap is expensive when crossed across the full
-            // literal/distance alphabets, but the code-length alphabet has
-            // only nineteen symbols.  Keeping it in the ordinary header
-            // repack closes source-tree RLE gaps without broadening token or
-            // data-tree search.
+            // The deft4j tree's PriorityQueue-compatible heap is expensive
+            // across the full data alphabets, but the code-length alphabet has
+            // only nineteen symbols. Keeping it in Columbo's ordinary header
+            // repack closes RLE gaps without broadening token search.
             if variant == 0 {
-                let java_lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
-                consider_deft4j_java_pruned_header(
+                let deft4j_lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
+                consider_deft4j_pruned_header(
                     data_bits,
                     literal_lengths,
                     distance_lengths,
                     &rle,
-                    &java_lengths,
+                    &deft4j_lengths,
                     best,
                 );
-                push_unique(&mut code_length_candidates, java_lengths);
-                // Defluff uses package merge for this same nineteen-symbol
-                // alphabet. Pricing it once is inexpensive and can beat the
-                // heap builders even when the data-tree lengths are fixed.
+                push_unique(&mut code_length_candidates, deft4j_lengths);
+                // This is Columbo's generic code-length tree with Defluff's
+                // limiter, not Defluff's complete tree builder. Pricing the
+                // hybrid once is inexpensive when the data trees are fixed.
                 push_unique(
                     &mut code_length_candidates,
-                    make_lengths_defluff_package_merge(&frequencies, 7, 0),
+                    make_lengths_columbo_defluff_limited(&frequencies, 7, 0),
                 );
             }
             if exhaustive {
@@ -854,26 +1228,26 @@ fn consider_rle(
     }
 }
 
-/// Price deft4j's Java code-length tree, including its equal-cost RLE prune.
+/// Add deft4j's code-length tree and equal-cost RLE prune to a Columbo header.
 ///
-/// The Java route first expands repeat tokens whose explicit spelling is no
+/// The deft4j route first expands repeat tokens whose explicit spelling is no
 /// dearer under the current code-length tree, then rebuilds that tiny tree.
 /// Although the first rewrite may tie, the changed frequencies can shorten the
 /// rebuilt header. Only the dynamic header changes; data symbols and LZ77
 /// tokens remain untouched.
-fn consider_deft4j_java_pruned_header(
+fn consider_deft4j_pruned_header(
     data_bits: u64,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     rle: &[RleToken],
-    java_lengths: &[u8],
+    deft4j_lengths: &[u8],
     best: &mut Option<DynamicPlan>,
 ) {
-    if java_lengths.len() != 19 || Huffman::build(java_lengths).is_none() {
+    if deft4j_lengths.len() != 19 || Huffman::build(deft4j_lengths).is_none() {
         return;
     }
     let mut code_length_lengths = [0_u8; 19];
-    code_length_lengths.copy_from_slice(java_lengths);
+    code_length_lengths.copy_from_slice(deft4j_lengths);
     if rle
         .iter()
         .any(|token| code_length_lengths[usize::from(token.symbol)] == 0)
@@ -925,12 +1299,14 @@ fn consider_deft4j_java_pruned_header(
     }
 }
 
-/// Follow DeflOpt's code-length RLE feedback until no repeat can be simplified.
+/// Price Columbo's bounded DeflOpt-derived local rewrite/rebuild candidate.
 ///
-/// The data-code lengths are fixed throughout. Only their RFC 1951 header
-/// spelling and the tiny code-length-code tree change, so decoded tokens and
-/// the LZ77 parse remain exactly as supplied by the input stream.
-fn consider_deflopt_rle_fixed_point(
+/// DeflOpt supplies the strict local repeat rewrite and height-tied tree
+/// rebuild. Columbo starts from each of its own RLE-mask seeds and also prices
+/// a frequency-reassigned tree as an additive candidate, rather than feeding
+/// every state through DeflOpt's complete bounded feedback route. The data-code
+/// lengths and LZ77 parse remain fixed.
+fn consider_columbo_deflopt_local_rewrite(
     data_bits: u64,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
@@ -973,8 +1349,8 @@ fn consider_deflopt_rle_fixed_point(
 
         // The pair-swap pass preserves the code-length tree histogram while
         // assigning its shorter codes to more frequent RLE symbols. Retain it
-        // as an additive candidate; feedback itself follows the unmodified
-        // DeflOpt tree, which keeps tie behaviour deterministic.
+        // as an additive candidate; the local rewrite/rebuild loop follows the
+        // unmodified DeflOpt tree, which keeps tie behaviour deterministic.
         let mut reordered = plan.clone();
         if reorder_code_length_lengths(&mut reordered.code_length_lengths, &frequencies) {
             reordered.hclen = trim_code_lengths(&reordered.code_length_lengths);
@@ -1101,7 +1477,7 @@ fn rewrite_rle_deflopt_local(
 /// Expand repeat tokens that are dearer (or tied) under a fixed tree.
 ///
 /// This mirrors deft4j's header-only prune. `include_equal` is used before a
-/// Java-tree rebuild because a tied local rewrite can change the next tree;
+/// deft4j tree rebuild because a tied local rewrite can change the next tree;
 /// the final optimize-header pass accepts strict local savings only.
 fn rewrite_rle_deft4j_literals(
     input: &[RleToken],
@@ -1257,7 +1633,11 @@ fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleT
     output
 }
 
-/// Encode nonzero repeats without leaving a one- or two-length literal tail.
+/// Columbo's generalized form of deft4j's balanced repeat-16 alternatives.
+///
+/// deft4j directly tries 4+3 and 4+4 for seven- and eight-value tails.
+/// Columbo applies the same idea whenever greedy six-value chunks would leave
+/// one or two explicit values.
 fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
     let mut output = Vec::new();
     let mut index = 0;
@@ -1452,8 +1832,9 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
             let cost = u64::from(code)
                 .saturating_add(rle_extra_bits(symbol))
                 .saturating_add(best[index + count]);
-            // Strict replacement retains the source-like transition order on
-            // equal cost, matching the C optimizer's deterministic ties.
+            // Strict replacement retains Columbo's source-like transition
+            // order on equal cost, matching the original Columbo C
+            // implementation.
             if cost < best[index] {
                 best[index] = cost;
                 step[index] = Some(Step {
@@ -1619,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn deflopt_local_feedback_has_a_strictly_decreasing_repeat_rank() {
+    fn deflopt_local_rewrite_has_a_strictly_decreasing_repeat_rank() {
         let input = [
             RleToken {
                 symbol: 0,
@@ -1641,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn deflopt_local_feedback_expands_only_a_strictly_dearer_repeat() {
+    fn deflopt_local_rewrite_expands_only_a_strictly_dearer_repeat() {
         let input = [RleToken {
             symbol: 18,
             extra: 0, // eleven zero lengths
@@ -1662,7 +2043,7 @@ mod tests {
     }
 
     #[test]
-    fn deft4j_java_prune_can_rebuild_after_an_equal_cost_rewrite() {
+    fn deft4j_prune_can_rebuild_after_an_equal_cost_rewrite() {
         let input = [RleToken {
             symbol: 17,
             extra: 0, // three zero lengths
@@ -1673,7 +2054,7 @@ mod tests {
 
         // Three explicit zero codes and one repeat-17 code plus its three
         // extra bits both cost six. The ordinary strict finalizer retains the
-        // repeat; Java's pre-rebuild prune deliberately expands the tie.
+        // repeat; deft4j's pre-rebuild prune deliberately expands the tie.
         assert!(rewrite_rle_deft4j_literals(&input, &code_lengths, false).is_none());
         assert_eq!(
             rewrite_rle_deft4j_literals(&input, &code_lengths, true).unwrap(),

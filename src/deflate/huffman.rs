@@ -23,8 +23,8 @@ pub(crate) struct HuffCode {
 /// A small canonical Huffman table.
 ///
 /// Deflate alphabets contain at most 288 symbols. A linear code list keeps the
-/// construction and malformed-stream checks easy to audit, and matches the C
-/// implementation's decoder exactly.
+/// construction and malformed-stream checks easy to audit, and exactly matches
+/// the original Columbo C implementation's decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Huffman {
     codes: Vec<HuffCode>,
@@ -35,8 +35,9 @@ impl Huffman {
     /// Build canonical codes from code lengths.
     ///
     /// `None` means that a length exceeds Deflate's 15-bit limit, the tree is
-    /// oversubscribed, or the alphabet cannot be represented by the C-compatible
-    /// table. Incomplete trees are valid: Deflate uses them for one-symbol trees.
+    /// oversubscribed, or the alphabet exceeds the original Columbo C decoder's
+    /// 320-code table limit. Incomplete trees are valid: Deflate uses them for
+    /// one-symbol trees.
     pub(crate) fn build(lengths: &[u8]) -> Option<Self> {
         if lengths.is_empty() {
             return None;
@@ -357,9 +358,10 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         count_by_length[bits] -= 1;
         count_by_length[bits + 1] += 2;
         count_by_length[limit] -= 1;
-        // The C counter is unsigned. An odd overflow wraps after its last
-        // pair and keeps repairing until no shorter code remains. Preserve
-        // that observable (and occasionally incomplete-tree) behavior.
+        // The original Columbo C counter is unsigned. An odd overflow wraps
+        // after its last pair and keeps repairing until no shorter code
+        // remains. Preserve that observable, occasionally incomplete-tree
+        // behavior.
         overflow = overflow.wrapping_sub(2);
     }
 
@@ -370,7 +372,8 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         .filter_map(|(symbol, frequency)| (frequency != 0).then_some((frequency, symbol)))
         .collect();
     // Longest repaired lengths go to the least frequent symbols. Symbol is a
-    // deterministic ascending tie-break, matching the C qsort comparator.
+    // deterministic ascending tie-break, matching Columbo's original C
+    // `qsort` comparator.
     leaves.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     lengths.fill(0);
@@ -434,19 +437,21 @@ pub(crate) fn tree_exceeds_limit(frequencies: &[u32], max_bits: u8) -> bool {
     unconstrained_huffman_max_depth(frequencies) > usize::from(max_bits)
 }
 
-/// Build the candidate that uses Defluff's package-list limiter only when the
-/// ordinary generic tree exceeds the requested depth.
-pub(crate) fn make_lengths_defluff_package_merge(
+/// Build Columbo's generic tree with Defluff's package-list depth limiter.
+///
+/// This is a Columbo hybrid, not Defluff's complete tree builder: it keeps
+/// Columbo's ordinary tree whenever that tree already satisfies `max_bits`.
+pub(crate) fn make_lengths_columbo_defluff_limited(
     frequencies: &[u32],
     max_bits: u8,
     variant: u32,
 ) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
-    make_lengths_defluff_package_merge_into(frequencies, &mut lengths, max_bits, variant);
+    make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, max_bits, variant);
     lengths
 }
 
-pub(crate) fn make_lengths_defluff_package_merge_into(
+pub(crate) fn make_lengths_columbo_defluff_limited_into(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
@@ -729,10 +734,15 @@ pub(crate) fn make_lengths_deflopt_heap_into(
     max_bits: u8,
     variant: u32,
 ) {
-    make_lengths_deflopt_heap_inner(frequencies, lengths, max_bits, variant, false);
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false);
 }
 
-/// Build Columbo's retained pointer-order interpretation of DeflOpt's heap.
+/// Build Columbo's legacy order-key heap extension.
+///
+/// This intentionally is not labelled as DeflOpt parity: DeflOpt 2.07 breaks
+/// frequency ties by subtree height, whereas the original Columbo C
+/// implementation retained this earlier order-key interpretation as an
+/// additive candidate.
 pub(crate) fn make_lengths_order_heap(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_order_heap_into(frequencies, &mut lengths, max_bits, variant);
@@ -745,10 +755,10 @@ pub(crate) fn make_lengths_order_heap_into(
     max_bits: u8,
     variant: u32,
 ) {
-    make_lengths_deflopt_heap_inner(frequencies, lengths, max_bits, variant, true);
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true);
 }
 
-fn make_lengths_deflopt_heap_inner(
+fn make_lengths_variant_heap_inner(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
@@ -895,32 +905,14 @@ fn repair_deflopt_overflow(
     }
 }
 
-/// Reverse-engineering alias for DeflOpt's in-place-parent implementation.
-pub(crate) fn make_lengths_deflopt_heap_exact(
-    frequencies: &[u32],
-    max_bits: u8,
-    variant: u32,
-) -> Vec<u8> {
-    make_lengths_deflopt_heap(frequencies, max_bits, variant)
-}
-
-#[cfg(test)]
-pub(crate) fn make_lengths_deflopt_heap_exact_into(
-    frequencies: &[u32],
-    lengths: &mut [u8],
-    max_bits: u8,
-    variant: u32,
-) {
-    make_lengths_deflopt_heap_into(frequencies, lengths, max_bits, variant);
-}
-
 fn java_heap_offer(nodes: &[Node], heap: &mut Vec<usize>, node: usize) {
     let mut position = heap.len();
     heap.push(node);
     while position > 0 {
         let parent = (position - 1) >> 1;
-        // java.util.PriorityQueue stops on compare >= 0. deft4j compares only
-        // frequency, so an equal node retains its current heap relationship.
+        // `java.util.PriorityQueue.siftUpComparable` stops on compare >= 0.
+        // deft4j compares only frequency, so an equal node retains its current
+        // heap relationship.
         if nodes[node].frequency >= nodes[heap[parent]].frequency {
             break;
         }
@@ -936,7 +928,8 @@ fn java_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut position: usize, 
         let mut child = position * 2 + 1;
         let mut candidate = heap[child];
         let right = child + 1;
-        // Java chooses the right child only when it is strictly smaller.
+        // `PriorityQueue` sift-down chooses the right child only when it is
+        // strictly smaller.
         if right < heap.len() && nodes[candidate].frequency > nodes[heap[right]].frequency {
             child = right;
             candidate = heap[child];
@@ -985,9 +978,9 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
         java_heap_offer(&nodes, &mut heap, index);
     }
 
-    // deft4j forces at least two leaves when the alphabet has spare symbols.
-    // This matters for empty distance trees and is intentionally unlike the
-    // generic one-symbol shortcut.
+    // `HuffmanTree` forces at least two leaves when the alphabet has spare
+    // symbols. deft4j's payload-distance caller separately bypasses this raw
+    // builder for zero- and one-symbol distance alphabets.
     let mut symbol = 0;
     while heap.len() < 2 && symbol < frequencies.len() {
         if frequencies[symbol] == 0 {
@@ -1209,11 +1202,10 @@ mod tests {
 
         let candidates = [
             make_lengths(&frequencies, 4, 0),
-            make_lengths_defluff_package_merge(&frequencies, 4, 0),
+            make_lengths_columbo_defluff_limited(&frequencies, 4, 0),
             make_lengths_defluff_exact(&frequencies, 4, 0),
             make_lengths_deflopt_heap(&frequencies, 4, 0),
             make_lengths_order_heap(&frequencies, 4, 0),
-            make_lengths_deflopt_heap_exact(&frequencies, 4, 0),
             make_lengths_deft4j_java_heap(&frequencies, 4),
         ];
         for lengths in candidates {
@@ -1222,15 +1214,15 @@ mod tests {
     }
 
     #[test]
-    fn length_families_match_c_reference_on_overflow() {
+    fn length_families_match_original_columbo_c_on_overflow() {
         let frequencies = [1, 1, 2, 3, 5, 8, 13, 0];
 
-        // These vectors come directly from huffman.c. In particular, the
-        // generic builder intentionally preserves its odd-overflow result,
-        // even though a complete bounded tree is available.
+        // These vectors come directly from the original Columbo `huffman.c`.
+        // In particular, the generic builder intentionally preserves its
+        // odd-overflow result even though a complete bounded tree is available.
         assert_eq!(make_lengths(&frequencies, 4, 0), [4, 4, 4, 4, 4, 4, 4, 0]);
         assert_eq!(
-            make_lengths_defluff_package_merge(&frequencies, 4, 0),
+            make_lengths_columbo_defluff_limited(&frequencies, 4, 0),
             [4, 4, 3, 3, 3, 2, 2, 0]
         );
         assert_eq!(
@@ -1252,7 +1244,7 @@ mod tests {
     }
 
     #[test]
-    fn variants_match_c_equal_frequency_tie_breaks() {
+    fn variants_match_original_columbo_c_equal_frequency_ties() {
         let frequencies = [4, 1, 9, 2, 2, 0];
         assert_eq!(make_lengths(&frequencies, 4, 0), [2, 4, 1, 4, 3, 0]);
         assert_eq!(make_lengths(&frequencies, 4, 1), [2, 4, 1, 3, 4, 0]);
@@ -1263,10 +1255,6 @@ mod tests {
         assert_eq!(
             make_lengths_order_heap(&frequencies, 4, 2),
             [2, 4, 1, 3, 4, 0]
-        );
-        assert_eq!(
-            make_lengths_deflopt_heap_exact(&frequencies, 4, 3),
-            make_lengths_deflopt_heap(&frequencies, 4, 3)
         );
     }
 
@@ -1287,10 +1275,10 @@ mod tests {
         make_lengths_defluff_exact_into(&frequencies, &mut output, 4, 0);
         assert_eq!(output, make_lengths_defluff_exact(&frequencies, 4, 0)[..]);
 
-        make_lengths_deflopt_heap_exact_into(&frequencies, &mut output, 4, 3);
+        make_lengths_columbo_defluff_limited_into(&frequencies, &mut output, 4, 0);
         assert_eq!(
             output,
-            make_lengths_deflopt_heap_exact(&frequencies, 4, 3)[..]
+            make_lengths_columbo_defluff_limited(&frequencies, 4, 0)[..]
         );
     }
 }

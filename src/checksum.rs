@@ -19,7 +19,7 @@ pub(crate) fn adler32(bytes: &[u8]) -> u32 {
     let (mut low, mut high) = (1_u32, 0_u32);
 
     // Limiting each inner batch avoids overflow without applying a modulus for
-    // every byte.  5,552 is the conventional safe Adler-32 batch size.
+    // every byte. 5,552 is the conventional safe Adler-32 batch size.
     for batch in bytes.chunks(5_552) {
         for &byte in batch {
             low += u32::from(byte);

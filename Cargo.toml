@@ -2,16 +2,16 @@
 
 [package]
 name = "columbo"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.73"
 description = "Structurally optimize existing Deflate streams without recompression"
 license = "MIT"
 readme = false
 
-# Local corpora and reverse-engineering tools are intentionally private.  An
-# allowlist protects them even while this new manifest has not yet been added
-# to Git and Cargo therefore cannot rely on the repository's ignore state.
+# Local corpora and reverse-engineering tools are intentionally private. This
+# allowlist keeps them out of source packages independently of Git's ignore
+# state.
 include = [
     "Cargo.toml",
     "Cargo.lock",
@@ -32,3 +32,10 @@ lto = "fat"
 overflow-checks = true
 panic = "unwind"
 strip = true
+
+# Published executables do not expose a recovery boundary for internal panics.
+# Aborting there removes the unwinder without changing optimization level or
+# normal error handling; developer and library release builds keep unwinding.
+[profile.distribution]
+inherits = "release"
+panic = "abort"

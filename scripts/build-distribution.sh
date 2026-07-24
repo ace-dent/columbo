@@ -3,12 +3,11 @@
 
 # Build a release executable without trading runtime speed for binary size.
 #
-# The pinned nightly compiler is used only for `location-detail=none`. That
-# flag removes panic call-site strings but does not select smaller, slower
-# algorithms. In particular, this build intentionally uses the toolchain's
-# speed-optimized prebuilt standard library instead of Cargo's `build-std`.
-# Compiler-owned paths in that prebuilt library are redacted after linking;
-# the replacement has the same length and does not alter executable code.
+# The pinned nightly compiler rebuilds the standard library with the same
+# speed-first profile as Columbo, allowing unused panic formatting and source
+# paths to disappear under whole-program LTO. Measured distribution builds
+# were no slower than the prebuilt standard library. The final path audit is
+# retained as a fail-closed check for toolchain or linker changes.
 
 set -eu
 
@@ -87,6 +86,11 @@ if ! rustup target list --toolchain "$TOOLCHAIN" --installed | grep -qx "$TARGET
     echo "install it with: rustup target add --toolchain $TOOLCHAIN $TARGET" >&2
     exit 1
 fi
+if ! rustup component list --toolchain "$TOOLCHAIN" --installed | grep -qx "rust-src"; then
+    echo "missing Rust component: rust-src" >&2
+    echo "install it with: rustup component add --toolchain $TOOLCHAIN rust-src" >&2
+    exit 1
+fi
 
 # Cargo normally discovers a native linker itself. Supply the conventional
 # MinGW cross-linker explicitly when producing Windows GNU binaries elsewhere.
@@ -96,10 +100,11 @@ if [ "$TARGET" = "x86_64-pc-windows-gnu" ] && \
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
 fi
 
-RUSTFLAGS="-Zlocation-detail=none" \
-    rustup run "$TOOLCHAIN" cargo build --locked --release --target "$TARGET"
+RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+    rustup run "$TOOLCHAIN" cargo build --locked --profile distribution \
+        --target "$TARGET" -Z build-std
 
-BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/release/$BINARY_NAME"
+BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/distribution/$BINARY_NAME"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" "$BINARY"
 
 # Editing a Mach-O invalidates its linker-generated ad-hoc signature. Restore

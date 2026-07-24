@@ -84,7 +84,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// LSB-first writer.  Bits not explicitly written remain zero, which also
+/// LSB-first writer. Bits not explicitly written remain zero, which also
 /// gives Deflate's required zero padding in the final partial byte.
 #[derive(Default)]
 pub(crate) struct BitWriter {

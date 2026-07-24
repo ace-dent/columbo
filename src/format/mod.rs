@@ -65,7 +65,7 @@ pub(super) fn scale_duration(duration: Duration, factor: f64) -> Duration {
 }
 
 /// A container may hold many independent Deflate streams, but `--timeout`
-/// applies to the file as a whole.  Raw optimizers remain self-contained and
+/// applies to the file as a whole. Raw optimizers remain self-contained and
 /// thread-safe; the wrapper passes each one only the search time still left.
 pub(super) struct SearchDeadline {
     started: Instant,

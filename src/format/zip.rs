@@ -77,7 +77,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         entry_count,
         options.strip_metadata,
     )?;
-    // Limit the sum before decoding any member.  This avoids doing expensive
+    // Limit the sum before decoding any member. This avoids doing expensive
     // work on an archive whose declared expansion is already unsafe.
     let mut expanded_size = 0_u64;
     for entry in &entries {
@@ -94,11 +94,12 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     // buffers before the reconstruction loop finally notices the overlap.
     let physical_order = preflight_local_entries(input, central_offset, &mut entries)?;
 
-    // Search order is independent of archive layout. In normal mode the C
-    // implementation gives the largest Deflate member first use of the shared
-    // deadline; max mode runs small members first and leaves the actual
-    // remainder for the final largest member. Local records are still emitted
-    // later in physical-offset order, and central records retain source order.
+    // Search order is independent of archive layout. In normal mode the
+    // original Columbo C implementation gives the largest Deflate member first
+    // use of the shared deadline; max mode runs small members first and leaves
+    // the actual remainder for the final largest member. Local records are
+    // still emitted later in physical-offset order, and central records retain
+    // source order.
     let build_order = optimization_order(&entries, options.exhaustive)?;
     let schedule = options.exhaustive.then(|| ZipSchedule::new(&entries));
     let mut timed_out = false;
@@ -111,7 +112,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         timed_out |= build_local_entry(input, central_offset, &mut entries[index], &call_options)?;
     }
 
-    // Local records need not appear in central-directory order.  Rewrite them
+    // Local records need not appear in central-directory order. Rewrite them
     // by physical offset so self-extracting prefixes and inter-record padding
     // remain byte-for-byte intact.
     let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
@@ -457,7 +458,7 @@ fn parse_central_entries(
     Ok(entries)
 }
 
-/// Build one complete local record.  The returned boolean is the raw
+/// Build one complete local record. The returned boolean is the raw
 /// optimizer's timeout flag.
 fn build_local_entry(
     input: &[u8],
@@ -502,7 +503,7 @@ fn build_local_entry(
             source_payload,
             options,
             u64::from(entry.uncompressed_size),
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
         )
         .map_err(|error| {
             if error.message().contains("internal memory safety") {

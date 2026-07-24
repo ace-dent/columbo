@@ -41,8 +41,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 /// Optimize a zlib stream embedded in another container.
 ///
 /// PNG metadata is allowed to contain data that merely resembles a compressed
-/// stream.  `lenient_header` therefore retains such data unchanged, matching
-/// the C implementation, while the top-level zlib handler rejects it.
+/// stream. `lenient_header` therefore retains such data unchanged, matching
+/// the original Columbo C implementation, while the top-level zlib handler
+/// rejects it.
 pub(super) fn optimize_embedded(
     input: &[u8],
     options: &Options,

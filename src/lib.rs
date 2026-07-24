@@ -9,8 +9,9 @@
 //! its decoded literals when that is cheaper.
 //!
 //! The public API deliberately separates format detection from optimization
-//! settings.  This keeps callers deterministic while allowing the command-line
-//! program to retain the C implementation's convenient auto-detection.
+//! settings. This keeps callers deterministic while allowing the command-line
+//! program to retain the original Columbo C implementation's convenient
+//! auto-detection.
 
 #![forbid(unsafe_code)]
 

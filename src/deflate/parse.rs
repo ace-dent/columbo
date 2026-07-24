@@ -3,7 +3,7 @@
 //! Strict Deflate parser used by every optimization route.
 //!
 //! Parsing is deliberately completed before any optional search observes the
-//! deadline.  A successful prefix result therefore always consumes one whole
+//! deadline. A successful prefix result therefore always consumes one whole
 //! stream; `timed_out` can never describe a partially decoded member.
 
 use crate::checksum::crc32_update;
@@ -25,19 +25,19 @@ type StoredPayload = (
     Option<DynamicPlan>,
 );
 
-// Parsed blocks deliberately retain decoded bytes, tokens, frequency tables,
-// and source metadata for later structural searches. A byte-only input limit
-// cannot bound that richer representation: a tiny stream may contain hundreds
-// of thousands of one-literal blocks. Keep the persistent model bounded so a
-// hostile but valid stream returns an error instead of exhausting the process.
+/// Parsed blocks deliberately retain decoded bytes, tokens, frequency tables,
+/// and source metadata for later structural searches. A byte-only input limit
+/// cannot bound that richer representation: a tiny stream may contain hundreds
+/// of thousands of one-literal blocks. Keep the persistent model bounded so a
+/// hostile but valid stream returns an error instead of exhausting the process.
 /// Shared ceiling for persistent parsing and optional transformed-token
 /// candidates. Search imports this value so a match cannot expand into a
 /// token vector larger than the model the parser itself is willing to keep.
 pub(crate) const MAX_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
-// Empty fixed blocks occupy only ten bits and are discarded from the retained
-// model. Without a separate count limit, a relatively small hostile stream
-// could therefore force millions of parser iterations while using almost no
-// decoded-byte or model budget.
+/// Empty fixed blocks occupy only ten bits and are discarded from the retained
+/// model. Without a separate count limit, a relatively small hostile stream
+/// could therefore force millions of parser iterations while using almost no
+/// decoded-byte or model budget.
 const MAX_SOURCE_BLOCKS: usize = 1_000_000;
 const PARSED_BLOCK_MODEL_BYTES: usize = std::mem::size_of::<ParsedBlock>() + 4 * 1024;
 
@@ -101,9 +101,10 @@ fn parse_stream_with_model_limit(
             // Empty blocks have no effect on decoded bytes or history. Keep
             // one only while the stream might prove entirely empty; once a
             // content block exists, every empty block can be discarded as it
-            // is parsed. This mirrors the C pending-block loop and prevents a
-            // compact run of empty blocks from amplifying into large memory
-            // use through per-block frequency tables.
+            // is parsed. This mirrors the original Columbo C implementation's
+            // pending-block loop and prevents a compact run of empty blocks
+            // from amplifying into large memory use through per-block frequency
+            // tables.
             if !saw_content && blocks.is_empty() {
                 blocks.try_reserve(1).map_err(|_| model_limit_error())?;
                 blocks.push(block);

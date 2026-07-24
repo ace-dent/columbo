@@ -16,7 +16,11 @@ use std::time::Duration;
 use columbo::{optimize, Format, Options, MAX_TIMEOUT, MIN_TIMEOUT};
 
 const PROGRAM_NAME: &str = "columbo";
-const PROGRAM_VERSION: &str = "0.3";
+const PROGRAM_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION_MAJOR"),
+    ".",
+    env!("CARGO_PKG_VERSION_MINOR")
+);
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -198,8 +202,8 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
 }
 
 fn select_format(format: &mut Format, conflict: &mut bool, selected: Format) {
-    // Repeating one mode is harmless in the C CLI; selecting two distinct
-    // modes is the error.
+    // Repeating one mode is harmless in the original Columbo C CLI; selecting
+    // two distinct modes is the error.
     if *format != selected {
         *conflict |= *format != Format::Auto;
         *format = selected;
@@ -211,7 +215,8 @@ fn starts_with_dash(value: &OsStr) -> bool {
 }
 
 fn parse_timeout(value: &OsStr) -> Option<Duration> {
-    // strtod(), used by the C CLI, accepts leading but not trailing space.
+    // strtod(), used by the original Columbo C CLI, accepts leading but not
+    // trailing space.
     let text = value.to_str()?.trim_start();
     let seconds: f64 = text.parse().ok()?;
     if !seconds.is_finite() || seconds < 0.0 {
@@ -248,7 +253,16 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "\"Just One More Thing\" - optimize the last few bytes in Deflate streams."
     )?;
-    writeln!(output, "usage: {PROGRAM_NAME} [--help|-h] [--verbose|-v] [--inspect] [--max|-m] [--timeout|-t seconds] [--mincodes 0|1] [--allow-258-alias] [--strip] [--raw|--png|--zlib|--gzip|--zip] input output")?;
+    writeln!(
+        output,
+        concat!(
+            "usage: {} [--help|-h] [--verbose|-v] [--inspect]",
+            " [--max|-m] [--timeout|-t seconds]",
+            "\n       [--mincodes 0|1] [--allow-258-alias] [--strip]",
+            "\n       [--raw|--png|--zlib|--gzip|--zip] input output"
+        ),
+        PROGRAM_NAME
+    )?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
     writeln!(output, "  -h, --help             show this help and exit")?;
@@ -264,11 +278,28 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "  -m, --max              enable slower byte-seeking searches"
     )?;
-    writeln!(output, "  -t, --timeout          stop byte-seeking searches after this many seconds (default: 180; range: 10..4000; fractions round up)")?;
-    writeln!(output, "      --mincodes 0|1     add Deflate distance codes for old decoder compatibility (default: 0)")?;
     writeln!(
         output,
-        "      --allow-258-alias  allow Defluff's decoder-compatible length-258 alias"
+        concat!(
+            "  -t, --timeout          stop byte-seeking searches after this many seconds",
+            "\n                         (default: 180; range: 10..4000;",
+            " fractions round up)"
+        )
+    )?;
+    writeln!(
+        output,
+        concat!(
+            "      --mincodes 0|1     add Deflate distance codes for old decoder",
+            "\n                         compatibility (default: 0)"
+        )
+    )?;
+    writeln!(
+        output,
+        "      --allow-258-alias  allow Columbo's non-standard symbol-284 length-258 spelling"
+    )?;
+    writeln!(
+        output,
+        "                         (strict Deflate decoders may reject it)"
     )?;
     writeln!(
         output,
@@ -345,8 +376,18 @@ fn read_bounded(reader: impl Read, maximum_size: u64) -> Result<Vec<u8>, ReadErr
 ///
 /// `create_new` prevents a symlink race on the temporary name, and the final
 /// rename replaces the directory entry rather than following a destination
-/// symlink. A failed write or sync leaves any existing output untouched.
+/// symlink. A failed write or pre-commit sync leaves any existing output
+/// untouched.
 fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let (mut temporary, file) = stage_private_output(path, bytes)?;
+    commit_temporary_output(path, &mut temporary, file)
+}
+
+/// Write and sync a private sibling without changing its access bits.
+///
+/// Keeping this phase separate from the final commit ensures that a temporary
+/// name never exposes partially written output using the destination's mode.
+fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<(TemporaryOutput, File)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -379,48 +420,90 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
             "could not create a unique temporary output",
         )
     })?;
-    let mut temporary = TemporaryOutput::new(temporary_path);
+    let temporary = TemporaryOutput::new(temporary_path);
     file.write_all(bytes)?;
-    preserve_output_permissions(path, &file)?;
     file.sync_all()?;
+    Ok((temporary, file))
+}
+
+/// Atomically install a synced private sibling.
+///
+/// Unix permits renaming an open file. Its handle is deliberately retained so
+/// a path substitution after the rename cannot redirect the permission update.
+#[cfg(unix)]
+fn commit_temporary_output(
+    path: &Path,
+    temporary: &mut TemporaryOutput,
+    file: File,
+) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let destination_mode = existing_regular_output_mode(path)?;
+    fs::rename(&temporary.path, path)?;
+    temporary.committed = true;
+
+    if let Some(mode) = destination_mode {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        // The data was synced while private. Sync again after chmod so success
+        // also means the restored access bits have reached the filesystem.
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Close before rename on platforms such as Windows, preserving prior
+/// behavior where an open handle cannot be atomically moved over the output.
+#[cfg(not(unix))]
+fn commit_temporary_output(
+    path: &Path,
+    temporary: &mut TemporaryOutput,
+    file: File,
+) -> io::Result<()> {
     drop(file);
     fs::rename(&temporary.path, path)?;
     temporary.committed = true;
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_temporary_output(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true).mode(0o600);
+    // Do not expose partially written data through the temporary name in a
+    // shared directory. Existing destination access bits are restored only
+    // after the private file has been renamed; a new output remains private.
+    let file = options.open(path)?;
+    if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
 fn create_temporary_output(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    // Do not expose partially written data through the temporary name in a
-    // shared directory. Existing destination access bits are restored before
-    // commit; a new output remains private by default.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
     options.open(path)
 }
 
 /// Preserve ordinary Unix access bits when replacing an existing output.
 /// Special mode bits are intentionally not copied to newly written data.
 #[cfg(unix)]
-fn preserve_output_permissions(path: &Path, file: &File) -> io::Result<()> {
+fn existing_regular_output_mode(path: &Path) -> io::Result<Option<u32>> {
     use std::os::unix::fs::PermissionsExt;
 
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {
-            let mode = metadata.permissions().mode() & 0o777;
-            file.set_permissions(fs::Permissions::from_mode(mode))
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            Ok(Some(metadata.permissions().mode() & 0o777))
         }
-        Ok(_) | Err(_) => Ok(()),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
     }
-}
-
-#[cfg(not(unix))]
-fn preserve_output_permissions(_path: &Path, _file: &File) -> io::Result<()> {
-    Ok(())
 }
 
 struct TemporaryOutput {
@@ -578,6 +661,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn staged_output_is_private_and_commit_preserves_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = unique_test_directory();
+        let output = directory.join("output.bin");
+        fs::write(&output, b"old").unwrap();
+        fs::set_permissions(&output, fs::Permissions::from_mode(0o751)).unwrap();
+
+        let (mut temporary, file) = stage_private_output(&output, b"new").unwrap();
+        assert_eq!(fs::read(&temporary.path).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&temporary.path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"old");
+
+        commit_temporary_output(&output, &mut temporary, file).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn output_commit_replaces_a_symlink_without_following_it() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -585,7 +697,7 @@ mod tests {
         let protected = directory.join("protected.bin");
         let output = directory.join("output.bin");
         fs::write(&protected, b"protected").unwrap();
-        fs::set_permissions(&protected, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&protected, fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&protected, &output).unwrap();
 
         write_file(&output, b"optimized").unwrap();

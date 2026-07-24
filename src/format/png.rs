@@ -9,22 +9,22 @@ use crate::{Error, Optimization, Options, Result};
 use super::{scale_duration, zlib, SearchDeadline};
 
 const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-// Exact cross-frame reuse is optional. Bounding the retained comparison bytes
-// keeps an APNG with many very large frames from doubling its memory use.
+/// Exact cross-frame reuse is optional. Bounding the retained comparison bytes
+/// keeps an APNG with many very large frames from doubling its memory use.
 const MAX_EXACT_REUSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXACT_REUSE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_PROBE_WORK_BYTES: u64 = 64 * 1024 * 1024;
-// Every APNG frame owns and validates an independent zlib stream. Bound that
-// invocation count separately from the generic chunk count because an empty
-// frame consumes almost no decoded-byte budget.
+/// Every APNG frame owns and validates an independent zlib stream. Bound that
+/// invocation count separately from the generic chunk count because an empty
+/// frame consumes almost no decoded-byte budget.
 const MAX_APNG_FRAMES: usize = 16_384;
-// Compressed ancillary chunks are each decoded and checksum-validated even
-// when the optional search deadline is exhausted. Keep zero-length metadata
-// streams from multiplying that mandatory parser setup indefinitely.
+/// Compressed ancillary chunks are each decoded and checksum-validated even
+/// when the optional search deadline is exhausted. Keep zero-length metadata
+/// streams from multiplying that mandatory parser setup indefinitely.
 const MAX_COMPRESSED_METADATA_STREAMS: usize = 4_096;
-// Twelve-byte empty chunks otherwise amplify into several independent Rust
-// model records. A million chunks is already far beyond practical PNG/APNG
-// use while keeping parser bookkeeping comfortably bounded.
+/// Twelve-byte empty chunks otherwise amplify into several independent Rust
+/// model records. A million chunks is already far beyond practical PNG/APNG
+/// use while keeping parser bookkeeping comfortably bounded.
 const MAX_PNG_CHUNKS: usize = 1_000_000;
 
 #[derive(Clone, Copy)]
@@ -73,6 +73,7 @@ struct ParseState {
     saw_bkgd: bool,
     saw_hist: bool,
     saw_phys: bool,
+    saw_scal: bool,
     saw_exif: bool,
     saw_time: bool,
 }
@@ -97,9 +98,10 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     };
     let parsed = parse(input)?;
 
-    // Small compressed metadata gets a short first pass in the C program so a
-    // profile or text comment cannot consume the image stream's search time.
-    // If that pass finds no reduction, reconstruction gives it one normal pass.
+    // Small compressed metadata gets a short first pass in the original
+    // Columbo C implementation so a profile or text comment cannot consume the
+    // image stream's search time. If that pass finds no reduction,
+    // reconstruction gives it one normal pass.
     let mut quick_replacements = Vec::new();
     quick_replacements
         .try_reserve_exact(parsed.chunks.len())
@@ -137,7 +139,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             chunk.kind,
             chunk.data,
             &quick_options,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
             &mut budget,
         );
         let decoded_work = probe_allowance.saturating_sub(budget.remaining);
@@ -205,7 +207,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         match &chunk.kind {
             b"IDAT" => {
                 if !idat_written {
-                    // IDAT boundaries are only packetization.  Coalescing them
+                    // IDAT boundaries are only packetization. Coalescing them
                     // saves twelve bytes for every redundant chunk.
                     append_chunk(&mut output, *b"IDAT", &optimized_idat)?;
                     idat_written = true;
@@ -251,7 +253,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                         chunk.kind,
                         chunk.data,
                         options,
-                        DefaultFloor::Bounded,
+                        DefaultFloor::Shared,
                         &mut budget,
                     )?
                 };
@@ -573,6 +575,24 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
         }
         state.saw_phys = true;
     }
+    if kind == *b"sCAL" {
+        let separator = find_nul(data, 1);
+        if state.saw_scal
+            || state.saw_idat
+            || data.len() < 4
+            || !matches!(data[0], 1 | 2)
+            || separator.is_none()
+            || separator.is_some_and(|offset| {
+                offset == 1
+                    || offset + 1 == data.len()
+                    || !valid_positive_png_float(&data[1..offset])
+                    || !valid_positive_png_float(&data[offset + 1..])
+            })
+        {
+            return Err(Error::new("invalid PNG sCAL"));
+        }
+        state.saw_scal = true;
+    }
     if kind == *b"eXIf" {
         if state.saw_exif || state.saw_idat {
             return Err(Error::new("invalid PNG eXIf"));
@@ -622,6 +642,62 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
         }
     }
     Ok(())
+}
+
+/// Validate the decimal notation registered for PNG extension chunks.
+///
+/// `sCAL` requires a value greater than zero, but converting untrusted text to
+/// `f64` would incorrectly reject valid extreme exponents through overflow or
+/// underflow. The sign and nonzero decimal digits establish positivity without
+/// imposing an artificial numeric range.
+fn valid_positive_png_float(value: &[u8]) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+
+    let mut index = 0;
+    match value[0] {
+        b'+' => index += 1,
+        b'-' => return false,
+        _ => {}
+    }
+
+    let mut integer_digits = 0;
+    let mut nonzero_mantissa = false;
+    while index < value.len() && value[index].is_ascii_digit() {
+        nonzero_mantissa |= value[index] != b'0';
+        integer_digits += 1;
+        index += 1;
+    }
+
+    let mut fraction_digits = 0;
+    if value.get(index) == Some(&b'.') {
+        index += 1;
+        while index < value.len() && value[index].is_ascii_digit() {
+            nonzero_mantissa |= value[index] != b'0';
+            fraction_digits += 1;
+            index += 1;
+        }
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return false;
+    }
+
+    if matches!(value.get(index).copied(), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(value.get(index).copied(), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while index < value.len() && value[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index == exponent_start {
+            return false;
+        }
+    }
+
+    index == value.len() && nonzero_mantissa
 }
 
 fn validate_compressed_metadata(kind: [u8; 4], data: &[u8]) -> Result<()> {
@@ -728,9 +804,10 @@ enum ImageJob {
 // but only the raw Deflate searches receive the proportional slices below.
 // Reserve ten percent outside the non-largest slices (twenty percent for a
 // container with more than 32 unique image streams), then permit the final
-// largest stream one bounded comparison-floor allowance. This mirrors the C
-// optimizer's per-stream fallback recovery; the black-box timeout tests cap the
-// complete process, including this at-most-two-second allowance.
+// largest stream one bounded comparison-floor allowance. This mirrors the
+// original Columbo C optimizer's per-stream fallback recovery; the black-box
+// timeout tests cap the complete process, including this at-most-two-second
+// allowance.
 const NON_LARGEST_IMAGE_SEARCH_FRACTION: f64 = 0.90;
 const MANY_IMAGE_SEARCH_FRACTION: f64 = 0.80;
 const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
@@ -818,6 +895,11 @@ fn optimize_image_streams(
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::new("could not allocate PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
+    let image_floor = if jobs.len() == 1 {
+        DefaultFloor::Bounded
+    } else {
+        DefaultFloor::Shared
+    };
     for job in jobs {
         let weight = match job {
             ImageJob::Idat => idat.len(),
@@ -843,13 +925,8 @@ fn optimize_image_streams(
             ImageJob::Idat => idat,
             ImageJob::Frame(index) => frames[index].as_slice(),
         };
-        let result = optimize_scheduled_png_zlib(
-            stream,
-            &call_options,
-            false,
-            DefaultFloor::Bounded,
-            budget,
-        )?;
+        let result =
+            optimize_scheduled_png_zlib(stream, &call_options, false, image_floor, budget)?;
         if extends_file_deadline && budget.deadline.remaining().is_zero() {
             budget.timed_out = true;
         }
@@ -1316,6 +1393,7 @@ fn is_strippable_metadata(kind: [u8; 4]) -> bool {
             | b"iTXt"
             | b"mDCV"
             | b"pHYs"
+            | b"sCAL"
             | b"sBIT"
             | b"sPLT"
             | b"sRGB"
@@ -1459,6 +1537,106 @@ mod tests {
         assert!(result.timed_out);
         assert!(result.data.len() <= input.len());
         parse(&result.data).unwrap();
+    }
+
+    #[test]
+    fn validates_scal_floats_without_imposing_a_machine_numeric_range() {
+        let valid: &[&[u8]] = &[
+            b"1",
+            b"+1.",
+            b".5",
+            b"0.0001",
+            b"5e-324",
+            b"1E+999999999999999999999999999999999999999",
+        ];
+        for value in valid {
+            assert!(valid_positive_png_float(value), "{value:?}");
+        }
+
+        let invalid: &[&[u8]] = &[
+            b"",
+            b"0",
+            b"+0.0e999",
+            b"-1",
+            b".",
+            b"+.",
+            b"1e",
+            b"1e+",
+            b"1 0",
+            b"1_0",
+            b"NaN",
+            b"inf",
+        ];
+        for value in invalid {
+            assert!(!valid_positive_png_float(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_duplicate_and_misordered_scal_chunks() {
+        let valid = [1, b'+', b'1', b'.', b'0', b'e', b'-', b'9', 0, b'.', b'5'];
+        let mut state = ParseState::default();
+        validate_ancillary(*b"sCAL", &valid, &mut state).unwrap();
+
+        let duplicate = validate_ancillary(*b"sCAL", &valid, &mut state).unwrap_err();
+        assert_eq!(duplicate.message(), "invalid PNG sCAL");
+
+        let invalid: &[&[u8]] = &[
+            &[0, b'1', 0, b'1'],
+            &[3, b'1', 0, b'1'],
+            &[1, b'1'],
+            &[1, 0, b'1'],
+            &[1, b'1', 0],
+            &[1, b'1', 0, b'1', 0],
+            &[1, b'0', 0, b'1'],
+            &[1, b'1', 0, b'-', b'1'],
+        ];
+        for data in invalid {
+            let error = validate_ancillary(*b"sCAL", data, &mut ParseState::default()).unwrap_err();
+            assert_eq!(error.message(), "invalid PNG sCAL", "{data:?}");
+        }
+
+        let mut after_idat = ParseState {
+            saw_idat: true,
+            ..ParseState::default()
+        };
+        let misordered = validate_ancillary(*b"sCAL", &valid, &mut after_idat).unwrap_err();
+        assert_eq!(misordered.message(), "invalid PNG sCAL");
+    }
+
+    #[test]
+    fn coalesces_ten_idat_chunks_and_preserves_registered_scal() {
+        // This is the already-minimal 1x1 zlib stream used by the 24-chunk
+        // corpus case. Only removing nine redundant IDAT wrappers can shrink
+        // it, for an exact saving of 9 * 12 bytes.
+        let zlib = [0x78, 0x01, 0x63, 0xf8, 0x0f, 0x00, 0x01, 0x01, 0x01, 0x00];
+        let scal = [1, b'1', b'.', b'0', 0, b'1', b'.', b'0'];
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"sCAL", &scal));
+        for byte in zlib {
+            input.extend(chunk(*b"IDAT", &[byte]));
+        }
+        input.extend(chunk(*b"IEND", &[]));
+
+        let result = optimize(&input, &Options::default()).unwrap();
+        assert_eq!(input.len() - result.data.len(), 108);
+
+        let parsed = parse(&result.data).unwrap();
+        assert_eq!(
+            parsed
+                .chunks
+                .iter()
+                .filter(|chunk| chunk.kind == *b"IDAT")
+                .count(),
+            1
+        );
+        let preserved = parsed
+            .chunks
+            .iter()
+            .find(|chunk| chunk.kind == *b"sCAL")
+            .expect("registered sCAL metadata should be preserved");
+        assert_eq!(preserved.data, scal);
     }
 
     #[test]

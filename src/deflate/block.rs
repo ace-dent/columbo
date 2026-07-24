@@ -69,9 +69,9 @@ fn plan_representation(
         expired,
     );
 
-    // The order is intentional: rewritten-form ties in the C optimizer prefer
-    // stored, then fixed, then dynamic. Exact original bits are considered
-    // afterward and win a tie, preventing churn without a size saving.
+    // Rewritten candidates intentionally use the original Columbo C tie order:
+    // stored before fixed before dynamic. A usable exact-original candidate is
+    // considered afterward and wins an equal-bit tie, avoiding pointless churn.
     let (mut representation, mut bits) = if stored_bits <= fixed_bits
         && dynamic
             .as_ref()
