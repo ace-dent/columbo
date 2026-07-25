@@ -846,7 +846,39 @@ pub(crate) fn plan_block_with_search<F>(
 where
     F: FnMut() -> bool,
 {
-    plan_block_with_search_policy(block, alignment, options, SearchPolicy::FULL, None, expired)
+    plan_block_with_search_policy(
+        block,
+        alignment,
+        options,
+        SearchPolicy::FULL,
+        SearchBase::Price,
+        expired,
+    )
+}
+
+/// Continue the full token search from an already completed ordinary plan.
+///
+/// Stream split discovery prices the unsplit block before it ranks any
+/// boundaries. Passing that exact plan back here avoids rebuilding the same
+/// exhaustive Huffman representation when the token search begins.
+pub(crate) fn plan_block_with_complete_base_search<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    base: PlannedBlock,
+    expired: &mut F,
+) -> PlannedBlock
+where
+    F: FnMut() -> bool,
+{
+    plan_block_with_search_policy(
+        block,
+        alignment,
+        options,
+        SearchPolicy::FULL,
+        SearchBase::Complete(base),
+        expired,
+    )
 }
 
 /// Search one complete source block without stream-split or iterative siblings.
@@ -877,7 +909,7 @@ where
             replay: false,
             large_source_bands: true,
         },
-        None,
+        SearchBase::Price,
         expired,
     )
 }
@@ -907,9 +939,18 @@ where
             replay: false,
             large_source_bands: true,
         },
-        Some(seed),
+        SearchBase::Additional(seed),
         expired,
     )
+}
+
+enum SearchBase {
+    /// Price the ordinary representation before trying token transforms.
+    Price,
+    /// Price the ordinary representation and retain this independent sibling.
+    Additional(PlannedBlock),
+    /// This is the already-priced ordinary representation for the same block.
+    Complete(PlannedBlock),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -936,16 +977,24 @@ fn plan_block_with_search_policy<F>(
     alignment: u8,
     options: &Options,
     policy: SearchPolicy,
-    seed: Option<PlannedBlock>,
+    base: SearchBase,
     expired: &mut F,
 ) -> PlannedBlock
 where
     F: FnMut() -> bool,
 {
-    let mut best = plan_block(block, alignment, options, &mut *expired);
-    if let Some(seed) = seed.filter(|seed| seed.bits < best.bits) {
-        best = seed;
-    }
+    let mut best = match base {
+        SearchBase::Price => plan_block(block, alignment, options, &mut *expired),
+        SearchBase::Additional(seed) => {
+            let ordinary = plan_block(block, alignment, options, &mut *expired);
+            if seed.bits < ordinary.bits {
+                seed
+            } else {
+                ordinary
+            }
+        }
+        SearchBase::Complete(base) => base,
+    };
     // Columbo's two feedback seeds are a bounded comparison floor: one is
     // Defluff's exact builder, while the other combines Columbo's generic tree
     // with Defluff's limiter. Price both before optional byte-seeking work.
@@ -959,12 +1008,25 @@ where
     // offers a broader opt-in reverse candidate whenever symbol 284 plus five
     // extra bits may beat symbol 285; unlike Defluff, it does not require
     // existing ordinary symbol-284 traffic.
-    if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
-        if normalized.as_slice() != block.tokens.as_slice() {
-            consider_tokens(block, normalized, alignment, options, expired, &mut best);
+    let has_258_alias = block.literal_frequencies[284] != 0
+        && block.tokens.iter().any(|token| {
+            matches!(
+                token,
+                Token::Match {
+                    length: 258,
+                    length_symbol: 284,
+                    ..
+                }
+            )
+        });
+    if has_258_alias {
+        if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
+            if normalized.as_slice() != block.tokens.as_slice() {
+                consider_tokens(block, normalized, alignment, options, expired, &mut best);
+            }
         }
     }
-    if !options.strict {
+    if !options.strict && block.literal_frequencies[285] != 0 {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
             if aliased.as_slice() != block.tokens.as_slice() {
                 consider_tokens(block, aliased, alignment, options, expired, &mut best);
@@ -973,10 +1035,17 @@ where
     }
 
     let match_count = block
-        .tokens
+        .distance_frequencies
         .iter()
-        .filter(|token| matches!(token, Token::Match { .. }))
-        .count();
+        .fold(0_u64, |count, &frequency| {
+            count.saturating_add(u64::from(frequency))
+        });
+    if match_count == 0 {
+        // Every remaining family only spells existing matches as literals.
+        // Feedback-tree pricing above is the only useful work on an already
+        // literal-only token stream.
+        return best;
+    }
 
     // Columbo directly prices the literal-only endpoint. Neither DeflOpt nor
     // Defluff implements this repeated match-group shortcut: they contribute
@@ -1160,7 +1229,7 @@ where
     // which those matches remain intact. This mirrors an alternate in the
     // original Columbo C scheduler without widening the queue or creating a
     // new LZ77 match. A failed clone simply retains the established path.
-    let pre_individual = try_ordered_queue
+    let pre_individual = (try_ordered_queue && try_individual_prune && match_count != 0)
         .then(|| try_clone_planned_block(&best))
         .flatten();
     if try_individual_prune && match_count != 0 && !expired() {
@@ -1236,10 +1305,21 @@ where
     best
 }
 
-#[derive(Clone)]
 struct QueueState {
     tokens: Vec<Token>,
     bits: u64,
+    table: QueueTable,
+}
+
+enum QueueTable {
+    /// The incumbent can carry a specialized or exact source table, while the
+    /// queue historically begins from its ordinary representation.
+    Unknown,
+    /// A child already owns the ordinary table built by `plan_tokens`.
+    Lengths { literal: Vec<u8>, distance: Vec<u8> },
+    /// A stored child has no Huffman descendants, but still occupies its
+    /// historical beam slot at the next depth.
+    NoCodes,
 }
 
 fn ordered_state_queue<F>(
@@ -1259,14 +1339,15 @@ fn ordered_state_queue<F>(
     let Some(initial_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len()) else {
         return;
     };
-    let Some(initial_seen) = try_clone_token_candidate(&best.tokens, block.plain.len()) else {
-        return;
-    };
     let mut current = vec![QueueState {
         tokens: initial_tokens,
         bits: best.bits,
+        table: QueueTable::Unknown,
     }];
-    let mut seen = vec![initial_seen];
+    // Every edge expands at least one match of length three or more. Token
+    // counts therefore increase monotonically, so no child can return to the
+    // unexpanded initial state.
+    let mut seen = Vec::new();
 
     for _ in 0..DEPTH {
         let mut next = Vec::new();
@@ -1274,23 +1355,42 @@ fn ordered_state_queue<F>(
             if expired() {
                 return;
             }
-            let Some(state_tokens) = try_clone_token_candidate(&state.tokens, block.plain.len())
-            else {
-                return;
+            let repriced_lengths;
+            let (literal_lengths, distance_lengths) = match &state.table {
+                QueueTable::Unknown => {
+                    let Some(state_tokens) =
+                        try_clone_token_candidate(&state.tokens, block.plain.len())
+                    else {
+                        return;
+                    };
+                    let Some(state_block) = try_transformed_block(block, state_tokens) else {
+                        return;
+                    };
+                    let state_plan = plan_block(&state_block, alignment, options, &mut *expired);
+                    let Some(lengths) = plan_lengths(&state_plan) else {
+                        continue;
+                    };
+                    repriced_lengths = lengths;
+                    (repriced_lengths.0.as_slice(), repriced_lengths.1.as_slice())
+                }
+                QueueTable::Lengths { literal, distance } => {
+                    (literal.as_slice(), distance.as_slice())
+                }
+                QueueTable::NoCodes => continue,
             };
-            let Some(state_block) = try_transformed_block(block, state_tokens) else {
-                return;
-            };
-            let state_plan = plan_block(&state_block, alignment, options, &mut *expired);
-            let Some((literal_lengths, distance_lengths)) = plan_lengths(&state_plan) else {
-                continue;
-            };
-            let groups = collect_match_groups(&state_block, &literal_lengths, &distance_lengths);
+            let groups = collect_match_groups(
+                &state.tokens,
+                &block.plain,
+                literal_lengths,
+                distance_lengths,
+            );
             for group in groups.iter().take(CHILDREN) {
                 if expired() {
                     return;
                 }
-                let Some(tokens) = expand_groups(&state_block, std::slice::from_ref(group)) else {
+                let Some(tokens) =
+                    expand_groups(&state.tokens, &block.plain, std::slice::from_ref(group))
+                else {
                     continue;
                 };
                 if seen.iter().any(|known| known == &tokens) {
@@ -1309,13 +1409,25 @@ fn ordered_state_queue<F>(
                 else {
                     return;
                 };
-                if plan.bits < best.bits {
-                    *best = plan.clone();
+                let plan_bits = plan.bits;
+                let improves_best = plan_bits < best.bits;
+                let enters_beam =
+                    plan_bits <= state.bits.saturating_add(MARGIN) || plan_bits <= best.bits;
+                let table = enters_beam.then(|| {
+                    plan_lengths(&plan).map_or(QueueTable::NoCodes, |(literal, distance)| {
+                        QueueTable::Lengths { literal, distance }
+                    })
+                });
+                if improves_best {
+                    // The queue keeps its own tokens and table below, so the
+                    // complete plan can become the incumbent without cloning.
+                    *best = plan;
                 }
-                if plan.bits <= state.bits.saturating_add(MARGIN) || plan.bits <= best.bits {
+                if let Some(table) = table {
                     next.push(QueueState {
                         tokens,
-                        bits: plan.bits,
+                        bits: plan_bits,
+                        table,
                     });
                 }
             }
@@ -1565,13 +1677,20 @@ fn match_group_search<F>(
     deduplicate_seeds(&mut seeds);
 
     for (literal_lengths, distance_lengths) in seeds {
-        let groups = collect_match_groups(block, &literal_lengths, &distance_lengths);
+        let groups = collect_match_groups(
+            &block.tokens,
+            &block.plain,
+            &literal_lengths,
+            &distance_lengths,
+        );
         let cap = if options.exhaustive { 20 } else { 8 };
         for group in groups.iter().take(cap) {
             if expired() {
                 return;
             }
-            if let Some(tokens) = expand_groups(block, std::slice::from_ref(group)) {
+            if let Some(tokens) =
+                expand_groups(&block.tokens, &block.plain, std::slice::from_ref(group))
+            {
                 consider_tokens(block, tokens, alignment, options, expired, best);
             }
         }
@@ -1583,7 +1702,7 @@ fn match_group_search<F>(
             if expired() {
                 return;
             }
-            if let Some(tokens) = expand_groups(block, &groups[..count]) {
+            if let Some(tokens) = expand_groups(&block.tokens, &block.plain, &groups[..count]) {
                 consider_tokens(block, tokens, alignment, options, expired, best);
             }
         }
@@ -1591,7 +1710,8 @@ fn match_group_search<F>(
 }
 
 fn collect_match_groups(
-    block: &ParsedBlock,
+    tokens: &[Token],
+    plain: &[u8],
     literal_lengths: &[u8],
     distance_lengths: &[u8],
 ) -> Vec<MatchGroup> {
@@ -1603,7 +1723,7 @@ fn collect_match_groups(
     let mut distance_valid = [true; 30];
     let mut plain_offset = 0;
 
-    for &token in block.tokens.iter() {
+    for &token in tokens {
         if let Token::Match {
             length,
             length_symbol,
@@ -1613,7 +1733,7 @@ fn collect_match_groups(
             ..
         } = token
         {
-            let decoded = &block.plain[plain_offset..plain_offset + usize::from(length)];
+            let decoded = &plain[plain_offset..plain_offset + usize::from(length)];
             let length_index = usize::from(length_symbol - 257);
             let distance_index = usize::from(distance_symbol);
             let literal_codes_available = decoded
@@ -1672,8 +1792,8 @@ fn collect_match_groups(
     groups
 }
 
-fn expand_groups(block: &ParsedBlock, groups: &[MatchGroup]) -> Option<Vec<Token>> {
-    expand_selected_matches(&block.tokens, &block.plain, |_, token, _| match token {
+fn expand_groups(tokens: &[Token], plain: &[u8], groups: &[MatchGroup]) -> Option<Vec<Token>> {
+    expand_selected_matches(tokens, plain, |_, token, _| match token {
         Token::Literal(_) => false,
         Token::Match {
             length_symbol,

@@ -239,6 +239,16 @@ impl Progress {
         );
     }
 
+    pub(crate) fn skipped(self, name: &'static str, reason: &'static str) {
+        if self.enabled {
+            println!(
+                "  S{}   {} {name} skipped · {reason}",
+                self.stream_id,
+                neutral(self.color)
+            );
+        }
+    }
+
     pub(crate) fn blocks(self, report: Option<BlockReport>) {
         if !self.enabled {
             return;
@@ -464,7 +474,7 @@ impl RouteProgress {
             });
         let best = self.best_bits.get().map_or_else(String::new, |bits| {
             format!(
-                " · established route best {bits} {} in {} {}",
+                " · best route: {bits} {} in {} {}",
                 plural_u64(bits, "bit", "bits"),
                 self.best_blocks.get(),
                 plural(self.best_blocks.get(), "block", "blocks")

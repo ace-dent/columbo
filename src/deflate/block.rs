@@ -75,13 +75,86 @@ pub(crate) fn plan_owned_block(
     }
 }
 
-fn plan_representation(
+/// Best fixed, dynamic, or non-stored source representation for one token set.
+///
+/// Huffman payload and header costs do not depend on the block's starting bit
+/// alignment. Stream boundary search can therefore build this comparatively
+/// expensive part once, then compare it with the eight cheap stored-padding
+/// possibilities.
+pub(crate) struct ReusableBlockPlan {
+    representation: Representation,
+    bits: u64,
+}
+
+impl ReusableBlockPlan {
+    /// Return the cheapest aligned bit count without cloning the representation.
+    pub(crate) fn bits_at_alignment(
+        &self,
+        plain_len: usize,
+        alignment: u8,
+        original: Option<OriginalBits>,
+    ) -> u64 {
+        let mut bits = stored_block_bits(alignment, plain_len).min(self.bits);
+        if let Some(original) = original {
+            bits = bits.min(original.len);
+        }
+        bits
+    }
+
+    /// Select one aligned representation while retaining this reusable kernel.
+    ///
+    /// A dynamic-table clone is optional work. If allocation fails, retain the
+    /// cheapest allocation-free stored or exact-original representation rather
+    /// than discarding the complete boundary-DP edge.
+    pub(crate) fn at_alignment(
+        &self,
+        plain_len: usize,
+        alignment: u8,
+        original: Option<OriginalBits>,
+    ) -> (Representation, u64) {
+        let stored_bits = stored_block_bits(alignment, plain_len);
+        let selected_bits = stored_bits.min(self.bits);
+        if let Some(original) = original.filter(|original| original.len <= selected_bits) {
+            return (Representation::Original(original), original.len);
+        }
+        if stored_bits <= self.bits {
+            return (Representation::Stored, stored_bits);
+        }
+        if let Some(representation) = self.representation.try_clone() {
+            return (representation, self.bits);
+        }
+
+        // The reusable dynamic table could not be copied. Exact source bits
+        // remain preferable to stored bytes on an equal-bit fallback.
+        if let Some(original) = original.filter(|original| original.len <= stored_bits) {
+            (Representation::Original(original), original.len)
+        } else {
+            (Representation::Stored, stored_bits)
+        }
+    }
+
+    fn into_alignment(
+        self,
+        block: &ParsedBlock,
+        alignment: u8,
+        strict: bool,
+    ) -> (Representation, u64) {
+        select_aligned_representation(
+            block.plain.len(),
+            reusable_original_bits(block, alignment, strict),
+            alignment,
+            self.representation,
+            self.bits,
+        )
+    }
+}
+
+/// Price the alignment-independent representation kernel for one block.
+pub(crate) fn plan_reusable_block(
     block: &ParsedBlock,
-    alignment: u8,
     options: &Options,
     expired: impl FnMut() -> bool,
-) -> (Representation, u64) {
-    let stored_bits = stored_block_bits(alignment, block.plain.len());
+) -> ReusableBlockPlan {
     let fixed_bits = fixed_block_bits(&block.tokens).unwrap_or(u64::MAX);
     let dynamic = best_dynamic_plan(
         &block.tokens,
@@ -93,16 +166,7 @@ fn plan_representation(
         expired,
     );
 
-    // Rewritten candidates intentionally use the original Columbo C tie order:
-    // stored before fixed before dynamic. A usable exact-original candidate is
-    // considered afterward and wins an equal-bit tie, avoiding pointless churn.
-    let (mut representation, mut bits) = if stored_bits <= fixed_bits
-        && dynamic
-            .as_ref()
-            .map_or(true, |candidate| stored_bits <= candidate.bits)
-    {
-        (Representation::Stored, stored_bits)
-    } else if dynamic
+    let (mut representation, mut bits) = if dynamic
         .as_ref()
         .map_or(true, |candidate| fixed_bits <= candidate.bits)
     {
@@ -113,7 +177,52 @@ fn plan_representation(
         (Representation::Dynamic(dynamic), bits)
     };
 
-    if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
+    // Exact fixed and dynamic source bits are alignment-independent and retain
+    // the original selector's final tie priority.
+    if let Some(original) = block
+        .original
+        .filter(|original| original.block_type != SourceBlockType::Stored)
+        .and_then(|_| reusable_original_bits(block, 0, options.strict))
+    {
+        if original.len <= bits {
+            representation = Representation::Original(original);
+            bits = original.len;
+        }
+    }
+
+    ReusableBlockPlan {
+        representation,
+        bits,
+    }
+}
+
+fn plan_representation(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    expired: impl FnMut() -> bool,
+) -> (Representation, u64) {
+    plan_reusable_block(block, options, expired).into_alignment(block, alignment, options.strict)
+}
+
+fn select_aligned_representation(
+    plain_len: usize,
+    original: Option<OriginalBits>,
+    alignment: u8,
+    huffman_representation: Representation,
+    huffman_bits: u64,
+) -> (Representation, u64) {
+    let stored_bits = stored_block_bits(alignment, plain_len);
+    // Rewritten candidates intentionally use the original Columbo C tie order:
+    // stored before fixed before dynamic. A usable exact-original candidate is
+    // considered afterward and wins an equal-bit tie, avoiding pointless churn.
+    let (mut representation, mut bits) = if stored_bits <= huffman_bits {
+        (Representation::Stored, stored_bits)
+    } else {
+        (huffman_representation, huffman_bits)
+    };
+
+    if let Some(original) = original {
         if original.len <= bits {
             representation = Representation::Original(original);
             bits = original.len;
@@ -361,6 +470,35 @@ mod tests {
             stored_block_bits(0, 65_536),
             3 + 5 + 32 + 65_535 * 8 + 3 + 5 + 32 + 8
         );
+    }
+
+    #[test]
+    fn reusable_huffman_plan_still_selects_stored_per_alignment() {
+        let mut block = block_with_original(SourceBlockType::Dynamic, 0, None);
+        block.plain = std::sync::Arc::new(vec![0; 26]);
+
+        // A 26-byte stored block costs 243 bits with no padding and 250 bits
+        // with seven padding bits. The reusable Huffman kernel must therefore
+        // remain a candidate rather than blindly reusing one aligned winner.
+        let (no_padding, no_padding_bits) = select_aligned_representation(
+            block.plain.len(),
+            reusable_original_bits(&block, 5, true),
+            5,
+            Representation::Fixed,
+            244,
+        );
+        assert!(matches!(no_padding, Representation::Stored));
+        assert_eq!(no_padding_bits, 243);
+
+        let (seven_padding, seven_padding_bits) = select_aligned_representation(
+            block.plain.len(),
+            reusable_original_bits(&block, 6, true),
+            6,
+            Representation::Fixed,
+            244,
+        );
+        assert!(matches!(seven_padding, Representation::Fixed));
+        assert_eq!(seven_padding_bits, 244);
     }
 
     #[test]

@@ -23,20 +23,22 @@ use std::thread;
 use crate::progress::RouteProgress;
 use crate::Options;
 
-use super::block::{plan_block, stored_block_bits};
+use super::block::{
+    plan_block, plan_reusable_block, reusable_original_bits, stored_block_bits, ReusableBlockPlan,
+};
 use super::deft4j::plan_source_block;
 use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
 use super::model::{
-    count_frequencies, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
-    SourceBlockType, Token,
+    count_frequencies, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock,
+    Representation, SourceBlockType, Token,
 };
 use super::search::{
     improve_plan_with_deft4j_tree_floor, improve_plan_with_floor,
-    improve_plan_with_short_family_floor, plan_block_with_floor, plan_block_with_narrow_search,
-    plan_block_with_search, plan_block_with_seeded_narrow_search,
-    plan_block_with_short_family_floor, replay_extended_floor, replay_table_ladder,
-    score_short_family_frequencies, tighten_terminal_plan, try_clone_planned_block,
-    ShortFamilyStats,
+    improve_plan_with_short_family_floor, plan_block_with_complete_base_search,
+    plan_block_with_floor, plan_block_with_narrow_search, plan_block_with_search,
+    plan_block_with_seeded_narrow_search, plan_block_with_short_family_floor,
+    replay_extended_floor, replay_table_ladder, score_short_family_frequencies,
+    tighten_terminal_plan, try_clone_planned_block, ShortFamilyStats,
 };
 
 // The original Columbo C implementation tries its default long-merge route in
@@ -817,15 +819,12 @@ fn source_aligned_huffman_floor_with_limit(
                 recode_base = Some((range, base));
                 selected
             } else {
-                plan_edge(
-                    blocks,
-                    &composite,
-                    start,
-                    end,
+                PlanTemplate::from_planned(plan_block(
+                    &blocks[start_index],
                     start_alignment,
                     &structural_options,
-                    &mut || false,
-                )?
+                    || false,
+                ))
             };
             let mut candidate_bits = template.bits;
             let mut candidate_is_stored = matches!(template.representation, Representation::Stored);
@@ -2071,6 +2070,10 @@ where
         // the seven inexpensive eighth probes.
         plan_block_with_search(block, alignment, options, expired)
     };
+    let complete_base = options
+        .exhaustive
+        .then(|| try_clone_planned_block(&base))
+        .flatten();
     let mut best = vec![base];
     let mut best_bits = total_bits(&best);
     if expired() {
@@ -2140,7 +2143,12 @@ where
     // time on adaptive discovery. If the new search reaches the deadline, the
     // eighth/32-token floor above remains available.
     if options.exhaustive && !expired() {
-        let searched_base = plan_block_with_search(block, alignment, options, expired);
+        let searched_base = match complete_base {
+            Some(base) => {
+                plan_block_with_complete_base_search(block, alignment, options, base, expired)
+            }
+            None => plan_block_with_search(block, alignment, options, expired),
+        };
         if searched_base.bits < best_bits {
             best_bits = searched_base.bits;
             best = vec![searched_base];
@@ -3037,16 +3045,23 @@ where
             if !edge_allowed(composite, start, end, options.exhaustive, allow_regroup) {
                 continue;
             }
+            if expired() {
+                return None;
+            }
+            let Some(edge) = prepare_edge(blocks, composite, start, end, options, &mut *expired)
+            else {
+                continue;
+            };
 
-            for &(alignment, prefix_bits) in &reachable[..reachable_len] {
-                if expired() {
+            for (reachable_index, &(alignment, prefix_bits)) in
+                reachable[..reachable_len].iter().enumerate()
+            {
+                // Match the former per-alignment loop: a plan that reaches the
+                // deadline is still allowed to update its first DP state.
+                if reachable_index != 0 && expired() {
                     return None;
                 }
-                let Some(template) =
-                    plan_edge(blocks, composite, start, end, alignment, options, expired)
-                else {
-                    continue;
-                };
+                let template = edge.plan(alignment);
                 let Some(bits) = prefix_bits.checked_add(template.bits) else {
                     continue;
                 };
@@ -3170,57 +3185,128 @@ fn overlapping_source_range(composite: &Composite, start: Cut, end: Cut) -> std:
     first..past_last
 }
 
+/// One boundary-DP edge with its alignment-independent Huffman work cached.
+///
+/// The old loop rebuilt and recopied the same range for every reachable bit
+/// alignment. Only stored padding and exact stored-source reuse vary across
+/// those eight states.
+struct PreparedEdge {
+    plain_len: usize,
+    source_type: SourceBlockType,
+    original: Option<OriginalBits>,
+    reusable: ReusableBlockPlan,
+    shared_dynamic: Option<DynamicPlan>,
+}
+
+impl PreparedEdge {
+    fn plan(&self, alignment: u8) -> PlanTemplate {
+        let original = self.original.filter(|original| {
+            original.block_type != SourceBlockType::Stored || original.alignment == alignment
+        });
+
+        // Prefer a strictly cheaper shared tree without first copying a
+        // dynamic base table. If that optional allocation fails, the complete
+        // ordinary plan below remains available.
+        let mut shared_clone_failed = false;
+        if let Some(shared) = self.shared_dynamic.as_ref() {
+            let theoretical_base_bits =
+                self.reusable
+                    .bits_at_alignment(self.plain_len, alignment, original);
+            if shared.bits < theoretical_base_bits {
+                if let Some(shared) = shared.try_clone() {
+                    return PlanTemplate {
+                        bits: shared.bits,
+                        representation: Representation::Dynamic(shared),
+                        source_type: self.source_type,
+                    };
+                }
+                shared_clone_failed = true;
+            }
+        }
+
+        let (representation, bits) =
+            self.reusable
+                .at_alignment(self.plain_len, alignment, original);
+        // A failed base-table clone can select a dearer allocation-free
+        // fallback. Give the shared table one chance against that fallback.
+        if !shared_clone_failed {
+            if let Some(shared) = self
+                .shared_dynamic
+                .as_ref()
+                .filter(|shared| shared.bits < bits)
+                .and_then(DynamicPlan::try_clone)
+            {
+                return PlanTemplate {
+                    bits: shared.bits,
+                    representation: Representation::Dynamic(shared),
+                    source_type: self.source_type,
+                };
+            }
+        }
+        PlanTemplate {
+            representation,
+            bits,
+            source_type: self.source_type,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn plan_edge<F>(
+fn prepare_edge<F>(
     blocks: &[ParsedBlock],
     composite: &Composite,
     start: Cut,
     end: Cut,
-    alignment: u8,
     options: &Options,
     expired: &mut F,
-) -> Option<PlanTemplate>
+) -> Option<PreparedEdge>
 where
     F: FnMut() -> bool,
 {
+    // Boundary DP is deliberately token-preserving. Match-to-literal spelling
+    // searches run in the complete sequential pass and again after every
+    // accepted structural replay; retaining them in each DP state would make
+    // memory proportional to cuts × alignments rather than to the input.
     if let Some(source_index) = exact_source(composite, start, end) {
-        let plan = plan_block(&blocks[source_index], alignment, options, expired);
-        return Some(PlanTemplate::from_planned(plan));
+        let block = &blocks[source_index];
+        let reusable = plan_reusable_block(block, options, expired);
+        return Some(PreparedEdge {
+            plain_len: block.plain.len(),
+            source_type: block.source_type,
+            original: usable_original(block, options.strict),
+            reusable,
+            shared_dynamic: None,
+        });
     }
 
     let range = make_range(composite, start, end)?;
-    let mut planned = plan_block(&range, alignment, options, &mut *expired);
-
+    // Keep ordinary fixed/dynamic pricing ahead of the optional shared-table
+    // probe, preserving the established deadline priority.
+    let reusable = plan_reusable_block(&range, options, &mut *expired);
     let source_range = overlapping_source_range(composite, start, end);
     let source_spans = &composite.sources[source_range.clone()];
     let whole_sources = source_spans.first().is_some_and(|first| {
         start.token == first.token_start
             && end.token == source_spans.last().expect("first was present").token_end
     });
+    let shared_dynamic = if whole_sources && source_spans.len() > 1 {
+        shared_dynamic_plan(&blocks[source_range], &range.tokens, options.strict)
+    } else {
+        None
+    };
+    Some(PreparedEdge {
+        plain_len: range.plain.len(),
+        source_type: range.source_type,
+        original: usable_original(&range, options.strict),
+        reusable,
+        shared_dynamic,
+    })
+}
 
-    // Boundary DP is deliberately token-preserving. Match-to-literal spelling
-    // searches run in the complete sequential pass and again after every
-    // accepted structural replay; retaining them in each DP state would make
-    // memory proportional to cuts × alignments rather than to the input.
-
-    if whole_sources && source_spans.len() > 1 {
-        if let Some(shared) =
-            shared_dynamic_plan(&blocks[source_range], &range.tokens, options.strict)
-        {
-            if shared.bits < planned.bits {
-                let bits = shared.bits;
-                planned = PlannedBlock {
-                    tokens: range.tokens.clone(),
-                    plain: range.plain.clone(),
-                    representation: Representation::Dynamic(shared),
-                    bits,
-                    source_type: range.source_type,
-                };
-            }
-        }
-    }
-
-    Some(PlanTemplate::from_planned(planned))
+/// Retain only exact-source metadata needed by the eight aligned selectors.
+fn usable_original(block: &ParsedBlock, strict: bool) -> Option<OriginalBits> {
+    let original = block.original?;
+    reusable_original_bits(block, original.alignment, strict)
 }
 
 fn exact_source(composite: &Composite, start: Cut, end: Cut) -> Option<usize> {

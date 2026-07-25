@@ -580,11 +580,13 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         // The encoded floor is all we need for comparison. Releasing its
         // copied tokens before max search keeps peak memory predictable.
         candidate.plans.clear();
+        let mut source_max_stabilized_incumbent = false;
 
         // Generic max also explores source-boundary and table families outside
         // deft4j's source-ordered graph. Run it before a rewritten seed can
         // spend the remainder on one large merged block.
         if let Some(max_candidate) = source_max_candidate {
+            source_max_stabilized_incumbent = candidate.is_encoding_stabilized_by(&max_candidate);
             candidate.replace_if_smaller(max_candidate);
         } else {
             let run_source_max = !suppress_later_source_max && !deadline.expired();
@@ -593,6 +595,8 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     build_source_max_candidate(source, options, progress, &deadline, &mut || {
                         deadline.expired()
                     })?;
+                source_max_stabilized_incumbent =
+                    candidate.is_encoding_stabilized_by(&max_candidate);
                 candidate.replace_if_smaller(max_candidate);
             }
         }
@@ -602,7 +606,21 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         candidate.plans.clear();
 
         let seed_selected = options.strict || candidate.is_strictly_smaller_than_source(source);
-        let run_seeded = seed_selected && !suppress_later_optional_routes && !deadline.expired();
+        // `build_candidate` has already run the same max planner on every
+        // accepted rewrite until it either stopped improving or hit its replay
+        // cap. If source max proved these exact bytes stable, reparsing them
+        // here can only repeat that final no-improvement round.
+        let max_seed_is_stable = candidate.max_planner_is_stable || source_max_stabilized_incumbent;
+        if seed_selected && max_seed_is_stable {
+            progress.skipped(
+                "Columbo rewritten-seed refinement",
+                "exact max-planner fixed point already established",
+            );
+        }
+        let run_seeded = seed_selected
+            && !max_seed_is_stable
+            && !suppress_later_optional_routes
+            && !deadline.expired();
         let seeded_step = run_seeded.then(|| progress.start("Columbo rewritten-seed refinement"));
         if run_seeded {
             // Rewritten match choices and boundaries can expose later max
@@ -828,6 +846,13 @@ struct Candidate {
     plans: Vec<PlannedBlock>,
     block_report: Option<BlockReport>,
     route: &'static str,
+    /// The exhaustive full-stream planner reparsed these exact bytes and
+    /// reached a strict fixed point without exhausting its search allowance.
+    ///
+    /// This is deliberately attached to the encoded candidate rather than to
+    /// a route name: an earlier route may have emitted byte-for-byte identical
+    /// output and won the stable tie order.
+    max_planner_is_stable: bool,
 }
 
 impl Candidate {
@@ -871,6 +896,14 @@ impl Candidate {
         } else {
             false
         }
+    }
+
+    /// Whether another candidate proved this exact encoding to be a max-plan
+    /// fixed point.
+    fn is_encoding_stabilized_by(&self, contender: &Self) -> bool {
+        contender.max_planner_is_stable
+            && contender.bits == self.bits
+            && contender.data == self.data
     }
 }
 
@@ -1781,6 +1814,7 @@ where
     // planning round. Each accepted round must improve the complete stream,
     // so this cannot oscillate even before the explicit cap is reached.
     let mut data_is_validated = false;
+    let mut max_planner_is_stable = false;
     for round in 1..=replay_limit {
         if initial_loses && !options.strict {
             if let Some(progress) = progress {
@@ -1820,6 +1854,15 @@ where
         };
         let (replay_data, replay_bits) = emit_plans(&data, &replay_plans, options.strict)?;
         if !is_strictly_better(replay_data.len(), replay_bits, data.len(), bits) {
+            // A completed exhaustive full replay from the current bytes is
+            // precisely the work performed by the later rewritten-seed route.
+            // Record the fixed point only while the allowance is still live;
+            // a deadline-truncated planner has not proved stability.
+            max_planner_is_stable = matches!(replay_planner, ReplayPlanner::Full)
+                && options.exhaustive
+                && replay_bits == bits
+                && replay_data == data
+                && !expired();
             if let (Some(progress), Some(started)) = (progress, replay_started) {
                 if progress.deadline_was_reached() {
                     progress.replay_stopped(
@@ -1878,6 +1921,7 @@ where
         } else {
             "Normal route"
         },
+        max_planner_is_stable,
     })
 }
 
@@ -1898,6 +1942,7 @@ fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Can
         plans: Vec::new(),
         block_report: None,
         route: "Original source",
+        max_planner_is_stable: false,
     })
 }
 
@@ -2124,6 +2169,7 @@ mod tests {
             plans: Vec::new(),
             block_report: None,
             route: "test",
+            max_planner_is_stable: false,
         }
     }
 
@@ -2159,6 +2205,13 @@ mod tests {
             comparison_candidate(1, 7, 8)
         ));
         assert_eq!(optional.unwrap().data, vec![8]);
+
+        let incumbent = comparison_candidate(2, 7, 9);
+        let mut stable = comparison_candidate(2, 7, 9);
+        stable.max_planner_is_stable = true;
+        assert!(incumbent.is_encoding_stabilized_by(&stable));
+        stable.data[0] = 10;
+        assert!(!incumbent.is_encoding_stabilized_by(&stable));
 
         let source_bytes = [0_u8; 2];
         let source = CandidateInput {
