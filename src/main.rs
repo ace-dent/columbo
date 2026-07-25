@@ -276,18 +276,13 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
     let arguments: Vec<OsString> = arguments.into_iter().collect();
     let mut options = Options::default();
     let mut format = Format::Auto;
-    let mut format_conflict = false;
     let mut index = 0_usize;
 
     while index < arguments.len() && starts_with_dash(&arguments[index]) {
         let argument = arguments[index].to_string_lossy();
         match argument.as_ref() {
             "-h" | "--help" => return Ok(ParsedCommand::Help),
-            "--raw" => select_format(&mut format, &mut format_conflict, Format::Raw),
-            "--png" => select_format(&mut format, &mut format_conflict, Format::Png),
-            "--zlib" => select_format(&mut format, &mut format_conflict, Format::Zlib),
-            "--gzip" => select_format(&mut format, &mut format_conflict, Format::Gzip),
-            "--zip" => select_format(&mut format, &mut format_conflict, Format::Zip),
+            "--raw" => format = Format::Raw,
             "-v" | "--verbose" => options.verbose = true,
             "-m" | "--max" => options.exhaustive = true,
             "--strip" => options.strip_metadata = true,
@@ -324,9 +319,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
         index += 1;
     }
 
-    if format_conflict {
-        return Err(CliError::message("choose only one input mode", false));
-    }
     if arguments.len() - index != 2 {
         return Err(CliError::usage());
     }
@@ -337,15 +329,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
         input: PathBuf::from(&arguments[index]),
         output: PathBuf::from(&arguments[index + 1]),
     }))
-}
-
-fn select_format(format: &mut Format, conflict: &mut bool, selected: Format) {
-    // Repeating one mode is harmless in the original Columbo C CLI; selecting
-    // two distinct modes is the error.
-    if *format != selected {
-        *conflict |= *format != Format::Auto;
-        *format = selected;
-    }
 }
 
 fn starts_with_dash(value: &OsStr) -> bool {
@@ -391,16 +374,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "\"Just One More Thing\" - optimize the last few bytes in Deflate streams."
     )?;
-    writeln!(
-        output,
-        concat!(
-            "usage: {} [--help|-h] [--verbose|-v]",
-            " [--max|-m] [--timeout|-t seconds]",
-            "\n       [--strict 0|1] [--strip]",
-            "\n       [--raw|--png|--zlib|--gzip|--zip] input output"
-        ),
-        PROGRAM_NAME
-    )?;
+    writeln!(output, "usage: {} [options] input output", PROGRAM_NAME)?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
     writeln!(output, "  -h, --help             show this help and exit")?;
@@ -433,17 +407,12 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "      --strip            strip supported metadata/comment wrapper fields"
     )?;
+    writeln!(output)?;
+    writeln!(output, "Advanced:")?;
     writeln!(
         output,
-        "      --raw              treat input as a raw Deflate stream"
+        "      --raw              force input to be treated as raw Deflate"
     )?;
-    writeln!(output, "      --png              treat input as PNG")?;
-    writeln!(
-        output,
-        "      --zlib             treat input as zlib-wrapped Deflate"
-    )?;
-    writeln!(output, "      --gzip             treat input as GZIP")?;
-    writeln!(output, "      --zip              treat input as ZIP")?;
     writeln!(output)?;
     writeln!(
         output,
@@ -774,7 +743,15 @@ mod tests {
 
     #[test]
     fn retired_cli_flags_are_rejected() {
-        for option in ["--mincodes", "--allow-258-alias", "--inspect"] {
+        for option in [
+            "--png",
+            "--zlib",
+            "--gzip",
+            "--zip",
+            "--mincodes",
+            "--allow-258-alias",
+            "--inspect",
+        ] {
             let error = match parse_args([
                 OsString::from(option),
                 OsString::from("in"),
@@ -798,6 +775,13 @@ mod tests {
         assert!(!help.contains("--mincodes"));
         assert!(!help.contains("--allow-258-alias"));
         assert!(!help.contains("--inspect"));
+        assert!(!help.contains("--png"));
+        assert!(!help.contains("--zlib"));
+        assert!(!help.contains("--gzip"));
+        assert!(!help.contains("--zip"));
+        assert!(help.contains("usage: columbo [options] input output"));
+        assert!(help.contains("Advanced:"));
+        assert!(help.contains("--raw"));
         assert!(help.contains("live route timings, bit gains, and block choices"));
     }
 
@@ -817,36 +801,14 @@ mod tests {
     }
 
     #[test]
-    fn parser_rejects_multiple_explicit_formats() {
-        let error = match parse_args([
-            OsString::from("--raw"),
-            OsString::from("--gzip"),
-            OsString::from("in"),
-            OsString::from("out"),
-        ]) {
-            Err(error) => error,
-            Ok(_) => panic!("multiple formats should fail"),
-        };
-        assert_eq!(error.message.as_deref(), Some("choose only one input mode"));
+    fn input_format_defaults_to_auto() {
+        assert_eq!(parsed_format(["in", "out"]), Format::Auto);
     }
 
     #[test]
-    fn many_conflicting_format_flags_cannot_wrap_the_conflict_state() {
-        let mut arguments = Vec::new();
-        for index in 0..300 {
-            arguments.push(OsString::from(if index % 2 == 0 {
-                "--raw"
-            } else {
-                "--gzip"
-            }));
-        }
-        arguments.extend([OsString::from("in"), OsString::from("out")]);
-
-        let error = match parse_args(arguments) {
-            Err(error) => error,
-            Ok(_) => panic!("conflicting formats should fail"),
-        };
-        assert_eq!(error.message.as_deref(), Some("choose only one input mode"));
+    fn raw_is_an_idempotent_advanced_override() {
+        assert_eq!(parsed_format(["--raw", "in", "out"]), Format::Raw);
+        assert_eq!(parsed_format(["--raw", "--raw", "in", "out"]), Format::Raw);
     }
 
     #[test]
@@ -950,6 +912,17 @@ mod tests {
         };
         match parsed {
             ParsedCommand::Run(command) => command.options,
+            ParsedCommand::Help => panic!("expected a runnable command"),
+        }
+    }
+
+    fn parsed_format<const N: usize>(arguments: [&str; N]) -> Format {
+        let parsed = match parse_args(arguments.into_iter().map(OsString::from)) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("expected valid command arguments"),
+        };
+        match parsed {
+            ParsedCommand::Run(command) => command.format,
             ParsedCommand::Help => panic!("expected a runnable command"),
         }
     }

@@ -8,6 +8,9 @@ use columbo::{optimize, Format, Options};
 
 const EMPTY_RAW: &[u8] = &[0x03, 0x00];
 const EMPTY_ZLIB: &[u8] = &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+// One stored byte followed by an empty final fixed block. Its 0x78, 0x01
+// prefix is also a valid RFC 1950 header, making byte-only detection ambiguous.
+const ZLIB_LIKE_RAW: &[u8] = &[0x78, 0x01, 0x00, 0xfe, 0xff, b'x', 0x03, 0x00];
 
 #[test]
 fn auto_detection_and_explicit_modes_agree() {
@@ -17,6 +20,15 @@ fn auto_detection_and_explicit_modes_agree() {
 
     assert_eq!(automatic, explicit);
     assert_eq!(automatic.data, EMPTY_ZLIB);
+}
+
+#[test]
+fn explicit_raw_mode_resolves_an_ambiguous_header() {
+    let options = Options::default();
+
+    assert!(optimize(ZLIB_LIKE_RAW, Format::Auto, &options).is_err());
+    let explicit = optimize(ZLIB_LIKE_RAW, Format::Raw, &options).unwrap();
+    assert!(!explicit.data.is_empty());
 }
 
 #[test]

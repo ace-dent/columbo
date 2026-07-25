@@ -14,6 +14,7 @@ const LOCAL_FILE_HEADER: u32 = 0x0403_4b50;
 const CENTRAL_DIRECTORY_HEADER: u32 = 0x0201_4b50;
 const END_OF_CENTRAL_DIRECTORY: u32 = 0x0605_4b50;
 const DATA_DESCRIPTOR: u32 = 0x0807_4b50;
+const ZIP64_END_OF_CENTRAL_DIRECTORY: u32 = 0x0606_4b50;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
@@ -37,6 +38,23 @@ struct Entry {
     flags: u16,
     skip: bool,
     strip_extra: bool,
+}
+
+/// Recognize both ordinary archives and ZIP-family inputs that should receive
+/// a specific malformed/unsupported ZIP diagnostic.
+///
+/// A leading signature retains the old behavior for truncated inputs. Looking
+/// for the terminal record additionally recognizes valid archives with a
+/// self-extracting or other prepended stub.
+pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
+    matches!(
+        read_le32(input, 0),
+        Some(LOCAL_FILE_HEADER)
+            | Some(CENTRAL_DIRECTORY_HEADER)
+            | Some(END_OF_CENTRAL_DIRECTORY)
+            | Some(DATA_DESCRIPTOR)
+            | Some(ZIP64_END_OF_CENTRAL_DIRECTORY)
+    ) || find_end_of_central_directory(input).is_some()
 }
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {

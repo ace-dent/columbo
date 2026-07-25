@@ -148,6 +148,15 @@ pub(super) fn has_rfc1950_header(input: &[u8]) -> bool {
     (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
 }
 
+/// Recognize the RFC 1950 compression method and window field before FCHECK
+/// validation. This lets auto mode route a damaged zlib header to the zlib
+/// parser for a specific diagnostic instead of treating it as unknown bytes.
+pub(super) fn has_recognizable_header(input: &[u8]) -> bool {
+    input
+        .first()
+        .is_some_and(|&cmf| (cmf & 0x0f) == 8 && (cmf >> 4) <= 7)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
