@@ -205,7 +205,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     }
     try_append_bytes(&mut output, &new_eocd, OUTPUT_ALLOCATION_ERROR)?;
 
-    if output.len() > input.len() && !options.min_distance_codes {
+    if output.len() > input.len() && !options.strict {
         output.clear();
         try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
     }
@@ -521,7 +521,7 @@ fn build_local_entry(
             return Err(Error::new("ZIP deflate member CRC or size mismatch"));
         }
         timed_out = raw.timed_out;
-        if raw.data.len() <= source_payload.len() || options.min_distance_codes {
+        if raw.data.len() <= source_payload.len() || options.strict {
             entry.compressed_size_after = u32::try_from(raw.data.len())
                 .map_err(|_| Error::new("ZIP local entry too large"))?;
             payload = raw.data;

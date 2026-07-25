@@ -136,7 +136,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         member_start = trailer_start + 8;
     }
 
-    if output.len() > input.len() && !options.min_distance_codes {
+    if output.len() > input.len() && !options.strict {
         output.clear();
         try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
     }

@@ -18,23 +18,22 @@ use super::model::{
 ///
 /// This answers only wire-format and compatibility questions, not whether the
 /// original is the cheapest representation. Stored blocks contain alignment
-/// padding, while dynamic originals must obey the optional two-distance-code
-/// policy.
+/// padding, while strict dynamic originals must use complete Huffman codes.
 pub(crate) fn reusable_original_bits(
     block: &ParsedBlock,
     alignment: u8,
-    min_distance_codes: bool,
+    strict: bool,
 ) -> Option<OriginalBits> {
     let original = block.original?;
     let alignment_is_usable =
         original.block_type != SourceBlockType::Stored || original.alignment == alignment;
-    let distance_alphabet_is_usable = !min_distance_codes
+    let huffman_alphabets_are_usable = !strict
         || original.block_type != SourceBlockType::Dynamic
         || block
             .original_dynamic
             .as_ref()
-            .is_some_and(DynamicPlan::has_two_usable_distance_codes);
-    (alignment_is_usable && distance_alphabet_is_usable).then_some(original)
+            .is_some_and(DynamicPlan::has_strictly_compatible_huffman_codes);
+    (alignment_is_usable && huffman_alphabets_are_usable).then_some(original)
 }
 
 pub(crate) fn plan_block(
@@ -89,7 +88,7 @@ fn plan_representation(
         &block.literal_frequencies,
         &block.distance_frequencies,
         block.original_dynamic.as_ref(),
-        options.min_distance_codes,
+        options.strict,
         options.exhaustive,
         expired,
     );
@@ -114,7 +113,7 @@ fn plan_representation(
         (Representation::Dynamic(dynamic), bits)
     };
 
-    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
+    if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
         if original.len <= bits {
             representation = Representation::Original(original);
             bits = original.len;
@@ -287,6 +286,12 @@ mod tests {
         alignment: u8,
         distance_lengths: Option<Vec<u8>>,
     ) -> ParsedBlock {
+        let mut literal_lengths = vec![0; 257];
+        literal_lengths[0] = 1;
+        literal_lengths[256] = 1;
+        let mut code_length_lengths = [0; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[1] = 1;
         ParsedBlock {
             tokens: std::sync::Arc::new(Vec::new()),
             plain: std::sync::Arc::new(Vec::new()),
@@ -295,9 +300,9 @@ mod tests {
             original_literal_lengths: None,
             original_distance_lengths: None,
             original_dynamic: distance_lengths.map(|distance_lengths| DynamicPlan {
-                literal_lengths: Vec::new(),
+                literal_lengths,
                 distance_lengths,
-                code_length_lengths: [0; 19],
+                code_length_lengths,
                 rle: Vec::new(),
                 hlit: 0,
                 hdist: 0,
@@ -332,6 +337,14 @@ mod tests {
         assert!(reusable_original_bits(&one_code, 0, true).is_none());
         let two_codes = block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1, 1]));
         assert!(reusable_original_bits(&two_codes, 0, true).is_some());
+
+        let mut singleton_literal =
+            block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1, 1]));
+        let dynamic = singleton_literal.original_dynamic.as_mut().unwrap();
+        dynamic.literal_lengths.fill(0);
+        dynamic.literal_lengths[256] = 1;
+        assert!(reusable_original_bits(&singleton_literal, 0, false).is_some());
+        assert!(reusable_original_bits(&singleton_literal, 0, true).is_none());
 
         let mut reserved_only = vec![0; 32];
         reserved_only[30] = 1;

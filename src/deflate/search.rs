@@ -118,7 +118,7 @@ pub(crate) fn improve_plan_with_floor(
             );
         }
     }
-    if options.allow_258_alias {
+    if !options.strict {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
             if aliased.as_slice() != block.tokens.as_slice() {
                 consider_tokens(
@@ -199,7 +199,7 @@ pub(crate) fn improve_plan_with_floor(
         &mut best,
         COLUMBO_SINGLE_MATCH_TRIALS,
     );
-    let feedback_seeds = feedback_tree_seeds(block, options.min_distance_codes);
+    let feedback_seeds = feedback_tree_seeds(block, options.strict);
     consider_feedback_seed_trees(block, &floor_options, &feedback_seeds, &mut best);
     consider_columbo_defluff_derived_rescan(
         block,
@@ -217,7 +217,7 @@ pub(crate) fn improve_plan_with_floor(
         if let Some(replay_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len()) {
             if let Some(replay_block) = try_transformed_block(block, replay_tokens) {
                 let mut replay = plan_block(&replay_block, alignment, &floor_options, || false);
-                let feedback_seeds = feedback_tree_seeds(&replay_block, options.min_distance_codes);
+                let feedback_seeds = feedback_tree_seeds(&replay_block, options.strict);
                 consider_feedback_seed_trees(
                     &replay_block,
                     &floor_options,
@@ -350,7 +350,7 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     };
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    let seeds = feedback_tree_seeds(&block, options.min_distance_codes);
+    let seeds = feedback_tree_seeds(&block, options.strict);
     consider_feedback_seed_trees(&block, &floor_options, &seeds, plan);
 
     // This Columbo terminal pass applies DeflOpt's strict table-replay
@@ -375,7 +375,7 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     // Ignore a stored result here because its padding was priced at the dummy
     // alignment; the stream planner has already retained the valid stored form.
     let mut candidate = plan_block(&transformed, 0, &floor_options, || false);
-    let seeds = feedback_tree_seeds(&transformed, options.min_distance_codes);
+    let seeds = feedback_tree_seeds(&transformed, options.strict);
     consider_feedback_seed_trees(&transformed, &floor_options, &seeds, &mut candidate);
     if !matches!(candidate.representation, Representation::Stored) && candidate.bits < plan.bits {
         *plan = candidate;
@@ -685,7 +685,7 @@ fn consider_short_family_tokens(
     best: &mut PlannedBlock,
 ) {
     let (literal_frequencies, mut distance_frequencies) = count_frequencies(&tokens);
-    ensure_floor_distance_symbols(&mut distance_frequencies, options.min_distance_codes);
+    ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     let mut best_dynamic = None;
     for variant in 0..4 {
         let literal = make_lengths_deflopt_heap(&literal_frequencies, 15, variant);
@@ -744,7 +744,7 @@ fn consider_deft4j_trees<F>(
     F: FnMut() -> bool,
 {
     let mut distance_frequencies = block.distance_frequencies;
-    ensure_floor_distance_symbols(&mut distance_frequencies, options.min_distance_codes);
+    ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     // Emulate the reference OpenJDK `PriorityQueue` heap operations. deft4j's
     // comparator has no secondary tie key, and `PriorityQueue` does not specify
     // equal-weight ordering; this implementation fixes the recovered reference
@@ -819,7 +819,7 @@ fn consider_deft4j_rebuild<F>(
         return;
     };
     let mut distance_frequencies = candidate.distance_frequencies;
-    ensure_floor_distance_symbols(&mut distance_frequencies, options.min_distance_codes);
+    ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     let literal = make_lengths_deft4j_java_heap(&candidate.literal_frequencies, 15);
     let distance = make_lengths_deft4j_java_heap(&distance_frequencies, 15);
     let deft4j =
@@ -949,7 +949,7 @@ where
     // Columbo's two feedback seeds are a bounded comparison floor: one is
     // Defluff's exact builder, while the other combines Columbo's generic tree
     // with Defluff's limiter. Price both before optional byte-seeking work.
-    let feedback_seeds = feedback_tree_seeds(block, options.min_distance_codes);
+    let feedback_seeds = feedback_tree_seeds(block, options.strict);
     consider_feedback_seed_trees(block, options, &feedback_seeds, &mut best);
     if expired() {
         return best;
@@ -964,7 +964,7 @@ where
             consider_tokens(block, normalized, alignment, options, expired, &mut best);
         }
     }
-    if options.allow_258_alias {
+    if !options.strict {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
             if aliased.as_slice() != block.tokens.as_slice() {
                 consider_tokens(block, aliased, alignment, options, expired, &mut best);
@@ -1954,7 +1954,7 @@ fn estimated_length(lengths: &[u8], symbol: usize) -> u64 {
         .map_or(15, u64::from)
 }
 
-fn rewrite_258_symbols(
+pub(crate) fn rewrite_258_symbols(
     tokens: &[Token],
     decoded_bytes: usize,
     use_alias: bool,

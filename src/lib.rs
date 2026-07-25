@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Deflate-stream optimization with container-aware, no-growth rewriting.
+//! Deflate-stream optimization with container-aware, compatibility-safe rewriting.
 //!
 //! Columbo is a structural optimizer, not a recompressor: it never searches
 //! for new LZ77 matches and never delegates to Zopfli, libdeflate, or a similar
@@ -37,8 +37,9 @@ pub struct Optimization {
 
 /// Optimize one raw stream or supported container.
 ///
-/// Except for the explicitly requested `min_distance_codes` compatibility
-/// mode, the returned byte vector is never larger than `input`.
+/// Strict mode may enlarge an input while completing a dynamic Huffman
+/// alphabet or canonicalizing a non-standard length-258 spelling. Relaxed
+/// mode and ordinary strict inputs retain the no-growth guarantee.
 /// Pathologically fragmented streams may also hit an internal parsed-model
 /// memory budget before reaching the configurable byte limits.
 pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optimization> {
@@ -54,6 +55,7 @@ mod robustness_tests {
     #[test]
     fn deterministic_malformed_corpus_never_panics_or_grows_output() {
         let options = Options {
+            strict: false,
             timeout: Duration::ZERO,
             max_input_bytes: 512,
             max_decoded_bytes: 4_096,

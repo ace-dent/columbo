@@ -121,9 +121,9 @@ pub(super) fn optimize_embedded(
     data.extend_from_slice(&raw.data);
     data.extend_from_slice(&input[input.len() - 4..]);
 
-    // Compatibility mode intentionally permits growth; every normal mode has
-    // the project's strict no-growth guarantee.
-    if data.len() > input.len() && !options.min_distance_codes {
+    // Strict compatibility can require a slightly larger Huffman alphabet.
+    // Relaxed mode retains the project's no-growth guarantee.
+    if data.len() > input.len() && !options.strict {
         data.clear();
         try_append_bytes(&mut data, input, OUTPUT_ALLOCATION_ERROR)?;
     }

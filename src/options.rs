@@ -43,14 +43,14 @@ pub struct Options {
     pub inspect: bool,
     /// Remove supported wrapper metadata while rebuilding the file.
     pub strip_metadata: bool,
-    /// Emit at least two distance codes for compatibility with old decoders.
-    pub min_distance_codes: bool,
-    /// Permit the Defluff-derived optimization that spells length 258 with
-    /// symbol 284.
+    /// Emit conservative Deflate that is accepted by strict and older decoders.
     ///
-    /// Columbo admits the candidate more broadly than Defluff. Some strict
-    /// Deflate decoders may reject this non-standard representation.
-    pub allow_258_alias: bool,
+    /// Strict mode completes dynamic literal/length and distance alphabets.
+    /// Relaxed mode permits RFC-sanctioned empty or singleton distance
+    /// alphabets, singleton literal/length alphabets accepted by common
+    /// decoders, and the Defluff-derived, non-standard symbol-284 spelling of
+    /// length 258.
+    pub strict: bool,
     /// Wall-clock search budget for the whole input file.
     ///
     /// Embedded PNG frames, GZIP members, and ZIP entries share this budget;
@@ -68,8 +68,7 @@ impl Default for Options {
             exhaustive: false,
             inspect: false,
             strip_metadata: false,
-            min_distance_codes: false,
-            allow_258_alias: false,
+            strict: true,
             timeout: DEFAULT_TIMEOUT,
             max_input_bytes: MAX_INPUT_BYTES,
             max_decoded_bytes: MAX_DECODED_BYTES,

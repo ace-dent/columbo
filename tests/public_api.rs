@@ -20,8 +20,16 @@ fn auto_detection_and_explicit_modes_agree() {
 }
 
 #[test]
-fn normal_optimization_never_grows_a_stream() {
-    let options = Options::default();
+fn strict_mode_is_the_default() {
+    assert!(Options::default().strict);
+}
+
+#[test]
+fn relaxed_optimization_never_grows_a_stream() {
+    let options = Options {
+        strict: false,
+        ..Options::default()
+    };
     let result = optimize(EMPTY_RAW, Format::Raw, &options).unwrap();
 
     assert!(result.data.len() <= EMPTY_RAW.len());

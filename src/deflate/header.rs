@@ -143,9 +143,9 @@ pub(crate) fn token_bits_from_frequencies(
 pub(crate) fn score_existing_dynamic(
     tokens: &[Token],
     source: &DynamicPlan,
-    min_distance_codes: bool,
+    strict: bool,
 ) -> Option<DynamicPlan> {
-    if min_distance_codes && !source.has_two_usable_distance_codes() {
+    if strict && !source.has_strictly_compatible_huffman_codes() {
         return None;
     }
     if source.hlit < 257
@@ -176,13 +176,12 @@ pub(crate) fn best_dynamic_plan(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
     original: Option<&DynamicPlan>,
-    min_distance_codes: bool,
+    strict: bool,
     exhaustive: bool,
     mut expired: impl FnMut() -> bool,
 ) -> Option<DynamicPlan> {
     let extra_bits = token_extra_bits(tokens);
-    let source_exact =
-        original.and_then(|plan| score_existing_dynamic(tokens, plan, min_distance_codes));
+    let source_exact = original.and_then(|plan| score_existing_dynamic(tokens, plan, strict));
     let source_is_compatible = source_exact.is_some();
     let mut best = source_exact;
 
@@ -211,9 +210,11 @@ pub(crate) fn best_dynamic_plan(
         }
     }
 
-    let mut literal_candidates = tree_candidates(literal_frequencies, 15, exhaustive);
+    let mut build_literal_frequencies = *literal_frequencies;
+    ensure_code_symbols(&mut build_literal_frequencies, strict);
+    let mut literal_candidates = tree_candidates(&build_literal_frequencies, 15, exhaustive);
     let mut build_distance_frequencies = *distance_frequencies;
-    ensure_distance_symbols(&mut build_distance_frequencies, min_distance_codes);
+    ensure_distance_symbols(&mut build_distance_frequencies, strict);
     let mut distance_candidates = tree_candidates(&build_distance_frequencies, 15, exhaustive);
 
     literal_candidates.retain(|lengths| {
@@ -262,7 +263,7 @@ pub(crate) fn best_dynamic_plan(
             literal_frequencies,
             distance_frequencies,
             extra_bits,
-            min_distance_codes,
+            strict,
             exhaustive,
         ) {
             keep_better(&mut best, candidate);
@@ -496,8 +497,8 @@ fn arrange_equal_frequency_lengths<const N: usize>(
     }
 }
 
-fn ensure_distance_symbols(frequencies: &mut [u32; 30], min_distance_codes: bool) {
-    if !min_distance_codes {
+fn ensure_code_symbols(frequencies: &mut [u32], strict: bool) {
+    if !strict {
         return;
     }
     let mut used = frequencies
@@ -512,6 +513,10 @@ fn ensure_distance_symbols(frequencies: &mut [u32; 30], min_distance_codes: bool
         (Some(only), None) => frequencies[usize::from(only == 0)] = 1,
         (Some(_), Some(_)) => {}
     }
+}
+
+fn ensure_distance_symbols(frequencies: &mut [u32; 30], strict: bool) {
+    ensure_code_symbols(frequencies, strict);
 }
 
 fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<Vec<u8>> {
@@ -576,7 +581,7 @@ fn columbo_rle_tree_candidate(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
     extra_bits: u64,
-    min_distance_codes: bool,
+    strict: bool,
     exhaustive: bool,
 ) -> Option<DynamicPlan> {
     let mut pseudo_literal_frequencies = *literal_frequencies;
@@ -590,7 +595,8 @@ fn columbo_rle_tree_candidate(
         return None;
     }
 
-    ensure_distance_symbols(&mut pseudo_distance_frequencies, min_distance_codes);
+    ensure_code_symbols(&mut pseudo_literal_frequencies, strict);
+    ensure_distance_symbols(&mut pseudo_distance_frequencies, strict);
     let literal = make_lengths(&pseudo_literal_frequencies, 15, 0);
     let distance = make_lengths(&pseudo_distance_frequencies, 15, 0);
     if literal_frequencies
@@ -650,8 +656,10 @@ pub(crate) fn estimate_boundary_block_bits(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
     extra_bits: u64,
-    min_distance_codes: bool,
+    strict: bool,
 ) -> Option<u64> {
+    let mut build_literal_frequencies = *literal_frequencies;
+    ensure_code_symbols(&mut build_literal_frequencies, strict);
     let mut build_distance_frequencies = *distance_frequencies;
     if build_distance_frequencies
         .iter()
@@ -659,11 +667,11 @@ pub(crate) fn estimate_boundary_block_bits(
     {
         build_distance_frequencies[0] = 1;
     }
-    ensure_distance_symbols(&mut build_distance_frequencies, min_distance_codes);
+    ensure_distance_symbols(&mut build_distance_frequencies, strict);
 
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
-    make_lengths_deflopt_heap_into(literal_frequencies, &mut literal_lengths, 15, 0);
+    make_lengths_deflopt_heap_into(&build_literal_frequencies, &mut literal_lengths, 15, 0);
     make_lengths_deflopt_heap_into(&build_distance_frequencies, &mut distance_lengths, 15, 0);
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
@@ -797,24 +805,22 @@ pub(crate) fn plan_for_deft4j_lengths_with_cost(
     extra_bits: u64,
     literal_lengths: &[u8; 286],
     distance_lengths: &[u8; 30],
-    min_distance_codes: bool,
+    strict: bool,
     policy: Deft4jHeaderPolicy,
 ) -> Option<DynamicPlan> {
+    let mut literal_lengths = *literal_lengths;
+    apply_min_code_lengths(&mut literal_lengths, literal_frequencies, strict);
     let mut distance_lengths = *distance_lengths;
-    apply_min_distance_codes(
-        &mut distance_lengths,
-        distance_frequencies,
-        min_distance_codes,
-    );
+    apply_min_code_lengths(&mut distance_lengths, distance_frequencies, strict);
 
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
         distance_frequencies,
-        literal_lengths,
+        &literal_lengths,
         &distance_lengths,
         extra_bits,
     )?;
-    let hlit = trim_literal(literal_lengths);
+    let hlit = trim_literal(&literal_lengths);
     let hdist = trim_distance(&distance_lengths);
     let literal = try_clone_slice(&literal_lengths[..hlit])?;
     let distance = try_clone_slice(&distance_lengths[..hdist])?;
@@ -921,7 +927,7 @@ pub(crate) fn plan_for_deft4j_lengths_with_cost(
     best
 }
 
-fn apply_min_distance_codes(lengths: &mut [u8; 30], frequencies: &[u32; 30], enabled: bool) {
+fn apply_min_code_lengths(lengths: &mut [u8], frequencies: &[u32], enabled: bool) {
     if !enabled || lengths.iter().filter(|&&length| length != 0).count() >= 2 {
         return;
     }
@@ -2451,6 +2457,58 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|lengths| lengths.iter().all(|&length| length == 0)));
+    }
+
+    #[test]
+    fn strict_empty_dynamic_plan_uses_complete_huffman_codes() {
+        // This is the shape that exposed libdeflate issue #323: an
+        // all-literal block can otherwise advertise an empty distance code.
+        // The EOB-only literal tree is another RFC edge case covered by
+        // libdeflate's broader complete-code fix.
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[256] = 1;
+        let distance_frequencies = [0_u32; 30];
+
+        let strict = best_dynamic_plan(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            None,
+            true,
+            false,
+            || false,
+        )
+        .unwrap();
+        assert!(strict.has_strictly_compatible_huffman_codes());
+        assert_eq!(
+            strict
+                .literal_lengths
+                .iter()
+                .filter(|&&length| length != 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            strict
+                .distance_lengths
+                .iter()
+                .take(30)
+                .filter(|&&length| length != 0)
+                .count(),
+            2
+        );
+
+        let relaxed = best_dynamic_plan(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            None,
+            false,
+            false,
+            || false,
+        )
+        .unwrap();
+        assert!(!relaxed.has_strictly_compatible_huffman_codes());
     }
 
     #[test]

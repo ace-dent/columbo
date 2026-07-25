@@ -10,8 +10,11 @@ use super::bitstream::BitWriter;
 use super::block::emit_block;
 use super::deft4j::plan_source_blocks;
 use super::header::plan_columbo_quad_lengthen_candidate;
-use super::model::{ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType};
+use super::model::{
+    ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
+};
 use super::parse::{parse_stream, parsed_model_bytes};
+use super::search::rewrite_258_symbols;
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,
     plan_compact_source_split_floor, plan_fragmented_replay, plan_source_no_split_route,
@@ -115,6 +118,40 @@ pub(crate) fn optimize_raw(input: &[u8], options: &Options) -> Result<RawOptimiz
     Ok(optimized)
 }
 
+/// Canonicalize Defluff's non-standard length-258 spelling before planning.
+///
+/// Merely disabling the relaxed rewrite candidate is insufficient: an alias
+/// already present in the input could otherwise survive through exact source
+/// reuse or an ordinary header rewrite. Clearing source representations makes
+/// every strict candidate encode the canonical symbol 285 token.
+fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<()> {
+    for block in blocks {
+        let has_alias = block.tokens.iter().any(|token| {
+            matches!(
+                token,
+                Token::Match {
+                    length: 258,
+                    length_symbol: 284,
+                    ..
+                }
+            )
+        });
+        if !has_alias {
+            continue;
+        }
+
+        let tokens = rewrite_258_symbols(&block.tokens, block.plain.len(), false)
+            .ok_or_else(|| Error::new("could not allocate strict Deflate token normalization"))?;
+        block.tokens = tokens.into();
+        block.recount_frequencies();
+        block.original = None;
+        block.original_literal_lengths = None;
+        block.original_distance_lengths = None;
+        block.original_dynamic = None;
+    }
+    Ok(())
+}
+
 /// Optimize the first complete Deflate stream in `input`.
 ///
 /// Prefix decoding is essential for concatenated GZIP members, whose trailer
@@ -143,7 +180,10 @@ pub(crate) fn optimize_raw_prefix_with_floor(
 
     let started = Instant::now();
     let parsed = parse_stream(input, decoded_limit.min(options.max_decoded_bytes))?;
-    let blocks = parsed.blocks;
+    let mut blocks = parsed.blocks;
+    if options.strict {
+        normalize_258_aliases(&mut blocks)?;
+    }
     let deadline = Deadline {
         started,
         duration: options.timeout,
@@ -507,8 +547,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             candidate.plans.clear();
         }
 
-        let seed_selected =
-            options.min_distance_codes || candidate.is_strictly_smaller_than_source(source);
+        let seed_selected = options.strict || candidate.is_strictly_smaller_than_source(source);
         if seed_selected && !suppress_later_optional_routes && !deadline.expired() {
             // Rewritten match choices and boundaries can expose later max
             // transformations, so retain one additive seeded pass after both
@@ -541,8 +580,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         inspect_plans(&candidate.plans);
     }
 
-    let keep_original =
-        !options.min_distance_codes && !candidate.is_strictly_smaller_than_source(source);
+    let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
         parsed.meaningful_bits
     } else {
@@ -1035,8 +1073,7 @@ fn build_bounded_floor_grouping_lineage(
 ) -> Result<(Candidate, Option<Candidate>)> {
     let mut floor =
         build_bounded_floor_candidate(source, options, &mut || deadline.route_should_stop())?;
-    let floor_selected =
-        options.min_distance_codes || floor.is_strictly_smaller_than_source(source);
+    let floor_selected = options.strict || floor.is_strictly_smaller_than_source(source);
     if !floor_selected || deadline.route_should_stop() {
         return Ok((floor, None));
     }
@@ -1089,8 +1126,7 @@ fn continue_bounded_floor_lineage(
     options: &Options,
     deadline: &Deadline,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let floor_selected =
-        options.min_distance_codes || floor.is_strictly_smaller_than_source(source);
+    let floor_selected = options.strict || floor.is_strictly_smaller_than_source(source);
     if !floor_selected || deadline.route_should_stop() {
         return Ok((floor, None));
     }
@@ -1499,7 +1535,7 @@ fn build_candidate_from_plans<F>(
 where
     F: FnMut() -> bool,
 {
-    let (mut data, mut bits) = emit_plans(source.compressed, &plans)?;
+    let (mut data, mut bits) = emit_plans(source.compressed, &plans, options.strict)?;
     let initial_loses = !is_strictly_better(
         data.len(),
         bits,
@@ -1513,7 +1549,7 @@ where
     // so this cannot oscillate even before the explicit cap is reached.
     let mut data_is_validated = false;
     for _ in 0..replay_limit {
-        if (initial_loses && !options.min_distance_codes) || expired() {
+        if (initial_loses && !options.strict) || expired() {
             break;
         }
 
@@ -1527,7 +1563,7 @@ where
         let Some(replay_plans) = replay_plans else {
             break;
         };
-        let (replay_data, replay_bits) = emit_plans(&data, &replay_plans)?;
+        let (replay_data, replay_bits) = emit_plans(&data, &replay_plans, options.strict)?;
         if !is_strictly_better(replay_data.len(), replay_bits, data.len(), bits) {
             break;
         }
@@ -1544,7 +1580,7 @@ where
     // Validate that final selectable stream as well. A known-losing generated
     // stream is skipped because the caller will retain the already-validated
     // source bytes instead.
-    if (!initial_loses || options.min_distance_codes) && !data_is_validated {
+    if (!initial_loses || options.strict) && !data_is_validated {
         parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
     }
 
@@ -1552,10 +1588,10 @@ where
 }
 
 /// Retain a parsed source when the mandatory plan list cannot be allocated.
-/// Compatibility mode must rewrite distance alphabets, so it reports the
+/// Strict mode must rewrite incompatible Huffman alphabets, so it reports an
 /// allocation failure rather than silently ignoring the requested transform.
 fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Candidate> {
-    if options.min_distance_codes {
+    if options.strict {
         return Err(Error::new("could not allocate Deflate plan"));
     }
     let mut data = Vec::new();
@@ -1603,7 +1639,21 @@ fn validate_replayed_stream(
     Ok(())
 }
 
-fn emit_plans(input: &[u8], plans: &[PlannedBlock]) -> Result<(Vec<u8>, u64)> {
+fn emit_plans(input: &[u8], plans: &[PlannedBlock], strict: bool) -> Result<(Vec<u8>, u64)> {
+    if strict
+        && plans.iter().any(|plan| {
+            matches!(
+                &plan.representation,
+                Representation::Dynamic(dynamic)
+                    if !dynamic.has_strictly_compatible_huffman_codes()
+            )
+        })
+    {
+        return Err(Error::new(
+            "internal strict Deflate plan has an incomplete Huffman code",
+        ));
+    }
+
     let mut writer = BitWriter::default();
     for (index, plan) in plans.iter().enumerate() {
         emit_block(&mut writer, input, plan, index + 1 == plans.len())?;
@@ -1703,7 +1753,7 @@ mod tests {
 
     use super::*;
     use crate::deflate::bitstream::BitWriter;
-    use crate::deflate::huffman::fixed_trees;
+    use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
     use crate::deflate::model::Token;
 
     fn comparison_candidate(bytes: usize, bits: u64, marker: u8) -> Candidate {
@@ -1785,9 +1835,13 @@ mod tests {
         assert_eq!(source.meaningful_bits, 331);
         assert_eq!(source.decoded_size, 86);
 
-        let first = optimize_raw(&input, &Options::default()).unwrap();
+        let options = Options {
+            strict: false,
+            ..Options::default()
+        };
+        let first = optimize_raw(&input, &options).unwrap();
         assert_eq!(first.info.deflate_bits, 325);
-        let second = optimize_raw(&first.data, &Options::default()).unwrap();
+        let second = optimize_raw(&first.data, &options).unwrap();
         assert_eq!(second.info.deflate_bits, 325);
         assert_eq!(second.data, first.data);
 
@@ -1796,6 +1850,7 @@ mod tests {
         // fixed point without requiring a second executable invocation.
         let max_options = Options {
             exhaustive: true,
+            strict: false,
             timeout: Duration::ZERO,
             ..Options::default()
         };
@@ -1826,7 +1881,7 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_never_creates_the_non_rfc_258_alias() {
+    fn strict_mode_never_creates_the_non_rfc_258_alias() {
         let (literal, distance) = fixed_trees();
         let mut writer = BitWriter::default();
         writer.write(1, 1).unwrap(); // Final block.
@@ -1856,6 +1911,87 @@ mod tests {
                 )
             })
         }));
+    }
+
+    #[test]
+    fn strict_mode_repairs_alias_and_single_distance_code_inputs() {
+        // This valid compatibility-extension input is a relaxed fixed point:
+        // its dynamic tree has one usable distance code and its final
+        // length-258 match uses Defluff's non-standard symbol-284 alias.
+        // Canonicalizing either detail costs bits, so this catches accidental
+        // source reuse in strict mode.
+        let input = [
+            0xe5, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x80, 0x20, 0xb6, 0xfd, 0xa5, 0x06, 0xa9,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01,
+        ];
+        let source = parse_stream(&input, 2_302).unwrap();
+        assert!(stream_uses_258_alias(&source));
+        assert!(source.blocks.iter().any(|block| {
+            block
+                .original_dynamic
+                .as_ref()
+                .is_some_and(|dynamic| !dynamic.has_two_usable_distance_codes())
+        }));
+
+        let strict = optimize_raw(&input, &Options::default()).unwrap();
+        let strict_stream = parse_stream(&strict.data, 2_302).unwrap();
+        assert_eq!(strict_stream.decoded_size, source.decoded_size);
+        assert!(!stream_uses_258_alias(&strict_stream));
+        let strict_dynamic: Vec<_> = strict_stream
+            .blocks
+            .iter()
+            .filter_map(|block| block.original_dynamic.as_ref())
+            .collect();
+        assert!(!strict_dynamic.is_empty());
+        for dynamic in strict_dynamic {
+            assert!(dynamic.has_strictly_compatible_huffman_codes());
+            assert!(huffman_tree_shape_is_complete(&dynamic.literal_lengths));
+            assert!(huffman_tree_shape_is_complete(&dynamic.distance_lengths));
+            assert!(huffman_tree_shape_is_complete(&dynamic.code_length_lengths));
+        }
+
+        let relaxed_options = Options {
+            strict: false,
+            ..Options::default()
+        };
+        let relaxed = optimize_raw(&input, &relaxed_options).unwrap();
+        let relaxed_stream = parse_stream(&relaxed.data, 2_302).unwrap();
+        assert_eq!(relaxed_stream.decoded_size, source.decoded_size);
+        assert!(stream_uses_258_alias(&relaxed_stream));
+        let relaxed_dynamic = relaxed_stream
+            .blocks
+            .iter()
+            .find_map(|block| block.original_dynamic.as_ref())
+            .unwrap();
+        assert_eq!(
+            relaxed_dynamic
+                .distance_lengths
+                .iter()
+                .take(30)
+                .filter(|&&length| length != 0)
+                .count(),
+            1
+        );
+        assert!(!huffman_tree_shape_is_complete(
+            &relaxed_dynamic.distance_lengths
+        ));
+    }
+
+    fn stream_uses_258_alias(stream: &ParsedStream) -> bool {
+        stream.blocks.iter().any(|block| {
+            block.tokens.iter().any(|token| {
+                matches!(
+                    token,
+                    Token::Match {
+                        length: 258,
+                        length_symbol: 284,
+                        length_extra: 31,
+                        length_extra_bits: 5,
+                        ..
+                    }
+                )
+            })
+        })
     }
 
     #[test]

@@ -297,12 +297,7 @@ impl Deft4jQueue {
         Some(index)
     }
 
-    fn score(
-        &mut self,
-        state: StateId,
-        kind: ScoreKind,
-        min_distance_codes: bool,
-    ) -> Option<&DynamicPlan> {
+    fn score(&mut self, state: StateId, kind: ScoreKind, strict: bool) -> Option<&DynamicPlan> {
         let state = &mut self.states[state];
         let slot = kind.index();
         if matches!(state.scores[slot], ScoreMemo::Unscored) {
@@ -312,7 +307,7 @@ impl Deft4jQueue {
                 state.extra_bits,
                 &state.literal_lengths,
                 &state.distance_lengths,
-                min_distance_codes,
+                strict,
                 kind.header_policy(),
             );
             state.scores[slot] = match plan {
@@ -866,14 +861,14 @@ struct Deft4jBest {
 struct Deft4jPipeline {
     queue: Deft4jQueue,
     plain: Arc<Vec<u8>>,
-    min_distance_codes: bool,
+    strict: bool,
 }
 
 impl Deft4jPipeline {
     fn submit(&mut self, state: StateId, best: &mut Deft4jBest) {
-        let Some(candidate) =
-            self.queue
-                .score(state, ScoreKind::CompleteHeader, self.min_distance_codes)
+        let Some(candidate) = self
+            .queue
+            .score(state, ScoreKind::CompleteHeader, self.strict)
         else {
             return;
         };
@@ -900,11 +895,7 @@ impl Deft4jPipeline {
         let mut current = source;
         let mut current_bits = self
             .queue
-            .score(
-                current,
-                ScoreKind::DefaultHeaderFixedPoint,
-                self.min_distance_codes,
-            )?
+            .score(current, ScoreKind::DefaultHeaderFixedPoint, self.strict)?
             .bits;
         let mut changed = false;
         while !expired() && !self.queue.saturated {
@@ -912,11 +903,10 @@ impl Deft4jPipeline {
             if next.state == current {
                 break;
             }
-            let Some(plan) = self.queue.score(
-                next.state,
-                ScoreKind::DefaultHeaderFixedPoint,
-                self.min_distance_codes,
-            ) else {
+            let Some(plan) =
+                self.queue
+                    .score(next.state, ScoreKind::DefaultHeaderFixedPoint, self.strict)
+            else {
                 break;
             };
             if plan.bits >= current_bits {
@@ -1203,7 +1193,7 @@ where
             let mut pipeline = Deft4jPipeline {
                 queue: Deft4jQueue::new(queue_limit),
                 plain: Arc::clone(&block.plain),
-                min_distance_codes: options.min_distance_codes,
+                strict: options.strict,
             };
             if let Some(base) = pipeline.queue.push(PendingState {
                 tokens: Arc::clone(&block.tokens),
@@ -1269,7 +1259,7 @@ fn alternate_seed_lengths(
 }
 
 fn initial_plan(block: &ParsedBlock, alignment: u8, options: &Options) -> PlannedBlock {
-    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
+    if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
         return PlannedBlock {
             tokens: Arc::clone(&block.tokens),
             plain: Arc::clone(&block.plain),
@@ -1293,7 +1283,7 @@ fn initial_plan(block: &ParsedBlock, alignment: u8, options: &Options) -> Planne
                     token_extra_bits(&block.tokens),
                     &literal,
                     &distance,
-                    options.min_distance_codes,
+                    options.strict,
                     Deft4jHeaderPolicy::Complete,
                 )
             })
@@ -1323,7 +1313,7 @@ fn cheap_current_plan(
     alignment: u8,
     options: &Options,
 ) -> Option<PlannedBlock> {
-    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
+    if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
         return Some(PlannedBlock {
             tokens: Arc::clone(&block.tokens),
             plain: Arc::clone(&block.plain),
@@ -1338,7 +1328,7 @@ fn cheap_current_plan(
         SourceBlockType::Fixed => Representation::Fixed,
         SourceBlockType::Dynamic => {
             let compatible_dynamic = block.original_dynamic.as_ref().filter(|dynamic| {
-                !options.min_distance_codes || dynamic.has_two_usable_distance_codes()
+                !options.strict || dynamic.has_strictly_compatible_huffman_codes()
             });
             match compatible_dynamic {
                 Some(dynamic) => Representation::Dynamic(dynamic.try_clone()?),

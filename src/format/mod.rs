@@ -27,8 +27,8 @@ pub(super) fn try_copy_bytes(source: &[u8], message: &'static str) -> Result<Vec
 }
 
 /// Reserve before extending a wrapper output. `Vec::extend_from_slice` may
-/// otherwise invoke the infallible allocation path when compatibility mode is
-/// allowed to grow a stream beyond its input-sized initial reservation.
+/// otherwise invoke the infallible allocation path when strict mode is allowed
+/// to grow a stream beyond its input-sized initial reservation.
 pub(super) fn try_append_bytes(
     output: &mut Vec<u8>,
     source: &[u8],

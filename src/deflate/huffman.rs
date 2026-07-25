@@ -34,8 +34,8 @@ pub(crate) const FIXED_LITERAL_CODE_LENGTHS: [u8; 288] = make_fixed_literal_code
 /// RFC 1951 fixed distance code lengths, including reserved symbols 30 and 31.
 pub(crate) const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
 
-/// Code-length alphabets have no empty or one-symbol exceptions.
-pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
+/// Whether code lengths occupy the complete canonical Huffman code space.
+pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
     let mut occupied = 0_u32;
     for &length in lengths {
         if length == 0 {
@@ -52,6 +52,11 @@ pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
     occupied == COMPLETE_HUFFMAN_CODE_SPACE
 }
 
+/// Code-length alphabets have no empty or one-symbol exceptions.
+pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
+    huffman_tree_shape_is_complete(lengths)
+}
+
 /// Validate the tree shapes accepted for Deflate payload alphabets.
 ///
 /// A populated literal/length or distance tree is normally complete. RFC 1951
@@ -63,7 +68,7 @@ pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> 
     match populated {
         0 => allow_empty,
         1 => lengths.contains(&1),
-        _ => code_length_tree_shape_is_valid(lengths),
+        _ => huffman_tree_shape_is_complete(lengths),
     }
 }
 

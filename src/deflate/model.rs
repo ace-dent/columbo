@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use super::huffman::huffman_tree_shape_is_complete;
+
 /// RFC 1951 advertises distance-code lengths for symbols 0 through 31.
 ///
 /// Symbols 30 and 31 participate in Huffman-tree construction but are
@@ -86,8 +88,8 @@ impl DynamicPlan {
     /// Whether the payload advertises at least two usable distance symbols.
     ///
     /// Dynamic headers may also carry lengths for reserved symbols 30 and 31;
-    /// those do not satisfy Columbo's `--min-distance-codes` compatibility
-    /// policy and are deliberately excluded from this count.
+    /// those do not satisfy Columbo's strict decoder-compatibility policy and
+    /// are deliberately excluded from this count.
     pub(crate) fn has_two_usable_distance_codes(&self) -> bool {
         self.distance_lengths
             .iter()
@@ -95,6 +97,20 @@ impl DynamicPlan {
             .filter(|&&length| length != 0)
             .count()
             >= 2
+    }
+
+    /// Whether all three dynamic alphabets follow conservative decoder
+    /// practice rather than RFC 1951's empty/singleton exceptions.
+    ///
+    /// This mirrors the compatibility fix made for libdeflate issue #323:
+    /// literal/length, distance, and code-length trees must all occupy their
+    /// complete Kraft code space. Distance symbols 30 and 31 remain reserved,
+    /// so at least two usable distance symbols are required as well.
+    pub(crate) fn has_strictly_compatible_huffman_codes(&self) -> bool {
+        huffman_tree_shape_is_complete(&self.literal_lengths)
+            && huffman_tree_shape_is_complete(&self.distance_lengths)
+            && huffman_tree_shape_is_complete(&self.code_length_lengths)
+            && self.has_two_usable_distance_codes()
     }
 
     /// Clone the small, owned Huffman-table vectors without relying on an

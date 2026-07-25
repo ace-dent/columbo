@@ -101,6 +101,13 @@ fn run() -> std::result::Result<(), u8> {
         }
     };
 
+    if command.verbose && !command.options.strict {
+        println!(
+            "note: strict mode disabled; enabling compact empty/singleton Huffman alphabets \
+             and the non-standard length-258 alias"
+        );
+    }
+
     let mut spinner = Spinner::start(command.options.exhaustive && !command.options.inspect);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
@@ -150,7 +157,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             "-v" | "--verbose" => verbose = true,
             "--inspect" => options.inspect = true,
             "-m" | "--max" => options.exhaustive = true,
-            "--allow-258-alias" => options.allow_258_alias = true,
             "--strip" => options.strip_metadata = true,
             "-t" | "--timeout" => {
                 index += 1;
@@ -160,20 +166,20 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
                     .and_then(|value| parse_timeout(value).ok_or_else(timeout_error))?;
                 options.timeout = value;
             }
-            "--mincodes" => {
+            "--strict" => {
                 index += 1;
-                options.min_distance_codes = arguments
+                options.strict = arguments
                     .get(index)
-                    .ok_or_else(mincodes_error)
-                    .and_then(|value| parse_mincodes(value).ok_or_else(mincodes_error))?;
+                    .ok_or_else(strict_error)
+                    .and_then(|value| parse_strict(value).ok_or_else(strict_error))?;
             }
             _ if argument.starts_with("--timeout=") => {
                 options.timeout =
                     parse_timeout(OsStr::new(&argument[10..])).ok_or_else(timeout_error)?;
             }
-            _ if argument.starts_with("--mincodes=") => {
-                options.min_distance_codes =
-                    parse_mincodes(OsStr::new(&argument[11..])).ok_or_else(mincodes_error)?;
+            _ if argument.starts_with("--strict=") => {
+                options.strict =
+                    parse_strict(OsStr::new(&argument[9..])).ok_or_else(strict_error)?;
             }
             _ => {
                 return Err(CliError::message(
@@ -228,7 +234,7 @@ fn parse_timeout(value: &OsStr) -> Option<Duration> {
     Some(Duration::from_secs(seconds))
 }
 
-fn parse_mincodes(value: &OsStr) -> Option<bool> {
+fn parse_strict(value: &OsStr) -> Option<bool> {
     match value.to_str()?.trim_start().parse::<i64>().ok()? {
         0 => Some(false),
         1 => Some(true),
@@ -240,8 +246,8 @@ fn timeout_error() -> CliError {
     CliError::message("--timeout requires a non-negative number of seconds", false)
 }
 
-fn mincodes_error() -> CliError {
-    CliError::message("--mincodes requires 0 or 1", false)
+fn strict_error() -> CliError {
+    CliError::message("--strict requires 0 or 1", false)
 }
 
 fn print_usage(output: &mut dyn Write) -> io::Result<()> {
@@ -258,7 +264,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         concat!(
             "usage: {} [--help|-h] [--verbose|-v] [--inspect]",
             " [--max|-m] [--timeout|-t seconds]",
-            "\n       [--mincodes 0|1] [--allow-258-alias] [--strip]",
+            "\n       [--strict 0|1] [--strip]",
             "\n       [--raw|--png|--zlib|--gzip|--zip] input output"
         ),
         PROGRAM_NAME
@@ -268,7 +274,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(output, "  -h, --help             show this help and exit")?;
     writeln!(
         output,
-        "  -v, --verbose          report when no bytes were saved"
+        "  -v, --verbose          report additional optimization information"
     )?;
     writeln!(
         output,
@@ -289,17 +295,11 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         concat!(
-            "      --mincodes 0|1     add Deflate distance codes for old decoder",
-            "\n                         compatibility (default: 0)"
+            "      --strict 0|1       emit conservative Deflate for strict and old",
+            "\n                         decoders (default: 1); 0 permits compact",
+            "\n                         empty/singleton Huffman alphabets and the",
+            "\n                         non-standard 258 alias"
         )
-    )?;
-    writeln!(
-        output,
-        "      --allow-258-alias  allow non-RFC Defluff-derived 258 alias"
-    )?;
-    writeln!(
-        output,
-        "                         (strict Deflate decoders may reject it)"
     )?;
     writeln!(
         output,
@@ -612,6 +612,54 @@ mod tests {
     }
 
     #[test]
+    fn strict_mode_defaults_on_and_accepts_only_zero_or_one() {
+        assert!(parsed_options(["in", "out"]).strict);
+        assert!(!parsed_options(["--strict", "0", "in", "out"]).strict);
+        assert!(!parsed_options(["--strict=0", "in", "out"]).strict);
+        assert!(parsed_options(["--strict", "1", "in", "out"]).strict);
+        assert!(parsed_options(["--strict=1", "in", "out"]).strict);
+
+        for arguments in [
+            vec!["--strict", "2", "in", "out"],
+            vec!["--strict", "true", "in", "out"],
+            vec!["--strict"],
+        ] {
+            let error = match parse_args(arguments.into_iter().map(OsString::from)) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid strict value should fail"),
+            };
+            assert_eq!(error.message.as_deref(), Some("--strict requires 0 or 1"));
+        }
+    }
+
+    #[test]
+    fn retired_compression_flags_are_rejected() {
+        for option in ["--mincodes", "--allow-258-alias"] {
+            let error = match parse_args([
+                OsString::from(option),
+                OsString::from("in"),
+                OsString::from("out"),
+            ]) {
+                Err(error) => error,
+                Ok(_) => panic!("retired option should fail"),
+            };
+            assert_eq!(error.message, Some(format!("unknown option: {option}")));
+        }
+    }
+
+    #[test]
+    fn help_describes_only_the_merged_strict_policy() {
+        let mut help = Vec::new();
+        print_usage(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--strict 0|1"));
+        assert!(help.contains("default: 1"));
+        assert!(!help.contains("--mincodes"));
+        assert!(!help.contains("--allow-258-alias"));
+    }
+
+    #[test]
     fn parser_rejects_multiple_explicit_formats() {
         let error = match parse_args([
             OsString::from("--raw"),
@@ -736,5 +784,16 @@ mod tests {
             }
         }
         panic!("could not create a unique test directory");
+    }
+
+    fn parsed_options<const N: usize>(arguments: [&str; N]) -> Options {
+        let parsed = match parse_args(arguments.into_iter().map(OsString::from)) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("expected valid command arguments"),
+        };
+        match parsed {
+            ParsedCommand::Run(command) => command.options,
+            ParsedCommand::Help => panic!("expected a runnable command"),
+        }
     }
 }

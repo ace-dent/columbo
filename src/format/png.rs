@@ -272,7 +272,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         }
     }
 
-    if output.len() > input.len() && !options.min_distance_codes {
+    if output.len() > input.len() && !options.strict {
         output.clear();
         output.extend_from_slice(input);
     }
@@ -1314,7 +1314,7 @@ fn optimize_compressed_body(
         return Ok(None);
     };
     let optimized = optimize_png_zlib(&data[zlib_offset..], options, true, default_floor, budget)?;
-    if zlib_offset + optimized.data.len() >= data.len() && !options.min_distance_codes {
+    if zlib_offset + optimized.data.len() >= data.len() && !options.strict {
         return Ok(None);
     }
     let body_len = zlib_offset

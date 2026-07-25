@@ -169,10 +169,10 @@ where
     // the stream is still parsed and validated. Retain its exact source bytes
     // through `build_candidate`'s fallback unless the stored repack above is
     // available; starting token recodes for dozens of later APNG frames would
-    // turn a bounded timeout into unbounded work. Compatibility mode must still
-    // rewrite its distance alphabet.
+    // turn a bounded timeout into unbounded work. Strict mode must still
+    // rewrite incompatible dynamic alphabets.
     let floor_time_available = !expired();
-    if !floor_time_available && !options.min_distance_codes {
+    if !floor_time_available && !options.strict {
         return stored_floor.map(|floor| finish_plan(floor, options));
     }
     let source_bytes = encoded_source_bytes(blocks);
@@ -726,7 +726,7 @@ fn source_aligned_huffman_floor_with_limit(
                 if let Some(shared) = shared_dynamic_plan(
                     &blocks[start_index..end_index],
                     &range.tokens,
-                    structural_options.min_distance_codes,
+                    structural_options.strict,
                 ) {
                     if shared.bits < selected.bits {
                         selected.bits = shared.bits;
@@ -1246,7 +1246,7 @@ fn bounded_huffman_grouping(
             &source_plans,
             &source_stats,
             &source_extra_bits,
-            structural_options.min_distance_codes,
+            structural_options.strict,
             0,
             blocks.len(),
         )?,
@@ -1255,7 +1255,7 @@ fn bounded_huffman_grouping(
             &source_plans,
             &source_stats,
             &source_extra_bits,
-            structural_options.min_distance_codes,
+            structural_options.strict,
         )?,
     };
 
@@ -1769,7 +1769,7 @@ where
             .and(merged.as_ref())
         {
             if let Some(dynamic) = pending_block.original_dynamic.as_ref().and_then(|source| {
-                score_existing_dynamic(&merged_block.tokens, source, options.min_distance_codes)
+                score_existing_dynamic(&merged_block.tokens, source, options.strict)
             }) {
                 if dynamic.bits < separate_bits
                     && merged_winner
@@ -2054,7 +2054,7 @@ where
             &composite,
             start,
             end,
-            options.min_distance_codes,
+            options.strict,
             expired,
         )
         .is_some()
@@ -3100,11 +3100,9 @@ where
     // memory proportional to cuts × alignments rather than to the input.
 
     if whole_sources && source_spans.len() > 1 {
-        if let Some(shared) = shared_dynamic_plan(
-            &blocks[source_range],
-            &range.tokens,
-            options.min_distance_codes,
-        ) {
+        if let Some(shared) =
+            shared_dynamic_plan(&blocks[source_range], &range.tokens, options.strict)
+        {
             if shared.bits < planned.bits {
                 let bits = shared.bits;
                 planned = PlannedBlock {
@@ -3174,7 +3172,7 @@ fn make_range(composite: &Composite, start: Cut, end: Cut) -> Option<ParsedBlock
 fn shared_dynamic_plan(
     blocks: &[ParsedBlock],
     tokens: &[Token],
-    min_distance_codes: bool,
+    strict: bool,
 ) -> Option<DynamicPlan> {
     let (first_block, rest) = blocks.split_first()?;
     let first = first_block.original_dynamic.as_ref()?;
@@ -3186,7 +3184,7 @@ fn shared_dynamic_plan(
     }) {
         return None;
     }
-    score_existing_dynamic(tokens, first, min_distance_codes)
+    score_existing_dynamic(tokens, first, strict)
 }
 
 /// Append one parsed block without repeatedly copying the accumulated prefix.
@@ -3757,7 +3755,11 @@ mod tests {
 
         // Repacking does not consult Huffman tables or alter LZ77 tokens, so
         // it remains safe after a ZIP/APNG file-wide search budget is spent.
-        let after_deadline = plan_stream(&blocks, 0, &Options::default(), &mut || true).unwrap();
+        let relaxed = Options {
+            strict: false,
+            ..Options::default()
+        };
+        let after_deadline = plan_stream(&blocks, 0, &relaxed, &mut || true).unwrap();
         assert_eq!(total_bits(&after_deadline), total_bits(&plans));
         assert_eq!(after_deadline.len(), plans.len());
     }
