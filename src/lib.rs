@@ -20,6 +20,7 @@ mod deflate;
 mod error;
 mod format;
 mod options;
+mod progress;
 
 pub use error::{Error, Result};
 pub use options::{

@@ -20,6 +20,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::thread;
 
+use crate::progress::RouteProgress;
 use crate::Options;
 
 use super::block::{plan_block, stored_block_bits};
@@ -159,6 +160,31 @@ pub(crate) fn plan_stream<F>(
 where
     F: FnMut() -> bool,
 {
+    let progress = RouteProgress::disabled();
+    plan_stream_with_progress(blocks, start_alignment, options, expired, &progress)
+}
+
+/// Plan a stream while exposing coarse progress for one long max route.
+///
+/// The ordinary entry point above supplies a disabled reporter, keeping all
+/// standard and non-verbose callers on the same search path.
+pub(crate) fn plan_stream_with_progress<F>(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    expired: &mut F,
+    progress: &RouteProgress,
+) -> Option<Vec<PlannedBlock>>
+where
+    F: FnMut() -> bool,
+{
+    let detailed_progress = progress.enabled().then_some(progress);
+    progress.phase(
+        "Establishing complete comparison floor",
+        blocks.len(),
+        "source block",
+        "source blocks",
+    );
     // Stored-only streams have a linear structural floor: adjacent
     // chunks can be repacked up to RFC 1951's 65,535-byte limit without any
     // Huffman or token search. Secure that result before consulting a shared
@@ -270,6 +296,7 @@ where
     } else {
         direct_structural_plan(blocks, start_alignment, options)?
     };
+    let mut fallback_bits = total_bits(&fallback);
     for floor in [
         stored_floor,
         source_merge_floor,
@@ -281,10 +308,13 @@ where
     .into_iter()
     .flatten()
     {
-        if total_bits(&floor) < total_bits(&fallback) {
+        let floor_bits = total_bits(&floor);
+        if floor_bits < fallback_bits {
             fallback = floor;
+            fallback_bits = floor_bits;
         }
     }
+    progress.checkpoint("Comparison floor", fallback_bits, fallback.len());
 
     // Search the most promising pre-grouped list before the original long
     // list can consume the deadline. Columbo's original C block-list route
@@ -292,6 +322,12 @@ where
     // the selected groups.
     let mut collected_search_completed = false;
     if let Some((kind, grouped)) = selected_grouping {
+        progress.phase(
+            "Searching selected grouped layout",
+            grouped.len(),
+            "grouped block",
+            "grouped blocks",
+        );
         if !expired() {
             if let Some(candidate) = sequential_plan(
                 grouped,
@@ -299,10 +335,15 @@ where
                 options,
                 AdjacentMergeSearch::Disabled,
                 expired,
+                detailed_progress,
             ) {
+                progress.advance(grouped.len());
                 collected_search_completed = kind == GroupedLayout::Collected;
-                if total_bits(&candidate) < total_bits(&fallback) {
+                let candidate_bits = total_bits(&candidate);
+                progress.checkpoint("Grouped-layout result", candidate_bits, candidate.len());
+                if candidate_bits < fallback_bits {
                     fallback = candidate;
+                    fallback_bits = candidate_bits;
                 }
             }
         }
@@ -321,6 +362,12 @@ where
     } else {
         AdjacentMergeSearch::Local
     };
+    progress.phase(
+        "Searching original source order",
+        blocks.len(),
+        "source block",
+        "source blocks",
+    );
     if !expired() {
         if let Some(candidate) = sequential_plan(
             blocks,
@@ -328,9 +375,14 @@ where
             options,
             fallback_merge_search,
             expired,
+            detailed_progress,
         ) {
-            if total_bits(&candidate) < total_bits(&fallback) {
+            progress.advance(blocks.len());
+            let candidate_bits = total_bits(&candidate);
+            progress.checkpoint("Source-order result", candidate_bits, candidate.len());
+            if candidate_bits < fallback_bits {
                 fallback = candidate;
+                fallback_bits = candidate_bits;
             }
         }
     }
@@ -349,16 +401,27 @@ where
     if allow_regroup && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS {
         if !collected_search_completed {
             if let Some(collected_blocks) = collected_blocks.as_deref() {
+                progress.phase(
+                    "Replaying collected block layout",
+                    collected_blocks.len(),
+                    "collected block",
+                    "collected blocks",
+                );
                 let collected = sequential_plan(
                     collected_blocks,
                     start_alignment,
                     options,
                     AdjacentMergeSearch::Disabled,
                     expired,
+                    detailed_progress,
                 );
                 if let Some(collected) = collected {
-                    if total_bits(&collected) < total_bits(&fallback) {
+                    progress.advance(collected_blocks.len());
+                    let collected_bits = total_bits(&collected);
+                    progress.checkpoint("Collected-layout result", collected_bits, collected.len());
+                    if collected_bits < fallback_bits {
                         fallback = collected;
+                        fallback_bits = collected_bits;
                     }
                 }
             }
@@ -384,6 +447,12 @@ where
         // candidates, so avoid multiplying those probes by alignment states.
         return Some(finish_plan(fallback, options));
     }
+    progress.phase(
+        "Building global boundary graph",
+        blocks.len(),
+        "source block",
+        "source blocks",
+    );
     let Some(composite) = Composite::new(blocks) else {
         return Some(finish_plan(fallback, options));
     };
@@ -394,6 +463,12 @@ where
         return Some(finish_plan(fallback, options));
     }
 
+    progress.phase(
+        "Pricing Columbo boundary DP",
+        cuts.len().saturating_sub(1),
+        "cut anchor",
+        "cut anchors",
+    );
     let Some(candidate) = boundary_dp(
         blocks,
         &composite,
@@ -402,10 +477,14 @@ where
         options,
         allow_regroup,
         expired,
+        detailed_progress,
     ) else {
         return Some(finish_plan(fallback, options));
     };
-    if total_bits(&candidate) < total_bits(&fallback) {
+    progress.advance(cuts.len().saturating_sub(1));
+    let candidate_bits = total_bits(&candidate);
+    progress.checkpoint("Boundary-DP result", candidate_bits, candidate.len());
+    if candidate_bits < fallback_bits {
         Some(finish_plan(candidate, options))
     } else {
         Some(finish_plan(fallback, options))
@@ -446,6 +525,7 @@ where
             allow_individual_prune,
         },
         expired,
+        None,
     );
     match searched {
         Some(candidate) if total_bits(&candidate) < total_bits(&fallback) => {
@@ -481,6 +561,7 @@ where
         AdjacentMergeSearch::LongRun,
         SourceBlockSearch::Floor,
         expired,
+        None,
     )?;
     (total_bits(&candidate) < total_bits(&fallback)).then(|| finish_plan(candidate, options))
 }
@@ -1663,6 +1744,7 @@ fn sequential_plan<F>(
     options: &Options,
     merge_search: AdjacentMergeSearch,
     expired: &mut F,
+    progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
 where
     F: FnMut() -> bool,
@@ -1674,6 +1756,7 @@ where
         merge_search,
         SourceBlockSearch::Full,
         expired,
+        progress,
     )
 }
 
@@ -1684,6 +1767,7 @@ fn sequential_plan_with_source_search<F>(
     merge_search: AdjacentMergeSearch,
     source_search: SourceBlockSearch,
     expired: &mut F,
+    progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
 where
     F: FnMut() -> bool,
@@ -1697,15 +1781,23 @@ where
     let mut pending = PendingBlock::Borrowed(first);
     let mut pending_cache: Option<(u8, Vec<PlannedBlock>)> = None;
 
-    for current in rest {
+    for (index, current) in rest.iter().enumerate() {
         let pending_block = pending.as_block();
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
+        if let Some(progress) = progress {
+            progress.item(index + 1, pending_block.tokens.len());
+            progress.activity("Columbo token and split search");
+        }
         let pending_plans = match pending_cache.take() {
             Some((cached_alignment, plans)) if cached_alignment == alignment => plans,
             _ => plan_source_with_search(pending_block, alignment, options, source_search, expired),
         };
         let pending_bits = total_bits(&pending_plans);
         let current_alignment = ((u64::from(alignment) + pending_bits) & 7) as u8;
+        if let Some(progress) = progress {
+            progress.item(index + 2, current.tokens.len());
+            progress.activity("Columbo token and split search");
+        }
         let current_plans =
             plan_source_with_search(current, current_alignment, options, source_search, expired);
         let separate_bits = pending_bits + total_bits(&current_plans);
@@ -1750,6 +1842,10 @@ where
             .flatten();
 
         if let Some(merged_block) = can_search_merge.then_some(()).and(merged.as_ref()) {
+            if let Some(progress) = progress {
+                progress.item(index + 2, merged_block.tokens.len());
+                progress.activity("Testing adjacent block merge");
+            }
             let candidate =
                 plan_source_with_search(merged_block, alignment, options, source_search, expired);
             if total_bits(&candidate) < separate_bits
@@ -1807,6 +1903,10 @@ where
     }
 
     let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
+    if let Some(progress) = progress {
+        progress.item(blocks.len(), pending.as_block().tokens.len());
+        progress.activity("Columbo token and split search");
+    }
     let pending_plans = match pending_cache {
         Some((cached_alignment, plans)) if cached_alignment == alignment => plans,
         _ => plan_source_with_search(
@@ -2892,6 +2992,7 @@ fn boundary_dp<F>(
     options: &Options,
     allow_regroup: bool,
     expired: &mut F,
+    progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
 where
     F: FnMut() -> bool,
@@ -2910,6 +3011,9 @@ where
     });
 
     for start_index in 0..cuts.len() - 1 {
+        if let Some(progress) = progress {
+            progress.advance(start_index);
+        }
         if expired() {
             return None;
         }
@@ -4007,6 +4111,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Local,
             &mut || false,
+            None,
         )
         .unwrap();
         assert_eq!(plans.len(), 1);
@@ -4082,6 +4187,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut || false,
+            None,
         )
         .unwrap();
         assert!(
@@ -4094,6 +4200,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut || false,
+            None,
         )
         .unwrap();
         assert!(total_bits(&collected) < total_bits(&adjacent));
@@ -4115,6 +4222,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut || false,
+            None,
         )
         .unwrap();
         let merged = sequential_plan(
@@ -4123,6 +4231,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut || false,
+            None,
         )
         .unwrap();
 
@@ -4185,6 +4294,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut || false,
+            None,
         )
         .unwrap();
         let long_route = sequential_plan(
@@ -4193,6 +4303,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut || false,
+            None,
         )
         .unwrap();
 

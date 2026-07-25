@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use columbo::{optimize, Format, Options, MAX_TIMEOUT, MIN_TIMEOUT};
 
@@ -28,7 +28,6 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct Command {
     format: Format,
     options: Options,
-    verbose: bool,
     input: PathBuf,
     output: PathBuf,
 }
@@ -84,6 +83,8 @@ fn run() -> std::result::Result<(), u8> {
         }
     };
 
+    let total_started = command.options.verbose.then(Instant::now);
+    let read_started = command.options.verbose.then(Instant::now);
     let input = match read_file(&command.input, command.options.max_input_bytes) {
         Ok(bytes) => bytes,
         Err(ReadError::TooLarge) => {
@@ -100,17 +101,24 @@ fn run() -> std::result::Result<(), u8> {
             return Err(1);
         }
     };
+    let read_elapsed = read_started.map_or(Duration::ZERO, |started| started.elapsed());
 
-    if command.verbose && !command.options.strict {
+    if command.options.verbose {
+        print_verbose_header(&command, input.len(), read_elapsed);
+    }
+
+    if command.options.verbose && !command.options.strict {
         println!(
             "note: strict mode disabled; enabling compact empty/singleton Huffman alphabets \
              and the non-standard length-258 alias"
         );
     }
 
-    let mut spinner = Spinner::start(command.options.exhaustive && !command.options.inspect);
+    let optimize_started = command.options.verbose.then(Instant::now);
+    let mut spinner = Spinner::start(command.options.exhaustive && !command.options.verbose);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
+    let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
     let optimized = match result {
         Ok(result) => result,
         Err(error) => {
@@ -119,22 +127,149 @@ fn run() -> std::result::Result<(), u8> {
         }
     };
 
+    let write_started = command.options.verbose.then(Instant::now);
     if write_file(&command.output, &optimized.data).is_err() {
         eprintln!("could not write {:?}", command.output);
         return Err(1);
     }
+    let write_elapsed = write_started.map_or(Duration::ZERO, |started| started.elapsed());
 
-    if command.verbose && optimized.data.len() >= input.len() {
-        eprintln!("no bytes saved; wrote original-size output");
-    }
-    if command.verbose && optimized.timed_out {
+    if optimized.timed_out {
         eprintln!(
             "Timeout triggered after {} seconds; wrote best output found so far.",
             command.options.timeout.as_secs()
         );
     }
-    eprintln!("{} -> {} bytes", input.len(), optimized.data.len());
+    if command.options.verbose {
+        print_verbose_result(
+            &command.output,
+            input.len(),
+            optimized.data.len(),
+            read_elapsed,
+            optimize_elapsed,
+            write_elapsed,
+            total_started.map_or(Duration::ZERO, |started| started.elapsed()),
+        );
+    } else {
+        eprintln!("{} -> {} bytes", input.len(), optimized.data.len());
+    }
     Ok(())
+}
+
+fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Duration) {
+    let input_name = command
+        .input
+        .file_name()
+        .unwrap_or(command.input.as_os_str());
+    println!();
+    println!("{PROGRAM_NAME} v{PROGRAM_VERSION} · verbose");
+    println!("────────────────────────");
+    println!(
+        "Input    {:?} · {input_bytes} {} · read {}",
+        input_name,
+        plural_bytes(input_bytes),
+        format_elapsed(read_elapsed)
+    );
+    let strictness = if command.options.strict {
+        "strict"
+    } else {
+        "relaxed"
+    };
+    if command.options.exhaustive {
+        println!(
+            "Mode     max · {strictness} · {} file-wide budget",
+            format_elapsed(command.options.timeout)
+        );
+    } else {
+        println!("Mode     normal · {strictness}");
+    }
+}
+
+fn print_verbose_result(
+    output: &Path,
+    input_bytes: usize,
+    output_bytes: usize,
+    read_elapsed: Duration,
+    optimize_elapsed: Duration,
+    write_elapsed: Duration,
+    total_elapsed: Duration,
+) {
+    let output_name = output.file_name().unwrap_or(output.as_os_str());
+    println!();
+    println!("Result");
+    println!("  Output  {:?}", output_name);
+    println!(
+        "  Size    {input_bytes} → {output_bytes} {} · {}",
+        plural_bytes(output_bytes),
+        describe_byte_change(input_bytes, output_bytes)
+    );
+    println!(
+        "  Time    {} total · read {} · optimize {} · write {}",
+        format_elapsed(total_elapsed),
+        format_elapsed(read_elapsed),
+        format_elapsed(optimize_elapsed),
+        format_elapsed(write_elapsed)
+    );
+}
+
+fn format_elapsed(duration: Duration) -> String {
+    if duration < Duration::from_millis(1) {
+        format!("{} µs", duration.subsec_micros())
+    } else if duration < Duration::from_secs(1) {
+        let centimilliseconds = (duration.subsec_micros() + 5) / 10;
+        format!(
+            "{}.{:02} ms",
+            centimilliseconds / 100,
+            centimilliseconds % 100
+        )
+    } else if duration < Duration::from_secs(10) {
+        let mut seconds = duration.as_secs();
+        let mut centiseconds = (duration.subsec_micros() + 5_000) / 10_000;
+        if centiseconds == 100 {
+            seconds += 1;
+            centiseconds = 0;
+        }
+        format!("{seconds}.{centiseconds:02} s")
+    } else {
+        let mut seconds = duration.as_secs();
+        let mut deciseconds = (duration.subsec_millis() + 50) / 100;
+        if deciseconds == 10 {
+            seconds = seconds.saturating_add(1);
+            deciseconds = 0;
+        }
+        format!("{seconds}.{deciseconds} s")
+    }
+}
+
+fn describe_byte_change(input_bytes: usize, output_bytes: usize) -> String {
+    match input_bytes.cmp(&output_bytes) {
+        std::cmp::Ordering::Greater => {
+            let saved = input_bytes - output_bytes;
+            // CLI inputs are capped at 1 GiB, so basis-point arithmetic is
+            // exact here and avoids pulling floating-point formatting into
+            // speed-first distribution binaries.
+            let percentage_hundredths = (saved * 10_000 + input_bytes / 2) / input_bytes;
+            format!(
+                "saved {saved} {} ({}.{:02}%)",
+                plural_bytes(saved),
+                percentage_hundredths / 100,
+                percentage_hundredths % 100
+            )
+        }
+        std::cmp::Ordering::Less => {
+            let added = output_bytes - input_bytes;
+            format!("added {added} {}", plural_bytes(added))
+        }
+        std::cmp::Ordering::Equal => "unchanged".to_owned(),
+    }
+}
+
+fn plural_bytes(count: usize) -> &'static str {
+    if count == 1 {
+        "byte"
+    } else {
+        "bytes"
+    }
 }
 
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand, CliError> {
@@ -142,7 +277,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
     let mut options = Options::default();
     let mut format = Format::Auto;
     let mut format_conflict = false;
-    let mut verbose = false;
     let mut index = 0_usize;
 
     while index < arguments.len() && starts_with_dash(&arguments[index]) {
@@ -154,8 +288,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             "--zlib" => select_format(&mut format, &mut format_conflict, Format::Zlib),
             "--gzip" => select_format(&mut format, &mut format_conflict, Format::Gzip),
             "--zip" => select_format(&mut format, &mut format_conflict, Format::Zip),
-            "-v" | "--verbose" => verbose = true,
-            "--inspect" => options.inspect = true,
+            "-v" | "--verbose" => options.verbose = true,
             "-m" | "--max" => options.exhaustive = true,
             "--strip" => options.strip_metadata = true,
             "-t" | "--timeout" => {
@@ -201,7 +334,6 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
     Ok(ParsedCommand::Run(Command {
         format,
         options,
-        verbose,
         input: PathBuf::from(&arguments[index]),
         output: PathBuf::from(&arguments[index + 1]),
     }))
@@ -262,7 +394,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         concat!(
-            "usage: {} [--help|-h] [--verbose|-v] [--inspect]",
+            "usage: {} [--help|-h] [--verbose|-v]",
             " [--max|-m] [--timeout|-t seconds]",
             "\n       [--strict 0|1] [--strip]",
             "\n       [--raw|--png|--zlib|--gzip|--zip] input output"
@@ -274,11 +406,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(output, "  -h, --help             show this help and exit")?;
     writeln!(
         output,
-        "  -v, --verbose          report additional optimization information"
-    )?;
-    writeln!(
-        output,
-        "      --inspect          print block-level optimization choices to stderr"
+        "  -v, --verbose          show live route timings, bit gains, and block choices"
     )?;
     writeln!(
         output,
@@ -554,6 +682,8 @@ impl Spinner {
         let worker = thread::spawn(move || {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut frame = 0;
+            // Avoid flashing a spinner for work that completes quickly.
+            thread::park_timeout(Duration::from_millis(300));
             while worker_running.load(Ordering::Relaxed) {
                 eprint!(
                     "\r\x1b[36m{}\x1b[0m maximizing compression...",
@@ -561,7 +691,7 @@ impl Spinner {
                 );
                 let _ = io::stderr().flush();
                 frame = (frame + 1) % FRAMES.len();
-                thread::sleep(Duration::from_millis(200));
+                thread::park_timeout(Duration::from_millis(200));
             }
             eprint!("\r\x1b[K");
             let _ = io::stderr().flush();
@@ -577,6 +707,9 @@ impl Spinner {
             running.store(false, Ordering::Relaxed);
         }
         if let Some(worker) = self.worker.take() {
+            // Wake an initial-delay or between-frame park so stopping never
+            // adds up to 300 ms to the measured command time.
+            worker.thread().unpark();
             let _ = worker.join();
         }
     }
@@ -633,8 +766,15 @@ mod tests {
     }
 
     #[test]
-    fn retired_compression_flags_are_rejected() {
-        for option in ["--mincodes", "--allow-258-alias"] {
+    fn verbose_flags_enable_progress_reporting() {
+        assert!(!parsed_options(["in", "out"]).verbose);
+        assert!(parsed_options(["-v", "in", "out"]).verbose);
+        assert!(parsed_options(["--verbose", "in", "out"]).verbose);
+    }
+
+    #[test]
+    fn retired_cli_flags_are_rejected() {
+        for option in ["--mincodes", "--allow-258-alias", "--inspect"] {
             let error = match parse_args([
                 OsString::from(option),
                 OsString::from("in"),
@@ -657,6 +797,23 @@ mod tests {
         assert!(help.contains("default: 1"));
         assert!(!help.contains("--mincodes"));
         assert!(!help.contains("--allow-258-alias"));
+        assert!(!help.contains("--inspect"));
+        assert!(help.contains("live route timings, bit gains, and block choices"));
+    }
+
+    #[test]
+    fn verbose_measurements_use_readable_units_and_change_wording() {
+        assert_eq!(format_elapsed(Duration::ZERO), "0 µs");
+        assert_eq!(format_elapsed(Duration::from_micros(999)), "999 µs");
+        assert_eq!(format_elapsed(Duration::from_millis(1)), "1.00 ms");
+        assert_eq!(format_elapsed(Duration::from_secs(1)), "1.00 s");
+
+        assert_eq!(describe_byte_change(100, 90), "saved 10 bytes (10.00%)");
+        assert_eq!(describe_byte_change(100, 99), "saved 1 byte (1.00%)");
+        assert_eq!(describe_byte_change(347, 346), "saved 1 byte (0.29%)");
+        assert_eq!(describe_byte_change(100, 100), "unchanged");
+        assert_eq!(describe_byte_change(100, 101), "added 1 byte");
+        assert_eq!(describe_byte_change(100, 111), "added 11 bytes");
     }
 
     #[test]

@@ -22,6 +22,22 @@ fn auto_detection_and_explicit_modes_agree() {
 #[test]
 fn strict_mode_is_the_default() {
     assert!(Options::default().strict);
+    assert!(!Options::default().verbose);
+}
+
+#[test]
+fn verbose_max_reporting_does_not_change_optimized_bytes() {
+    let quiet = Options {
+        exhaustive: true,
+        ..Options::default()
+    };
+    let mut verbose = quiet.clone();
+    verbose.verbose = true;
+
+    let quiet_result = optimize(EMPTY_RAW, Format::Raw, &quiet).unwrap();
+    let verbose_result = optimize(EMPTY_RAW, Format::Raw, &verbose).unwrap();
+
+    assert_eq!(verbose_result, quiet_result);
 }
 
 #[test]

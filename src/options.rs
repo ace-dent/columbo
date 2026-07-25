@@ -39,8 +39,12 @@ pub enum Format {
 pub struct Options {
     /// Enable the slower block-boundary and token-spelling search (`--max`).
     pub exhaustive: bool,
-    /// Print block-level decisions to standard error.
-    pub inspect: bool,
+    /// Report route timings, bit gains, and final block choices to standard
+    /// output.
+    ///
+    /// Reporting is deliberately kept out of hot token and Huffman loops.
+    /// Quiet and verbose runs use the same optimization and memory policies.
+    pub verbose: bool,
     /// Remove supported wrapper metadata while rebuilding the file.
     pub strip_metadata: bool,
     /// Emit conservative Deflate that is accepted by strict and older decoders.
@@ -66,7 +70,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             exhaustive: false,
-            inspect: false,
+            verbose: false,
             strip_metadata: false,
             strict: true,
             timeout: DEFAULT_TIMEOUT,

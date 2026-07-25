@@ -101,6 +101,7 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         Format::Auto => detect(input),
         explicit => explicit,
     };
+    crate::progress::format_detected(options, format);
 
     match format {
         Format::Auto | Format::Raw => {

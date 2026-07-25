@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Instant;
 
+use crate::progress::{
+    BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress, RouteProgress,
+    StreamProgress, MAX_REPORTED_BLOCKS,
+};
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
@@ -18,7 +22,7 @@ use super::search::rewrite_258_symbols;
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,
     plan_compact_source_split_floor, plan_fragmented_replay, plan_source_no_split_route,
-    plan_stream, plan_terminal_merge_route,
+    plan_stream, plan_stream_with_progress, plan_terminal_merge_route,
 };
 
 // Long source-block chains can need one pass to establish profitable adjacent
@@ -124,7 +128,8 @@ pub(crate) fn optimize_raw(input: &[u8], options: &Options) -> Result<RawOptimiz
 /// already present in the input could otherwise survive through exact source
 /// reuse or an ordinary header rewrite. Clearing source representations makes
 /// every strict candidate encode the canonical symbol 285 token.
-fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<()> {
+fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<usize> {
+    let mut normalized_blocks = 0_usize;
     for block in blocks {
         let has_alias = block.tokens.iter().any(|token| {
             matches!(
@@ -140,6 +145,7 @@ fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<()> {
             continue;
         }
 
+        normalized_blocks += 1;
         let tokens = rewrite_258_symbols(&block.tokens, block.plain.len(), false)
             .ok_or_else(|| Error::new("could not allocate strict Deflate token normalization"))?;
         block.tokens = tokens.into();
@@ -149,7 +155,7 @@ fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<()> {
         block.original_distance_lengths = None;
         block.original_dynamic = None;
     }
-    Ok(())
+    Ok(normalized_blocks)
 }
 
 /// Optimize the first complete Deflate stream in `input`.
@@ -180,10 +186,33 @@ pub(crate) fn optimize_raw_prefix_with_floor(
 
     let started = Instant::now();
     let parsed = parse_stream(input, decoded_limit.min(options.max_decoded_bytes))?;
+    // Avoid even an extra clock read in ordinary speed-first runs.
+    let parse_elapsed = if options.verbose {
+        started.elapsed()
+    } else {
+        std::time::Duration::ZERO
+    };
     let mut blocks = parsed.blocks;
+    let progress = Progress::begin(
+        options,
+        started,
+        StreamProgress {
+            blocks: parsed.source_block_count,
+            compressed_bytes: parsed.consumed,
+            decoded_bytes: parsed.decoded_size,
+            empty_blocks: parsed.source_empty_block_count,
+            meaningful_bits: parsed.meaningful_bits,
+            parse_elapsed,
+        },
+    );
     if options.strict {
-        normalize_258_aliases(&mut blocks)?;
+        let normalization_started = progress.enabled().then(Instant::now);
+        let normalized_blocks = normalize_258_aliases(&mut blocks)?;
+        if let Some(normalization_started) = normalization_started {
+            progress.normalization(normalized_blocks, normalization_started.elapsed());
+        }
     }
+    progress.routes();
     let deadline = Deadline {
         started,
         duration: options.timeout,
@@ -242,10 +271,12 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     } else {
         BoundedPngMaxPolicy::default()
     };
+    let bounded_step = (options.exhaustive && default_floor.is_bounded())
+        .then(|| progress.start("Bounded comparison routes"));
     let bounded_candidates = if options.exhaustive && default_floor.is_bounded() {
         match png_policy {
             BoundedPngMaxPolicy::GenericParallel => {
-                build_bounded_generic_max_candidates(source, options, &deadline)?
+                build_bounded_generic_max_candidates(source, options, &deadline, progress)?
             }
             BoundedPngMaxPolicy::LegacyGrouping => {
                 let (floor, floor_seeded) =
@@ -282,41 +313,25 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let mut source_max_candidate = bounded_candidates.source_max;
     let suppress_later_source_max = bounded_candidates.suppress_later_source_max;
     let suppress_later_optional_routes = bounded_candidates.suppress_later_optional_routes;
-    if options.inspect {
-        if let Some(floor) = &bounded_floor_candidate {
-            eprintln!(
-                "inspect: route=bounded-floor bytes={} bits={}",
-                floor.data.len(),
-                floor.bits
-            );
-        }
-        if let Some(seeded) = &floor_seeded_candidate {
-            eprintln!(
-                "inspect: route=columbo-floor-seeded bytes={} bits={}",
-                seeded.data.len(),
-                seeded.bits
-            );
-        }
-        if let Some(deft4j) = &deft4j_candidate {
-            eprintln!(
-                "inspect: route=columbo-deft4j-derived bytes={} bits={}",
-                deft4j.data.len(),
-                deft4j.bits
-            );
-        }
-        if let Some(narrow) = &narrow_candidate {
-            eprintln!(
-                "inspect: route=no-split bytes={} bits={}",
-                narrow.data.len(),
-                narrow.bits
-            );
-        }
-        if let Some(source_max) = &source_max_candidate {
-            eprintln!(
-                "inspect: route=columbo-source-max bytes={} bits={}",
-                source_max.data.len(),
-                source_max.bits
-            );
+    if let Some(step) = bounded_step {
+        step.finish_phase();
+        for (name, candidate) in [
+            ("Normal floor", bounded_floor_candidate.as_ref()),
+            ("Columbo floor-seeded", floor_seeded_candidate.as_ref()),
+            ("deft4j-derived source", deft4j_candidate.as_ref()),
+            ("No-split source", narrow_candidate.as_ref()),
+            ("Columbo source max", source_max_candidate.as_ref()),
+        ] {
+            if let Some(candidate) = candidate {
+                progress.candidate(
+                    name,
+                    candidate_progress(
+                        candidate,
+                        source.meaningful_bits,
+                        candidate.is_strictly_smaller_than_source(source),
+                    ),
+                );
+            }
         }
     }
     let seed_weak_deft4j = default_floor == DefaultFloor::Bounded
@@ -328,30 +343,32 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     WEAK_DEFT4J_GAIN_BASIS_POINTS,
                 )
         });
-    if !options.inspect {
-        if let Some(floor) = &mut bounded_floor_candidate {
-            // The later deft4j refinement needs only the encoded floor for its
-            // strict comparison. Release transformed floor plans before it
-            // reparses another complete candidate.
-            floor.plans.clear();
-        }
-        if let Some(seeded) = &mut floor_seeded_candidate {
-            seeded.plans.clear();
-        }
-        if let Some(deft4j) = &mut deft4j_candidate {
-            // Refinement needs only the encoded stream. Release retained
-            // deft4j-route token plans before reparsing it so the models do not
-            // overlap at peak memory.
-            deft4j.plans.clear();
-        }
-        if let Some(narrow) = &mut narrow_candidate {
-            narrow.plans.clear();
-        }
-        if let Some(source_max) = &mut source_max_candidate {
-            source_max.plans.clear();
-        }
+    if let Some(floor) = &mut bounded_floor_candidate {
+        // The later deft4j refinement needs only the encoded floor for its
+        // strict comparison. Release transformed floor plans before it
+        // reparses another complete candidate.
+        floor.plans.clear();
     }
-    if default_floor.is_bounded() && !deadline.expired() {
+    if let Some(seeded) = &mut floor_seeded_candidate {
+        seeded.plans.clear();
+    }
+    if let Some(deft4j) = &mut deft4j_candidate {
+        // Refinement needs only the encoded stream. Release retained
+        // deft4j-route token plans before reparsing it so the models do not
+        // overlap at peak memory.
+        deft4j.plans.clear();
+    }
+    if let Some(narrow) = &mut narrow_candidate {
+        narrow.plans.clear();
+    }
+    if let Some(source_max) = &mut source_max_candidate {
+        source_max.plans.clear();
+    }
+    let run_bounded_refinement = default_floor.is_bounded() && !deadline.expired();
+    let refinement_step = (run_bounded_refinement
+        && (seed_weak_deft4j || deft4j_candidate.is_some()))
+    .then(|| progress.start("deft4j-derived refinement"));
+    if run_bounded_refinement {
         if seed_weak_deft4j {
             if let Some(floor) = bounded_floor_candidate
                 .as_ref()
@@ -404,35 +421,51 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             replace_optional_if_smaller(&mut deft4j_candidate, refined);
         }
     }
+    if let Some(step) = refinement_step {
+        step.finish(deft4j_candidate.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+    }
     if default_floor == DefaultFloor::Bounded && seed_weak_deft4j {
+        let compact_split_step = progress.start("Columbo compact split floor");
         let compact_split = match deft4j_candidate.as_ref() {
             Some(deft4j) => {
                 refine_with_compact_source_split_floor(deft4j, options, decoded_limit, identity)?
             }
             None => None,
         };
+        compact_split_step.finish(compact_split.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
         if let Some(split) = compact_split {
-            if options.inspect {
-                eprintln!(
-                    "inspect: route=columbo-compact-split-floor bytes={} bits={}",
-                    split.data.len(),
-                    split.bits
-                );
-            }
             replace_optional_if_smaller(&mut deft4j_candidate, split);
         }
     }
-    if !options.inspect {
-        if let Some(deft4j) = &mut deft4j_candidate {
-            // Keep only the encoded incumbent for comparison and later routes;
-            // refinement can otherwise retain another expanded token graph.
-            deft4j.plans.clear();
-        }
+    if let Some(deft4j) = &mut deft4j_candidate {
+        // Keep only the encoded incumbent for comparison and later routes;
+        // refinement can otherwise retain another expanded token graph.
+        deft4j.plans.clear();
     }
     if let Some(narrow) = narrow_candidate {
         replace_optional_if_smaller(&mut deft4j_candidate, narrow);
     }
 
+    let needs_initial_floor = bounded_floor_candidate.is_none();
+    let initial_step = needs_initial_floor.then(|| {
+        progress.start(if options.exhaustive {
+            "Normal comparison floor"
+        } else {
+            "Normal route"
+        })
+    });
     let mut candidate = if let Some(floor) = bounded_floor_candidate {
         floor
     } else if options.exhaustive {
@@ -461,19 +494,32 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             deadline.expired()
         })?
     };
+    if let Some(step) = initial_step {
+        step.finish(Some(candidate_progress(
+            &candidate,
+            source.meaningful_bits,
+            candidate.is_strictly_smaller_than_source(source),
+        )));
+    }
     if deft4j_eligible && default_floor == DefaultFloor::Complete && !deadline.expired() {
+        let deft4j_step = progress.start("deft4j-derived source route");
         deft4j_candidate =
             build_deft4j_source_candidate(source, options, &mut || deadline.expired())?;
+        deft4j_step.finish(deft4j_candidate.as_ref().map(|deft4j| {
+            candidate_progress(
+                deft4j,
+                source.meaningful_bits,
+                deft4j.is_strictly_smaller_than_source(source),
+            )
+        }));
     }
 
     if let Some(seeded) = floor_seeded_candidate {
         candidate.replace_if_smaller(seeded);
     }
 
-    if !options.inspect {
-        if let Some(deft4j) = &mut deft4j_candidate {
-            deft4j.plans.clear();
-        }
+    if let Some(deft4j) = &mut deft4j_candidate {
+        deft4j.plans.clear();
     }
     let mut deft4j_lineage = false;
     if let Some(deft4j) = deft4j_candidate {
@@ -487,13 +533,14 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     // seed itself remains deadline-independent and can still win when there is
     // no time left for its optional replay rounds. Its 64-source-block minimum
     // also keeps it outside the audited 13-to-32-block legacy corpus band.
-    let mut fragmented_candidate = if options.exhaustive
+    let run_fragmented = options.exhaustive
         && !suppress_later_optional_routes
         // Once the source-ordered deft4j route has won and spent the deadline,
         // another source-derived seed cannot receive any replay work. Avoid
         // that duplicate post-deadline collection.
-        && (!deft4j_lineage || !deadline.expired())
-    {
+        && (!deft4j_lineage || !deadline.expired());
+    let fragmented_step = run_fragmented.then(|| progress.start("Columbo fragmented collection"));
+    let mut fragmented_candidate = if run_fragmented {
         fragmented_collect_seed(&blocks, 0, options)
             .map(|plans| {
                 let mut replay_options = options.clone();
@@ -506,15 +553,23 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     ReplayPlanner::Fragmented,
                     &mut || deadline.expired(),
                 )
+                .map(|candidate| candidate.named("Columbo fragmented collection"))
             })
             .transpose()?
     } else {
         None
     };
-    if !options.inspect {
-        if let Some(fragmented) = &mut fragmented_candidate {
-            fragmented.plans.clear();
-        }
+    if let Some(step) = fragmented_step {
+        step.finish(fragmented_candidate.as_ref().map(|fragmented| {
+            candidate_progress(
+                fragmented,
+                source.meaningful_bits,
+                fragmented.is_strictly_smaller_than_source(source),
+            )
+        }));
+    }
+    if let Some(fragmented) = &mut fragmented_candidate {
+        fragmented.plans.clear();
     }
 
     if let Some(fragmented) = fragmented_candidate {
@@ -522,33 +577,34 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     }
 
     if options.exhaustive {
-        if !options.inspect {
-            // The encoded floor is all we need for comparison. Releasing its
-            // copied tokens before max search keeps peak memory predictable.
-            candidate.plans.clear();
-        }
+        // The encoded floor is all we need for comparison. Releasing its
+        // copied tokens before max search keeps peak memory predictable.
+        candidate.plans.clear();
 
         // Generic max also explores source-boundary and table families outside
         // deft4j's source-ordered graph. Run it before a rewritten seed can
         // spend the remainder on one large merged block.
         if let Some(max_candidate) = source_max_candidate {
             candidate.replace_if_smaller(max_candidate);
-        } else if !suppress_later_source_max && !deadline.expired() {
-            let max_candidate =
-                build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, &mut || {
-                    deadline.expired()
-                })?;
-            candidate.replace_if_smaller(max_candidate);
+        } else {
+            let run_source_max = !suppress_later_source_max && !deadline.expired();
+            if run_source_max {
+                let max_candidate =
+                    build_source_max_candidate(source, options, progress, &deadline, &mut || {
+                        deadline.expired()
+                    })?;
+                candidate.replace_if_smaller(max_candidate);
+            }
         }
 
-        if !options.inspect {
-            // A winning source restart can own another full plan graph. Only
-            // its encoded bytes are needed as the optional replay seed.
-            candidate.plans.clear();
-        }
+        // A winning source restart can own another full plan graph. Only its
+        // encoded bytes are needed as the optional replay seed.
+        candidate.plans.clear();
 
         let seed_selected = options.strict || candidate.is_strictly_smaller_than_source(source);
-        if seed_selected && !suppress_later_optional_routes && !deadline.expired() {
+        let run_seeded = seed_selected && !suppress_later_optional_routes && !deadline.expired();
+        let seeded_step = run_seeded.then(|| progress.start("Columbo rewritten-seed refinement"));
+        if run_seeded {
             // Rewritten match choices and boundaries can expose later max
             // transformations, so retain one additive seeded pass after both
             // source-shaped routes. Its incumbent remains available if this
@@ -557,27 +613,30 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 refine_with_max_planner(&candidate, options, decoded_limit, identity, &mut || {
                     deadline.expired()
                 })?;
+            if let Some(step) = seeded_step {
+                step.finish(Some(candidate_progress(
+                    &seeded_candidate,
+                    source.meaningful_bits,
+                    seeded_candidate.is_strictly_smaller_than_source(source),
+                )));
+            }
             candidate.replace_if_smaller(seeded_candidate);
         }
     }
 
     if compact_quad_eligible {
-        if let Some(quad) =
-            refine_with_compact_quad_floor(&candidate, options, decoded_limit, identity)?
-        {
-            if options.inspect {
-                eprintln!(
-                    "inspect: route=columbo-compact-quad-floor bytes={} bits={}",
-                    quad.data.len(),
-                    quad.bits
-                );
-            }
+        let quad_step = progress.start("Columbo compact quad floor");
+        let quad = refine_with_compact_quad_floor(&candidate, options, decoded_limit, identity)?;
+        quad_step.finish(quad.as_ref().map(|quad| {
+            candidate_progress(
+                quad,
+                source.meaningful_bits,
+                quad.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(quad) = quad {
             candidate.replace_if_smaller(quad);
         }
-    }
-
-    if options.inspect {
-        inspect_plans(&candidate.plans);
     }
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
@@ -586,6 +645,30 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     } else {
         candidate.bits
     };
+    let final_report = if keep_original {
+        capture_source_block_report(&blocks, parsed.source_block_count, options.verbose)
+    } else {
+        candidate.block_report.take()
+    };
+    let selected_route = if keep_original {
+        "Original source"
+    } else {
+        candidate.route
+    };
+    let output_bytes = if keep_original {
+        original.len()
+    } else {
+        candidate.data.len()
+    };
+    let timed_out = deadline.was_triggered();
+    progress.blocks(final_report);
+    progress.finish(
+        selected_route,
+        output_bytes,
+        deflate_bits,
+        parsed.meaningful_bits,
+        timed_out,
+    );
 
     // Planning is complete. Drop model storage before copying a winning source
     // stream, then reuse the generated output allocation where possible. This
@@ -615,7 +698,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             source_block_count: parsed.source_block_count,
             source_empty_block_count: parsed.source_empty_block_count,
         },
-        timed_out: deadline.was_triggered(),
+        timed_out,
     })
 }
 
@@ -743,9 +826,16 @@ struct Candidate {
     data: Vec<u8>,
     bits: u64,
     plans: Vec<PlannedBlock>,
+    block_report: Option<BlockReport>,
+    route: &'static str,
 }
 
 impl Candidate {
+    fn named(mut self, route: &'static str) -> Self {
+        self.route = route;
+        self
+    }
+
     /// Compare complete encodings by bytes, then by meaningful Deflate bits.
     ///
     /// The comparison is deliberately strict: equal candidates retain the
@@ -780,6 +870,94 @@ impl Candidate {
             true
         } else {
             false
+        }
+    }
+}
+
+fn candidate_progress(
+    candidate: &Candidate,
+    reference_bits: u64,
+    profitable: bool,
+) -> CandidateProgress {
+    CandidateProgress {
+        bytes: candidate.data.len(),
+        bits: candidate.bits,
+        reference_bits,
+        profitable,
+    }
+}
+
+/// Run one original-source max search, with nested telemetry only in verbose
+/// mode and the historical hot path otherwise.
+fn build_source_max_candidate<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    progress: Progress,
+    deadline: &Deadline,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    if !progress.enabled() {
+        let candidate = build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)?;
+        return Ok(if candidate.route == "Original source" {
+            candidate
+        } else {
+            candidate.named("Columbo source max route")
+        });
+    }
+
+    build_source_max_candidate_verbose(source, options, progress, deadline, expired)
+}
+
+/// Keep the telemetry-heavy planner monomorphized only once. The generic
+/// wrapper above preserves inlined deadline checks for production quiet mode,
+/// while verbose mode can afford one indirect call at its existing probes.
+fn build_source_max_candidate_verbose(
+    source: CandidateInput<'_>,
+    options: &Options,
+    progress: Progress,
+    deadline: &Deadline,
+    expired: &mut dyn FnMut() -> bool,
+) -> Result<Candidate> {
+    let (step, details) = progress.start_detailed(
+        "Columbo source max route",
+        source.meaningful_bits,
+        deadline.remaining(),
+    );
+    let mut monitored_expired = || {
+        details.heartbeat();
+        let should_stop = expired();
+        if should_stop && deadline.was_triggered() {
+            details.deadline_reached();
+        }
+        should_stop
+    };
+    match build_candidate_with_progress(
+        source,
+        options,
+        MAX_RAW_REPLAY_LIMIT,
+        &mut monitored_expired,
+        &details,
+    ) {
+        Ok(candidate) if candidate.route == "Original source" => {
+            details.stopped("No complete source-max plan was available");
+            step.finish(None);
+            Ok(candidate)
+        }
+        Ok(candidate) => {
+            let candidate = candidate.named("Columbo source max route");
+            step.finish(Some(candidate_progress(
+                &candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )));
+            Ok(candidate)
+        }
+        Err(error) => {
+            step.fail();
+            Err(error)
         }
     }
 }
@@ -1042,6 +1220,7 @@ where
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     build_candidate(source, &floor_options, DEFAULT_RAW_REPLAY_LIMIT, expired)
+        .map(|candidate| candidate.named("Normal floor"))
 }
 
 /// Build the ordinary bounded floor, then continue through the historical
@@ -1078,11 +1257,9 @@ fn build_bounded_floor_grouping_lineage(
         return Ok((floor, None));
     }
 
-    if !options.inspect {
-        // The grouping route reparses the encoded floor and owns its grouped
-        // tokens, so the earlier token plans need not overlap that model.
-        floor.plans.clear();
-    }
+    // The grouping route reparses the encoded floor and owns its grouped
+    // tokens, so the earlier token plans need not overlap that model.
+    floor.plans.clear();
     let seeded =
         refine_with_bounded_grouping_floor(&floor, options, source.decoded_limit, source.identity)?;
     Ok((floor, seeded))
@@ -1131,11 +1308,9 @@ fn continue_bounded_floor_lineage(
         return Ok((floor, None));
     }
 
-    if !options.inspect {
-        // The seeded parse owns its rewritten tokens. Release the floor plans
-        // before allocating that model so this remains one route arena.
-        floor.plans.clear();
-    }
+    // The seeded parse owns its rewritten tokens. Release the floor plans
+    // before allocating that model so this remains one route arena.
+    floor.plans.clear();
     let seeded = refine_with_max_planner(
         &floor,
         options,
@@ -1155,13 +1330,14 @@ fn build_bounded_generic_max_candidates(
     source: CandidateInput<'_>,
     options: &Options,
     deadline: &Deadline,
+    progress: Progress,
 ) -> Result<BoundedPhaseCandidates> {
     thread::scope(|scope| {
         let source_worker = thread::Builder::new()
             .name("columbo-source-max".into())
             .spawn_scoped(scope, || {
                 run_route_with_cancellation(deadline, || {
-                    build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, &mut || {
+                    build_source_max_candidate(source, options, progress, deadline, &mut || {
                         deadline.route_should_stop()
                     })
                 })
@@ -1177,7 +1353,7 @@ fn build_bounded_generic_max_candidates(
                 Err(payload) => std::panic::resume_unwind(payload),
             },
             None if !deadline.route_should_stop() => run_route_with_cancellation(deadline, || {
-                build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, &mut || {
+                build_source_max_candidate(source, options, progress, deadline, &mut || {
                     deadline.route_should_stop()
                 })
             })
@@ -1216,7 +1392,8 @@ where
     let Some(plans) = plan_source_blocks(source.blocks, 0, options, &mut *expired) else {
         return Ok(None);
     };
-    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired).map(Some)
+    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
+        .map(|candidate| Some(candidate.named("deft4j-derived source")))
 }
 
 /// Build one direct source-order candidate without the broader split graph.
@@ -1237,7 +1414,8 @@ where
     else {
         return Ok(None);
     };
-    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired).map(Some)
+    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
+        .map(|candidate| Some(candidate.named("No-split source")))
 }
 
 /// Apply the source-ordered deft4j route to a genuinely rewritten floor state.
@@ -1287,6 +1465,7 @@ where
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     build_candidate(source, &floor_options, DEFAULT_RAW_REPLAY_LIMIT, expired)
+        .map(|candidate| candidate.named("Default refinement"))
 }
 
 /// Finish a small deft4j-derived seed with Columbo's structural split floor.
@@ -1325,7 +1504,7 @@ fn refine_with_compact_source_split_floor(
         ReplayPlanner::Full,
         &mut never_expires,
     )
-    .map(Some)
+    .map(|candidate| Some(candidate.named("Columbo compact split floor")))
 }
 
 fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]) -> bool {
@@ -1406,7 +1585,7 @@ fn refine_with_compact_quad_floor(
         ReplayPlanner::Full,
         &mut never_expires,
     )
-    .map(Some)
+    .map(|candidate| Some(candidate.named("Columbo compact quad floor")))
 }
 
 /// Apply the full Columbo max planner to a complete rewritten candidate.
@@ -1423,6 +1602,7 @@ where
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)
+        .map(|candidate| candidate.named("Columbo max refinement"))
 }
 
 /// Apply Columbo's bounded source-grouping floor to a complete rewritten
@@ -1447,7 +1627,7 @@ fn refine_with_bounded_grouping_floor(
         ReplayPlanner::Full,
         &mut never_expires,
     )
-    .map(Some)
+    .map(|candidate| Some(candidate.named("Columbo floor-seeded grouping")))
 }
 
 /// Apply one linear, deterministic merge cleanup to a selected max seed.
@@ -1485,7 +1665,7 @@ where
         ReplayPlanner::Full,
         expired,
     )
-    .map(Some)
+    .map(|candidate| Some(candidate.named("Columbo terminal merge")))
 }
 
 /// Build one complete-stream candidate and follow strict improvements through
@@ -1512,6 +1692,35 @@ where
     )
 }
 
+/// Build the direct source-max candidate with nested human-facing telemetry.
+///
+/// Keeping this separate from `build_candidate` means ordinary and quiet
+/// routes do not take clocks or maintain progress state in their hot loops.
+fn build_candidate_with_progress<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    replay_limit: usize,
+    expired: &mut F,
+    progress: &RouteProgress,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    let Some(plans) = plan_stream_with_progress(source.blocks, 0, options, &mut *expired, progress)
+    else {
+        return source_candidate(source, options);
+    };
+    build_candidate_from_plans_with_progress(
+        source,
+        plans,
+        options,
+        replay_limit,
+        ReplayPlanner::Full,
+        expired,
+        Some(progress),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum ReplayPlanner {
     Full,
@@ -1526,11 +1735,35 @@ enum ReplayPlanner {
 /// replacing it before its new block boundaries have been reparsed.
 fn build_candidate_from_plans<F>(
     source: CandidateInput<'_>,
+    plans: Vec<PlannedBlock>,
+    options: &Options,
+    replay_limit: usize,
+    replay_planner: ReplayPlanner,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    build_candidate_from_plans_with_progress(
+        source,
+        plans,
+        options,
+        replay_limit,
+        replay_planner,
+        expired,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_candidate_from_plans_with_progress<F>(
+    source: CandidateInput<'_>,
     mut plans: Vec<PlannedBlock>,
     options: &Options,
     replay_limit: usize,
     replay_planner: ReplayPlanner,
     expired: &mut F,
+    progress: Option<&RouteProgress>,
 ) -> Result<Candidate>
 where
     F: FnMut() -> bool,
@@ -1548,24 +1781,74 @@ where
     // planning round. Each accepted round must improve the complete stream,
     // so this cannot oscillate even before the explicit cap is reached.
     let mut data_is_validated = false;
-    for _ in 0..replay_limit {
-        if (initial_loses && !options.strict) || expired() {
+    for round in 1..=replay_limit {
+        if initial_loses && !options.strict {
+            if let Some(progress) = progress {
+                progress.stopped("Replays skipped because the initial route is not smaller");
+            }
+            break;
+        }
+        if expired() {
+            if let Some(progress) = progress {
+                progress.deadline_reached();
+                progress.stopped("File-wide deadline reached before the next replay");
+            }
             break;
         }
 
+        let replay_started = progress.map(|progress| {
+            progress.replay_started(round, replay_limit, plans.len(), bits);
+            Instant::now()
+        });
         let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
         data_is_validated = true;
 
         let replay_plans = match replay_planner {
-            ReplayPlanner::Full => plan_stream(&replayed.blocks, 0, options, &mut *expired),
+            ReplayPlanner::Full => match progress {
+                Some(progress) => {
+                    plan_stream_with_progress(&replayed.blocks, 0, options, &mut *expired, progress)
+                }
+                None => plan_stream(&replayed.blocks, 0, options, &mut *expired),
+            },
             ReplayPlanner::Fragmented => plan_fragmented_replay(&replayed.blocks, 0, options),
         };
         let Some(replay_plans) = replay_plans else {
+            if let Some(progress) = progress {
+                progress.stopped("Replay planner produced no complete candidate");
+            }
             break;
         };
         let (replay_data, replay_bits) = emit_plans(&data, &replay_plans, options.strict)?;
         if !is_strictly_better(replay_data.len(), replay_bits, data.len(), bits) {
+            if let (Some(progress), Some(started)) = (progress, replay_started) {
+                if progress.deadline_was_reached() {
+                    progress.replay_stopped(
+                        round,
+                        started.elapsed(),
+                        "file-wide deadline reached; retained the best completed plans",
+                    );
+                } else {
+                    progress.replay_finished(
+                        round,
+                        bits,
+                        replay_bits,
+                        replay_plans.len(),
+                        started.elapsed(),
+                        false,
+                    );
+                }
+            }
             break;
+        }
+        if let (Some(progress), Some(started)) = (progress, replay_started) {
+            progress.replay_finished(
+                round,
+                bits,
+                replay_bits,
+                replay_plans.len(),
+                started.elapsed(),
+                true,
+            );
         }
         data = replay_data;
         bits = replay_bits;
@@ -1584,7 +1867,18 @@ where
         parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
     }
 
-    Ok(Candidate { data, bits, plans })
+    let block_report = capture_planned_block_report(&plans, options.verbose);
+    Ok(Candidate {
+        data,
+        bits,
+        plans,
+        block_report,
+        route: if options.exhaustive {
+            "Columbo max route"
+        } else {
+            "Normal route"
+        },
+    })
 }
 
 /// Retain a parsed source when the mandatory plan list cannot be allocated.
@@ -1602,6 +1896,8 @@ fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Can
         data,
         bits: source.meaningful_bits,
         plans: Vec::new(),
+        block_report: None,
+        route: "Original source",
     })
 }
 
@@ -1672,33 +1968,94 @@ fn is_strictly_better(
         || (candidate_bytes == reference_bytes && candidate_bits < reference_bits)
 }
 
-fn inspect_plans(plans: &[PlannedBlock]) {
+fn capture_planned_block_report(plans: &[PlannedBlock], enabled: bool) -> Option<BlockReport> {
+    if !enabled {
+        return None;
+    }
+    let shown = plans.len().min(MAX_REPORTED_BLOCKS);
+    let mut blocks = Vec::new();
+    blocks.try_reserve_exact(shown).ok()?;
     let mut alignment = 0_u8;
-    for (index, plan) in plans.iter().enumerate() {
-        inspect_plan(index, alignment, index + 1 == plans.len(), plan);
+    for (index, plan) in plans.iter().take(shown).enumerate() {
+        blocks.push(block_progress(
+            alignment,
+            index + 1 == plans.len(),
+            plan.source_type,
+            &plan.representation,
+            plan.plain.len(),
+            plan.tokens.len(),
+            plan.bits,
+        ));
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
     }
+    Some(BlockReport {
+        blocks,
+        total_blocks: plans.len(),
+    })
 }
 
-fn inspect_plan(index: usize, alignment: u8, final_block: bool, plan: &PlannedBlock) {
-    let output = match &plan.representation {
-        Representation::Original(_) => "original",
-        Representation::Stored => "stored",
-        Representation::Fixed => "fixed",
-        Representation::Dynamic(_) => "dynamic",
+fn capture_source_block_report(
+    blocks: &[ParsedBlock],
+    source_block_count: usize,
+    enabled: bool,
+) -> Option<BlockReport> {
+    // The parser intentionally collapses pathological runs of empty blocks.
+    // In that case it no longer has an exact block-for-block view of source
+    // bytes, so omit details instead of presenting the compact model as the
+    // original stream.
+    if !enabled || blocks.len() != source_block_count {
+        return None;
+    }
+    let shown = blocks.len().min(MAX_REPORTED_BLOCKS);
+    let mut report = Vec::new();
+    report.try_reserve_exact(shown).ok()?;
+    for (index, block) in blocks.iter().take(shown).enumerate() {
+        let original = block.original?;
+        report.push(block_progress(
+            original.alignment,
+            index + 1 == blocks.len(),
+            block.source_type,
+            &Representation::Original(original),
+            block.plain.len(),
+            block.tokens.len(),
+            original.len,
+        ));
+    }
+    Some(BlockReport {
+        blocks: report,
+        total_blocks: source_block_count,
+    })
+}
+
+fn block_progress(
+    alignment: u8,
+    final_block: bool,
+    source_type: SourceBlockType,
+    representation: &Representation,
+    decoded_bytes: usize,
+    tokens: usize,
+    output_bits: u64,
+) -> BlockProgress {
+    let output = match representation {
+        Representation::Original(_) => BlockEncoding::Original,
+        Representation::Stored => BlockEncoding::Stored,
+        Representation::Fixed => BlockEncoding::Fixed,
+        Representation::Dynamic(_) => BlockEncoding::Dynamic,
     };
-    let input = match plan.source_type {
-        SourceBlockType::Stored => "stored",
-        SourceBlockType::Fixed => "fixed",
-        SourceBlockType::Dynamic => "dynamic",
+    let input = match source_type {
+        SourceBlockType::Stored => BlockEncoding::Stored,
+        SourceBlockType::Fixed => BlockEncoding::Fixed,
+        SourceBlockType::Dynamic => BlockEncoding::Dynamic,
     };
-    eprintln!(
-        "inspect: block={index} final={} align={alignment} input={input} plain={} tokens={} output={output} output_bits={}",
-        usize::from(final_block),
-        plan.plain.len(),
-        plan.tokens.len(),
-        plan.bits,
-    );
+    BlockProgress {
+        alignment,
+        decoded_bytes,
+        final_block,
+        input,
+        output,
+        output_bits,
+        tokens,
+    }
 }
 
 const DEADLINE_TIMED_OUT: u8 = 1;
@@ -1714,6 +2071,10 @@ struct Deadline {
 }
 
 impl Deadline {
+    fn remaining(&self) -> std::time::Duration {
+        self.duration.saturating_sub(self.started.elapsed())
+    }
+
     fn expired(&self) -> bool {
         if self.state.load(Ordering::Relaxed) & DEADLINE_TIMED_OUT != 0
             || self.started.elapsed() >= self.duration
@@ -1761,6 +2122,8 @@ mod tests {
             data: vec![marker; bytes],
             bits,
             plans: Vec::new(),
+            block_report: None,
+            route: "test",
         }
     }
 
@@ -2231,10 +2594,30 @@ mod tests {
             duration: Duration::MAX,
             state: AtomicU8::new(0),
         };
-        let candidates = build_bounded_generic_max_candidates(source, &options, &deadline).unwrap();
+        let progress = Progress::begin(
+            &options,
+            deadline.started,
+            StreamProgress {
+                blocks: parsed.source_block_count,
+                compressed_bytes: input.len(),
+                decoded_bytes: parsed.decoded_size,
+                empty_blocks: parsed.source_empty_block_count,
+                meaningful_bits: parsed.meaningful_bits,
+                parse_elapsed: Duration::ZERO,
+            },
+        );
+        let candidates =
+            build_bounded_generic_max_candidates(source, &options, &deadline, progress).unwrap();
 
         assert!(candidates.floor_seeded.is_some());
         assert!(candidates.source_max.is_some());
+        assert_eq!(
+            candidates
+                .source_max
+                .as_ref()
+                .map(|candidate| candidate.route),
+            Some("Columbo source max route")
+        );
         assert!(candidates.suppress_later_source_max);
         assert!(!candidates.suppress_later_optional_routes);
         assert!(candidates.deft4j.is_none());
