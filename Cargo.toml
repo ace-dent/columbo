@@ -13,13 +13,14 @@ readme = false
 # allowlist keeps them out of source packages independently of Git's ignore
 # state.
 include = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "LICENSE",
-    "scripts/build-distribution.sh",
-    "scripts/sanitize-binary-paths.py",
-    "src/**",
-    "tests/public_api.rs",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/scripts/build-distribution.sh",
+    "/scripts/sanitize-binary-paths.py",
+    "/src/*.rs",
+    "/src/**/*.rs",
+    "/tests/public_api.rs",
 ]
 
 [profile.release]

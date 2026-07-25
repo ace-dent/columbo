@@ -21,8 +21,11 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     if input.len() < 6 {
         return Err(Error::new("zlib stream too small"));
     }
-    if !valid_header(input) {
+    if !has_rfc1950_header(input) {
         return Err(Error::new("invalid zlib header"));
+    }
+    if input[1] & 0x20 != 0 {
+        return Err(Error::new("preset zlib dictionaries are not supported"));
     }
 
     let optimized = optimize_embedded(
@@ -51,7 +54,8 @@ pub(super) fn optimize_embedded(
     lenient_header: bool,
     default_floor: DefaultFloor,
 ) -> Result<StreamOptimization> {
-    if input.len() < 6 || !valid_header(input) {
+    let unsupported_dictionary = has_rfc1950_header(input) && input[1] & 0x20 != 0;
+    if input.len() < 6 || !has_rfc1950_header(input) || unsupported_dictionary {
         if lenient_header {
             return Ok(StreamOptimization {
                 data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
@@ -61,6 +65,8 @@ pub(super) fn optimize_embedded(
         }
         return Err(Error::new(if input.len() < 6 {
             "zlib stream too small"
+        } else if unsupported_dictionary {
+            "preset zlib dictionaries are not supported"
         } else {
             "invalid zlib header"
         }));
@@ -129,16 +135,17 @@ pub(super) fn optimize_embedded(
     })
 }
 
-fn valid_header(input: &[u8]) -> bool {
+/// Recognize the complete two-byte RFC 1950 header.
+///
+/// FDICT remains part of the wrapper signature even though Columbo cannot
+/// optimize a stream that depends on a caller-supplied preset dictionary.
+pub(super) fn has_rfc1950_header(input: &[u8]) -> bool {
     if input.len() < 2 {
         return false;
     }
     let cmf = input[0];
     let flg = input[1];
-    (cmf & 0x0f) == 8
-        && (cmf >> 4) <= 7
-        && (flg & 0x20) == 0
-        && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
+    (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
 }
 
 #[cfg(test)]
@@ -149,7 +156,10 @@ mod tests {
     fn rejects_preset_dictionary_header() {
         // 0x78 0x20 has FDICT set and a valid FCHECK value.
         let error = optimize(&[0x78, 0x20, 0, 0, 0, 0], &Options::default()).unwrap_err();
-        assert_eq!(error.message(), "invalid zlib header");
+        assert_eq!(
+            error.message(),
+            "preset zlib dictionaries are not supported"
+        );
     }
 
     #[test]

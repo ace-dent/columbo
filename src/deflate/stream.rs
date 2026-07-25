@@ -9,18 +9,22 @@
 //! tables. It never discovers new LZ77 matches here.
 //!
 //! Stream-level attribution is intentionally narrow: DeflOpt contributes only
-//! the exact fixed/fixed 10-bit coalescing rule. Arbitrary merging, regrouping,
-//! splitting, eighth probes, boundary dynamic programming, and timed routing
-//! are Columbo methods. The deft4j-derived greedy merge lives in `deft4j`.
+//! the exact fixed/fixed 10-bit coalescing rule. Columbo contributes arbitrary
+//! merging, regrouping, eighth probes, boundary dynamic programming, exact
+//! candidate acceptance, and timed routing. Max mode also contains Columbo's
+//! independent, speed-bounded implementation of a coarse boundary-search
+//! concept described by Turtledeflate. The deft4j-derived greedy merge lives
+//! in `deft4j`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::thread;
 
 use crate::Options;
 
 use super::block::{plan_block, stored_block_bits};
 use super::deft4j::plan_source_block;
-use super::header::score_existing_dynamic;
+use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
 use super::model::{
     count_frequencies, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
     SourceBlockType, Token,
@@ -61,6 +65,10 @@ const WIDE_COLLECT_MIN_SOURCE_BLOCKS: usize = 128;
 // use the 8,192-token collection floor above instead.
 const MAX_GREEDY_SOURCE_BLOCKS: usize = 128;
 const MAX_BOUNDED_GROUP_SPAN: usize = 16;
+// The bounded-grouping score rows are independent. Four workers cover the
+// useful wall-clock gain without letting this optional route consume every
+// hardware thread or multiply its small row table without bound.
+const MAX_BOUNDED_GROUP_WORKERS: usize = 4;
 // Optional structural routes may copy payloads while the parsed source is
 // still live. Two 48 MiB retained-payload partitions leave 32 MiB of a 128 MiB
 // envelope for the bounded DP table and Huffman metadata. Boundary DP itself
@@ -68,8 +76,26 @@ const MAX_BOUNDED_GROUP_SPAN: usize = 16;
 // sequential/replay passes rather than once per cut and alignment.
 const MAX_GROUPED_MODEL_BYTES: usize = 48 * 1024 * 1024;
 const MAX_COMPOSITE_MODEL_BYTES: usize = 48 * 1024 * 1024;
-/// Boundary DP is an optional max route. Capping its cut count keeps the dense
-/// eight-alignment state table small on adversarially fragmented streams.
+// Concept inspired by Turtledeflate's `turtledeflate_create_global_histogram`
+// and `turtledeflate_get_partial_histogram` at commit 756f844. Both use
+// 256-token cumulative checkpoints. This is an independent Rust
+// implementation: Columbo reconstructs and subtracts two prefixes instead of
+// subtracting an aligned middle and scanning both edges.
+const RANGE_HISTOGRAM_INTERVAL: usize = 256;
+// Columbo independently implements the sample/smooth/narrow concept used by
+// Turtledeflate's `turtledeflate_best_block_split`, with a much smaller fixed
+// budget before handing one cut to its exact planner.
+const ADAPTIVE_SPLIT_MIN_TOKENS: usize = 513;
+const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
+const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
+const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
+const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
+// A marginal adaptive split can unlock another whole-stream replay whose cost
+// dwarfs the saving. Require four bytes at the Deflate level before allowing
+// this optional route to alter the established max result.
+const ADAPTIVE_SPLIT_MIN_EXACT_SAVINGS_BITS: u64 = 32;
+// Boundary DP is an optional max route. Capping its cut count keeps the dense
+// eight-alignment state table small on adversarially fragmented streams.
 const MAX_BOUNDARY_DP_CUTS: usize = 2_048;
 // Only near-tied first splits justify an extra child refinement in default
 // mode; a wider gap is very unlikely to be recovered by one added header.
@@ -95,6 +121,27 @@ enum SourceBlockSearch {
     Narrow { allow_individual_prune: bool },
     /// Deterministic table floors only, for a selected terminal seed.
     Floor,
+}
+
+/// Identifies the cheap pre-grouped layout selected for the first replay.
+///
+/// The kind is retained alongside the slice so a completed collected-layout
+/// replay is not repeated later in the stream route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupedLayout {
+    Greedy,
+    Bounded,
+    Collected,
+}
+
+fn cheapest_grouped_layout(
+    candidates: [Option<(GroupedLayout, &[ParsedBlock], u64)>; 3],
+) -> Option<(GroupedLayout, &[ParsedBlock])> {
+    candidates
+        .into_iter()
+        .flatten()
+        .min_by_key(|(_, _, bits)| *bits)
+        .map(|(kind, blocks, _)| (kind, blocks))
 }
 
 /// Plan all blocks in a raw Deflate stream, beginning at `start_alignment`.
@@ -161,7 +208,8 @@ where
         && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS
         && blocks.len() <= MAX_GREEDY_SOURCE_BLOCKS
     {
-        bounded_huffman_grouping(blocks, options).filter(|grouped| grouped.len() < blocks.len())
+        bounded_huffman_grouping(blocks, options, BoundedRangePricing::Serial)
+            .filter(|grouped| grouped.len() < blocks.len())
     } else {
         None
     };
@@ -199,21 +247,20 @@ where
     // Search whichever cheap grouping has the best complete direct price.
     // Keeping this choice separate from the emitted fallback means all other
     // layouts remain available as strict no-growth candidates.
-    let grouped_search = [
+    let selected_grouping = cheapest_grouped_layout([
         greedy_blocks
             .as_deref()
-            .zip(greedy_floor.as_ref().map(|floor| total_bits(floor))),
+            .zip(greedy_floor.as_ref().map(|floor| total_bits(floor)))
+            .map(|(blocks, bits)| (GroupedLayout::Greedy, blocks, bits)),
         bounded_group_blocks
             .as_deref()
-            .zip(bounded_group_floor.as_ref().map(|floor| total_bits(floor))),
+            .zip(bounded_group_floor.as_ref().map(|floor| total_bits(floor)))
+            .map(|(blocks, bits)| (GroupedLayout::Bounded, blocks, bits)),
         collected_blocks
             .as_deref()
-            .zip(collected_floor.as_ref().map(|floor| total_bits(floor))),
-    ]
-    .into_iter()
-    .flatten()
-    .min_by_key(|(_, bits)| *bits)
-    .map(|(grouped, _)| grouped);
+            .zip(collected_floor.as_ref().map(|floor| total_bits(floor)))
+            .map(|(blocks, bits)| (GroupedLayout::Collected, blocks, bits)),
+    ]);
 
     // Secure a complete deadline-independent path before token-spelling or
     // split searches. On a shared container deadline this also guarantees
@@ -243,7 +290,8 @@ where
     // list can consume the deadline. Columbo's original C block-list route
     // does the same: it first commits cheap adjacent structure, then replays
     // the selected groups.
-    if let Some(grouped) = grouped_search {
+    let mut collected_search_completed = false;
+    if let Some((kind, grouped)) = selected_grouping {
         if !expired() {
             if let Some(candidate) = sequential_plan(
                 grouped,
@@ -252,6 +300,7 @@ where
                 AdjacentMergeSearch::Disabled,
                 expired,
             ) {
+                collected_search_completed = kind == GroupedLayout::Collected;
                 if total_bits(&candidate) < total_bits(&fallback) {
                     fallback = candidate;
                 }
@@ -298,17 +347,19 @@ where
     // for itself. Savings found by the greedy adjacent walk do not dominate that
     // different grouping, even when those savings happen to be large elsewhere.
     if allow_regroup && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS {
-        if let Some(collected_blocks) = collected_blocks.as_deref() {
-            let collected = sequential_plan(
-                collected_blocks,
-                start_alignment,
-                options,
-                AdjacentMergeSearch::Disabled,
-                expired,
-            );
-            if let Some(collected) = collected {
-                if total_bits(&collected) < total_bits(&fallback) {
-                    fallback = collected;
+        if !collected_search_completed {
+            if let Some(collected_blocks) = collected_blocks.as_deref() {
+                let collected = sequential_plan(
+                    collected_blocks,
+                    start_alignment,
+                    options,
+                    AdjacentMergeSearch::Disabled,
+                    expired,
+                );
+                if let Some(collected) = collected {
+                    if total_bits(&collected) < total_bits(&fallback) {
+                        fallback = collected;
+                    }
                 }
             }
         }
@@ -867,7 +918,7 @@ pub(crate) fn plan_fragmented_replay(
             best = grouped;
         }
     }
-    if let Some(split) = direct_eighth_split_floor(blocks, start_alignment, options) {
+    if let Some(split) = plan_compact_source_split_floor(blocks, start_alignment, options) {
         if split.len() <= MAX_FRAGMENTED_REPLAY_BLOCKS && total_bits(&split) < total_bits(&best) {
             best = split;
         }
@@ -876,22 +927,23 @@ pub(crate) fn plan_fragmented_replay(
 }
 
 /// Price one direct decoded-eighth split per block without deep token search.
+///
+/// Fragmented replay and the compact post-deft4j route share this exact
+/// structural floor so neither rebuilds or subtly reimplements its cut logic.
 /// Accepted children become ordinary source blocks after emission, so a later
 /// bounded replay can split them again or merge either child with a neighbour.
-fn direct_eighth_split_floor(
+pub(crate) fn plan_compact_source_split_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
 ) -> Option<Vec<PlannedBlock>> {
-    let mut structural_options = options.clone();
-    structural_options.exhaustive = false;
     let mut output = Vec::new();
     output.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
 
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        let base = plan_block(block, alignment, &structural_options, || false);
+        let base = plan_block(block, alignment, options, || false);
         // Each source block contributes either itself or two children. Reserve
         // that tiny upper bound fallibly so even optional replay work respects
         // the optimizer's allocation-failure contract.
@@ -916,7 +968,7 @@ fn direct_eighth_split_floor(
             cuts.dedup_by_key(|cut| cut.token);
             for split in cuts {
                 let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
-                let left_plan = plan_block(&left, alignment, &structural_options, || false);
+                let left_plan = plan_block(&left, alignment, options, || false);
                 let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
                 let right = make_range(
                     &composite,
@@ -926,7 +978,7 @@ fn direct_eighth_split_floor(
                         plain: block.plain.len(),
                     },
                 )?;
-                let right_plan = plan_block(&right, right_alignment, &structural_options, || false);
+                let right_plan = plan_block(&right, right_alignment, options, || false);
                 let bits = left_plan.bits.checked_add(right_plan.bits)?;
                 if bits < winner_bits {
                     winner_bits = bits;
@@ -1112,6 +1164,30 @@ fn greedy_huffman_blocklist(
     Some(grouped)
 }
 
+/// Replan an already-rewritten Columbo floor with bounded Huffman grouping.
+///
+/// The general stream planner evaluates several unrelated layouts and token
+/// searches. A selected floor needs only this grouping pass: its independent
+/// range-score rows run on at most four workers, then the unchanged ordered
+/// suffix DP selects and emits one deterministic complete candidate.
+pub(crate) fn plan_columbo_floor_seeded_bounded_grouping(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+) -> Option<Vec<PlannedBlock>> {
+    let prepared = prepare_blocks(blocks);
+    let blocks = prepared.as_deref().unwrap_or(blocks);
+    let grouped = bounded_huffman_grouping(blocks, options, BoundedRangePricing::Parallel)?;
+    let plans = direct_structural_plan(&grouped, start_alignment, options)?;
+    Some(finish_plan(plans, options))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedRangePricing {
+    Serial,
+    Parallel,
+}
+
 /// Find useful source-boundary groups with a small lookahead.
 ///
 /// Greedy adjacent merging models Columbo's original C block list, but a first
@@ -1120,7 +1196,11 @@ fn greedy_huffman_blocklist(
 /// groups, commit the strict best saving, and continue after it. This keeps the
 /// pass linear in practical group count while retaining the important
 /// lookahead.
-fn bounded_huffman_grouping(blocks: &[ParsedBlock], options: &Options) -> Option<Vec<ParsedBlock>> {
+fn bounded_huffman_grouping(
+    blocks: &[ParsedBlock],
+    options: &Options,
+    pricing: BoundedRangePricing,
+) -> Option<Vec<ParsedBlock>> {
     if blocks.len() < 2
         || blocks.len() > MAX_GREEDY_SOURCE_BLOCKS
         || blocks
@@ -1150,69 +1230,34 @@ fn bounded_huffman_grouping(blocks: &[ParsedBlock], options: &Options) -> Option
     for block in blocks {
         source_stats.push(ShortFamilyStats::from_block(block)?);
     }
+    let mut source_extra_bits = Vec::new();
+    source_extra_bits.try_reserve_exact(blocks.len()).ok()?;
+    for block in blocks {
+        source_extra_bits.push(token_extra_bits(&block.tokens));
+    }
 
     // Price every bounded range once. Range costs are independent of their
     // neighbours because all candidates here are Huffman blocks, so a small
     // suffix DP can choose the best complete segmentation instead of making
     // an irreversible greedy choice at each source boundary.
-    let mut range_bits = Vec::new();
-    range_bits.try_reserve_exact(blocks.len()).ok()?;
-    for start in 0..blocks.len() {
-        let mut prices = [None; MAX_BOUNDED_GROUP_SPAN + 1];
-        prices[1] = Some(source_plans[start].bits);
-        let mut literal_frequencies = [0_u32; 286];
-        let mut distance_frequencies = [0_u32; 30];
-        let mut range_extra_bits = 0_u64;
-        let mut range_tokens = 0_usize;
-        let mut range_plain = 0_usize;
-        let mut range_stats = source_stats[start].clone();
-
-        for end in start + 1..=blocks.len().min(start + MAX_BOUNDED_GROUP_SPAN) {
-            let block = &blocks[end - 1];
-            range_tokens = range_tokens.checked_add(block.tokens.len())?;
-            range_plain = range_plain.checked_add(block.plain.len())?;
-            range_extra_bits = range_extra_bits.checked_add(token_extra_bits(&block.tokens))?;
-            for (total, &frequency) in literal_frequencies
-                .iter_mut()
-                .zip(&block.literal_frequencies)
-            {
-                *total = total.checked_add(frequency)?;
-            }
-            for (total, &frequency) in distance_frequencies
-                .iter_mut()
-                .zip(&block.distance_frequencies)
-            {
-                *total = total.checked_add(frequency)?;
-            }
-
-            if end > start + 1 {
-                // Every parsed source block owns an end-of-block symbol. A
-                // grouped range emits only one, at the end of the range.
-                literal_frequencies[256] = literal_frequencies[256].checked_sub(1)?;
-                range_stats.add_assign(&source_stats[end - 1])?;
-            }
-
-            if range_tokens > MAX_MERGED_TOKENS || range_plain > MAX_MERGED_PLAIN {
-                break;
-            }
-            if end == start + 1 {
-                continue;
-            }
-
-            // Short-family token changes have additive frequency effects.
-            // Score each possible range from these fixed-size summaries, then
-            // materialize and fully plan only the range that is selected.
-            let group_bits = score_short_family_frequencies(
-                &literal_frequencies,
-                &distance_frequencies,
-                range_extra_bits,
-                &range_stats,
-                structural_options.min_distance_codes,
-            );
-            prices[end - start] = group_bits;
-        }
-        range_bits.push(prices);
-    }
+    let range_bits = match pricing {
+        BoundedRangePricing::Serial => bounded_range_prices(
+            blocks,
+            &source_plans,
+            &source_stats,
+            &source_extra_bits,
+            structural_options.min_distance_codes,
+            0,
+            blocks.len(),
+        )?,
+        BoundedRangePricing::Parallel => parallel_bounded_range_prices(
+            blocks,
+            &source_plans,
+            &source_stats,
+            &source_extra_bits,
+            structural_options.min_distance_codes,
+        )?,
+    };
 
     let next_boundary = choose_bounded_boundaries(&range_bits)?;
 
@@ -1250,6 +1295,193 @@ fn bounded_huffman_grouping(blocks: &[ParsedBlock], options: &Options) -> Option
         }
     }
     Some(grouped)
+}
+
+type BoundedRangePrices = [Option<u64>; MAX_BOUNDED_GROUP_SPAN + 1];
+
+/// Price independent start rows concurrently, preserving source-row order.
+///
+/// Thread creation is optional: a failed spawn is evaluated immediately on
+/// the caller. Once any worker starts, every handle is joined before an
+/// allocation failure is returned or the first worker panic is resumed.
+fn parallel_bounded_range_prices(
+    blocks: &[ParsedBlock],
+    source_plans: &[PlannedBlock],
+    source_stats: &[ShortFamilyStats],
+    source_extra_bits: &[u64],
+    min_distance_codes: bool,
+) -> Option<Vec<BoundedRangePrices>> {
+    let worker_count = thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(MAX_BOUNDED_GROUP_WORKERS)
+        .min(blocks.len());
+    if worker_count <= 1 {
+        return bounded_range_prices(
+            blocks,
+            source_plans,
+            source_stats,
+            source_extra_bits,
+            min_distance_codes,
+            0,
+            blocks.len(),
+        );
+    }
+
+    let rows_per_worker = blocks.len().div_ceil(worker_count);
+    let chunk_count = blocks.len().div_ceil(rows_per_worker);
+    thread::scope(|scope| {
+        let mut completed = Vec::new();
+        completed.try_reserve_exact(chunk_count).ok()?;
+        completed.resize_with(chunk_count, || None);
+
+        let mut handles = Vec::new();
+        if handles.try_reserve_exact(chunk_count).is_err() {
+            return bounded_range_prices(
+                blocks,
+                source_plans,
+                source_stats,
+                source_extra_bits,
+                min_distance_codes,
+                0,
+                blocks.len(),
+            );
+        }
+
+        let mut pricing_failed = false;
+        for (chunk_index, start) in (0..blocks.len()).step_by(rows_per_worker).enumerate() {
+            let end = blocks.len().min(start + rows_per_worker);
+            let worker = thread::Builder::new().spawn_scoped(scope, move || {
+                bounded_range_prices(
+                    blocks,
+                    source_plans,
+                    source_stats,
+                    source_extra_bits,
+                    min_distance_codes,
+                    start,
+                    end,
+                )
+            });
+            match worker {
+                Ok(handle) => handles.push((chunk_index, handle)),
+                Err(_) => match bounded_range_prices(
+                    blocks,
+                    source_plans,
+                    source_stats,
+                    source_extra_bits,
+                    min_distance_codes,
+                    start,
+                    end,
+                ) {
+                    Some(rows) => completed[chunk_index] = Some(rows),
+                    None => pricing_failed = true,
+                },
+            }
+        }
+
+        let mut first_panic = None;
+        for (chunk_index, handle) in handles {
+            match handle.join() {
+                Ok(Some(rows)) => completed[chunk_index] = Some(rows),
+                Ok(None) => pricing_failed = true,
+                Err(payload) => {
+                    if first_panic.is_none() {
+                        first_panic = Some(payload);
+                    }
+                }
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+        if pricing_failed {
+            return None;
+        }
+
+        let mut prices = Vec::new();
+        prices.try_reserve_exact(blocks.len()).ok()?;
+        for chunk in completed {
+            let rows = chunk?;
+            let combined_len = prices.len().checked_add(rows.len())?;
+            if combined_len > blocks.len() {
+                return None;
+            }
+            prices.extend(rows);
+        }
+        (prices.len() == blocks.len()).then_some(prices)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_range_prices(
+    blocks: &[ParsedBlock],
+    source_plans: &[PlannedBlock],
+    source_stats: &[ShortFamilyStats],
+    source_extra_bits: &[u64],
+    min_distance_codes: bool,
+    start_index: usize,
+    end_index: usize,
+) -> Option<Vec<BoundedRangePrices>> {
+    let mut range_bits = Vec::new();
+    range_bits
+        .try_reserve_exact(end_index.checked_sub(start_index)?)
+        .ok()?;
+    for start in start_index..end_index {
+        let mut prices = [None; MAX_BOUNDED_GROUP_SPAN + 1];
+        prices[1] = Some(source_plans.get(start)?.bits);
+        let mut literal_frequencies = [0_u32; 286];
+        let mut distance_frequencies = [0_u32; 30];
+        let mut range_extra_bits = 0_u64;
+        let mut range_tokens = 0_usize;
+        let mut range_plain = 0_usize;
+        let mut range_stats = source_stats.get(start)?.clone();
+
+        for end in start + 1..=blocks.len().min(start + MAX_BOUNDED_GROUP_SPAN) {
+            let block = &blocks[end - 1];
+            range_tokens = range_tokens.checked_add(block.tokens.len())?;
+            range_plain = range_plain.checked_add(block.plain.len())?;
+            range_extra_bits = range_extra_bits.checked_add(*source_extra_bits.get(end - 1)?)?;
+            for (total, &frequency) in literal_frequencies
+                .iter_mut()
+                .zip(&block.literal_frequencies)
+            {
+                *total = total.checked_add(frequency)?;
+            }
+            for (total, &frequency) in distance_frequencies
+                .iter_mut()
+                .zip(&block.distance_frequencies)
+            {
+                *total = total.checked_add(frequency)?;
+            }
+
+            if end > start + 1 {
+                // Every parsed source block owns an end-of-block symbol. A
+                // grouped range emits only one, at the end of the range.
+                literal_frequencies[256] = literal_frequencies[256].checked_sub(1)?;
+                range_stats.add_assign(source_stats.get(end - 1)?)?;
+            }
+
+            if range_tokens > MAX_MERGED_TOKENS || range_plain > MAX_MERGED_PLAIN {
+                break;
+            }
+            if end == start + 1 {
+                continue;
+            }
+
+            // Short-family token changes have additive frequency effects.
+            // Score each possible range from these fixed-size summaries, then
+            // materialize and fully plan only the range that is selected.
+            prices[end - start] = score_short_family_frequencies(
+                &literal_frequencies,
+                &distance_frequencies,
+                range_extra_bits,
+                &range_stats,
+                min_distance_codes,
+            );
+        }
+        range_bits.push(prices);
+    }
+    Some(range_bits)
 }
 
 /// Choose the least-cost complete segmentation from bounded range prices.
@@ -1711,9 +1943,11 @@ fn blocks_share_dynamic_tree(left: &ParsedBlock, right: &ParsedBlock) -> bool {
 }
 
 /// Test Columbo's bounded one-boundary split route for one source block.
-/// Default mode uses seven decoded eighths; `--max` also retains its compact
-/// 32-token probes. Children use the direct block planner in default mode, as
-/// they have not yet become pending merge candidates.
+///
+/// Default mode uses Columbo's seven decoded eighths. `--max` also retains
+/// Columbo's compact 32-token probes and tries one Turtledeflate-inspired
+/// adaptive probe before exact Columbo replanning. Children use the direct
+/// block planner in default mode because they are not pending merge candidates.
 fn plan_source_with_splits<F>(
     block: &ParsedBlock,
     alignment: u8,
@@ -1739,11 +1973,19 @@ where
     };
     let mut best = vec![base];
     let mut best_bits = total_bits(&best);
+    if expired() {
+        return best;
+    }
 
     let Some(composite) = Composite::new(std::slice::from_ref(block)) else {
         return best;
     };
     let source = composite.sources[0];
+    let start = Cut { token: 0, plain: 0 };
+    let end = Cut {
+        token: block.tokens.len(),
+        plain: block.plain.len(),
+    };
     let mut cuts = Vec::new();
     if add_eighth_cuts(
         &mut cuts,
@@ -1772,33 +2014,74 @@ where
     // blocks it can consume the complete deadline before a useful late split
     // (the 10th or 11th 32-token probe is common in sprite data) is reached.
     // Price every bounded boundary with direct structural planning first.
-    let start = Cut { token: 0, plain: 0 };
-    let end = Cut {
-        token: block.tokens.len(),
-        plain: block.plain.len(),
-    };
-    let mut ranked_splits = Vec::with_capacity(cuts.len());
+    let mut ranked_splits = Vec::new();
+    if ranked_splits.try_reserve_exact(cuts.len()).is_err() {
+        return best;
+    }
     for &split in &cuts {
         if expired() {
             break;
         }
-        let Some(left) = make_range(&composite, start, split) else {
+        let boundaries = [start, split, end];
+        let Some(candidate) =
+            plan_structural_ranges(&composite, &boundaries, alignment, options, expired)
+        else {
             continue;
         };
-        let left_plan = plan_block(&left, alignment, options, &mut *expired);
-        if expired() {
-            break;
-        }
-        let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
-        let Some(right) = make_range(&composite, split, end) else {
-            continue;
-        };
-        let right_plan = plan_block(&right, right_alignment, options, &mut *expired);
-        let candidate_bits = left_plan.bits + right_plan.bits;
+        let candidate_bits = total_bits(&candidate);
         ranked_splits.push((candidate_bits, split));
         if candidate_bits < best_bits {
             best_bits = candidate_bits;
-            best = vec![left_plan, right_plan];
+            best = candidate;
+        }
+    }
+
+    // Secure all established exact candidates before spending remaining max
+    // time on adaptive discovery. If the new search reaches the deadline, the
+    // eighth/32-token floor above remains available.
+    if options.exhaustive && !expired() {
+        let searched_base = plan_block_with_search(block, alignment, options, expired);
+        if searched_base.bits < best_bits {
+            best_bits = searched_base.bits;
+            best = vec![searched_base];
+        }
+    }
+
+    if options.exhaustive && !expired() {
+        let mut adaptive_cut = Vec::new();
+        if add_adaptive_split_cut(
+            &mut adaptive_cut,
+            &composite,
+            start,
+            end,
+            options.min_distance_codes,
+            expired,
+        )
+        .is_some()
+        {
+            if let Some(&split) = adaptive_cut.first() {
+                if !cuts.contains(&split) {
+                    let boundaries = [start, split, end];
+                    let candidate = plan_structural_ranges(
+                        &composite,
+                        &boundaries,
+                        alignment,
+                        options,
+                        expired,
+                    );
+                    if let Some(candidate) = candidate {
+                        // The histogram route already discovered this cut and
+                        // exact structural planning has validated it. Feeding
+                        // it into the older child token-search ladder repeats
+                        // expensive work for negligible observed gain.
+                        let candidate_bits = total_bits(&candidate);
+                        if adaptive_split_is_worth_replay(candidate_bits, best_bits) {
+                            best_bits = candidate_bits;
+                            best = candidate;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1848,15 +2131,10 @@ where
         return best;
     }
 
-    // With the complete structural floor secured, search the whole block and
-    // refine promising split children while time remains. Ranking by direct
-    // cost makes max mode deterministic and gives plausible boundaries the
-    // first search slots.
-    let searched_base = plan_block_with_search(block, alignment, options, expired);
-    if searched_base.bits < best_bits {
-        best_bits = searched_base.bits;
-        best = vec![searched_base];
-    }
+    // With the complete structural and whole-block floors secured, refine
+    // promising split children while time remains. Ranking by direct cost
+    // makes max mode deterministic and gives plausible boundaries the first
+    // search slots.
     for (_, split) in ranked_splits {
         if expired() {
             break;
@@ -1880,6 +2158,12 @@ where
         }
     }
     best
+}
+
+fn adaptive_split_is_worth_replay(candidate_bits: u64, established_bits: u64) -> bool {
+    candidate_bits
+        .checked_add(ADAPTIVE_SPLIT_MIN_EXACT_SAVINGS_BITS)
+        .is_some_and(|required_bits| required_bits <= established_bits)
 }
 
 /// Return the legal token boundary immediately before a decoded midpoint.
@@ -1959,12 +2243,78 @@ struct SourceSpan {
     source_type: SourceBlockType,
 }
 
+#[derive(Clone)]
+struct FrequencyCheckpoint {
+    literal: [u32; 286],
+    distance: [u32; 30],
+    extra_bits: u64,
+}
+
+impl FrequencyCheckpoint {
+    fn zero() -> Self {
+        Self {
+            literal: [0; 286],
+            distance: [0; 30],
+            extra_bits: 0,
+        }
+    }
+
+    fn add_token(&mut self, token: &Token) -> Option<()> {
+        match *token {
+            Token::Literal(value) => {
+                let frequency = &mut self.literal[usize::from(value)];
+                *frequency = frequency.checked_add(1)?;
+            }
+            Token::Match {
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } => {
+                let literal = &mut self.literal[usize::from(length_symbol)];
+                *literal = literal.checked_add(1)?;
+                let distance = &mut self.distance[usize::from(distance_symbol)];
+                *distance = distance.checked_add(1)?;
+                self.extra_bits = self
+                    .extra_bits
+                    .checked_add(u64::from(length_extra_bits) + u64::from(distance_extra_bits))?;
+            }
+        }
+        Some(())
+    }
+
+    fn checked_sub(&self, earlier: &Self) -> Option<Self> {
+        let mut difference = Self::zero();
+        for ((result, &after), &before) in difference
+            .literal
+            .iter_mut()
+            .zip(&self.literal)
+            .zip(&earlier.literal)
+        {
+            *result = after.checked_sub(before)?;
+        }
+        for ((result, &after), &before) in difference
+            .distance
+            .iter_mut()
+            .zip(&self.distance)
+            .zip(&earlier.distance)
+        {
+            *result = after.checked_sub(before)?;
+        }
+        difference.extra_bits = self.extra_bits.checked_sub(earlier.extra_bits)?;
+        Some(difference)
+    }
+}
+
 /// Concatenated view used only while evaluating boundary positions.
 struct Composite<'a> {
     tokens: Cow<'a, [Token]>,
     plain: Cow<'a, [u8]>,
     /// Decoded offset at every token boundary, including the final boundary.
     token_plain_offsets: Vec<usize>,
+    // Strided cumulative counts over parsed symbols and payload extra bits.
+    frequency_checkpoints: Option<Vec<FrequencyCheckpoint>>,
     sources: Vec<SourceSpan>,
 }
 
@@ -1989,13 +2339,20 @@ impl<'a> Composite<'a> {
         let source_bytes = blocks
             .len()
             .checked_mul(std::mem::size_of::<SourceSpan>())?;
-        let optional_bytes = payload_bytes
+        let checkpoint_count = token_count
+            .checked_div(RANGE_HISTOGRAM_INTERVAL)?
+            .checked_add(1)?;
+        let base_optional_bytes = payload_bytes
             .checked_mul(3)?
             .checked_add(offset_bytes)?
             .checked_add(source_bytes)?;
-        if optional_bytes > MAX_COMPOSITE_MODEL_BYTES {
+        if base_optional_bytes > MAX_COMPOSITE_MODEL_BYTES {
             return None;
         }
+        let index_fits = checkpoint_count
+            .checked_mul(std::mem::size_of::<FrequencyCheckpoint>())
+            .and_then(|bytes| base_optional_bytes.checked_add(bytes))
+            .is_some_and(|bytes| bytes <= MAX_COMPOSITE_MODEL_BYTES);
 
         let (tokens, plain) = if let [block] = blocks {
             (
@@ -2048,12 +2405,77 @@ impl<'a> Composite<'a> {
         }
         debug_assert_eq!(token_plain_offsets.last().copied(), Some(plain.len()));
 
+        let frequency_checkpoints = if index_fits {
+            let mut checkpoints = Vec::new();
+            if checkpoints.try_reserve_exact(checkpoint_count).is_ok() {
+                let mut frequencies = FrequencyCheckpoint::zero();
+                checkpoints.push(frequencies.clone());
+                for (index, token) in tokens.iter().enumerate() {
+                    frequencies.add_token(token)?;
+                    if (index + 1) % RANGE_HISTOGRAM_INTERVAL == 0 {
+                        checkpoints.push(frequencies.clone());
+                    }
+                }
+                debug_assert_eq!(checkpoints.len(), checkpoint_count);
+                Some(checkpoints)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Some(Self {
             tokens,
             plain,
             token_plain_offsets,
+            frequency_checkpoints,
             sources,
         })
+    }
+
+    /// Reconstruct cumulative counts at an arbitrary token boundary.
+    ///
+    /// A stored checkpoint supplies the long prefix; at most 255 following
+    /// tokens need to be counted directly.
+    fn prefix_frequencies(&self, end: usize) -> Option<FrequencyCheckpoint> {
+        if end > self.tokens.len() {
+            return None;
+        }
+        let checkpoint = end / RANGE_HISTOGRAM_INTERVAL;
+        let mut frequencies = self
+            .frequency_checkpoints
+            .as_ref()?
+            .get(checkpoint)?
+            .clone();
+        let checkpoint_token = checkpoint.checked_mul(RANGE_HISTOGRAM_INTERVAL)?;
+        for token in &self.tokens[checkpoint_token..end] {
+            frequencies.add_token(token)?;
+        }
+        Some(frequencies)
+    }
+
+    /// Count one token range by subtracting independently reconstructed
+    /// prefixes. The optional index makes work independent of the range's
+    /// interior length; near the memory ceiling, a direct scan preserves the
+    /// established structural route without exceeding its model budget.
+    fn range_frequencies(&self, start: usize, end: usize) -> Option<FrequencyCheckpoint> {
+        if start > end || end > self.tokens.len() {
+            return None;
+        }
+        if self.frequency_checkpoints.is_none() {
+            let mut frequencies = FrequencyCheckpoint::zero();
+            for token in &self.tokens[start..end] {
+                frequencies.add_token(token)?;
+            }
+            frequencies.literal[256] = frequencies.literal[256].checked_add(1)?;
+            return Some(frequencies);
+        }
+        let start_prefix = self.prefix_frequencies(start)?;
+        let end_prefix = self.prefix_frequencies(end)?;
+        let mut frequencies = end_prefix.checked_sub(&start_prefix)?;
+        frequencies.literal[256] = frequencies.literal[256].checked_add(1)?;
+        Some(frequencies)
     }
 }
 
@@ -2178,6 +2600,216 @@ fn add_cut(cuts: &mut Vec<Cut>, composite: &Composite, token: usize) -> Option<(
         cuts.push(Cut { token, plain });
     }
     Some(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdaptiveSplit {
+    token: usize,
+    bits: u64,
+}
+
+/// Add one max-only cut using Columbo's independent, bounded implementation of
+/// the coarse-to-fine concept in Turtledeflate's
+/// `turtledeflate_best_block_split` at commit 756f844.
+///
+/// Both methods sample evenly spaced costs, smooth neighbouring samples,
+/// narrow around the best basin, and scan the terminal interval. Columbo uses
+/// eight samples, a three-point filter, a 16-token terminal window, and hard
+/// probe/deadline caps. It omits Turtledeflate's alternate edge-basin stack;
+/// the caller accepts the cut only after exact token-preserving replanning and
+/// a material complete-plan win.
+fn add_adaptive_split_cut<F>(
+    cuts: &mut Vec<Cut>,
+    composite: &Composite,
+    start: Cut,
+    end: Cut,
+    min_distance_codes: bool,
+    expired: &mut F,
+) -> Option<()>
+where
+    F: FnMut() -> bool,
+{
+    let token_count = end.token.checked_sub(start.token)?;
+    let plain_count = end.plain.checked_sub(start.plain)?;
+    if !(ADAPTIVE_SPLIT_MIN_TOKENS..=MAX_MERGED_TOKENS).contains(&token_count)
+        || plain_count < 128
+        || composite.frequency_checkpoints.is_none()
+    {
+        return Some(());
+    }
+
+    let whole = composite.range_frequencies(start.token, end.token)?;
+    let unsplit_bits = estimate_histogram_range_bits(&whole, plain_count, min_distance_codes);
+    let mut score_split = |token: usize| {
+        let split_plain = *composite.token_plain_offsets.get(token)?;
+        if split_plain <= start.plain || split_plain >= end.plain {
+            return None;
+        }
+
+        let left = composite.range_frequencies(start.token, token)?;
+        let mut right = whole.checked_sub(&left)?;
+        // Both complete range histograms contain one end-of-block count. Their
+        // difference contains none, while the prospective right child needs
+        // exactly one.
+        right.literal[256] = 1;
+        let left_bits = estimate_histogram_range_bits(
+            &left,
+            split_plain.checked_sub(start.plain)?,
+            min_distance_codes,
+        );
+        let right_bits = estimate_histogram_range_bits(
+            &right,
+            end.plain.checked_sub(split_plain)?,
+            min_distance_codes,
+        );
+        left_bits.checked_add(right_bits)
+    };
+
+    let Some(candidate) = coarse_to_fine_split(start.token, end.token, &mut score_split, expired)
+    else {
+        return Some(());
+    };
+    if candidate.bits < unsplit_bits {
+        add_cut(cuts, composite, candidate.token)?;
+    }
+    Some(())
+}
+
+fn estimate_histogram_range_bits(
+    frequencies: &FrequencyCheckpoint,
+    plain_len: usize,
+    min_distance_codes: bool,
+) -> u64 {
+    let stored = stored_block_bits(0, plain_len);
+    estimate_boundary_block_bits(
+        &frequencies.literal,
+        &frequencies.distance,
+        frequencies.extra_bits,
+        min_distance_codes,
+    )
+    .map_or(stored, |huffman| huffman.min(stored))
+}
+
+/// Search kernel for `add_adaptive_split_cut`.
+///
+/// This independent Columbo implementation is substantially different from
+/// Turtledeflate's `turtledeflate_best_block_split`; it is not a translation
+/// or exact recreation.
+fn coarse_to_fine_split<S, F>(
+    start: usize,
+    end: usize,
+    score: &mut S,
+    expired: &mut F,
+) -> Option<AdaptiveSplit>
+where
+    S: FnMut(usize) -> Option<u64>,
+    F: FnMut() -> bool,
+{
+    if end <= start.checked_add(2)? {
+        return None;
+    }
+    let original_midpoint = start + (end - start) / 2;
+    let mut range_start = start + 1;
+    let mut range_end = end - 1;
+    let mut probes = 0_usize;
+    let mut cache = Vec::<AdaptiveSplit>::new();
+    cache.try_reserve_exact(ADAPTIVE_SPLIT_MAX_PROBES).ok()?;
+    // Always retain the original midpoint. Besides being a useful probe, it
+    // makes a completely flat score choose two balanced children.
+    cached_adaptive_split_score(original_midpoint, &mut probes, &mut cache, score, expired)?;
+
+    while range_end - range_start > ADAPTIVE_SPLIT_FINAL_WIDTH {
+        if expired() {
+            return None;
+        }
+        let span = range_end - range_start;
+        let mut samples = Vec::new();
+        samples
+            .try_reserve_exact(ADAPTIVE_SPLIT_INTERVALS + 1)
+            .ok()?;
+        for interval in 0..=ADAPTIVE_SPLIT_INTERVALS {
+            let token = range_start + span.checked_mul(interval)? / ADAPTIVE_SPLIT_INTERVALS;
+            if samples
+                .last()
+                .is_some_and(|sample: &AdaptiveSplit| sample.token == token)
+            {
+                continue;
+            }
+            let bits = cached_adaptive_split_score(token, &mut probes, &mut cache, score, expired)?;
+            samples.push(AdaptiveSplit { token, bits });
+        }
+        if samples.len() < 2 {
+            return None;
+        }
+
+        let interval_midpoint = range_start + span / 2;
+        let mut selected = 0_usize;
+        let mut selected_key = (u128::MAX, usize::MAX, usize::MAX);
+        for (index, sample) in samples.iter().enumerate() {
+            let left = samples[index.saturating_sub(1)].bits;
+            let right = samples[(index + 1).min(samples.len() - 1)].bits;
+            let filtered = u128::from(left)
+                .checked_add(u128::from(sample.bits))?
+                .checked_add(u128::from(right))?;
+            let key = (
+                filtered,
+                sample.token.abs_diff(interval_midpoint),
+                sample.token,
+            );
+            if key < selected_key {
+                selected = index;
+                selected_key = key;
+            }
+        }
+
+        let left_index = selected.saturating_sub(ADAPTIVE_SPLIT_CENTER_RADIUS);
+        let right_index = (selected + ADAPTIVE_SPLIT_CENTER_RADIUS).min(samples.len() - 1);
+        let next_start = samples[left_index].token;
+        let next_end = samples[right_index].token;
+        if next_start == range_start && next_end == range_end {
+            break;
+        }
+        range_start = next_start;
+        range_end = next_end;
+    }
+
+    if expired() {
+        return None;
+    }
+    for token in range_start..=range_end {
+        cached_adaptive_split_score(token, &mut probes, &mut cache, score, expired)?;
+    }
+
+    cache.into_iter().min_by_key(|candidate| {
+        (
+            candidate.bits,
+            candidate.token.abs_diff(original_midpoint),
+            candidate.token,
+        )
+    })
+}
+
+fn cached_adaptive_split_score<S, F>(
+    token: usize,
+    probes: &mut usize,
+    cache: &mut Vec<AdaptiveSplit>,
+    score: &mut S,
+    expired: &mut F,
+) -> Option<u64>
+where
+    S: FnMut(usize) -> Option<u64>,
+    F: FnMut() -> bool,
+{
+    if let Some(candidate) = cache.iter().find(|candidate| candidate.token == token) {
+        return Some(candidate.bits);
+    }
+    if *probes >= ADAPTIVE_SPLIT_MAX_PROBES || expired() {
+        return None;
+    }
+    let bits = score(token)?;
+    *probes += 1;
+    cache.push(AdaptiveSplit { token, bits });
+    Some(bits)
 }
 
 fn huffman_runs(sources: &[SourceSpan]) -> Option<Vec<(usize, usize)>> {
@@ -2505,29 +3137,25 @@ fn exact_source(composite: &Composite, start: Cut, end: Cut) -> Option<usize> {
 
 fn make_range(composite: &Composite, start: Cut, end: Cut) -> Option<ParsedBlock> {
     let tokens = try_shared_slice(&composite.tokens[start.token..end.token])?;
-    let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+    let frequencies = composite.range_frequencies(start.token, end.token)?;
+    let literal_frequencies = frequencies.literal;
+    let distance_frequencies = frequencies.distance;
     let source_range = overlapping_source_range(composite, start, end);
-    let source_type = composite.sources[source_range]
+    let sources = &composite.sources[source_range];
+    let source_type = sources
         .iter()
         .map(|source| source.source_type)
         .reduce(merged_source_type)
         .unwrap_or(SourceBlockType::Dynamic);
-    let split_count = composite
-        .sources
-        .iter()
-        .filter(|source| source.plain_end > start.plain && source.plain_end < end.plain)
-        .count();
     let mut source_splits = Vec::new();
-    source_splits.try_reserve_exact(split_count).ok()?;
-    // Filter before subtracting: eagerly forming the offset for an earlier
-    // source would underflow even though it is outside this range.
-    source_splits.extend(
-        composite
-            .sources
-            .iter()
-            .filter(|source| source.plain_end > start.plain && source.plain_end < end.plain)
-            .map(|source| source.plain_end - start.plain),
-    );
+    source_splits
+        .try_reserve_exact(sources.len().saturating_sub(1))
+        .ok()?;
+    for source in sources {
+        if source.plain_end > start.plain && source.plain_end < end.plain {
+            source_splits.push(source.plain_end.checked_sub(start.plain)?);
+        }
+    }
 
     Some(ParsedBlock {
         tokens,
@@ -2761,11 +3389,10 @@ fn try_merge_parsed_blocks(left: &ParsedBlock, right: &ParsedBlock) -> Option<Pa
 fn merged_source_type(left: SourceBlockType, right: SourceBlockType) -> SourceBlockType {
     if left == right {
         left
-    } else if left != SourceBlockType::Stored && right != SourceBlockType::Stored {
-        SourceBlockType::Dynamic
     } else {
-        // Mixed stored/Huffman ranges are not currently admitted by the DP.
-        // Dynamic is the least surprising provenance if this helper is reused.
+        // Dynamic is the common provenance for mixed source types. The DP does
+        // not currently admit stored/Huffman pairs, but this remains the least
+        // surprising fallback if that policy changes.
         SourceBlockType::Dynamic
     }
 }
@@ -2789,6 +3416,20 @@ mod tests {
     use crate::deflate::block::{emit_block, stored_block_bits};
     use crate::deflate::model::OriginalBits;
     use crate::deflate::parse::parse_stream;
+
+    #[test]
+    fn cheapest_grouped_layout_retains_the_selected_route_kind() {
+        let blocks: &[ParsedBlock] = &[];
+        let selected = cheapest_grouped_layout([
+            Some((GroupedLayout::Greedy, blocks, 30)),
+            Some((GroupedLayout::Bounded, blocks, 20)),
+            Some((GroupedLayout::Collected, blocks, 10)),
+        ]);
+
+        let (kind, selected_blocks) = selected.expect("one grouped layout is available");
+        assert_eq!(kind, GroupedLayout::Collected);
+        assert!(selected_blocks.is_empty());
+    }
 
     fn literal_block(bytes: &[u8], source_type: SourceBlockType) -> ParsedBlock {
         let tokens: Vec<_> = bytes.iter().copied().map(Token::Literal).collect();
@@ -2832,6 +3473,175 @@ mod tests {
             source_splits: Vec::new(),
             source_type: SourceBlockType::Dynamic,
         }
+    }
+
+    #[test]
+    fn strided_range_histograms_match_direct_recounting() {
+        let tokens: Vec<_> = (0..700)
+            .map(|index| {
+                if index % 7 == 0 {
+                    Token::Match {
+                        length: 11,
+                        distance: 5,
+                        length_symbol: 265,
+                        distance_symbol: 4,
+                        length_extra: 0,
+                        distance_extra: 0,
+                        length_extra_bits: 1,
+                        distance_extra_bits: 1,
+                    }
+                } else {
+                    Token::Literal((index % 251) as u8)
+                }
+            })
+            .collect();
+        let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let block = ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![0; plain_len].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        };
+        let blocks = [block];
+        let mut composite = Composite::new(&blocks).unwrap();
+
+        for (start, end) in [
+            (0, 0),
+            (0, 1),
+            (1, 50),
+            (10, 20),
+            (0, 255),
+            (0, 256),
+            (0, 257),
+            (17, 257),
+            (250, 520),
+            (256, 512),
+            (255, 511),
+            (256, 512),
+            (257, 513),
+            (257, 699),
+            (699, 700),
+            (0, 700),
+        ] {
+            let indexed = composite.range_frequencies(start, end).unwrap();
+            let direct = count_frequencies(&composite.tokens[start..end]);
+            assert_eq!(indexed.literal, direct.0, "{start}..{end}");
+            assert_eq!(indexed.distance, direct.1, "{start}..{end}");
+            assert_eq!(
+                indexed.extra_bits,
+                token_extra_bits(&composite.tokens[start..end]),
+                "{start}..{end}"
+            );
+        }
+
+        // Near the optional-model ceiling, Columbo preserves the established
+        // structural route without the index and falls back to a direct scan.
+        composite.frequency_checkpoints = None;
+        let fallback = composite.range_frequencies(257, 699).unwrap();
+        let direct = count_frequencies(&composite.tokens[257..699]);
+        assert_eq!(fallback.literal, direct.0);
+        assert_eq!(fallback.distance, direct.1);
+        assert_eq!(
+            fallback.extra_bits,
+            token_extra_bits(&composite.tokens[257..699])
+        );
+    }
+
+    #[test]
+    fn coarse_to_fine_split_finds_an_off_grid_minimum_under_its_probe_cap() {
+        let mut probes = 0_usize;
+        let mut score = |token: usize| {
+            probes += 1;
+            let distance = token.abs_diff(733) as u64;
+            Some(distance * distance)
+        };
+        let candidate =
+            coarse_to_fine_split(0, 2_048, &mut score, &mut || false).expect("a legal cut");
+
+        assert_eq!(candidate.token, 733);
+        assert_eq!(candidate.bits, 0);
+        assert!(probes <= ADAPTIVE_SPLIT_MAX_PROBES);
+    }
+
+    #[test]
+    fn coarse_to_fine_split_centres_flat_ties() {
+        let candidate =
+            coarse_to_fine_split(0, 2_048, &mut |_| Some(1), &mut || false).expect("a legal cut");
+
+        assert_eq!(candidate.token, 1_024);
+    }
+
+    #[test]
+    fn adaptive_histogram_cut_finds_a_literal_transition() {
+        let mut bytes = vec![b'a'; 733];
+        bytes.extend(std::iter::repeat(b'z').take(1_315));
+        let block = literal_block(&bytes, SourceBlockType::Dynamic);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let mut cuts = Vec::new();
+        let start = Cut { token: 0, plain: 0 };
+        let end = Cut {
+            token: bytes.len(),
+            plain: bytes.len(),
+        };
+
+        add_adaptive_split_cut(&mut cuts, &composite, start, end, false, &mut || false).unwrap();
+
+        assert_eq!(
+            cuts,
+            [Cut {
+                token: 733,
+                plain: 733,
+            }]
+        );
+    }
+
+    #[test]
+    fn adaptive_split_skips_small_ranges_and_respects_an_expired_deadline() {
+        let small = literal_block(&vec![b'x'; 512], SourceBlockType::Dynamic);
+        let small_blocks = [small];
+        let small_composite = Composite::new(&small_blocks).unwrap();
+        let mut cuts = Vec::new();
+        add_adaptive_split_cut(
+            &mut cuts,
+            &small_composite,
+            Cut { token: 0, plain: 0 },
+            Cut {
+                token: 512,
+                plain: 512,
+            },
+            false,
+            &mut || false,
+        )
+        .unwrap();
+        assert!(cuts.is_empty());
+
+        let mut scorer_called = false;
+        let candidate = coarse_to_fine_split(
+            0,
+            2_048,
+            &mut |_| {
+                scorer_called = true;
+                Some(0)
+            },
+            &mut || true,
+        );
+        assert!(candidate.is_none());
+        assert!(!scorer_called);
+    }
+
+    #[test]
+    fn adaptive_split_requires_a_material_exact_saving() {
+        assert!(!adaptive_split_is_worth_replay(969, 1_000));
+        assert!(adaptive_split_is_worth_replay(968, 1_000));
+        assert!(!adaptive_split_is_worth_replay(u64::MAX, u64::MAX));
     }
 
     fn assert_same_plan(left: &PlannedBlock, right: &PlannedBlock) {
@@ -3002,6 +3812,65 @@ mod tests {
 
         let boundaries = choose_bounded_boundaries(&prices).unwrap();
         assert_eq!(boundaries, [2, 2, 4, 4]);
+    }
+
+    #[test]
+    fn parallel_bounded_grouping_matches_the_serial_candidate() {
+        let blocks: Vec<_> = (0..20)
+            .map(|_| {
+                let mut tokens = vec![Token::Literal(b'a')];
+                tokens.extend((0..100).map(|_| Token::Match {
+                    length: 11,
+                    distance: 1,
+                    length_symbol: 265,
+                    distance_symbol: 0,
+                    length_extra: 0,
+                    distance_extra: 0,
+                    length_extra_bits: 1,
+                    distance_extra_bits: 0,
+                }));
+                let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+                ParsedBlock {
+                    tokens: tokens.into(),
+                    plain: vec![b'a'; 1_101].into(),
+                    literal_frequencies,
+                    distance_frequencies,
+                    original_literal_lengths: None,
+                    original_distance_lengths: None,
+                    original_dynamic: None,
+                    original: None,
+                    source_splits: Vec::new(),
+                    source_type: SourceBlockType::Dynamic,
+                }
+            })
+            .collect();
+        let options = Options::default();
+        let serial =
+            bounded_huffman_grouping(&blocks, &options, BoundedRangePricing::Serial).unwrap();
+        let parallel =
+            bounded_huffman_grouping(&blocks, &options, BoundedRangePricing::Parallel).unwrap();
+
+        assert!(serial.len() < blocks.len());
+        assert_eq!(parallel.len(), serial.len());
+        for (parallel, serial) in parallel.iter().zip(&serial) {
+            assert_eq!(parallel.tokens, serial.tokens);
+            assert_eq!(parallel.plain, serial.plain);
+            assert_eq!(parallel.literal_frequencies, serial.literal_frequencies);
+            assert_eq!(parallel.distance_frequencies, serial.distance_frequencies);
+            assert_eq!(parallel.source_splits, serial.source_splits);
+            assert_eq!(parallel.source_type, serial.source_type);
+        }
+
+        let serial_plans = finish_plan(
+            direct_structural_plan(&serial, 0, &options).unwrap(),
+            &options,
+        );
+        let parallel_plans =
+            plan_columbo_floor_seeded_bounded_grouping(&blocks, 0, &options).unwrap();
+        assert_eq!(parallel_plans.len(), serial_plans.len());
+        for (parallel, serial) in parallel_plans.iter().zip(&serial_plans) {
+            assert_same_plan(parallel, serial);
+        }
     }
 
     #[test]

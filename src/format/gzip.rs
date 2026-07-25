@@ -18,6 +18,10 @@ const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate GZIP output";
 const MAX_GZIP_MEMBERS: usize = 16_384;
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    if input.is_empty() {
+        return Err(Error::new("invalid GZIP signature"));
+    }
+
     let deadline = SearchDeadline::new(options);
     let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
     let mut member_start = 0;
@@ -192,6 +196,12 @@ mod tests {
         input.resize(18, 0);
         let error = optimize(&input, &Options::default()).unwrap_err();
         assert_eq!(error.message(), "reserved GZIP flags are set");
+    }
+
+    #[test]
+    fn rejects_an_empty_gzip_file() {
+        let error = optimize(&[], &Options::default()).unwrap_err();
+        assert_eq!(error.message(), "invalid GZIP signature");
     }
 
     #[test]

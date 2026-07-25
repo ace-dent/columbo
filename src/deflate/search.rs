@@ -22,10 +22,11 @@ use super::header::{
 };
 use super::huffman::{
     make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap, make_lengths_defluff_exact,
-    make_lengths_deft4j_java_heap,
+    make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    count_frequencies, DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token,
+    count_frequencies, try_clone_slice, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
+    Token,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 
@@ -1744,13 +1745,6 @@ fn try_transformed_block(source: &ParsedBlock, tokens: Vec<Token>) -> Option<Par
     })
 }
 
-fn try_clone_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
-    let mut output = Vec::new();
-    output.try_reserve_exact(source.len()).ok()?;
-    output.extend_from_slice(source);
-    Some(output)
-}
-
 fn plan_lengths(plan: &PlannedBlock) -> Option<(Vec<u8>, Vec<u8>)> {
     match &plan.representation {
         Representation::Dynamic(dynamic) => Some((
@@ -1773,12 +1767,10 @@ pub(crate) fn try_clone_planned_block(plan: &PlannedBlock) -> Option<PlannedBloc
 }
 
 fn fixed_lengths() -> (Vec<u8>, Vec<u8>) {
-    let mut literal = vec![0_u8; 288];
-    literal[..144].fill(8);
-    literal[144..256].fill(9);
-    literal[256..280].fill(7);
-    literal[280..].fill(8);
-    (literal, vec![5; 32])
+    (
+        FIXED_LITERAL_CODE_LENGTHS.to_vec(),
+        FIXED_DISTANCE_CODE_LENGTHS.to_vec(),
+    )
 }
 
 fn deduplicate_seeds(seeds: &mut Vec<(Vec<u8>, Vec<u8>)>) {
@@ -2108,6 +2100,36 @@ fn individual_prune_seed_lengths(
 mod tests {
     use super::*;
     use crate::deflate::model::{token_extra_bits, OriginalBits, SourceBlockType};
+
+    #[test]
+    fn the_258_alias_rewrite_is_bidirectional_but_explicit() {
+        let canonical = Token::Match {
+            length: 258,
+            distance: 1,
+            length_symbol: 285,
+            distance_symbol: 0,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 0,
+            distance_extra_bits: 0,
+        };
+
+        let aliased = rewrite_258_symbols(&[canonical], 258, true)
+            .expect("the bounded one-token rewrite fits");
+        assert!(matches!(
+            aliased.as_slice(),
+            [Token::Match {
+                length_symbol: 284,
+                length_extra: 31,
+                length_extra_bits: 5,
+                ..
+            }]
+        ));
+
+        let normalized = rewrite_258_symbols(&aliased, 258, false)
+            .expect("the bounded one-token normalization fits");
+        assert_eq!(normalized, [canonical]);
+    }
 
     #[test]
     fn large_source_bands_have_explicit_model_bounds() {

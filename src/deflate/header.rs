@@ -3,18 +3,25 @@
 //! Dynamic-header construction and exact bit accounting.
 
 use super::huffman::{
-    make_lengths, make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap,
-    make_lengths_defluff_exact, make_lengths_deft4j_java_heap, make_lengths_order_heap, Huffman,
+    code_length_tree_shape_is_valid, make_columbo_rle_pseudofrequencies, make_lengths,
+    make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap,
+    make_lengths_deflopt_heap_into, make_lengths_defluff_exact, make_lengths_deft4j_java_heap,
+    make_lengths_order_heap, payload_tree_shape_is_valid, Huffman, FIXED_DISTANCE_CODE_LENGTHS,
+    FIXED_LITERAL_CODE_LENGTHS,
 };
-use super::model::{token_extra_bits, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER};
+use super::model::{
+    token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
+    MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
+};
 
 const INF: u64 = u64::MAX / 4;
 
 /// Which deft4j header spelling governs a source-state decision.
 ///
-/// `Complete` is the full `addOptimisedRecoded` option grid. The deliberately
-/// narrower `DefaultRecode` spelling is used only while deciding whether
-/// deft4j's repeated individual-prune step reached a smaller fixed point.
+/// `Complete` is the full 56-way header option grid used by
+/// `addOptimisedRecoded`. The deliberately narrower `DefaultRecode` spelling
+/// is used only while deciding whether deft4j's repeated individual-prune step
+/// reached a smaller fixed point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Deft4jHeaderPolicy {
     Complete,
@@ -63,18 +70,23 @@ pub(crate) fn token_bits(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
 ) -> Option<u64> {
-    let mut bits = token_extra_bits(tokens);
+    // Code lengths and match extras are both token-local. Accumulate them in
+    // one pass because fixed-block pricing calls this on every ordinary plan.
+    let mut bits = 0_u64;
     for token in tokens {
         match *token {
             Token::Literal(value) => {
-                bits = bits.checked_add(u64::from(*literal_lengths.get(usize::from(value))?))?;
-                if literal_lengths[usize::from(value)] == 0 {
+                let literal = *literal_lengths.get(usize::from(value))?;
+                if literal == 0 {
                     return None;
                 }
+                bits = bits.checked_add(u64::from(literal))?;
             }
             Token::Match {
                 length_symbol,
                 distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
                 ..
             } => {
                 let literal = *literal_lengths.get(usize::from(length_symbol))?;
@@ -82,7 +94,11 @@ pub(crate) fn token_bits(
                 if literal == 0 || distance == 0 {
                     return None;
                 }
-                bits = bits.checked_add(u64::from(literal) + u64::from(distance))?;
+                let token_bits = u64::from(literal)
+                    + u64::from(distance)
+                    + u64::from(length_extra_bits)
+                    + u64::from(distance_extra_bits);
+                bits = bits.checked_add(token_bits)?;
             }
         }
     }
@@ -129,20 +145,13 @@ pub(crate) fn score_existing_dynamic(
     source: &DynamicPlan,
     min_distance_codes: bool,
 ) -> Option<DynamicPlan> {
-    if min_distance_codes
-        && source
-            .distance_lengths
-            .iter()
-            .filter(|&&length| length != 0)
-            .count()
-            < 2
-    {
+    if min_distance_codes && !source.has_two_usable_distance_codes() {
         return None;
     }
     if source.hlit < 257
         || source.hlit > 286
         || source.hdist == 0
-        || source.hdist > 30
+        || source.hdist > RFC_DISTANCE_CODE_COUNT
         || source.hclen < 4
         || source.hclen > 19
         || source.literal_lengths.len() != source.hlit
@@ -150,6 +159,9 @@ pub(crate) fn score_existing_dynamic(
         || Huffman::build(&source.literal_lengths).is_none()
         || Huffman::build(&source.distance_lengths).is_none()
         || Huffman::build(&source.code_length_lengths).is_none()
+        || !code_length_tree_shape_is_valid(&source.code_length_lengths)
+        || !payload_tree_shape_is_valid(&source.literal_lengths, false)
+        || !payload_tree_shape_is_valid(&source.distance_lengths, true)
     {
         return None;
     }
@@ -204,12 +216,15 @@ pub(crate) fn best_dynamic_plan(
     ensure_distance_symbols(&mut build_distance_frequencies, min_distance_codes);
     let mut distance_candidates = tree_candidates(&build_distance_frequencies, 15, exhaustive);
 
-    literal_candidates.retain(|lengths| lengths.get(256).copied().unwrap_or(0) != 0);
+    literal_candidates.retain(|lengths| {
+        lengths.get(256).copied().unwrap_or(0) != 0 && payload_tree_shape_is_valid(lengths, false)
+    });
     distance_candidates.retain(|lengths| {
-        distance_frequencies
-            .iter()
-            .enumerate()
-            .all(|(symbol, &frequency)| frequency == 0 || lengths[symbol] != 0)
+        payload_tree_shape_is_valid(lengths, true)
+            && distance_frequencies
+                .iter()
+                .enumerate()
+                .all(|(symbol, &frequency)| frequency == 0 || lengths[symbol] != 0)
     });
     // The original Columbo C planner preserves family/variant insertion order
     // and keeps up to twenty unique trees per alphabet. Payload sorting is
@@ -236,6 +251,21 @@ pub(crate) fn best_dynamic_plan(
                     keep_better(&mut best, candidate);
                 }
             }
+        }
+    }
+
+    // Keep the RLE-smoothed pair in --max: the ordinary tree-family grid
+    // already covers the fast path, and `keep_better` requires a strict win
+    // from the completely priced alternate plan.
+    if exhaustive && !expired() {
+        if let Some(candidate) = columbo_rle_tree_candidate(
+            literal_frequencies,
+            distance_frequencies,
+            extra_bits,
+            min_distance_codes,
+            exhaustive,
+        ) {
+            keep_better(&mut best, candidate);
         }
     }
 
@@ -303,6 +333,126 @@ fn pad_lengths<const N: usize>(lengths: &[u8]) -> [u8; N] {
     let count = lengths.len().min(N);
     padded[..count].copy_from_slice(&lengths[..count]);
     padded
+}
+
+/// Try the original Columbo C quad-lengthening finished-tree move.
+///
+/// This is Columbo's `consider_quad_lengthen_moves_fast`, not a DeflOpt,
+/// Defluff, or deft4j method. Shortening one length-L literal and lengthening
+/// four length-(L+1) literals preserves the Kraft sum. The five-symbol caps and
+/// eighteen-bit payload margin bound the route to at most 300 exact header
+/// trials. Frequency scoring avoids rescanning the same tokens for every trial.
+pub(crate) fn plan_columbo_quad_lengthen_candidate(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    seed: &DynamicPlan,
+) -> Option<DynamicPlan> {
+    const CANDIDATE_CAP: usize = 5;
+    const PAYLOAD_MARGIN_BITS: i64 = 18;
+
+    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
+        return None;
+    }
+    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
+    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
+    let extra_bits = token_extra_bits(tokens);
+    let mut best: Option<DynamicPlan> = None;
+    let mut shorten = Vec::<(usize, u32)>::new();
+    let mut lengthen = Vec::<(usize, u32)>::new();
+    if shorten.try_reserve_exact(CANDIDATE_CAP).is_err()
+        || lengthen.try_reserve_exact(CANDIDATE_CAP).is_err()
+    {
+        return None;
+    }
+
+    for length in 2_u8..=13 {
+        shorten.clear();
+        lengthen.clear();
+        for (symbol, &candidate) in seed_literal.iter().enumerate() {
+            if candidate == length {
+                let entry = (symbol, literal_frequencies[symbol]);
+                let insertion = shorten
+                    .iter()
+                    .position(|&(_, frequency)| frequency < entry.1)
+                    .unwrap_or(shorten.len());
+                if insertion < CANDIDATE_CAP {
+                    if shorten.len() == CANDIDATE_CAP {
+                        shorten.pop();
+                    }
+                    shorten.insert(insertion, entry);
+                }
+            } else if candidate == length + 1 {
+                let entry = (symbol, literal_frequencies[symbol]);
+                let insertion = lengthen
+                    .iter()
+                    .position(|&(_, frequency)| frequency > entry.1)
+                    .unwrap_or(lengthen.len());
+                if insertion < CANDIDATE_CAP {
+                    if lengthen.len() == CANDIDATE_CAP {
+                        lengthen.pop();
+                    }
+                    lengthen.insert(insertion, entry);
+                }
+            }
+        }
+        if shorten.is_empty() || lengthen.len() < 4 {
+            continue;
+        }
+
+        // Symbols arrive in ascending order. Inserting only before a strictly
+        // worse frequency keeps ties in that order, matching the old stable
+        // sort while retaining no more than the five entries we can inspect.
+
+        for &(short_symbol, short_frequency) in &shorten {
+            for first in 0..lengthen.len() - 3 {
+                for second in first + 1..lengthen.len() - 2 {
+                    for third in second + 1..lengthen.len() - 1 {
+                        for fourth in third + 1..lengthen.len() {
+                            let long_symbols = [
+                                lengthen[first],
+                                lengthen[second],
+                                lengthen[third],
+                                lengthen[fourth],
+                            ];
+                            let payload_delta = long_symbols
+                                .iter()
+                                .fold(-i64::from(short_frequency), |delta, (_, frequency)| {
+                                    delta + i64::from(*frequency)
+                                });
+                            if payload_delta > PAYLOAD_MARGIN_BITS {
+                                continue;
+                            }
+
+                            let mut literal = seed_literal;
+                            literal[short_symbol] -= 1;
+                            for &(symbol, _) in &long_symbols {
+                                literal[symbol] += 1;
+                            }
+                            let Some(data_bits) = token_bits_from_frequencies(
+                                literal_frequencies,
+                                distance_frequencies,
+                                &literal,
+                                &seed_distance,
+                                extra_bits,
+                            ) else {
+                                continue;
+                            };
+                            if let Some(candidate) = plan_for_explicit_lengths_with_cost(
+                                &literal,
+                                &seed_distance,
+                                data_bits,
+                                true,
+                            ) {
+                                keep_better(&mut best, candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Reassign one tree's lengths within equal-frequency symbol groups.
@@ -399,14 +549,10 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
             &mut candidates,
             make_lengths_defluff_exact(frequencies, max_bits, 0),
         );
-        for variant in 0..4 {
-            if variant == 0 {
-                push_unique(
-                    &mut candidates,
-                    make_lengths_deft4j_java_heap(frequencies, max_bits),
-                );
-            }
-        }
+        push_unique(
+            &mut candidates,
+            make_lengths_deft4j_java_heap(frequencies, max_bits),
+        );
     }
     candidates.retain(|lengths| {
         lengths.len() == frequencies.len()
@@ -419,6 +565,57 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     candidates
 }
 
+/// Build Columbo's adjacency-quantized RLE-friendly tree candidate.
+///
+/// Zopfli's pseudo-frequency route, as used by Turtledeflate when writing
+/// dynamic blocks and, above compression level seven, estimating them,
+/// motivates this candidate shape. Columbo's adjacency quantizer, tree
+/// construction, complete header search, and strict scoring against the
+/// original frequencies are original.
+fn columbo_rle_tree_candidate(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    min_distance_codes: bool,
+    exhaustive: bool,
+) -> Option<DynamicPlan> {
+    let mut pseudo_literal_frequencies = *literal_frequencies;
+    let mut pseudo_distance_frequencies = *distance_frequencies;
+    make_columbo_rle_pseudofrequencies(&mut pseudo_literal_frequencies);
+    make_columbo_rle_pseudofrequencies(&mut pseudo_distance_frequencies);
+
+    let quantization_changed_tree_weights = pseudo_literal_frequencies != *literal_frequencies
+        || pseudo_distance_frequencies != *distance_frequencies;
+    if !quantization_changed_tree_weights {
+        return None;
+    }
+
+    ensure_distance_symbols(&mut pseudo_distance_frequencies, min_distance_codes);
+    let literal = make_lengths(&pseudo_literal_frequencies, 15, 0);
+    let distance = make_lengths(&pseudo_distance_frequencies, 15, 0);
+    if literal_frequencies
+        .iter()
+        .zip(&literal)
+        .any(|(&frequency, &length)| frequency != 0 && length == 0)
+        || distance_frequencies
+            .iter()
+            .zip(&distance)
+            .any(|(&frequency, &length)| frequency != 0 && length == 0)
+    {
+        return None;
+    }
+    Huffman::build(&literal)?;
+    Huffman::build(&distance)?;
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        &literal,
+        &distance,
+        extra_bits,
+    )?;
+    plan_for_explicit_lengths_with_cost(&literal, &distance, data_bits, exhaustive)
+}
+
 fn push_unique(candidates: &mut Vec<Vec<u8>>, candidate: Vec<u8>) {
     if !candidates.iter().any(|current| current == &candidate) {
         candidates.push(candidate);
@@ -426,21 +623,110 @@ fn push_unique(candidates: &mut Vec<Vec<u8>>, candidate: Vec<u8>) {
 }
 
 fn trim_literal(lengths: &[u8]) -> usize {
-    lengths
-        .iter()
-        .enumerate()
-        .skip(257)
-        .rfind(|(_, length)| **length != 0)
-        .map_or(257, |(index, _)| index + 1)
+    trim_to_last_nonzero(lengths, 257)
 }
 
 fn trim_distance(lengths: &[u8]) -> usize {
+    trim_to_last_nonzero(lengths, 1)
+}
+
+fn trim_to_last_nonzero(lengths: &[u8], minimum: usize) -> usize {
     lengths
         .iter()
         .enumerate()
-        .skip(1)
+        .skip(minimum)
         .rfind(|(_, length)| **length != 0)
-        .map_or(1, |(index, _)| index + 1)
+        .map_or(minimum, |(index, _)| index + 1)
+}
+
+/// Estimate one block for coarse structural boundary discovery.
+///
+/// This intentionally prices only DeflOpt's variant-zero data trees with one
+/// ordinary greedy dynamic-header spelling, plus the fixed tree. It is cheap
+/// enough for many histogram probes and is never an acceptance test: every
+/// selected boundary is subsequently replanned by Columbo's complete exact
+/// representation selector.
+pub(crate) fn estimate_boundary_block_bits(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    min_distance_codes: bool,
+) -> Option<u64> {
+    let mut build_distance_frequencies = *distance_frequencies;
+    if build_distance_frequencies
+        .iter()
+        .all(|&frequency| frequency == 0)
+    {
+        build_distance_frequencies[0] = 1;
+    }
+    ensure_distance_symbols(&mut build_distance_frequencies, min_distance_codes);
+
+    let mut literal_lengths = [0_u8; 286];
+    let mut distance_lengths = [0_u8; 30];
+    make_lengths_deflopt_heap_into(literal_frequencies, &mut literal_lengths, 15, 0);
+    make_lengths_deflopt_heap_into(&build_distance_frequencies, &mut distance_lengths, 15, 0);
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        &literal_lengths,
+        &distance_lengths,
+        extra_bits,
+    )?;
+    let dynamic_bits = greedy_dynamic_header_bits(&literal_lengths, &distance_lengths, data_bits)?;
+
+    let fixed_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        &FIXED_LITERAL_CODE_LENGTHS,
+        &FIXED_DISTANCE_CODE_LENGTHS,
+        extra_bits,
+    )?
+    .checked_add(3)?;
+
+    Some(dynamic_bits.min(fixed_bits))
+}
+
+fn greedy_dynamic_header_bits(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+) -> Option<u64> {
+    let hlit = trim_literal(literal_lengths);
+    let hdist = trim_distance(distance_lengths);
+    let concatenated_len = hlit.checked_add(hdist)?;
+    let mut concatenated = [0_u8; MAX_DYNAMIC_CODE_LENGTH_COUNT];
+    concatenated
+        .get_mut(..hlit)?
+        .copy_from_slice(&literal_lengths[..hlit]);
+    concatenated
+        .get_mut(hlit..concatenated_len)?
+        .copy_from_slice(&distance_lengths[..hdist]);
+
+    let rle = greedy_rle(&concatenated[..concatenated_len], false, false, false);
+    let code_length_frequencies = rle_frequencies(&rle);
+    let mut code_length_lengths = [0_u8; 19];
+    make_lengths_deflopt_heap_into(&code_length_frequencies, &mut code_length_lengths, 7, 0);
+    Huffman::build(&code_length_lengths)?;
+    if !code_length_tree_shape_is_valid(&code_length_lengths) {
+        return None;
+    }
+
+    let hclen = trim_code_lengths(&code_length_lengths);
+    let mut bits = 3_u64
+        .checked_add(5)?
+        .checked_add(5)?
+        .checked_add(4)?
+        .checked_add(u64::try_from(hclen).ok()?.checked_mul(3)?)?;
+    for token in rle {
+        let code_bits = *code_length_lengths.get(usize::from(token.symbol))?;
+        if code_bits == 0 {
+            return None;
+        }
+        bits = bits
+            .checked_add(u64::from(code_bits))?
+            .checked_add(rle_extra_bits(token.symbol))?;
+    }
+    bits.checked_add(data_bits)
 }
 
 /// Score an explicitly assigned literal/length and distance tree.
@@ -496,14 +782,14 @@ pub(crate) fn plan_for_explicit_lengths_with_cost(
     )
 }
 
-/// Score a dynamic header with deft4j beta 17's ordered header grid.
+/// Score a dynamic header with deft4j beta-17's ordered header grid.
 ///
 /// Columbo's ordinary planner intentionally considers a wider family of
 /// headers. The deft4j-derived route cannot use that wider score to guide its
 /// state graph without changing which intermediate states the source ordering
 /// retains. This helper therefore keeps the data trees fixed and reproduces
 /// deft4j's option grid and insertion order after Columbo trims HLIT and HDIST.
-/// beta 17 can instead retain the source header's advertised spans for its
+/// beta-17 can instead retain the source header's advertised spans for its
 /// source-dynamic base.
 pub(crate) fn plan_for_deft4j_lengths_with_cost(
     literal_frequencies: &[u32; 286],
@@ -530,9 +816,13 @@ pub(crate) fn plan_for_deft4j_lengths_with_cost(
     )?;
     let hlit = trim_literal(literal_lengths);
     let hdist = trim_distance(&distance_lengths);
-    let literal = try_vec_from_slice(&literal_lengths[..hlit])?;
-    let distance = try_vec_from_slice(&distance_lengths[..hdist])?;
-    if Huffman::build(&literal).is_none() || Huffman::build(&distance).is_none() {
+    let literal = try_clone_slice(&literal_lengths[..hlit])?;
+    let distance = try_clone_slice(&distance_lengths[..hdist])?;
+    if Huffman::build(&literal).is_none()
+        || Huffman::build(&distance).is_none()
+        || !payload_tree_shape_is_valid(&literal, false)
+        || !payload_tree_shape_is_valid(&distance, true)
+    {
         return None;
     }
 
@@ -695,7 +985,10 @@ fn build_deft4j_header(
 fn deft4j_code_length_tree(rle: &[RleToken]) -> Option<[u8; 19]> {
     let frequencies = rle_frequencies(rle);
     let lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
-    if lengths.len() != 19 || Huffman::build(&lengths).is_none() {
+    if lengths.len() != 19
+        || Huffman::build(&lengths).is_none()
+        || !code_length_tree_shape_is_valid(&lengths)
+    {
         return None;
     }
     let mut result = [0_u8; 19];
@@ -714,8 +1007,8 @@ fn deft4j_dynamic_plan(
 ) -> Option<DynamicPlan> {
     let hclen = trim_code_lengths(&code_length_lengths);
     let mut plan = DynamicPlan {
-        literal_lengths: try_vec_from_slice(literal_lengths)?,
-        distance_lengths: try_vec_from_slice(distance_lengths)?,
+        literal_lengths: try_clone_slice(literal_lengths)?,
+        distance_lengths: try_clone_slice(distance_lengths)?,
         code_length_lengths,
         rle,
         hlit: literal_lengths.len(),
@@ -727,16 +1020,11 @@ fn deft4j_dynamic_plan(
     Some(plan)
 }
 
-fn try_vec_from_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
-    let mut output = Vec::new();
-    output.try_reserve_exact(source.len()).ok()?;
-    output.extend_from_slice(source);
-    Some(output)
-}
-
 fn deft4j_pack_code_lengths(lengths: &[u8], options: Deft4jPackOptions) -> Option<Vec<RleToken>> {
     let mut output = Vec::new();
-    output.try_reserve_exact(316).ok()?;
+    output
+        .try_reserve_exact(MAX_DYNAMIC_CODE_LENGTH_COUNT)
+        .ok()?;
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -829,7 +1117,7 @@ fn deft4j_pack_code_lengths(lengths: &[u8], options: Deft4jPackOptions) -> Optio
             .take(run),
         );
     }
-    (output.len() <= 316).then_some(output)
+    (output.len() <= MAX_DYNAMIC_CODE_LENGTH_COUNT).then_some(output)
 }
 
 fn plan_for_trimmed_lengths(
@@ -839,8 +1127,13 @@ fn plan_for_trimmed_lengths(
     exhaustive: bool,
     rle_mask: u8,
 ) -> Option<DynamicPlan> {
-    let mut concatenated = literal_lengths.clone();
-    concatenated.extend_from_slice(&distance_lengths);
+    if !payload_tree_shape_is_valid(&literal_lengths, false)
+        || !payload_tree_shape_is_valid(&distance_lengths, true)
+    {
+        return None;
+    }
+    let mut decoded_lengths = literal_lengths.clone();
+    decoded_lengths.extend_from_slice(&distance_lengths);
     let mut best: Option<DynamicPlan> = None;
     for mask in 0..8 {
         if rle_mask & (1 << mask) == 0 {
@@ -849,11 +1142,12 @@ fn plan_for_trimmed_lengths(
         let no_16 = mask & 1 != 0;
         let no_17 = mask & 2 != 0;
         let no_18 = mask & 4 != 0;
-        let rle = greedy_rle(&concatenated, no_16, no_17, no_18);
+        let rle = greedy_rle(&decoded_lengths, no_16, no_17, no_18);
         consider_rle(
             data_bits,
             &literal_lengths,
             &distance_lengths,
+            &decoded_lengths,
             &rle,
             exhaustive,
             &mut best,
@@ -863,28 +1157,30 @@ fn plan_for_trimmed_lengths(
         // Columbo's additive packer generalizes deft4j's 4+3 and 4+4 OHH
         // alternatives so those tails can use repeats instead of literals.
         if !no_16 {
-            let balanced = balanced_repeat_rle(&concatenated, no_17, no_18);
+            let balanced = balanced_repeat_rle(&decoded_lengths, no_17, no_18);
             if balanced != rle {
                 consider_rle(
                     data_bits,
                     &literal_lengths,
                     &distance_lengths,
+                    &decoded_lengths,
                     &balanced,
                     exhaustive,
                     &mut best,
                 );
             }
 
-            // deft4j also permits symbol 16 to continue a zero left explicit
-            // after disabling either zero-repeat code. This source-shaped
-            // header is distinct from the ordinary mask grid, which spells
-            // every short zero tail literally.
-            let zero_repeat = deft4j_zero_repeat_rle(&concatenated, no_17, no_18);
+            // Inspired by deft4j's ability to continue a zero with symbol 16,
+            // Columbo generalizes the residual split. This source-shaped
+            // header is distinct from both the exact deft4j packer and the
+            // ordinary mask grid.
+            let zero_repeat = columbo_zero_repeat_rle(&decoded_lengths, no_17, no_18);
             if zero_repeat != rle && zero_repeat != balanced {
                 consider_rle(
                     data_bits,
                     &literal_lengths,
                     &distance_lengths,
+                    &decoded_lengths,
                     &zero_repeat,
                     exhaustive,
                     &mut best,
@@ -1067,20 +1363,12 @@ fn consider_rle(
     data_bits: u64,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
+    decoded_lengths: &[u8],
     initial_rle: &[RleToken],
     exhaustive: bool,
     best: &mut Option<DynamicPlan>,
 ) {
     let mut rle = initial_rle.to_vec();
-    let mut decoded_lengths = Vec::new();
-    if decoded_lengths
-        .try_reserve_exact(literal_lengths.len() + distance_lengths.len())
-        .is_err()
-    {
-        return;
-    }
-    decoded_lengths.extend_from_slice(literal_lengths);
-    decoded_lengths.extend_from_slice(distance_lengths);
 
     // From each Columbo RLE-mask seed, price a DeflOpt-derived local candidate:
     // build DeflOpt's height-tied code-length tree, replace repeat tokens that
@@ -1154,6 +1442,7 @@ fn consider_rle(
         for candidate_lengths in code_length_candidates {
             if candidate_lengths.len() != 19
                 || Huffman::build(&candidate_lengths).is_none()
+                || !code_length_tree_shape_is_valid(&candidate_lengths)
                 || rle
                     .iter()
                     .any(|token| candidate_lengths[usize::from(token.symbol)] == 0)
@@ -1210,7 +1499,7 @@ fn consider_rle(
         };
         let mut rewritten = rewrite_rle_deflopt_local(&rle, &tree);
         if exhaustive {
-            if let Some(shortest) = shortest_rle(&decoded_lengths, &tree) {
+            if let Some(shortest) = shortest_rle(decoded_lengths, &tree) {
                 if rewritten.as_ref().map_or(true, |local| {
                     rle_cost(&shortest, &tree) < rle_cost(local, &tree)
                 }) {
@@ -1243,7 +1532,10 @@ fn consider_deft4j_pruned_header(
     deft4j_lengths: &[u8],
     best: &mut Option<DynamicPlan>,
 ) {
-    if deft4j_lengths.len() != 19 || Huffman::build(deft4j_lengths).is_none() {
+    if deft4j_lengths.len() != 19
+        || Huffman::build(deft4j_lengths).is_none()
+        || !code_length_tree_shape_is_valid(deft4j_lengths)
+    {
         return;
     }
     let mut code_length_lengths = [0_u8; 19];
@@ -1260,7 +1552,10 @@ fn consider_deft4j_pruned_header(
     };
     let frequencies = rle_frequencies(&pruned);
     let rebuilt = make_lengths_deft4j_java_heap(&frequencies, 7);
-    if rebuilt.len() != 19 || Huffman::build(&rebuilt).is_none() {
+    if rebuilt.len() != 19
+        || Huffman::build(&rebuilt).is_none()
+        || !code_length_tree_shape_is_valid(&rebuilt)
+    {
         return;
     }
     code_length_lengths.copy_from_slice(&rebuilt);
@@ -1322,6 +1617,7 @@ fn consider_columbo_deflopt_local_rewrite(
         let candidate_lengths = make_lengths_deflopt_heap(&frequencies, 7, variant);
         if candidate_lengths.len() != 19
             || Huffman::build(&candidate_lengths).is_none()
+            || !code_length_tree_shape_is_valid(&candidate_lengths)
             || rle
                 .iter()
                 .any(|token| candidate_lengths[usize::from(token.symbol)] == 0)
@@ -1485,7 +1781,7 @@ fn rewrite_rle_deft4j_literals(
     include_equal: bool,
 ) -> Option<Vec<RleToken>> {
     let mut output = Vec::new();
-    output.try_reserve(316).ok()?;
+    output.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
     let mut previous = None;
     let mut changed = false;
 
@@ -1504,7 +1800,7 @@ fn rewrite_rle_deft4j_literals(
         let explicit = explicit_rle_cost(code_length_lengths, value, count);
         let repeat = rle_symbol_cost(code_length_lengths, token.symbol);
         if explicit < repeat || (include_equal && explicit == repeat) {
-            if output.len().checked_add(count)? > 316 {
+            if output.len().checked_add(count)? > MAX_DYNAMIC_CODE_LENGTH_COUNT {
                 return None;
             }
             output.extend(
@@ -1696,8 +1992,8 @@ fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken
     output
 }
 
-/// deft4j's greedy packing with repeat-16 enabled for residual zero runs.
-fn deft4j_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
+/// Build Columbo's deft4j-inspired residual-zero repeat candidate.
+fn columbo_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
     let mut output = Vec::new();
     let mut index = 0;
     while index < lengths.len() {
@@ -1795,14 +2091,7 @@ fn rle_extra_bits(symbol: u8) -> u64 {
 
 fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
     rle.iter()
-        .map(|token| {
-            let code = lengths[usize::from(token.symbol)];
-            if code == 0 {
-                INF
-            } else {
-                u64::from(code) + rle_extra_bits(token.symbol)
-            }
-        })
+        .map(|token| rle_symbol_cost(lengths, token.symbol))
         .fold(0_u64, |sum, value| sum.saturating_add(value).min(INF))
 }
 
@@ -1877,6 +2166,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_bits_counts_huffman_codes_and_match_extras_together() {
+        let tokens = [
+            Token::Literal(b'A'),
+            Token::Match {
+                length: 12,
+                distance: 5,
+                length_symbol: 265,
+                distance_symbol: 4,
+                length_extra: 1,
+                distance_extra: 0,
+                length_extra_bits: 1,
+                distance_extra_bits: 1,
+            },
+        ];
+        let mut literal_lengths = [0_u8; 286];
+        literal_lengths[usize::from(b'A')] = 8;
+        literal_lengths[256] = 7;
+        literal_lengths[265] = 7;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[4] = 5;
+
+        // literal + length code + distance code + both extras + end code
+        assert_eq!(
+            token_bits(&tokens, &literal_lengths, &distance_lengths),
+            Some(8 + 7 + 5 + 1 + 1 + 7)
+        );
+    }
+
+    #[test]
     fn rle_round_trip_shape() {
         let lengths = [0, 0, 0, 0, 3, 3, 3, 3, 3, 0, 0, 0];
         let rle = greedy_rle(&lengths, false, false, false);
@@ -1889,6 +2207,53 @@ mod tests {
         let mut lengths = [0_u8; 30];
         lengths[1] = 1;
         assert_eq!(trim_distance(&lengths), 2);
+    }
+
+    #[test]
+    fn columbo_quad_move_preserves_a_complete_tree() {
+        let mut tokens = vec![Token::Literal(b'A'); 100];
+        tokens.extend(b"bcde".iter().copied().map(Token::Literal));
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[usize::from(b'A')] = 100;
+        for symbol in b"bcde" {
+            literal_frequencies[usize::from(*symbol)] = 1;
+        }
+        literal_frequencies[256] = 1;
+        let distance_frequencies = [0_u32; 30];
+
+        // Two length-two leaves and four length-three leaves form a complete
+        // tree. The quad move shortens the frequent leaf and lengthens all
+        // four rare leaves while preserving that Kraft sum.
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[usize::from(b'A')] = 2;
+        literal_lengths[256] = 2;
+        for symbol in b"bcde" {
+            literal_lengths[usize::from(*symbol)] = 3;
+        }
+        let seed = DynamicPlan {
+            literal_lengths,
+            distance_lengths: vec![1],
+            code_length_lengths: [0; 19],
+            rle: Vec::new(),
+            hlit: 257,
+            hdist: 1,
+            hclen: 4,
+            bits: 0,
+        };
+
+        let candidate = plan_columbo_quad_lengthen_candidate(
+            &tokens,
+            &literal_frequencies,
+            &distance_frequencies,
+            &seed,
+        )
+        .expect("the Kraft-preserving quad move is legal");
+
+        assert_eq!(candidate.literal_lengths[usize::from(b'A')], 1);
+        for symbol in b"bcde" {
+            assert_eq!(candidate.literal_lengths[usize::from(*symbol)], 4);
+        }
+        assert!(Huffman::build(&candidate.literal_lengths).is_some());
     }
 
     #[test]
@@ -1923,10 +2288,10 @@ mod tests {
     }
 
     #[test]
-    fn deft4j_zero_repeat_can_continue_a_literal_zero() {
+    fn columbo_zero_repeat_can_continue_a_literal_zero() {
         let lengths = [0_u8; 5];
         let ordinary = greedy_rle(&lengths, false, true, false);
-        let deft4j = deft4j_zero_repeat_rle(&lengths, true, false);
+        let source_shaped = columbo_zero_repeat_rle(&lengths, true, false);
 
         assert_eq!(
             ordinary,
@@ -1939,7 +2304,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            deft4j,
+            source_shaped,
             [
                 RleToken {
                     symbol: 0,
@@ -1987,6 +2352,7 @@ mod tests {
             4_496,
             &lengths[..286],
             &lengths[286..],
+            &lengths,
             &rle,
             false,
             &mut best,
@@ -1997,6 +2363,16 @@ mod tests {
             best.code_length_lengths,
             [1, 6, 0, 7, 7, 6, 6, 4, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn generated_plans_reject_incomplete_multi_symbol_payload_trees() {
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[0] = 15;
+        literal_lengths[256] = 15;
+
+        assert!(Huffman::build(&literal_lengths).is_some());
+        assert!(plan_for_explicit_lengths(&[], &literal_lengths, &[1], false).is_none());
     }
 
     #[test]

@@ -45,9 +45,11 @@ pub struct Options {
     pub strip_metadata: bool,
     /// Emit at least two distance codes for compatibility with old decoders.
     pub min_distance_codes: bool,
-    /// Permit Columbo's non-standard symbol-284 spelling of length 258.
+    /// Permit the Defluff-derived optimization that spells length 258 with
+    /// symbol 284.
     ///
-    /// Some strict Deflate decoders may reject this representation.
+    /// Columbo admits the candidate more broadly than Defluff. Some strict
+    /// Deflate decoders may reject this non-standard representation.
     pub allow_258_alias: bool,
     /// Wall-clock search budget for the whole input file.
     ///

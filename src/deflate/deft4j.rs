@@ -23,9 +23,11 @@ use std::sync::Arc;
 
 use crate::Options;
 
-use super::block::{fixed_block_bits, stored_block_bits};
+use super::block::{fixed_block_bits, reusable_original_bits, stored_block_bits};
 use super::header::{plan_for_deft4j_lengths_with_cost, Deft4jHeaderPolicy};
-use super::huffman::make_lengths_deft4j_java_heap;
+use super::huffman::{
+    make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+};
 use super::model::{
     count_frequencies, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
     SourceBlockType, Token,
@@ -171,9 +173,34 @@ struct Deft4jState {
     least_families: LeastFamilyMemo,
 }
 
+#[derive(Clone, Copy)]
+enum TokenPayloadCharge {
+    /// The token allocation is already owned by the parser or another state.
+    Shared,
+    /// This state retains a newly expanded token allocation in the arena.
+    NewlyAllocated,
+}
+
+/// Fully computed state waiting to enter the memoized deft4j queue.
+///
+/// Named fields make the two `u64` values and four Huffman arrays unambiguous at
+/// call sites. Callers still supply already-computed statistics so insertion
+/// never rescans a potentially large token vector.
+struct PendingState {
+    tokens: Arc<Vec<Token>>,
+    token_hash: u64,
+    literal_lengths: [u8; 286],
+    distance_lengths: [u8; 30],
+    literal_frequencies: [u32; 286],
+    distance_frequencies: [u32; 30],
+    extra_bits: u64,
+    depth: usize,
+    token_payload_charge: TokenPayloadCharge,
+}
+
 /// Columbo's memoized execution queue for deft4j's ordered candidate graph.
 ///
-/// deft4j beta 17's key objects retain `Object`'s identity-based equality and
+/// deft4j beta-17's key objects retain `Object`'s identity-based equality and
 /// hashing, while `LinkedHashMap` preserves their insertion order. Columbo
 /// hashes equivalent token/table content to avoid duplicate work while
 /// preserving first-insertion order.
@@ -203,19 +230,18 @@ impl Deft4jQueue {
         self.limit_bytes.saturating_sub(self.accounted_bytes)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn push(
-        &mut self,
-        tokens: Arc<Vec<Token>>,
-        token_hash: u64,
-        literal_lengths: [u8; 286],
-        distance_lengths: [u8; 30],
-        literal_frequencies: [u32; 286],
-        distance_frequencies: [u32; 30],
-        extra_bits: u64,
-        depth: usize,
-        owns_token_payload: bool,
-    ) -> Option<StateId> {
+    fn push(&mut self, pending: PendingState) -> Option<StateId> {
+        let PendingState {
+            tokens,
+            token_hash,
+            literal_lengths,
+            distance_lengths,
+            literal_frequencies,
+            distance_frequencies,
+            extra_bits,
+            depth,
+            token_payload_charge,
+        } = pending;
         let hash = state_hash(token_hash, &literal_lengths, &distance_lengths);
         if let Some(&candidate) = self.first_by_hash.get(&hash) {
             if state_matches(
@@ -239,10 +265,9 @@ impl Deft4jQueue {
             self.saturated = true;
             return None;
         }
-        let payload_bytes = if owns_token_payload {
-            tokens.len().checked_mul(size_of::<Token>())?
-        } else {
-            0
+        let payload_bytes = match token_payload_charge {
+            TokenPayloadCharge::Shared => 0,
+            TokenPayloadCharge::NewlyAllocated => tokens.len().checked_mul(size_of::<Token>())?,
         };
         let added = size_of::<Deft4jState>().checked_add(payload_bytes)?;
         let new_total = self.accounted_bytes.checked_add(added)?;
@@ -319,7 +344,7 @@ impl Deft4jQueue {
         let depth = state.depth.checked_add(1)?;
         let (literal_lengths, distance_lengths) =
             columbo_deft4j_lengths(&literal_frequencies, &distance_frequencies)?;
-        let result = self.push(
+        let result = self.push(PendingState {
             tokens,
             token_hash,
             literal_lengths,
@@ -328,8 +353,8 @@ impl Deft4jQueue {
             distance_frequencies,
             extra_bits,
             depth,
-            false,
-        )?;
+            token_payload_charge: TokenPayloadCharge::Shared,
+        })?;
         let memo = TransformMemo {
             state: result,
             changed: result != source,
@@ -422,17 +447,17 @@ impl Deft4jQueue {
         let literal_lengths = state.literal_lengths;
         let distance_lengths = state.distance_lengths;
         let depth = state.depth.checked_add(1)?;
-        let result = self.push(
-            expanded.tokens,
-            expanded.token_hash,
+        let result = self.push(PendingState {
+            tokens: expanded.tokens,
+            token_hash: expanded.token_hash,
             literal_lengths,
             distance_lengths,
-            expanded.literal_frequencies,
-            expanded.distance_frequencies,
-            expanded.extra_bits,
+            literal_frequencies: expanded.literal_frequencies,
+            distance_frequencies: expanded.distance_frequencies,
+            extra_bits: expanded.extra_bits,
             depth,
-            true,
-        )?;
+            token_payload_charge: TokenPayloadCharge::NewlyAllocated,
+        })?;
         let memo = TransformMemo {
             state: result,
             changed: true,
@@ -487,7 +512,7 @@ impl Deft4jQueue {
             literal_frequencies,
             distance_frequencies,
             extra_bits,
-            owns_payload,
+            token_payload_charge,
         ) = if changed {
             let payload_budget = transform_budget.checked_sub(marks.len())?;
             let expanded = expand_marked(&state.tokens, plain, &marks, payload_budget)?;
@@ -497,7 +522,7 @@ impl Deft4jQueue {
                 expanded.literal_frequencies,
                 expanded.distance_frequencies,
                 expanded.extra_bits,
-                true,
+                TokenPayloadCharge::NewlyAllocated,
             )
         } else {
             (
@@ -506,7 +531,7 @@ impl Deft4jQueue {
                 state.literal_frequencies,
                 state.distance_frequencies,
                 state.extra_bits,
-                false,
+                TokenPayloadCharge::Shared,
             )
         };
         // The transform decision is fully represented by `tokens` now. Drop
@@ -519,7 +544,7 @@ impl Deft4jQueue {
             (state.literal_lengths, state.distance_lengths)
         };
         let depth = state.depth.checked_add(1)?;
-        let result = self.push(
+        let result = self.push(PendingState {
             tokens,
             token_hash,
             literal_lengths,
@@ -528,8 +553,8 @@ impl Deft4jQueue {
             distance_frequencies,
             extra_bits,
             depth,
-            owns_payload,
-        )?;
+            token_payload_charge,
+        })?;
         let memo = TransformMemo {
             state: result,
             changed,
@@ -1172,23 +1197,25 @@ where
         if let Some((literal_lengths, distance_lengths)) = seed {
             // Both ordered seeds keep the source token stream. Hash it once;
             // the queue still compares token contents on a hash collision.
+            // Their token extra-bit total is likewise identical.
             let source_token_hash = token_hash(&block.tokens);
+            let source_extra_bits = token_extra_bits(&block.tokens);
             let mut pipeline = Deft4jPipeline {
                 queue: Deft4jQueue::new(queue_limit),
                 plain: Arc::clone(&block.plain),
                 min_distance_codes: options.min_distance_codes,
             };
-            if let Some(base) = pipeline.queue.push(
-                Arc::clone(&block.tokens),
-                source_token_hash,
+            if let Some(base) = pipeline.queue.push(PendingState {
+                tokens: Arc::clone(&block.tokens),
+                token_hash: source_token_hash,
                 literal_lengths,
                 distance_lengths,
-                block.literal_frequencies,
-                block.distance_frequencies,
-                token_extra_bits(&block.tokens),
-                0,
-                false,
-            ) {
+                literal_frequencies: block.literal_frequencies,
+                distance_frequencies: block.distance_frequencies,
+                extra_bits: source_extra_bits,
+                depth: 0,
+                token_payload_charge: TokenPayloadCharge::Shared,
+            }) {
                 pipeline.run_ordered(base, &mut best, expired);
 
                 // The source table and deft4j recodes form the source-derived
@@ -1203,17 +1230,17 @@ where
                     if let Some((alternate_literal, alternate_distance)) =
                         alternate_seed_lengths(&best.plan, &literal_lengths, &distance_lengths)
                     {
-                        if let Some(alternate_base) = pipeline.queue.push(
-                            Arc::clone(&block.tokens),
-                            source_token_hash,
-                            alternate_literal,
-                            alternate_distance,
-                            block.literal_frequencies,
-                            block.distance_frequencies,
-                            token_extra_bits(&block.tokens),
-                            0,
-                            false,
-                        ) {
+                        if let Some(alternate_base) = pipeline.queue.push(PendingState {
+                            tokens: Arc::clone(&block.tokens),
+                            token_hash: source_token_hash,
+                            literal_lengths: alternate_literal,
+                            distance_lengths: alternate_distance,
+                            literal_frequencies: block.literal_frequencies,
+                            distance_frequencies: block.distance_frequencies,
+                            extra_bits: source_extra_bits,
+                            depth: 0,
+                            token_payload_charge: TokenPayloadCharge::Shared,
+                        }) {
                             pipeline.run_ordered(alternate_base, &mut best, expired);
                         }
                     }
@@ -1242,10 +1269,7 @@ fn alternate_seed_lengths(
 }
 
 fn initial_plan(block: &ParsedBlock, alignment: u8, options: &Options) -> PlannedBlock {
-    if let Some(original) = block
-        .original
-        .filter(|original| original_usable(block, *original, alignment, options.min_distance_codes))
-    {
+    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
         return PlannedBlock {
             tokens: Arc::clone(&block.tokens),
             plain: Arc::clone(&block.plain),
@@ -1299,10 +1323,7 @@ fn cheap_current_plan(
     alignment: u8,
     options: &Options,
 ) -> Option<PlannedBlock> {
-    if let Some(original) = block
-        .original
-        .filter(|original| original_usable(block, *original, alignment, options.min_distance_codes))
-    {
+    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
         return Some(PlannedBlock {
             tokens: Arc::clone(&block.tokens),
             plain: Arc::clone(&block.plain),
@@ -1317,13 +1338,7 @@ fn cheap_current_plan(
         SourceBlockType::Fixed => Representation::Fixed,
         SourceBlockType::Dynamic => {
             let compatible_dynamic = block.original_dynamic.as_ref().filter(|dynamic| {
-                !options.min_distance_codes
-                    || dynamic
-                        .distance_lengths
-                        .iter()
-                        .filter(|&&length| length != 0)
-                        .count()
-                        >= 2
+                !options.min_distance_codes || dynamic.has_two_usable_distance_codes()
             });
             match compatible_dynamic {
                 Some(dynamic) => Representation::Dynamic(dynamic.try_clone()?),
@@ -1354,27 +1369,6 @@ fn representation_bits(
     }
 }
 
-fn original_usable(
-    block: &ParsedBlock,
-    original: super::model::OriginalBits,
-    alignment: u8,
-    min_distance_codes: bool,
-) -> bool {
-    let alignment_ok =
-        original.block_type != SourceBlockType::Stored || original.alignment == alignment;
-    let distance_ok = !min_distance_codes
-        || original.block_type != SourceBlockType::Dynamic
-        || block.original_dynamic.as_ref().is_some_and(|dynamic| {
-            dynamic
-                .distance_lengths
-                .iter()
-                .filter(|&&length| length != 0)
-                .count()
-                >= 2
-        });
-    alignment_ok && distance_ok
-}
-
 fn dynamic_length_arrays(dynamic: &DynamicPlan) -> Option<([u8; 286], [u8; 30])> {
     if dynamic.literal_lengths.len() > 286 || dynamic.distance_lengths.len() > 30 {
         return None;
@@ -1388,11 +1382,10 @@ fn dynamic_length_arrays(dynamic: &DynamicPlan) -> Option<([u8; 286], [u8; 30])>
 
 fn fixed_lengths() -> ([u8; 286], [u8; 30]) {
     let mut literal = [0_u8; 286];
-    literal[..144].fill(8);
-    literal[144..256].fill(9);
-    literal[256..280].fill(7);
-    literal[280..].fill(8);
-    (literal, [5; 30])
+    literal.copy_from_slice(&FIXED_LITERAL_CODE_LENGTHS[..286]);
+    let mut distance = [0_u8; 30];
+    distance.copy_from_slice(&FIXED_DISTANCE_CODE_LENGTHS[..30]);
+    (literal, distance)
 }
 
 struct WorkingBlock {
@@ -1602,7 +1595,7 @@ where
 
     // deft4j first optimizes every list member in source order. Columbo
     // deliberately recomputes the true alignment after every chosen block,
-    // correcting beta 17's repeated-pass position-accounting quirk.
+    // correcting beta-17's repeated-pass position-accounting quirk.
     let mut alignment = start_alignment & 7;
     for block in &mut blocks {
         if expired() {
@@ -1682,7 +1675,7 @@ where
 
 fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<WorkingBlock>> {
     // Columbo removes every redundant empty block while retaining one legal
-    // block for an all-empty stream. beta 17 intends this behavior but its
+    // block for an all-empty stream. beta-17 intends this behavior but its
     // cleared linked-list successor stops each source walk after one removal.
     let nonempty = source
         .iter()
@@ -1857,17 +1850,17 @@ mod tests {
         let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
         let (literal_lengths, distance_lengths) = fixed_lengths();
         queue
-            .push(
-                Arc::clone(&tokens),
-                token_hash(&tokens),
+            .push(PendingState {
+                tokens: Arc::clone(&tokens),
+                token_hash: token_hash(&tokens),
                 literal_lengths,
                 distance_lengths,
                 literal_frequencies,
                 distance_frequencies,
-                token_extra_bits(&tokens),
-                0,
-                false,
-            )
+                extra_bits: token_extra_bits(&tokens),
+                depth: 0,
+                token_payload_charge: TokenPayloadCharge::Shared,
+            })
             .unwrap()
     }
 
@@ -2003,30 +1996,30 @@ mod tests {
         second_literal[0] = second_literal[0].saturating_add(1);
         let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
         let first = queue
-            .push(
-                Arc::clone(&block.tokens),
-                token_hash(&block.tokens),
-                first_literal,
-                first_distance,
-                block.literal_frequencies,
-                block.distance_frequencies,
-                0,
-                0,
-                false,
-            )
+            .push(PendingState {
+                tokens: Arc::clone(&block.tokens),
+                token_hash: token_hash(&block.tokens),
+                literal_lengths: first_literal,
+                distance_lengths: first_distance,
+                literal_frequencies: block.literal_frequencies,
+                distance_frequencies: block.distance_frequencies,
+                extra_bits: 0,
+                depth: 0,
+                token_payload_charge: TokenPayloadCharge::Shared,
+            })
             .unwrap();
         let second = queue
-            .push(
-                Arc::clone(&block.tokens),
-                token_hash(&block.tokens),
-                second_literal,
-                first_distance,
-                block.literal_frequencies,
-                block.distance_frequencies,
-                0,
-                0,
-                false,
-            )
+            .push(PendingState {
+                tokens: Arc::clone(&block.tokens),
+                token_hash: token_hash(&block.tokens),
+                literal_lengths: second_literal,
+                distance_lengths: first_distance,
+                literal_frequencies: block.literal_frequencies,
+                distance_frequencies: block.distance_frequencies,
+                extra_bits: 0,
+                depth: 0,
+                token_payload_charge: TokenPayloadCharge::Shared,
+            })
             .unwrap();
         assert_ne!(first, second);
     }
@@ -2062,13 +2055,32 @@ mod tests {
 
         // The common table-only path shares the allocation. A separately
         // allocated but equal token vector still exercises the collision-safe
-        // content fallback and must resolve to the same state.
+        // content fallback and must resolve to the same state. Duplicate
+        // detection happens before arena charging, even when the caller just
+        // allocated that equivalent payload.
         let shared = push_fixed_state(&mut queue, Arc::clone(&block.tokens));
-        let copied = push_fixed_state(&mut queue, Arc::new(block.tokens.as_ref().clone()));
+        let accounted_before_duplicate = queue.accounted_bytes;
+        let copied_tokens = Arc::new(block.tokens.as_ref().clone());
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&copied_tokens);
+        let (literal_lengths, distance_lengths) = fixed_lengths();
+        let copied = queue
+            .push(PendingState {
+                tokens: Arc::clone(&copied_tokens),
+                token_hash: token_hash(&copied_tokens),
+                literal_lengths,
+                distance_lengths,
+                literal_frequencies,
+                distance_frequencies,
+                extra_bits: token_extra_bits(&copied_tokens),
+                depth: 0,
+                token_payload_charge: TokenPayloadCharge::NewlyAllocated,
+            })
+            .unwrap();
 
         assert_eq!(shared, first);
         assert_eq!(copied, first);
         assert_eq!(queue.states.len(), 1);
+        assert_eq!(queue.accounted_bytes, accounted_before_duplicate);
     }
 
     #[test]

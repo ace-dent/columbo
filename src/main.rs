@@ -295,7 +295,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "      --allow-258-alias  allow Columbo's non-standard symbol-284 length-258 spelling"
+        "      --allow-258-alias  allow non-RFC Defluff-derived 258 alias"
     )?;
     writeln!(
         output,
@@ -383,10 +383,17 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     commit_temporary_output(path, &mut temporary, file)
 }
 
-/// Write and sync a private sibling without changing its access bits.
+/// Write and sync a collision-safe sibling before replacing the destination.
 ///
-/// Keeping this phase separate from the final commit ensures that a temporary
-/// name never exposes partially written output using the destination's mode.
+/// Unix builds force mode `0600` throughout staging. Keeping this phase
+/// separate from the final commit avoids exposing partial data through the
+/// destination's ordinary access bits.
+/// Platform ACLs and Windows security descriptors are outside Rust's standard
+/// file API: a sibling can inherit them from its directory, and atomic rename
+/// installs the sibling's metadata instead of preserving the destination ACL.
+/// Extended authorization can therefore change when replacing an existing
+/// file; ACL-sensitive callers should use a new output path and a native,
+/// policy-aware replacement step.
 fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<(TemporaryOutput, File)> {
     let parent = path
         .parent()

@@ -6,11 +6,36 @@ use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
 use super::header::{best_dynamic_plan, token_bits};
-use super::huffman::{fixed_trees, Huffman};
+use super::huffman::{
+    fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+};
 use super::model::{
-    DynamicPlan, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
+    DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
     CODE_LENGTH_ORDER,
 };
+
+/// Return original block bits that remain safe at the requested alignment.
+///
+/// This answers only wire-format and compatibility questions, not whether the
+/// original is the cheapest representation. Stored blocks contain alignment
+/// padding, while dynamic originals must obey the optional two-distance-code
+/// policy.
+pub(crate) fn reusable_original_bits(
+    block: &ParsedBlock,
+    alignment: u8,
+    min_distance_codes: bool,
+) -> Option<OriginalBits> {
+    let original = block.original?;
+    let alignment_is_usable =
+        original.block_type != SourceBlockType::Stored || original.alignment == alignment;
+    let distance_alphabet_is_usable = !min_distance_codes
+        || original.block_type != SourceBlockType::Dynamic
+        || block
+            .original_dynamic
+            .as_ref()
+            .is_some_and(DynamicPlan::has_two_usable_distance_codes);
+    (alignment_is_usable && distance_alphabet_is_usable).then_some(original)
+}
 
 pub(crate) fn plan_block(
     block: &ParsedBlock,
@@ -89,20 +114,8 @@ fn plan_representation(
         (Representation::Dynamic(dynamic), bits)
     };
 
-    if let Some(original) = block.original {
-        let mincodes_allows_original = !options.min_distance_codes
-            || original.block_type != SourceBlockType::Dynamic
-            || block.original_dynamic.as_ref().is_some_and(|dynamic| {
-                dynamic
-                    .distance_lengths
-                    .iter()
-                    .filter(|&&length| length != 0)
-                    .count()
-                    >= 2
-            });
-        let alignment_allows_original =
-            original.block_type != SourceBlockType::Stored || original.alignment == alignment;
-        if mincodes_allows_original && alignment_allows_original && original.len <= bits {
+    if let Some(original) = reusable_original_bits(block, alignment, options.min_distance_codes) {
+        if original.len <= bits {
             representation = Representation::Original(original);
             bits = original.len;
         }
@@ -112,8 +125,12 @@ fn plan_representation(
 }
 
 pub(crate) fn fixed_block_bits(tokens: &[Token]) -> Option<u64> {
-    let (literal, distance) = fixed_length_arrays();
-    token_bits(tokens, &literal, &distance)?.checked_add(3)
+    token_bits(
+        tokens,
+        &FIXED_LITERAL_CODE_LENGTHS,
+        &FIXED_DISTANCE_CODE_LENGTHS,
+    )?
+    .checked_add(3)
 }
 
 pub(crate) fn stored_block_bits(mut alignment: u8, plain_size: usize) -> u64 {
@@ -261,18 +278,67 @@ fn emit_symbol(writer: &mut BitWriter, tree: &Huffman, symbol: usize) -> Result<
     writer.write(u32::from(code.code), code.length)
 }
 
-fn fixed_length_arrays() -> ([u8; 288], [u8; 32]) {
-    let mut literal = [0_u8; 288];
-    literal[..144].fill(8);
-    literal[144..256].fill(9);
-    literal[256..280].fill(7);
-    literal[280..].fill(8);
-    (literal, [5; 32])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_with_original(
+        block_type: SourceBlockType,
+        alignment: u8,
+        distance_lengths: Option<Vec<u8>>,
+    ) -> ParsedBlock {
+        ParsedBlock {
+            tokens: std::sync::Arc::new(Vec::new()),
+            plain: std::sync::Arc::new(Vec::new()),
+            literal_frequencies: [0; 286],
+            distance_frequencies: [0; 30],
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: distance_lengths.map(|distance_lengths| DynamicPlan {
+                literal_lengths: Vec::new(),
+                distance_lengths,
+                code_length_lengths: [0; 19],
+                rle: Vec::new(),
+                hlit: 0,
+                hdist: 0,
+                hclen: 0,
+                bits: 0,
+            }),
+            original: Some(OriginalBits {
+                start: 0,
+                len: 10,
+                alignment,
+                block_type,
+            }),
+            source_splits: Vec::new(),
+            source_type: block_type,
+        }
+    }
+
+    #[test]
+    fn original_reuse_enforces_alignment_and_distance_policy() {
+        let stored = block_with_original(SourceBlockType::Stored, 3, None);
+        assert!(reusable_original_bits(&stored, 3, false).is_some());
+        assert!(reusable_original_bits(&stored, 2, false).is_none());
+
+        let fixed = block_with_original(SourceBlockType::Fixed, 3, None);
+        assert!(reusable_original_bits(&fixed, 7, true).is_some());
+
+        let no_dynamic_header = block_with_original(SourceBlockType::Dynamic, 0, None);
+        assert!(reusable_original_bits(&no_dynamic_header, 0, false).is_some());
+        assert!(reusable_original_bits(&no_dynamic_header, 0, true).is_none());
+
+        let one_code = block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1]));
+        assert!(reusable_original_bits(&one_code, 0, true).is_none());
+        let two_codes = block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1, 1]));
+        assert!(reusable_original_bits(&two_codes, 0, true).is_some());
+
+        let mut reserved_only = vec![0; 32];
+        reserved_only[30] = 1;
+        reserved_only[31] = 1;
+        let reserved_only = block_with_original(SourceBlockType::Dynamic, 0, Some(reserved_only));
+        assert!(reusable_original_bits(&reserved_only, 0, true).is_none());
+    }
 
     #[test]
     fn stored_cost_includes_alignment_and_chunks() {
@@ -282,5 +348,10 @@ mod tests {
             stored_block_bits(0, 65_536),
             3 + 5 + 32 + 65_535 * 8 + 3 + 5 + 32 + 8
         );
+    }
+
+    #[test]
+    fn empty_fixed_block_has_only_a_header_and_end_code() {
+        assert_eq!(fixed_block_bits(&[]), Some(10));
     }
 }

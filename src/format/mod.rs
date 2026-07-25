@@ -131,7 +131,7 @@ fn detect(input: &[u8]) -> Format {
 }
 
 fn looks_like_zlib(input: &[u8]) -> bool {
-    matches!(input, [0x78, 0x01 | 0x5e | 0x9c | 0xda, ..])
+    zlib::has_rfc1950_header(input)
 }
 
 fn looks_like_zip(input: &[u8]) -> bool {
@@ -144,6 +144,14 @@ fn looks_like_zip(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zlib_header(cinfo: u8, flevel: u8, preset_dictionary: bool) -> [u8; 2] {
+        let cmf = (cinfo << 4) | 8;
+        let mut flg = (flevel << 6) | (u8::from(preset_dictionary) << 5);
+        let header = (u16::from(cmf) << 8) | u16::from(flg);
+        flg += ((31 - header % 31) % 31) as u8;
+        [cmf, flg]
+    }
 
     #[test]
     fn file_deadline_is_shared_in_normal_mode_too() {
@@ -176,5 +184,33 @@ mod tests {
         assert!(scaled < Duration::MAX);
         assert_eq!(scale_duration(Duration::MAX, 1.0), Duration::MAX);
         assert_eq!(scale_duration(Duration::MAX, f64::NAN), Duration::ZERO);
+    }
+
+    #[test]
+    fn auto_detects_every_rfc_1950_window_and_level() {
+        for cinfo in 0..=7 {
+            for flevel in 0..=3 {
+                let mut input = zlib_header(cinfo, flevel, false).to_vec();
+                input.extend_from_slice(&[0x03, 0x00]); // Empty fixed Deflate stream.
+                input.extend_from_slice(&1_u32.to_be_bytes()); // Adler-32("").
+
+                let optimized = optimize(&input, Format::Auto, &Options::default()).unwrap();
+                assert_eq!(optimized.data, input, "CINFO={cinfo}, FLEVEL={flevel}");
+            }
+        }
+    }
+
+    #[test]
+    fn auto_detection_reports_an_unsupported_zlib_dictionary() {
+        let mut input = zlib_header(7, 2, true).to_vec();
+        input.extend_from_slice(&0_u32.to_be_bytes()); // DICTID.
+        input.extend_from_slice(&[0x03, 0x00]); // Empty fixed Deflate stream.
+        input.extend_from_slice(&1_u32.to_be_bytes()); // Adler-32("").
+
+        let error = optimize(&input, Format::Auto, &Options::default()).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "preset zlib dictionaries are not supported"
+        );
     }
 }

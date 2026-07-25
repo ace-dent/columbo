@@ -25,7 +25,7 @@ WINDOWS_SEPARATOR = b"\\"
 COMPILER_PREFIX = UNIX_SEPARATOR.join((b"", b"rustc", b""))
 REDACTED_COMPILER_PREFIX = b"rustc_/"
 UNIX_LIBRARY_MARKER = UNIX_SEPARATOR.join((b"", b"library", b""))
-WINDOWS_LIBRARY_MARKER = UNIX_SEPARATOR + b"library" + WINDOWS_SEPARATOR
+WINDOWS_LIBRARY_MARKER = WINDOWS_SEPARATOR.join((b"", b"library", b""))
 PRIVATE_PATH_MARKERS = {
     "macOS user directory": UNIX_SEPARATOR.join((b"", b"Users", b"")),
     "Unix user directory": UNIX_SEPARATOR.join((b"", b"home", b"")),
@@ -34,8 +34,40 @@ PRIVATE_PATH_MARKERS = {
         (b"", b"private", b"var", b"folders", b"")
     ),
     "temporary build directory": UNIX_SEPARATOR.join((b"", b"private", b"tmp", b"")),
+    "generic temporary directory": UNIX_SEPARATOR.join((b"", b"tmp", b"")),
+    "generic macOS temporary directory": UNIX_SEPARATOR.join(
+        (b"", b"var", b"folders", b"")
+    ),
+    "Unix root user directory": UNIX_SEPARATOR.join((b"", b"root", b"")),
+    "macOS mounted volume": UNIX_SEPARATOR.join((b"", b"Volumes", b"")),
     "Windows user directory": WINDOWS_SEPARATOR.join((b"Users", b"")),
+    "Windows user directory (forward slash)": UNIX_SEPARATOR.join(
+        (b":", b"Users", b"")
+    ),
+    "GitHub Actions Windows directory": WINDOWS_SEPARATOR.join((b":", b"a", b"")),
 }
+
+
+def private_path_markers() -> dict[str, bytes]:
+    """Return generic markers plus this checkout's runtime-resolved roots."""
+
+    markers = dict(PRIVATE_PATH_MARKERS)
+    local_roots = {
+        "current build directory": Path.cwd(),
+        "project source directory": Path(__file__).resolve().parent.parent,
+    }
+    for category, root in local_roots.items():
+        encoded = os.fsencode(root)
+        # Never turn an unexpectedly broad root into a binary-wide match.
+        if root.is_absolute() and len(root.parts) > 2:
+            markers[category] = encoded
+            markers[f"{category} (forward slash)"] = encoded.replace(
+                WINDOWS_SEPARATOR, UNIX_SEPARATOR
+            )
+            markers[f"{category} (backslash)"] = encoded.replace(
+                UNIX_SEPARATOR, WINDOWS_SEPARATOR
+            )
+    return markers
 
 
 def compiler_path_offsets(data: bytes) -> list[int]:
@@ -62,7 +94,7 @@ def audit(data: bytes, *, require_redacted: bool) -> int:
     """Return the number of compiler paths, rejecting private build roots."""
 
     leaked_categories = [
-        category for category, marker in PRIVATE_PATH_MARKERS.items() if marker in data
+        category for category, marker in private_path_markers().items() if marker in data
     ]
     if leaked_categories:
         categories = ", ".join(leaked_categories)

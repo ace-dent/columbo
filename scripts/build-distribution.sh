@@ -48,17 +48,14 @@ case "$TARGET" in
     *-apple-darwin)
         PLATFORM="macos"
         BINARY_NAME="columbo"
-        SUFFIX=""
         ;;
     *-windows-*)
         PLATFORM="windows"
         BINARY_NAME="columbo.exe"
-        SUFFIX=".exe"
         ;;
     *-linux-*)
         PLATFORM="linux"
         BINARY_NAME="columbo"
-        SUFFIX=""
         ;;
     *)
         echo "unsupported release platform in target: $TARGET" >&2
@@ -117,7 +114,9 @@ python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$BINARY"
 
 DIST_DIR="${CARGO_TARGET_DIR:-target}/dist"
 RELEASE_STEM="columbo-v$VERSION-$PLATFORM-$CPU_ARCHITECTURE"
-DIST_NAME="$RELEASE_STEM$SUFFIX"
+# The archive carries release identity. Keep the executable's product basename
+# stable so process monitors show "columbo", independently of platform/version.
+DIST_NAME="$BINARY_NAME"
 mkdir -p "$DIST_DIR"
 DIST_BINARY="$DIST_DIR/$DIST_NAME"
 ARCHIVE="$DIST_DIR/$RELEASE_STEM.zip"
@@ -126,14 +125,13 @@ TEMP_ARCHIVE="$DIST_DIR/.$RELEASE_STEM.tmp.zip"
 cp "$BINARY" "$DIST_BINARY"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$DIST_BINARY"
 
-# -9 selects maximum compression. -X omits host-specific extended attributes,
-# and running from the distribution directory stores only the public filename.
+# -9 selects maximum compression, -X omits host-specific extended attributes,
+# and -j stores only public basenames. Include the project licence beside the
+# executable in every release archive.
 trap 'rm -f "$TEMP_ARCHIVE"' 0 HUP INT TERM
 rm -f "$TEMP_ARCHIVE"
-(
-    cd "$DIST_DIR"
-    zip -9 -X -q ".$RELEASE_STEM.tmp.zip" "$DIST_NAME"
-)
+zip -9 -X -j -q "$TEMP_ARCHIVE" \
+    "$DIST_BINARY" "$PROJECT_ROOT/LICENSE"
 zip -T "$TEMP_ARCHIVE" >/dev/null
 mv "$TEMP_ARCHIVE" "$ARCHIVE"
 rm "$DIST_BINARY"

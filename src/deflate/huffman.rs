@@ -8,6 +8,64 @@ use crate::{Error, Result};
 const MAX_CODE_BITS: usize = 15;
 const MAX_C_CODES: usize = 320;
 const MAX_TRACKED_DEPTH: usize = 63;
+const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
+
+const fn make_fixed_literal_code_lengths() -> [u8; 288] {
+    let mut lengths = [0_u8; 288];
+    let mut symbol = 0;
+    while symbol < lengths.len() {
+        lengths[symbol] = if symbol < 144 {
+            8
+        } else if symbol < 256 {
+            9
+        } else if symbol < 280 {
+            7
+        } else {
+            8
+        };
+        symbol += 1;
+    }
+    lengths
+}
+
+/// RFC 1951 fixed literal/length code lengths, including reserved symbols
+/// 286 and 287 because they are part of the predefined Huffman alphabet.
+pub(crate) const FIXED_LITERAL_CODE_LENGTHS: [u8; 288] = make_fixed_literal_code_lengths();
+/// RFC 1951 fixed distance code lengths, including reserved symbols 30 and 31.
+pub(crate) const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
+
+/// Code-length alphabets have no empty or one-symbol exceptions.
+pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
+    let mut occupied = 0_u32;
+    for &length in lengths {
+        if length == 0 {
+            continue;
+        }
+        let Some(shift) = MAX_CODE_BITS.checked_sub(usize::from(length)) else {
+            return false;
+        };
+        let Some(updated) = occupied.checked_add(1_u32 << shift) else {
+            return false;
+        };
+        occupied = updated;
+    }
+    occupied == COMPLETE_HUFFMAN_CODE_SPACE
+}
+
+/// Validate the tree shapes accepted for Deflate payload alphabets.
+///
+/// A populated literal/length or distance tree is normally complete. RFC 1951
+/// explicitly permits a one-bit singleton distance tree; the zlib-compatible
+/// profile also accepts a one-bit singleton literal/end tree. `allow_empty`
+/// admits the literal-only distance-alphabet case.
+pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> bool {
+    let populated = lengths.iter().filter(|&&length| length != 0).count();
+    match populated {
+        0 => allow_empty,
+        1 => lengths.contains(&1),
+        _ => code_length_tree_shape_is_valid(lengths),
+    }
+}
 
 /// One canonical Huffman code in the bit order used on the Deflate wire.
 ///
@@ -22,12 +80,20 @@ pub(crate) struct HuffCode {
 
 /// A small canonical Huffman table.
 ///
-/// Deflate alphabets contain at most 288 symbols. A linear code list keeps the
-/// construction and malformed-stream checks easy to audit, and exactly matches
-/// the original Columbo C implementation's decoder.
+/// Deflate alphabets contain at most 288 payload symbols. Emission retains a
+/// compact symbol-ordered code list, while decoding uses one canonical range
+/// per possible bit length so malformed input cannot trigger alphabet-wide
+/// scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Huffman {
+    /// Emission entries remain in symbol order for binary lookup.
     codes: Vec<HuffCode>,
+    /// Canonical-code ranges allow decoding in at most fifteen comparisons,
+    /// independent of the alphabet size.
+    first_code: [u16; MAX_CODE_BITS + 1],
+    first_symbol: [u16; MAX_CODE_BITS + 1],
+    code_count: [u16; MAX_CODE_BITS + 1],
+    decode_symbols: Vec<u16>,
     max_bits: u8,
 }
 
@@ -36,8 +102,8 @@ impl Huffman {
     ///
     /// `None` means that a length exceeds Deflate's 15-bit limit, the tree is
     /// oversubscribed, or the alphabet exceeds the original Columbo C decoder's
-    /// 320-code table limit. Incomplete trees are valid: Deflate uses them for
-    /// one-symbol trees.
+    /// 320-code table limit. Construction can represent an incomplete tree;
+    /// callers apply the alphabet-specific complete, empty, or singleton rule.
     pub(crate) fn build(lengths: &[u8]) -> Option<Self> {
         if lengths.is_empty() {
             return None;
@@ -71,6 +137,19 @@ impl Huffman {
             next_code[bits] = code;
         }
 
+        let mut first_code = [0_u16; MAX_CODE_BITS + 1];
+        let mut first_symbol = [0_u16; MAX_CODE_BITS + 1];
+        let mut code_count = [0_u16; MAX_CODE_BITS + 1];
+        let mut symbol_offset = 0_u16;
+        for bits in 1..=MAX_CODE_BITS {
+            first_code[bits] = next_code[bits] as u16;
+            first_symbol[bits] = symbol_offset;
+            code_count[bits] = count_by_length[bits] as u16;
+            symbol_offset += code_count[bits];
+        }
+
+        let mut decode_symbols = vec![0_u16; populated];
+        let mut next_symbol = first_symbol;
         let mut codes = Vec::with_capacity(populated);
         for (symbol, &length) in lengths.iter().enumerate() {
             if length == 0 {
@@ -78,6 +157,9 @@ impl Huffman {
             }
             let symbol = u16::try_from(symbol).ok()?;
             let index = usize::from(length);
+            let decode_index = usize::from(next_symbol[index]);
+            decode_symbols[decode_index] = symbol;
+            next_symbol[index] += 1;
             codes.push(HuffCode {
                 symbol,
                 length,
@@ -86,20 +168,30 @@ impl Huffman {
             next_code[index] += 1;
         }
 
-        Some(Self { codes, max_bits })
+        Some(Self {
+            codes,
+            first_code,
+            first_symbol,
+            code_count,
+            decode_symbols,
+            max_bits,
+        })
     }
 
     /// Decode one symbol, consuming no more than the tree's maximum length.
     pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         let mut code = 0_u16;
         for length in 1..=self.max_bits {
-            code |= (reader.read(1)? as u16) << (length - 1);
-            if let Some(entry) = self
-                .codes
-                .iter()
-                .find(|entry| entry.length == length && entry.code == code)
-            {
-                return Ok(entry.symbol);
+            // Huffman bits arrive in canonical most-significant-bit order,
+            // even though fixed-width Deflate fields are least-significant
+            // bit first. Building the canonical value incrementally avoids a
+            // bit reversal and an alphabet-wide scan at every depth.
+            code = (code << 1) | reader.read(1)? as u16;
+            let index = usize::from(length);
+            let offset = code.wrapping_sub(self.first_code[index]);
+            if offset < self.code_count[index] {
+                let symbol_index = usize::from(self.first_symbol[index]) + usize::from(offset);
+                return Ok(self.decode_symbols[symbol_index]);
             }
         }
         Err(Error::new("invalid Huffman code in Deflate stream"))
@@ -109,9 +201,9 @@ impl Huffman {
     pub(crate) fn code(&self, symbol: usize) -> Option<HuffCode> {
         let symbol = u16::try_from(symbol).ok()?;
         self.codes
-            .iter()
-            .copied()
-            .find(|entry| entry.symbol == symbol)
+            .binary_search_by_key(&symbol, |entry| entry.symbol)
+            .ok()
+            .map(|index| self.codes[index])
     }
 
     #[cfg(test)]
@@ -131,21 +223,15 @@ fn reverse_bits(mut code: u16, length: u8) -> u16 {
 
 /// Return the RFC 1951 fixed literal/length and distance trees.
 ///
-/// `OnceLock` avoids rebuilding and reallocating these tables for every fixed
-/// block while still leaving their construction visible and testable.
+/// `OnceLock` avoids rebuilding the decode tables for every fixed block. The
+/// underlying code lengths are shared with every planner that prices a fixed
+/// representation, so the RFC table has a single definition.
 pub(crate) fn fixed_trees() -> (&'static Huffman, &'static Huffman) {
     static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     let (literal_length, distance) = FIXED.get_or_init(|| {
-        let mut literal_lengths = [0_u8; 288];
-        literal_lengths[..144].fill(8);
-        literal_lengths[144..256].fill(9);
-        literal_lengths[256..280].fill(7);
-        literal_lengths[280..].fill(8);
-
-        let distance_lengths = [5_u8; 32];
         (
-            Huffman::build(&literal_lengths).expect("fixed literal tree is valid"),
-            Huffman::build(&distance_lengths).expect("fixed distance tree is valid"),
+            Huffman::build(&FIXED_LITERAL_CODE_LENGTHS).expect("fixed literal tree is valid"),
+            Huffman::build(&FIXED_DISTANCE_CODE_LENGTHS).expect("fixed distance tree is valid"),
         )
     });
     (literal_length, distance)
@@ -435,6 +521,46 @@ fn unconstrained_huffman_max_depth(frequencies: &[u32]) -> usize {
 
 pub(crate) fn tree_exceeds_limit(frequencies: &[u32], max_bits: u8) -> bool {
     unconstrained_huffman_max_depth(frequencies) > usize::from(max_bits)
+}
+
+fn columbo_rle_frequency_bucket(frequency: u32) -> u32 {
+    if frequency == 0 {
+        return 0;
+    }
+
+    // Retain roughly two leading significant bits. A u64 calculation makes
+    // rounding safe even for a count at u32::MAX.
+    let highest_bit = u32::BITS - 1 - frequency.leading_zeros();
+    let quantum = 1_u64 << highest_bit.saturating_sub(1);
+    let rounded = ((u64::from(frequency) + quantum / 2) / quantum) * quantum;
+    rounded.min(u64::from(u32::MAX)) as u32
+}
+
+/// Construct Columbo's adjacency-aware Huffman pseudofrequencies.
+///
+/// Zopfli's `OptimizeHuffmanForRle`, which Turtledeflate embeds with Zopfli's
+/// attribution, motivates trying an alternate tree from RLE-friendly weights.
+/// This quantizer is Columbo-original: it rounds counts onto a logarithmic grid
+/// and changes a nonzero count only when an immediate neighbour shares its
+/// bucket. It does not implement Zopfli's run marking or stride averaging.
+/// Callers must score the resulting tree against the original frequencies.
+pub(crate) fn make_columbo_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
+    let mut buckets = [0_u32; N];
+    for (bucket, &frequency) in buckets.iter_mut().zip(frequencies.iter()) {
+        *bucket = columbo_rle_frequency_bucket(frequency);
+    }
+
+    for symbol in 0..N {
+        if frequencies[symbol] == 0 {
+            continue;
+        }
+        let bucket = buckets[symbol];
+        let matches_left = symbol != 0 && buckets[symbol - 1] == bucket;
+        let matches_right = symbol + 1 < N && buckets[symbol + 1] == bucket;
+        if matches_left || matches_right {
+            frequencies[symbol] = bucket;
+        }
+    }
 }
 
 /// Build Columbo's generic tree with Defluff's package-list depth limiter.
@@ -953,6 +1079,9 @@ fn java_heap_poll(nodes: &[Node], heap: &mut Vec<usize>) -> Option<usize> {
 }
 
 /// Build the tree produced by deft4j's `java.util.PriorityQueue` path.
+///
+/// Columbo defensively falls back to DeflOpt's variant-zero tree if an
+/// internally inconsistent heap or over-depth repair cannot be reconstructed.
 pub(crate) fn make_lengths_deft4j_java_heap(frequencies: &[u32], max_bits: u8) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, max_bits);
@@ -1184,14 +1313,33 @@ mod tests {
 
     #[test]
     fn fixed_trees_have_rfc_1951_lengths() {
+        // Keep the RFC ranges explicit: comparing a tree only with the table
+        // that built it would not detect an incorrectly defined table.
+        assert!(FIXED_LITERAL_CODE_LENGTHS[..144]
+            .iter()
+            .all(|&length| length == 8));
+        assert!(FIXED_LITERAL_CODE_LENGTHS[144..256]
+            .iter()
+            .all(|&length| length == 9));
+        assert!(FIXED_LITERAL_CODE_LENGTHS[256..280]
+            .iter()
+            .all(|&length| length == 7));
+        assert!(FIXED_LITERAL_CODE_LENGTHS[280..]
+            .iter()
+            .all(|&length| length == 8));
+        assert!(FIXED_DISTANCE_CODE_LENGTHS
+            .iter()
+            .all(|&length| length == 5));
+
         let (literal, distance) = fixed_trees();
         assert_eq!(literal.max_bits(), 9);
         assert_eq!(distance.max_bits(), 5);
-        assert_eq!(literal.code(0).unwrap().length, 8);
-        assert_eq!(literal.code(143).unwrap().length, 8);
-        assert_eq!(literal.code(144).unwrap().length, 9);
-        assert_eq!(literal.code(256).unwrap().length, 7);
-        assert_eq!(literal.code(280).unwrap().length, 8);
+        for (symbol, &length) in FIXED_LITERAL_CODE_LENGTHS.iter().enumerate() {
+            assert_eq!(literal.code(symbol).unwrap().length, length);
+        }
+        for (symbol, &length) in FIXED_DISTANCE_CODE_LENGTHS.iter().enumerate() {
+            assert_eq!(distance.code(symbol).unwrap().length, length);
+        }
     }
 
     #[test]
@@ -1263,6 +1411,38 @@ mod tests {
         let frequencies = [0, 7, 0, 0];
         assert_eq!(make_lengths(&frequencies, 3, 0), [0, 1, 0, 0]);
         assert_eq!(make_lengths_deft4j_java_heap(&frequencies, 3), [1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn columbo_rle_pseudofrequencies_join_adjacent_buckets() {
+        let mut frequencies = [9, 10, 11, 12, 21, 0, 0];
+
+        make_columbo_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(frequencies, [9, 12, 12, 12, 21, 0, 0]);
+    }
+
+    #[test]
+    fn columbo_rle_pseudofrequencies_do_not_bridge_zero_symbols() {
+        let mut frequencies = [10, 0, 11, 7, 8, 0, 0];
+        let original = frequencies;
+
+        make_columbo_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(frequencies, [10, 0, 11, 8, 8, 0, 0]);
+        assert!(original
+            .iter()
+            .zip(frequencies)
+            .all(|(&before, after)| before == 0 || after != 0));
+    }
+
+    #[test]
+    fn columbo_rle_frequency_buckets_handle_maximum_counts() {
+        let mut frequencies = [u32::MAX - 1, u32::MAX, 0];
+
+        make_columbo_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(frequencies, [u32::MAX, u32::MAX, 0]);
     }
 
     #[test]

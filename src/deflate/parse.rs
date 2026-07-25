@@ -1,29 +1,36 @@
 // SPDX-License-Identifier: MIT
 
-//! Strict Deflate parser used by every optimization route.
+//! Validating Deflate parser used by every optimization route.
 //!
 //! Parsing is deliberately completed before any optional search observes the
 //! deadline. A successful prefix result therefore always consumes one whole
-//! stream; `timed_out` can never describe a partially decoded member.
+//! stream; `timed_out` can never describe a partially decoded member. The one
+//! deliberate compatibility extension is Defluff's non-RFC length-258 alias.
 
 use crate::checksum::crc32_update;
 use crate::{Error, Result};
 
 use super::bitstream::BitReader;
-use super::huffman::{fixed_trees, Huffman};
+use super::huffman::{
+    code_length_tree_shape_is_valid, fixed_trees, payload_tree_shape_is_valid, Huffman,
+};
 use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, RleToken, SourceBlockType, Token,
     CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA_BITS, LENGTH_BASE, LENGTH_EXTRA_BITS,
+    RFC_DISTANCE_CODE_COUNT, USABLE_DISTANCE_CODE_COUNT,
 };
 
-type HuffmanPayload = (Vec<Token>, Vec<u8>, [u32; 286], [u32; 30]);
-type StoredPayload = (
-    Vec<Token>,
-    Vec<u8>,
-    [u32; 286],
-    [u32; 30],
-    Option<DynamicPlan>,
-);
+/// Data shared by every block representation after its payload is decoded.
+///
+/// Naming these fields keeps the stored, fixed, and dynamic parser routes
+/// visibly aligned without relying on the position of values in a long tuple.
+struct BlockPayload {
+    tokens: Vec<Token>,
+    plain: Vec<u8>,
+    literal_frequencies: [u32; 286],
+    distance_frequencies: [u32; 30],
+    dynamic: Option<DynamicPlan>,
+}
 
 /// Parsed blocks deliberately retain decoded bytes, tokens, frequency tables,
 /// and source metadata for later structural searches. A byte-only input limit
@@ -85,6 +92,7 @@ fn parse_stream_with_model_limit(
     let mut blocks = Vec::new();
     let mut source_blocks = 0;
     let mut empty_blocks = 0;
+    let mut trailing_empty_blocks = 0;
     let mut saw_content = false;
     loop {
         if source_blocks >= MAX_SOURCE_BLOCKS {
@@ -97,6 +105,7 @@ fn parse_stream_with_model_limit(
         source_blocks += 1;
         if block.plain.is_empty() {
             empty_blocks += 1;
+            trailing_empty_blocks += 1;
 
             // Empty blocks have no effect on decoded bytes or history. Keep
             // one only while the stream might prove entirely empty; once a
@@ -110,6 +119,7 @@ fn parse_stream_with_model_limit(
                 blocks.push(block);
             }
         } else {
+            trailing_empty_blocks = 0;
             if !saw_content {
                 blocks.clear(); // Drop the provisional all-empty block.
                 saw_content = true;
@@ -130,6 +140,7 @@ fn parse_stream_with_model_limit(
     Ok(ParsedStream {
         source_block_count: source_blocks,
         source_empty_block_count: empty_blocks,
+        source_trailing_empty_block_count: trailing_empty_blocks,
         blocks,
         consumed,
         meaningful_bits,
@@ -165,33 +176,26 @@ impl Parser<'_> {
             _ => return Err(Error::new("invalid Deflate block type")),
         };
 
-        let (tokens, plain, literal_frequencies, distance_frequencies, dynamic) = match block_type {
+        let payload = match block_type {
             SourceBlockType::Stored => self.parse_stored_block()?,
             SourceBlockType::Fixed => {
                 let (literal, distance) = fixed_trees();
-                let (tokens, plain, literal_frequencies, distance_frequencies) =
-                    self.parse_huffman_payload(literal, distance)?;
-                (
-                    tokens,
-                    plain,
-                    literal_frequencies,
-                    distance_frequencies,
-                    None,
-                )
+                self.parse_huffman_payload(literal, distance)?
             }
             SourceBlockType::Dynamic => {
                 let (literal, distance, plan) = self.parse_dynamic_header()?;
-                let (tokens, plain, literal_frequencies, distance_frequencies) =
-                    self.parse_huffman_payload(&literal, &distance)?;
-                (
-                    tokens,
-                    plain,
-                    literal_frequencies,
-                    distance_frequencies,
-                    Some(plan),
-                )
+                let mut payload = self.parse_huffman_payload(&literal, &distance)?;
+                payload.dynamic = Some(plan);
+                payload
             }
         };
+        let BlockPayload {
+            tokens,
+            plain,
+            literal_frequencies,
+            distance_frequencies,
+            dynamic,
+        } = payload;
 
         self.update_checksums(&plain);
         let end = self.reader.bit_position();
@@ -208,7 +212,9 @@ impl Parser<'_> {
             let mut literal = [0_u8; 286];
             let mut distance = [0_u8; 30];
             literal[..plan.literal_lengths.len()].copy_from_slice(&plan.literal_lengths);
-            distance[..plan.distance_lengths.len()].copy_from_slice(&plan.distance_lengths);
+            let usable_distance_codes = plan.distance_lengths.len().min(USABLE_DISTANCE_CODE_COUNT);
+            distance[..usable_distance_codes]
+                .copy_from_slice(&plan.distance_lengths[..usable_distance_codes]);
             original_literal_lengths = Some(literal);
             original_distance_lengths = Some(distance);
         }
@@ -230,7 +236,7 @@ impl Parser<'_> {
         ))
     }
 
-    fn parse_stored_block(&mut self) -> Result<StoredPayload> {
+    fn parse_stored_block(&mut self) -> Result<BlockPayload> {
         self.reader.align_to_byte()?;
         let length = self.reader.read(16)? as u16;
         let complement = self.reader.read(16)? as u16;
@@ -257,14 +263,20 @@ impl Parser<'_> {
         }
         literal_frequencies[256] = 1;
         self.append_history(&plain);
-        Ok((tokens, plain, literal_frequencies, [0; 30], None))
+        Ok(BlockPayload {
+            tokens,
+            plain,
+            literal_frequencies,
+            distance_frequencies: [0; 30],
+            dynamic: None,
+        })
     }
 
     fn parse_dynamic_header(&mut self) -> Result<(Huffman, Huffman, DynamicPlan)> {
         let hlit = self.reader.read(5)? as usize + 257;
         let hdist = self.reader.read(5)? as usize + 1;
         let hclen = self.reader.read(4)? as usize + 4;
-        if hlit > 286 || hdist > 30 {
+        if hlit > 286 || hdist > RFC_DISTANCE_CODE_COUNT {
             return Err(Error::new("invalid dynamic Huffman header"));
         }
 
@@ -274,6 +286,11 @@ impl Parser<'_> {
         }
         let code_length_tree = Huffman::build(&code_length_lengths)
             .ok_or_else(|| Error::new("invalid code-length Huffman tree"))?;
+        // The code-length alphabet has none of the one-symbol exceptions used
+        // by payload trees. zlib-compatible decoders require it to be complete.
+        if !code_length_tree_shape_is_valid(&code_length_lengths) {
+            return Err(Error::new("invalid code-length Huffman tree"));
+        }
 
         let target = hlit + hdist;
         let mut lengths = Vec::with_capacity(target);
@@ -291,6 +308,11 @@ impl Parser<'_> {
                     });
                 }
                 16 => {
+                    // Symbol 16 copies an already decoded length; unlike 17 and
+                    // 18, it does not provide an implicit initial zero.
+                    if lengths.is_empty() {
+                        return Err(Error::new("dynamic length repeat has no previous length"));
+                    }
                     let extra = self.reader.read(2)? as u8;
                     let count = usize::from(extra) + 3;
                     if lengths.len() + count > target {
@@ -327,10 +349,16 @@ impl Parser<'_> {
         let distance_lengths = lengths[hlit..].to_vec();
         let literal = Huffman::build(&literal_lengths)
             .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
-        let distance = Huffman::build(&distance_lengths)
-            .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
         if literal.code(256).is_none() {
             return Err(Error::new("dynamic Huffman tree has no end code"));
+        }
+        if !payload_tree_shape_is_valid(&literal_lengths, false) {
+            return Err(Error::new("invalid literal/length Huffman tree"));
+        }
+        let distance = Huffman::build(&distance_lengths)
+            .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
+        if !payload_tree_shape_is_valid(&distance_lengths, true) {
+            return Err(Error::new("invalid distance Huffman tree"));
         }
 
         Ok((
@@ -353,7 +381,7 @@ impl Parser<'_> {
         &mut self,
         literal_tree: &Huffman,
         distance_tree: &Huffman,
-    ) -> Result<HuffmanPayload> {
+    ) -> Result<BlockPayload> {
         let mut tokens = Vec::new();
         let mut plain = Vec::new();
         let mut literal_frequencies = [0_u32; 286];
@@ -429,7 +457,13 @@ impl Parser<'_> {
             }
         }
 
-        Ok((tokens, plain, literal_frequencies, distance_frequencies))
+        Ok(BlockPayload {
+            tokens,
+            plain,
+            literal_frequencies,
+            distance_frequencies,
+            dynamic: None,
+        })
     }
 
     fn reserve_decoded(&self, count: u64) -> Result<()> {
@@ -549,6 +583,58 @@ mod tests {
     use super::*;
     use crate::deflate::bitstream::BitWriter;
 
+    fn write_dynamic_prefix(
+        writer: &mut BitWriter,
+        literal_count: usize,
+        distance_count: usize,
+        code_length_lengths: &[u8; 19],
+    ) {
+        assert!((257..=286).contains(&literal_count));
+        assert!((1..=RFC_DISTANCE_CODE_COUNT).contains(&distance_count));
+        let hclen = CODE_LENGTH_ORDER
+            .iter()
+            .rposition(|&symbol| code_length_lengths[symbol] != 0)
+            .map_or(4, |position| (position + 1).max(4));
+
+        writer.write(1, 1).unwrap(); // Final block.
+        writer.write(2, 2).unwrap(); // Dynamic Huffman block.
+        writer.write((literal_count - 257) as u32, 5).unwrap();
+        writer.write((distance_count - 1) as u32, 5).unwrap();
+        writer.write((hclen - 4) as u32, 4).unwrap();
+        for &symbol in &CODE_LENGTH_ORDER[..hclen] {
+            writer
+                .write(u32::from(code_length_lengths[symbol]), 3)
+                .unwrap();
+        }
+    }
+
+    fn explicit_dynamic_stream(
+        literal_lengths: &[u8],
+        distance_lengths: &[u8],
+        code_length_lengths: [u8; 19],
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_dynamic_prefix(
+            &mut writer,
+            literal_lengths.len(),
+            distance_lengths.len(),
+            &code_length_lengths,
+        );
+
+        let code_length_tree = Huffman::build(&code_length_lengths).unwrap();
+        for &length in literal_lengths.iter().chain(distance_lengths) {
+            let code = code_length_tree.code(usize::from(length)).unwrap();
+            writer.write(u32::from(code.code), code.length).unwrap();
+        }
+
+        // Invalid tree-shape tests are rejected before reaching this payload.
+        // Valid empty-block fixtures consume the ordinary end code.
+        if let Some(end) = Huffman::build(literal_lengths).and_then(|tree| tree.code(256)) {
+            writer.write(u32::from(end.code), end.length).unwrap();
+        }
+        writer.into_bytes()
+    }
+
     #[test]
     fn parses_empty_fixed_stream() {
         // BFINAL=1, BTYPE=fixed, EOB=256 (seven zero wire bits).
@@ -566,6 +652,176 @@ mod tests {
     }
 
     #[test]
+    fn rejects_incomplete_code_length_tree() {
+        let mut writer = BitWriter::default();
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1; // One one-bit code is still incomplete here.
+        write_dynamic_prefix(&mut writer, 257, 1, &code_length_lengths);
+
+        let error = parse_stream(&writer.into_bytes(), 0).unwrap_err();
+        assert_eq!(error.message(), "invalid code-length Huffman tree");
+    }
+
+    #[test]
+    fn rejects_repeat_sixteen_without_a_previous_length() {
+        let mut writer = BitWriter::default();
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[16] = 1;
+        code_length_lengths[18] = 1;
+        write_dynamic_prefix(&mut writer, 257, 1, &code_length_lengths);
+
+        let code_length_tree = Huffman::build(&code_length_lengths).unwrap();
+        let repeat = code_length_tree.code(16).unwrap();
+        writer.write(u32::from(repeat.code), repeat.length).unwrap();
+        writer.write(0, 2).unwrap();
+
+        let error = parse_stream(&writer.into_bytes(), 0).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "dynamic length repeat has no previous length"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_multi_symbol_payload_trees() {
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[2] = 1;
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[0] = 2;
+        literal_lengths[256] = 2;
+        let input = explicit_dynamic_stream(&literal_lengths, &[0], code_length_lengths);
+        let error = parse_stream(&input, 0).unwrap_err();
+        assert_eq!(error.message(), "invalid literal/length Huffman tree");
+
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[1] = 2;
+        code_length_lengths[2] = 2;
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[256] = 1;
+        let input = explicit_dynamic_stream(&literal_lengths, &[2, 2], code_length_lengths);
+        let error = parse_stream(&input, 0).unwrap_err();
+        assert_eq!(error.message(), "invalid distance Huffman tree");
+    }
+
+    #[test]
+    fn accepts_minimal_payload_tree_exceptions() {
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[1] = 1;
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[256] = 1;
+
+        for distance_length in [0, 1] {
+            let input =
+                explicit_dynamic_stream(&literal_lengths, &[distance_length], code_length_lengths);
+            let parsed = parse_stream(&input, 0).unwrap();
+            assert_eq!(parsed.decoded_size, 0);
+        }
+    }
+
+    #[test]
+    fn accepts_unused_reserved_distance_codes_in_dynamic_headers() {
+        // RFC 1951 permits HDIST to advertise all 32 distance-code lengths.
+        // Symbols 30 and 31 may participate in the tree, but cannot be used
+        // by the compressed payload.
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[1] = 1;
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[256] = 1;
+
+        for reserved_symbol in 30..=31 {
+            let mut distance_lengths = vec![0_u8; reserved_symbol + 1];
+            distance_lengths[reserved_symbol] = 1;
+            let input =
+                explicit_dynamic_stream(&literal_lengths, &distance_lengths, code_length_lengths);
+
+            let parsed = parse_stream(&input, 0).unwrap();
+            let dynamic = parsed.blocks[0].original_dynamic.as_ref().unwrap();
+            assert_eq!(dynamic.hdist, reserved_symbol + 1);
+            assert_eq!(dynamic.distance_lengths[reserved_symbol], 1);
+            assert_eq!(parsed.decoded_size, 0);
+        }
+
+        // Also retain the audit's compact HDIST=32/all-zero-distance vector.
+        let all_zero = [
+            0x05, 0xdf, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0xff, 0x6b, 0x2b, 0x00,
+        ];
+        let parsed = parse_stream(&all_zero, 0).unwrap();
+        assert_eq!(
+            parsed.blocks[0].original_dynamic.as_ref().unwrap().hdist,
+            32
+        );
+    }
+
+    #[test]
+    fn rejects_a_reserved_distance_code_when_the_payload_uses_it() {
+        let mut code_length_lengths = [0_u8; 19];
+        code_length_lengths[0] = 1;
+        code_length_lengths[1] = 1;
+        let mut literal_lengths = vec![0_u8; 258];
+        literal_lengths[256] = 1;
+        literal_lengths[257] = 1;
+        let mut distance_lengths = vec![0_u8; 31];
+        distance_lengths[30] = 1;
+
+        let mut writer = BitWriter::default();
+        write_dynamic_prefix(
+            &mut writer,
+            literal_lengths.len(),
+            distance_lengths.len(),
+            &code_length_lengths,
+        );
+        let code_length_tree = Huffman::build(&code_length_lengths).unwrap();
+        for &length in literal_lengths.iter().chain(&distance_lengths) {
+            let code = code_length_tree.code(usize::from(length)).unwrap();
+            writer.write(u32::from(code.code), code.length).unwrap();
+        }
+        let literal_tree = Huffman::build(&literal_lengths).unwrap();
+        let distance_tree = Huffman::build(&distance_lengths).unwrap();
+        let match_code = literal_tree.code(257).unwrap();
+        writer
+            .write(u32::from(match_code.code), match_code.length)
+            .unwrap();
+        let reserved = distance_tree.code(30).unwrap();
+        writer
+            .write(u32::from(reserved.code), reserved.length)
+            .unwrap();
+
+        let error = parse_stream(&writer.into_bytes(), 3).unwrap_err();
+        assert_eq!(error.message(), "invalid distance code");
+    }
+
+    #[test]
+    fn accepts_the_defluff_258_alias_as_an_input_compatibility_extension() {
+        // Defluff emits symbol 284 with extra value 31 for length 258. That
+        // spelling is outside RFC 1951, but accepting existing streams lets
+        // default mode normalize them when doing so is no larger.
+        let input = [
+            0xe5, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x80, 0x20, 0xb6, 0xfd, 0xa5, 0x06, 0xa9,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01,
+        ];
+        let parsed = parse_stream(&input, 4_096).unwrap();
+
+        assert!(parsed.blocks.iter().any(|block| {
+            block.tokens.iter().any(|token| {
+                matches!(
+                    token,
+                    Token::Match {
+                        length: 258,
+                        length_symbol: 284,
+                        length_extra: 31,
+                        length_extra_bits: 5,
+                        ..
+                    }
+                )
+            })
+        }));
+    }
+
+    #[test]
     fn collapses_long_runs_of_empty_blocks_while_counting_them() {
         const BLOCKS: usize = 10_000;
 
@@ -579,8 +835,38 @@ mod tests {
         let parsed = parse_stream(&writer.into_bytes(), 0).unwrap();
         assert_eq!(parsed.source_block_count, BLOCKS);
         assert_eq!(parsed.source_empty_block_count, BLOCKS);
+        assert_eq!(parsed.source_trailing_empty_block_count, BLOCKS);
         assert_eq!(parsed.blocks.len(), 1);
         assert_eq!(parsed.decoded_size, 0);
+    }
+
+    #[test]
+    fn counts_only_consecutive_empty_blocks_at_the_source_tail() {
+        let mut writer = BitWriter::default();
+
+        writer.write(0, 1).unwrap(); // Non-final empty fixed block.
+        writer.write(1, 2).unwrap();
+        writer.write(0, 7).unwrap(); // Fixed end-of-block symbol 256.
+
+        writer.write(0, 1).unwrap(); // Non-final stored content block.
+        writer.write(0, 2).unwrap();
+        writer.align_to_byte().unwrap();
+        writer.write(1, 16).unwrap();
+        writer.write(0xfffe, 16).unwrap();
+        writer.write_aligned_bytes(b"x").unwrap();
+
+        for index in 0..2 {
+            writer.write(u32::from(index == 1), 1).unwrap();
+            writer.write(1, 2).unwrap();
+            writer.write(0, 7).unwrap();
+        }
+
+        let parsed = parse_stream(&writer.into_bytes(), 1).unwrap();
+        assert_eq!(parsed.source_block_count, 4);
+        assert_eq!(parsed.source_empty_block_count, 3);
+        assert_eq!(parsed.source_trailing_empty_block_count, 2);
+        assert_eq!(parsed.blocks.len(), 1);
+        assert_eq!(parsed.decoded_size, 1);
     }
 
     #[test]

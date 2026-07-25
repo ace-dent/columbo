@@ -8,6 +8,14 @@
 
 use std::sync::Arc;
 
+/// RFC 1951 advertises distance-code lengths for symbols 0 through 31.
+///
+/// Symbols 30 and 31 participate in Huffman-tree construction but are
+/// reserved and must never occur in a compressed payload.
+pub(crate) const RFC_DISTANCE_CODE_COUNT: usize = 32;
+pub(crate) const USABLE_DISTANCE_CODE_COUNT: usize = 30;
+pub(crate) const MAX_DYNAMIC_CODE_LENGTH_COUNT: usize = 286 + RFC_DISTANCE_CODE_COUNT;
+
 pub(crate) const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
@@ -75,6 +83,20 @@ pub(crate) struct DynamicPlan {
 }
 
 impl DynamicPlan {
+    /// Whether the payload advertises at least two usable distance symbols.
+    ///
+    /// Dynamic headers may also carry lengths for reserved symbols 30 and 31;
+    /// those do not satisfy Columbo's `--min-distance-codes` compatibility
+    /// policy and are deliberately excluded from this count.
+    pub(crate) fn has_two_usable_distance_codes(&self) -> bool {
+        self.distance_lengths
+            .iter()
+            .take(USABLE_DISTANCE_CODE_COUNT)
+            .filter(|&&length| length != 0)
+            .count()
+            >= 2
+    }
+
     /// Clone the small, owned Huffman-table vectors without relying on an
     /// infallible allocator. Optional searches can abandon a candidate when
     /// memory is tight while retaining the already-valid source plan.
@@ -194,6 +216,7 @@ pub(crate) struct ParsedStream {
     pub(crate) max_distance: u16,
     pub(crate) source_block_count: usize,
     pub(crate) source_empty_block_count: usize,
+    pub(crate) source_trailing_empty_block_count: usize,
 }
 
 pub(crate) fn count_frequencies(tokens: &[Token]) -> ([u32; 286], [u32; 30]) {
@@ -230,7 +253,8 @@ pub(crate) fn token_extra_bits(tokens: &[Token]) -> u64 {
         .sum()
 }
 
-fn try_clone_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
+/// Fallibly copy a slice for optional planning routes.
+pub(crate) fn try_clone_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
     let mut output = Vec::new();
     output.try_reserve_exact(source.len()).ok()?;
     output.extend_from_slice(source);
