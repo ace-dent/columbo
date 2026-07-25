@@ -13,10 +13,9 @@ Code in this project has been generated with the assistance of OpenAI models. Re
 Combines methods from the following work:
 
 - [DeflOpt](http://web.archive.org/web/20131208161446/http://www.walbeehm.com/download/index.html) v2.07 (05-Sep-2007) by Ben Jos Walbeehm. Binary is compiled for Windows 32-bit `i386`.
-
 - [defluff](https://web.archive.org/web/20230604215335/https://encode.su/threads/1214-defluff-a-deflate-huffman-optimizer) v0.3.2 (07-Apr-2011) by Joachim Henke. Binaries for Windows `i686`; macOS `i386` (and PowerPC); linux `i686` and `x86_64`.
-
 - [deft4j](https://github.com/NeRdTheNed/deft4j) v1.0.0-beta-17 (12-Nov-2023) by Ned Loynd.
+- [turtledeflate](https://github.com/rwillenbacher/turtledeflate) (as at 25-Jul-2026) by Ralf Willenbacher.
 
 This project focuses on reverse-engineering the techniques used to save the last few bytes from deflate streams.
 
