@@ -94,19 +94,24 @@ pub(crate) struct RawOptimization {
 ///
 /// A standalone stream uses [`DefaultFloor::Complete`] so `--max` cannot lose
 /// an optimization found by normal mode. A single scheduled PNG image uses
-/// [`DefaultFloor::Bounded`]. Multi-stream containers use
-/// [`DefaultFloor::Shared`], which also prevents a tiny single-block deft4j
-/// route from consuming time needed by later members.
+/// [`DefaultFloor::CompleteThenBounded`]: it establishes that same incumbent,
+/// then spends only the remaining file budget on PNG's bounded max routes.
+/// Multi-stream containers use [`DefaultFloor::Shared`], which also prevents a
+/// tiny single-block deft4j route from consuming time needed by later members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
     Complete,
-    Bounded,
+    CompleteThenBounded,
     Shared,
 }
 
 impl DefaultFloor {
     fn is_bounded(self) -> bool {
         !matches!(self, Self::Complete)
+    }
+
+    fn uses_bounded_png_routes(self) -> bool {
+        matches!(self, Self::CompleteThenBounded)
     }
 
     fn allows_single_block_deft4j(self) -> bool {
@@ -247,8 +252,38 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         decoded_limit,
         identity,
     };
+    // A standalone PNG must retain the genuine normal-mode result while still
+    // allowing the historical bounded max routes to use the remaining file
+    // budget. Establishing this incumbent first keeps the complete-floor
+    // guarantee without letting that floor starve all max-only work.
+    let guaranteed_floor_step = (options.exhaustive
+        && default_floor == DefaultFloor::CompleteThenBounded)
+        .then(|| progress.start("Normal comparison floor"));
+    let mut guaranteed_floor_candidate =
+        if options.exhaustive && default_floor == DefaultFloor::CompleteThenBounded {
+            let mut floor_options = options.clone();
+            floor_options.exhaustive = false;
+            let mut never_expires = || false;
+            Some(build_candidate(
+                source,
+                &floor_options,
+                DEFAULT_RAW_REPLAY_LIMIT,
+                &mut never_expires,
+            )?)
+        } else {
+            None
+        };
+    if let Some(step) = guaranteed_floor_step {
+        step.finish(guaranteed_floor_candidate.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+    }
     let compact_quad_eligible = options.exhaustive
-        && default_floor == DefaultFloor::Bounded
+        && default_floor.uses_bounded_png_routes()
         && compact_quad_source_eligible(original.len(), parsed.decoded_size, &blocks);
     let deft4j_eligible = options.exhaustive
         && deft4j_source_route_eligible(
@@ -264,11 +299,11 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     // floor lineage so current gains remain selectable. Complete standalone
     // floors keep their unbounded order.
     let run_narrow_source = options.exhaustive
-        && default_floor == DefaultFloor::Bounded
+        && default_floor.uses_bounded_png_routes()
         && narrow_source_route_eligible(&blocks, original.len());
     let parallel_routes =
         options.exhaustive && default_floor.is_bounded() && parallel_route_is_bounded(source);
-    let png_policy = if default_floor == DefaultFloor::Bounded && parallel_routes {
+    let png_policy = if default_floor.uses_bounded_png_routes() && parallel_routes {
         bounded_png_max_policy(
             blocks
                 .iter()
@@ -285,13 +320,27 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let bounded_step = (options.exhaustive && default_floor.is_bounded())
         .then(|| progress.start("Bounded comparison routes"));
     let bounded_candidates = if options.exhaustive && default_floor.is_bounded() {
+        // A single-image PNG has already finished this exact ordinary-mode
+        // floor above. Continue that candidate's retained plans instead of
+        // rebuilding them inside the bounded phase. Apart from avoiding
+        // duplicate work, this gives the max-only descendants the same wall
+        // time that historical bounded PNG scheduling made available.
+        let completed_floor = guaranteed_floor_candidate.take();
         match png_policy {
-            BoundedPngMaxPolicy::GenericParallel => {
-                build_bounded_generic_max_candidates(source, options, &deadline, progress)?
-            }
+            BoundedPngMaxPolicy::GenericParallel => build_bounded_generic_max_candidates(
+                source,
+                options,
+                &deadline,
+                progress,
+                completed_floor,
+            )?,
             BoundedPngMaxPolicy::LegacyGrouping => {
-                let (floor, floor_seeded) =
-                    build_bounded_floor_grouping_lineage(source, options, &deadline)?;
+                let (floor, floor_seeded) = build_bounded_floor_grouping_lineage(
+                    source,
+                    options,
+                    &deadline,
+                    completed_floor,
+                )?;
                 let suppress_later_source_max = floor_seeded.is_some();
                 BoundedPhaseCandidates {
                     floor: Some(floor),
@@ -311,6 +360,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     run_narrow_source,
                     parallel_routes,
                     &deadline,
+                    completed_floor,
                 )?
             }
         }
@@ -345,7 +395,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             }
         }
     }
-    let seed_weak_deft4j = default_floor == DefaultFloor::Bounded
+    let seed_weak_deft4j = default_floor.uses_bounded_png_routes()
         && deft4j_candidate.as_ref().is_some_and(|deft4j| {
             has_multiple_nonempty_blocks(&blocks)
                 && deft4j_gain_is_below(
@@ -441,7 +491,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             )
         }));
     }
-    if default_floor == DefaultFloor::Bounded && seed_weak_deft4j {
+    if default_floor.uses_bounded_png_routes() && seed_weak_deft4j {
         let compact_split_step = progress.start("Columbo compact split floor");
         let compact_split = match deft4j_candidate.as_ref() {
             Some(deft4j) => {
@@ -496,7 +546,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     &mut never_expires,
                 )?
             }
-            DefaultFloor::Bounded | DefaultFloor::Shared => {
+            DefaultFloor::CompleteThenBounded | DefaultFloor::Shared => {
                 build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
             }
         }
@@ -512,6 +562,9 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             candidate.is_strictly_smaller_than_source(source),
         )));
     }
+    // The complete standalone PNG floor is consumed by the bounded phase and
+    // returned as `bounded_floor_candidate`; other policies never create it.
+    debug_assert!(guaranteed_floor_candidate.is_none());
     if deft4j_eligible && default_floor == DefaultFloor::Complete && !deadline.expired() {
         let deft4j_step = progress.start("deft4j-derived source route");
         deft4j_candidate =
@@ -1079,6 +1132,7 @@ fn build_bounded_phase_candidates(
     run_narrow: bool,
     parallel_routes: bool,
     deadline: &Deadline,
+    completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
     if !run_deft4j && !run_narrow {
         let (floor, floor_seeded) = build_bounded_expanding_floor_lineage(
@@ -1086,6 +1140,7 @@ fn build_bounded_phase_candidates(
             options,
             probe_floor_expansion,
             deadline,
+            completed_floor,
         )?;
         return Ok(BoundedPhaseCandidates {
             floor: Some(floor),
@@ -1096,7 +1151,12 @@ fn build_bounded_phase_candidates(
 
     if !parallel_routes {
         return build_bounded_phase_candidates_sequential(
-            source, options, run_deft4j, run_narrow, deadline,
+            source,
+            options,
+            run_deft4j,
+            run_narrow,
+            deadline,
+            completed_floor,
         );
     }
 
@@ -1130,7 +1190,13 @@ fn build_bounded_phase_candidates(
         // ordinary deadline check. Join every successfully spawned worker
         // before choosing the fixed deft4j/narrow/floor error order below.
         let floor = run_route_with_cancellation(deadline, || {
-            build_bounded_expanding_floor_lineage(source, options, probe_floor_expansion, deadline)
+            build_bounded_expanding_floor_lineage(
+                source,
+                options,
+                probe_floor_expansion,
+                deadline,
+                completed_floor,
+            )
         });
         let deft4j = match deft4j_worker.flatten() {
             Some(worker) => worker.join(),
@@ -1175,6 +1241,7 @@ fn build_bounded_phase_candidates_sequential(
     run_deft4j: bool,
     run_narrow: bool,
     deadline: &Deadline,
+    completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
     let deft4j = if run_deft4j {
         build_deft4j_source_candidate(source, options, &mut || deadline.expired())?
@@ -1186,7 +1253,8 @@ fn build_bounded_phase_candidates_sequential(
     } else {
         None
     };
-    let floor = build_bounded_floor_candidate(source, options, &mut || deadline.expired())?;
+    let floor =
+        completed_or_bounded_floor(source, options, completed_floor, &mut || deadline.expired())?;
     Ok(BoundedPhaseCandidates {
         floor: Some(floor),
         deft4j,
@@ -1267,6 +1335,25 @@ where
         .map(|candidate| candidate.named("Normal floor"))
 }
 
+/// Reuse a completed ordinary-mode floor when PNG scheduling already made it.
+///
+/// Its retained plans have the same shape needed by each bounded continuation,
+/// so rebuilding the candidate would only consume deadline and memory.
+fn completed_or_bounded_floor<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    completed_floor: Option<Candidate>,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    match completed_floor {
+        Some(floor) => Ok(floor.named("Normal floor")),
+        None => build_bounded_floor_candidate(source, options, expired),
+    }
+}
+
 /// Build the ordinary bounded floor, then continue through the historical
 /// Columbo max route seeded from that rewritten floor.
 ///
@@ -1277,9 +1364,11 @@ fn build_bounded_floor_lineage(
     source: CandidateInput<'_>,
     options: &Options,
     deadline: &Deadline,
+    completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let floor =
-        build_bounded_floor_candidate(source, options, &mut || deadline.route_should_stop())?;
+    let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
+        deadline.route_should_stop()
+    })?;
     continue_bounded_floor_lineage(source, floor, options, deadline)
 }
 
@@ -1293,9 +1382,11 @@ fn build_bounded_floor_grouping_lineage(
     source: CandidateInput<'_>,
     options: &Options,
     deadline: &Deadline,
+    completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let mut floor =
-        build_bounded_floor_candidate(source, options, &mut || deadline.route_should_stop())?;
+    let mut floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
+        deadline.route_should_stop()
+    })?;
     let floor_selected = options.strict || floor.is_strictly_smaller_than_source(source);
     if !floor_selected || deadline.route_should_stop() {
         return Ok((floor, None));
@@ -1316,9 +1407,11 @@ fn build_bounded_expanding_floor_lineage(
     options: &Options,
     probe_expansion: bool,
     deadline: &Deadline,
+    completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let floor =
-        build_bounded_floor_candidate(source, options, &mut || deadline.route_should_stop())?;
+    let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
+        deadline.route_should_stop()
+    })?;
     if !probe_expansion {
         return Ok((floor, None));
     }
@@ -1375,6 +1468,7 @@ fn build_bounded_generic_max_candidates(
     options: &Options,
     deadline: &Deadline,
     progress: Progress,
+    completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
     thread::scope(|scope| {
         let source_worker = thread::Builder::new()
@@ -1389,7 +1483,7 @@ fn build_bounded_generic_max_candidates(
             .ok();
 
         let floor = run_route_with_cancellation(deadline, || {
-            build_bounded_floor_lineage(source, options, deadline)
+            build_bounded_floor_lineage(source, options, deadline, completed_floor)
         });
         let source_max = match source_worker {
             Some(worker) => match worker.join() {
@@ -2569,7 +2663,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_max_floor_still_returns_a_complete_stream() {
+    fn shared_max_floor_still_returns_a_complete_stream() {
         let input = [0x03, 0x00];
         let options = Options {
             exhaustive: true,
@@ -2581,7 +2675,7 @@ mod tests {
             &input,
             &options,
             options.max_decoded_bytes,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
         )
         .unwrap();
         assert!(optimized.timed_out);
@@ -2590,6 +2684,63 @@ mod tests {
         let reparsed = parse_stream(&optimized.data, 1).unwrap();
         assert_eq!(reparsed.consumed, optimized.data.len());
         assert_eq!(reparsed.decoded_size, 0);
+    }
+
+    #[test]
+    fn complete_then_bounded_floor_keeps_the_finished_default_at_zero_timeout() {
+        let input = [0x03, 0x00];
+        let default = optimize_raw(&input, &Options::default()).unwrap();
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::ZERO,
+            ..Options::default()
+        };
+
+        let maximum = optimize_raw_prefix_with_floor(
+            &input,
+            &options,
+            options.max_decoded_bytes,
+            DefaultFloor::CompleteThenBounded,
+        )
+        .unwrap();
+
+        assert!(maximum.timed_out);
+        assert!(
+            maximum.data.len() < default.data.len()
+                || (maximum.data.len() == default.data.len()
+                    && maximum.info.deflate_bits <= default.info.deflate_bits)
+        );
+    }
+
+    #[test]
+    fn completed_png_floor_is_reused_without_rebuilding() {
+        let input = [0x03, 0x00];
+        let parsed = parse_stream(&input, 1).unwrap();
+        let source = CandidateInput {
+            compressed: &input,
+            blocks: &parsed.blocks,
+            meaningful_bits: parsed.meaningful_bits,
+            decoded_limit: 1,
+            identity: StreamIdentity {
+                decoded_size: parsed.decoded_size,
+                crc32: parsed.crc32,
+                adler32: parsed.adler32,
+            },
+        };
+        let options = Options::default();
+        let completed =
+            build_candidate(source, &options, DEFAULT_RAW_REPLAY_LIMIT, &mut || false).unwrap();
+        let expected_data = completed.data.clone();
+        let expected_bits = completed.bits;
+
+        let reused = completed_or_bounded_floor(source, &options, Some(completed), &mut || {
+            panic!("reusing a completed floor must not start another build")
+        })
+        .unwrap();
+
+        assert_eq!(reused.data, expected_data);
+        assert_eq!(reused.bits, expected_bits);
+        assert_eq!(reused.route, "Normal floor");
     }
 
     #[test]
@@ -2620,7 +2771,7 @@ mod tests {
             &input,
             &options,
             options.max_decoded_bytes,
-            DefaultFloor::Bounded,
+            DefaultFloor::CompleteThenBounded,
         )
         .unwrap();
         let reparsed = parse_stream(&optimized.data, 2).unwrap();
@@ -2755,7 +2906,8 @@ mod tests {
             },
         );
         let candidates =
-            build_bounded_generic_max_candidates(source, &options, &deadline, progress).unwrap();
+            build_bounded_generic_max_candidates(source, &options, &deadline, progress, None)
+                .unwrap();
 
         assert!(candidates.floor_seeded.is_some());
         assert!(candidates.source_max.is_some());

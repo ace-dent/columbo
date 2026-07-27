@@ -896,12 +896,11 @@ fn optimize_image_streams(
         .map_err(|_| Error::new("could not allocate PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
     let image_floor = if jobs.len() == 1 {
-        // A standalone PNG image must finish the same normal route used
-        // without `--max` before spending time on max-only searches. The
-        // benchmark grants measured normal runtime plus five seconds; a
-        // bounded floor could expire a few bits short of that incumbent and
-        // make max output larger than default.
-        DefaultFloor::Complete
+        // Establish the genuine normal result before spending the remaining
+        // file budget on PNG's bounded max routes. This keeps max output no
+        // larger than default without allowing a slow normal floor to starve
+        // every max-only route.
+        DefaultFloor::CompleteThenBounded
     } else {
         DefaultFloor::Shared
     };
@@ -2039,7 +2038,7 @@ mod tests {
             &lookalike,
             &options,
             true,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
             &mut budget,
         )
         .unwrap();
@@ -2050,7 +2049,7 @@ mod tests {
             &lookalike,
             &options,
             true,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
             &mut budget,
         )
         .unwrap_err();

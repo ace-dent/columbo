@@ -972,6 +972,7 @@ fn parsed_block_from_plan(plan: &PlannedBlock) -> Option<ParsedBlock> {
 /// existing matches in symbol 260, then symbols 260..=261, and so on through
 /// symbol 264 are written as literals. The family is inspired by repeated
 /// deft4j least-family pruning, but the fixed cumulative bands are Columbo's.
+#[cfg(test)]
 pub(crate) fn plan_block_with_short_family_floor(
     block: &ParsedBlock,
     alignment: u8,

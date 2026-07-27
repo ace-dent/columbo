@@ -24,7 +24,8 @@ use crate::progress::RouteProgress;
 use crate::Options;
 
 use super::block::{
-    plan_block, plan_reusable_block, reusable_original_bits, stored_block_bits, ReusableBlockPlan,
+    lookup_block_cached, plan_block, plan_block_cached, plan_reusable_block,
+    reusable_original_bits, stored_block_bits, CanonicalPlanCache, ReusableBlockPlan,
 };
 use super::deft4j::plan_source_block;
 use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
@@ -35,9 +36,8 @@ use super::model::{
 use super::search::{
     improve_plan_with_deft4j_tree_floor, improve_plan_with_floor,
     improve_plan_with_same_distance_floor, improve_plan_with_short_family_floor,
-    plan_block_with_complete_base_search, plan_block_with_floor, plan_block_with_narrow_search,
-    plan_block_with_search, plan_block_with_seeded_narrow_search,
-    plan_block_with_short_family_floor, replay_extended_floor, replay_table_ladder,
+    plan_block_with_complete_base_search, plan_block_with_narrow_search, plan_block_with_search,
+    plan_block_with_seeded_narrow_search, replay_extended_floor, replay_table_ladder,
     score_short_family_frequencies, tighten_terminal_plan, try_clone_planned_block,
     ShortFamilyStats,
 };
@@ -182,6 +182,7 @@ where
     F: FnMut() -> bool,
 {
     let detailed_progress = progress.enabled().then_some(progress);
+    let mut plan_cache = CanonicalPlanCache::new();
     progress.phase(
         "Establishing complete comparison floor",
         blocks.len(),
@@ -219,40 +220,45 @@ where
     let default_long_run =
         !options.exhaustive && allow_regroup && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS;
     let source_merge_floor = allow_regroup
-        .then(|| source_aligned_huffman_floor(blocks, start_alignment, options))
+        .then(|| source_aligned_huffman_floor(blocks, start_alignment, options, &mut plan_cache))
         .flatten();
     let greedy_blocks = if allow_regroup
         && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS
         && blocks.len() <= MAX_GREEDY_SOURCE_BLOCKS
     {
-        greedy_huffman_blocklist(blocks, start_alignment, options)
+        greedy_huffman_blocklist(blocks, start_alignment, options, &mut plan_cache)
             .filter(|grouped| grouped.len() < blocks.len())
     } else {
         None
     };
-    let greedy_floor = greedy_blocks
-        .as_deref()
-        .and_then(|grouped| direct_structural_plan(grouped, start_alignment, options));
+    let greedy_floor = greedy_blocks.as_deref().and_then(|grouped| {
+        direct_structural_plan(grouped, start_alignment, options, &mut plan_cache)
+    });
     let bounded_group_blocks = if allow_regroup
         && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS
         && blocks.len() <= MAX_GREEDY_SOURCE_BLOCKS
     {
-        bounded_huffman_grouping(blocks, options, BoundedRangePricing::Serial)
-            .filter(|grouped| grouped.len() < blocks.len())
+        bounded_huffman_grouping(
+            blocks,
+            options,
+            BoundedRangePricing::Serial,
+            &mut plan_cache,
+        )
+        .filter(|grouped| grouped.len() < blocks.len())
     } else {
         None
     };
-    let bounded_group_floor = bounded_group_blocks
-        .as_deref()
-        .and_then(|grouped| direct_structural_plan(grouped, start_alignment, options));
+    let bounded_group_floor = bounded_group_blocks.as_deref().and_then(|grouped| {
+        direct_structural_plan(grouped, start_alignment, options, &mut plan_cache)
+    });
     let collected_blocks = if allow_regroup && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS {
         collect_huffman_runs(blocks, false).filter(|collected| collected.len() < blocks.len())
     } else {
         None
     };
-    let collected_floor = collected_blocks
-        .as_deref()
-        .and_then(|collected| direct_structural_plan(collected, start_alignment, options));
+    let collected_floor = collected_blocks.as_deref().and_then(|collected| {
+        direct_structural_plan(collected, start_alignment, options, &mut plan_cache)
+    });
     // Price a wide collection as an additive candidate. It is effective for
     // uniform runs, while the bounded collection above keeps several local
     // tables for streams such as row-flushed PNG data.
@@ -271,7 +277,7 @@ where
     };
     let wide_collected_floor = wide_collected_blocks
         .as_deref()
-        .and_then(|wide| direct_structural_plan(wide, start_alignment, options));
+        .and_then(|wide| direct_structural_plan(wide, start_alignment, options, &mut plan_cache));
 
     // Search whichever cheap grouping has the best complete direct price.
     // Keeping this choice separate from the emitted fallback means all other
@@ -295,9 +301,9 @@ where
     // split searches. On a shared container deadline this also guarantees
     // that every stream receives useful structural optimization.
     let mut fallback = if floor_time_available && !expired() {
-        mandatory_token_floor_plan(blocks, start_alignment, options)?
+        mandatory_token_floor_plan(blocks, start_alignment, options, &mut plan_cache)?
     } else {
-        direct_structural_plan(blocks, start_alignment, options)?
+        direct_structural_plan(blocks, start_alignment, options, &mut plan_cache)?
     };
     let mut fallback_bits = total_bits(&fallback);
     for floor in [
@@ -337,6 +343,7 @@ where
                 start_alignment,
                 options,
                 AdjacentMergeSearch::Disabled,
+                &mut plan_cache,
                 expired,
                 detailed_progress,
             ) {
@@ -377,6 +384,7 @@ where
             start_alignment,
             options,
             fallback_merge_search,
+            &mut plan_cache,
             expired,
             detailed_progress,
         ) {
@@ -415,6 +423,7 @@ where
                     start_alignment,
                     options,
                     AdjacentMergeSearch::Disabled,
+                    &mut plan_cache,
                     expired,
                     detailed_progress,
                 );
@@ -467,7 +476,7 @@ where
     }
 
     progress.phase(
-        "Pricing Columbo boundary DP",
+        "Pricing block boundaries",
         cuts.len().saturating_sub(1),
         "cut anchor",
         "cut anchors",
@@ -479,6 +488,7 @@ where
         start_alignment,
         options,
         allow_regroup,
+        &mut plan_cache,
         expired,
         detailed_progress,
     ) else {
@@ -514,7 +524,8 @@ where
 {
     let prepared = prepare_blocks(blocks);
     let blocks = prepared.as_deref().unwrap_or(blocks);
-    let fallback = direct_structural_plan(blocks, start_alignment, options)?;
+    let mut plan_cache = CanonicalPlanCache::new();
+    let fallback = direct_structural_plan(blocks, start_alignment, options, &mut plan_cache)?;
     if expired() {
         return Some(finish_plan(fallback, options));
     }
@@ -527,6 +538,7 @@ where
         SourceBlockSearch::Narrow {
             allow_individual_prune,
         },
+        &mut plan_cache,
         expired,
         None,
     );
@@ -556,13 +568,15 @@ where
     if blocks.len() < 2 || blocks.len() > MAX_GREEDY_SOURCE_BLOCKS || expired() {
         return None;
     }
-    let fallback = direct_structural_plan(blocks, start_alignment, options)?;
+    let mut plan_cache = CanonicalPlanCache::new();
+    let fallback = direct_structural_plan(blocks, start_alignment, options, &mut plan_cache)?;
     let candidate = sequential_plan_with_source_search(
         blocks,
         start_alignment,
         options,
         AdjacentMergeSearch::LongRun,
         SourceBlockSearch::Floor,
+        &mut plan_cache,
         expired,
         None,
     )?;
@@ -594,6 +608,7 @@ fn direct_structural_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<PlannedBlock>> {
     let mut structural_options = options.clone();
     structural_options.exhaustive = false;
@@ -603,7 +618,7 @@ fn direct_structural_plan(
 
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        let plan = plan_block(block, alignment, &structural_options, || false);
+        let plan = plan_block_cached(block, alignment, &structural_options, plan_cache);
         append_output_plan(&mut plans, &mut output_bits, plan, true)?;
     }
     Some(plans)
@@ -620,9 +635,10 @@ fn mandatory_token_floor_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<PlannedBlock>> {
     if blocks.len() > MAX_GREEDY_SOURCE_BLOCKS {
-        return direct_structural_plan(blocks, start_alignment, options);
+        return direct_structural_plan(blocks, start_alignment, options, plan_cache);
     }
     let mut plans = Vec::new();
     plans.try_reserve_exact(blocks.len()).ok()?;
@@ -632,7 +648,7 @@ fn mandatory_token_floor_plan(
     floor_options.exhaustive = false;
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        let base = plan_block(block, alignment, &floor_options, || false);
+        let base = plan_block_cached(block, alignment, &floor_options, plan_cache);
         let mut plan = improve_plan_with_floor(block, alignment, &floor_options, extended, base);
         // Columbo's five cumulative symbol-260..264 bands are inspired by
         // repeated deft4j least-family pruning, but are not deft4j states.
@@ -642,6 +658,32 @@ fn mandatory_token_floor_plan(
         append_output_plan(&mut plans, &mut output_bits, plan, true)?;
     }
     Some(plans)
+}
+
+fn plan_block_with_floor_cached(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    extended: bool,
+    plan_cache: &mut CanonicalPlanCache,
+) -> PlannedBlock {
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    let base = plan_block_cached(block, alignment, &floor_options, plan_cache);
+    improve_plan_with_floor(block, alignment, &floor_options, extended, base)
+}
+
+fn plan_block_with_short_family_floor_cached(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+) -> PlannedBlock {
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    let base = plan_block_cached(block, alignment, &floor_options, plan_cache);
+    let base = improve_plan_with_same_distance_floor(block, alignment, &floor_options, base);
+    improve_plan_with_short_family_floor(block, &floor_options, base)
 }
 
 /// Repacketize an all-stored stream using the largest legal stored payloads.
@@ -721,12 +763,14 @@ fn source_aligned_huffman_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<PlannedBlock>> {
     source_aligned_huffman_floor_with_limit(
         blocks,
         start_alignment,
         options,
         MAX_REGROUP_SOURCE_BLOCKS,
+        plan_cache,
     )
 }
 
@@ -735,6 +779,7 @@ fn source_aligned_huffman_floor_with_limit(
     start_alignment: u8,
     options: &Options,
     max_blocks: usize,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<PlannedBlock>> {
     if !(2..=max_blocks).contains(&blocks.len())
         || blocks
@@ -806,7 +851,8 @@ fn source_aligned_huffman_floor_with_limit(
             let mut singleton_same_distance = None;
             let template = if end_index - start_index > 1 {
                 let range = make_range(&composite, start, end)?;
-                let base = plan_block(&range, start_alignment, &structural_options, || false);
+                let base =
+                    plan_block_cached(&range, start_alignment, &structural_options, plan_cache);
                 let mut selected = PlanTemplate::try_from_planned(&base)?;
                 if let Some(shared) = shared_dynamic_plan(
                     &blocks[start_index..end_index],
@@ -822,7 +868,8 @@ fn source_aligned_huffman_floor_with_limit(
                 selected
             } else {
                 let block = &blocks[start_index];
-                let base = plan_block(block, start_alignment, &structural_options, || false);
+                let base =
+                    plan_block_cached(block, start_alignment, &structural_options, plan_cache);
                 let selected = PlanTemplate::try_from_planned(&base)?;
                 singleton_same_distance = Some(improve_plan_with_same_distance_floor(
                     block,
@@ -1026,18 +1073,22 @@ pub(crate) fn plan_fragmented_replay(
         return None;
     }
 
-    let mut best = mandatory_token_floor_plan(blocks, start_alignment, options)?;
+    let mut plan_cache = CanonicalPlanCache::new();
+    let mut best = mandatory_token_floor_plan(blocks, start_alignment, options, &mut plan_cache)?;
     if let Some(grouped) = source_aligned_huffman_floor_with_limit(
         blocks,
         start_alignment,
         options,
         MAX_FRAGMENTED_REPLAY_BLOCKS,
+        &mut plan_cache,
     ) {
         if total_bits(&grouped) < total_bits(&best) {
             best = grouped;
         }
     }
-    if let Some(split) = plan_compact_source_split_floor(blocks, start_alignment, options) {
+    if let Some(split) =
+        plan_compact_source_split_floor_cached(blocks, start_alignment, options, &mut plan_cache)
+    {
         if split.len() <= MAX_FRAGMENTED_REPLAY_BLOCKS && total_bits(&split) < total_bits(&best) {
             best = split;
         }
@@ -1056,13 +1107,23 @@ pub(crate) fn plan_compact_source_split_floor(
     start_alignment: u8,
     options: &Options,
 ) -> Option<Vec<PlannedBlock>> {
+    let mut plan_cache = CanonicalPlanCache::new();
+    plan_compact_source_split_floor_cached(blocks, start_alignment, options, &mut plan_cache)
+}
+
+fn plan_compact_source_split_floor_cached(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+) -> Option<Vec<PlannedBlock>> {
     let mut output = Vec::new();
     output.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
 
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        let base = plan_block(block, alignment, options, || false);
+        let base = plan_block_cached(block, alignment, options, plan_cache);
         // Each source block contributes either itself or two children. Reserve
         // that tiny upper bound fallibly so even optional replay work respects
         // the optimizer's allocation-failure contract.
@@ -1087,7 +1148,7 @@ pub(crate) fn plan_compact_source_split_floor(
             cuts.dedup_by_key(|cut| cut.token);
             for split in cuts {
                 let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
-                let left_plan = plan_block(&left, alignment, options, || false);
+                let left_plan = plan_block_cached(&left, alignment, options, plan_cache);
                 let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
                 let right = make_range(
                     &composite,
@@ -1097,7 +1158,7 @@ pub(crate) fn plan_compact_source_split_floor(
                         plain: block.plain.len(),
                     },
                 )?;
-                let right_plan = plan_block(&right, right_alignment, options, || false);
+                let right_plan = plan_block_cached(&right, right_alignment, options, plan_cache);
                 let bits = left_plan.bits.checked_add(right_plan.bits)?;
                 if bits < winner_bits {
                     winner_bits = bits;
@@ -1203,6 +1264,7 @@ fn greedy_huffman_blocklist(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<ParsedBlock>> {
     let (first, rest) = blocks.split_first()?;
     if rest.is_empty()
@@ -1231,11 +1293,22 @@ fn greedy_huffman_blocklist(
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
         let pending_plan = match pending_cache.take() {
             Some((cached_alignment, plan)) if cached_alignment == alignment => plan,
-            _ => plan_block_with_floor(pending.as_block(), alignment, &structural_options, false),
+            _ => plan_block_with_floor_cached(
+                pending.as_block(),
+                alignment,
+                &structural_options,
+                false,
+                plan_cache,
+            ),
         };
         let current_alignment = ((u64::from(alignment) + pending_plan.bits) & 7) as u8;
-        let current_plan =
-            plan_block_with_floor(current, current_alignment, &structural_options, false);
+        let current_plan = plan_block_with_floor_cached(
+            current,
+            current_alignment,
+            &structural_options,
+            false,
+            plan_cache,
+        );
         let mut separate_bits = pending_plan.bits.checked_add(current_plan.bits)?;
         // Two fixed plans are emitted as one fixed run elsewhere, so compare a
         // rebuilt dynamic block with that exact ten-bit-cheaper floor.
@@ -1256,8 +1329,13 @@ fn greedy_huffman_blocklist(
                 .is_some_and(|plain| plain <= MAX_MERGED_PLAIN);
         if can_merge {
             if let Some(merged) = try_merge_parsed_blocks(pending_block, current) {
-                let merged_plan =
-                    plan_block_with_floor(&merged, alignment, &structural_options, false);
+                let merged_plan = plan_block_with_floor_cached(
+                    &merged,
+                    alignment,
+                    &structural_options,
+                    false,
+                    plan_cache,
+                );
                 if merged_plan.bits < separate_bits {
                     let mut merged = merged;
                     // Carry a strict intermediate token winner into the next
@@ -1296,8 +1374,14 @@ pub(crate) fn plan_columbo_floor_seeded_bounded_grouping(
 ) -> Option<Vec<PlannedBlock>> {
     let prepared = prepare_blocks(blocks);
     let blocks = prepared.as_deref().unwrap_or(blocks);
-    let grouped = bounded_huffman_grouping(blocks, options, BoundedRangePricing::Parallel)?;
-    let plans = direct_structural_plan(&grouped, start_alignment, options)?;
+    let mut plan_cache = CanonicalPlanCache::new();
+    let grouped = bounded_huffman_grouping(
+        blocks,
+        options,
+        BoundedRangePricing::Parallel,
+        &mut plan_cache,
+    )?;
+    let plans = direct_structural_plan(&grouped, start_alignment, options, &mut plan_cache)?;
     Some(finish_plan(plans, options))
 }
 
@@ -1319,6 +1403,7 @@ fn bounded_huffman_grouping(
     blocks: &[ParsedBlock],
     options: &Options,
     pricing: BoundedRangePricing,
+    plan_cache: &mut CanonicalPlanCache,
 ) -> Option<Vec<ParsedBlock>> {
     if blocks.len() < 2
         || blocks.len() > MAX_GREEDY_SOURCE_BLOCKS
@@ -1337,7 +1422,7 @@ fn bounded_huffman_grouping(
     let mut source_plans = Vec::new();
     source_plans.try_reserve_exact(blocks.len()).ok()?;
     for block in blocks {
-        let plan = plan_block_with_floor(block, 0, &structural_options, false);
+        let plan = plan_block_with_floor_cached(block, 0, &structural_options, false, plan_cache);
         if matches!(plan.representation, Representation::Stored) {
             return None;
         }
@@ -1392,7 +1477,12 @@ fn bounded_huffman_grouping(
                     return None;
                 }
             }
-            let plan = plan_block_with_short_family_floor(&winner, 0, &structural_options);
+            let plan = plan_block_with_short_family_floor_cached(
+                &winner,
+                0,
+                &structural_options,
+                plan_cache,
+            );
             let predicted = range_bits[start][end - start]?;
             // The frequency score prices a concrete paired-tree candidate.
             // If materializing that token spelling failed under memory
@@ -1753,7 +1843,8 @@ pub(crate) fn fragmented_collect_seed(
     {
         return None;
     }
-    direct_structural_plan(&collected, start_alignment, options)
+    let mut plan_cache = CanonicalPlanCache::new();
+    direct_structural_plan(&collected, start_alignment, options, &mut plan_cache)
 }
 
 // One owned merged block is large but short-lived. Keeping it inline avoids an
@@ -1781,6 +1872,7 @@ fn sequential_plan<F>(
     start_alignment: u8,
     options: &Options,
     merge_search: AdjacentMergeSearch,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
     progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
@@ -1793,17 +1885,20 @@ where
         options,
         merge_search,
         SourceBlockSearch::Full,
+        plan_cache,
         expired,
         progress,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sequential_plan_with_source_search<F>(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     merge_search: AdjacentMergeSearch,
     source_search: SourceBlockSearch,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
     progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
@@ -1828,7 +1923,14 @@ where
         }
         let pending_plans = match pending_cache.take() {
             Some((cached_alignment, plans)) if cached_alignment == alignment => plans,
-            _ => plan_source_with_search(pending_block, alignment, options, source_search, expired),
+            _ => plan_source_with_search(
+                pending_block,
+                alignment,
+                options,
+                source_search,
+                plan_cache,
+                expired,
+            ),
         };
         let pending_bits = total_bits(&pending_plans);
         let current_alignment = ((u64::from(alignment) + pending_bits) & 7) as u8;
@@ -1836,8 +1938,14 @@ where
             progress.item(index + 2, current.tokens.len());
             progress.activity("Columbo token and split search");
         }
-        let current_plans =
-            plan_source_with_search(current, current_alignment, options, source_search, expired);
+        let current_plans = plan_source_with_search(
+            current,
+            current_alignment,
+            options,
+            source_search,
+            plan_cache,
+            expired,
+        );
         let separate_bits = pending_bits + total_bits(&current_plans);
 
         let shared_tree = blocks_share_dynamic_tree(pending_block, current);
@@ -1884,8 +1992,14 @@ where
                 progress.item(index + 2, merged_block.tokens.len());
                 progress.activity("Testing adjacent block merge");
             }
-            let candidate =
-                plan_source_with_search(merged_block, alignment, options, source_search, expired);
+            let candidate = plan_source_with_search(
+                merged_block,
+                alignment,
+                options,
+                source_search,
+                plan_cache,
+                expired,
+            );
             if total_bits(&candidate) < separate_bits
                 && merged_winner
                     .as_ref()
@@ -1952,6 +2066,7 @@ where
             alignment,
             options,
             source_search,
+            plan_cache,
             expired,
         ),
     };
@@ -1964,13 +2079,16 @@ fn plan_source_with_search<F>(
     alignment: u8,
     options: &Options,
     search: SourceBlockSearch,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
 ) -> Vec<PlannedBlock>
 where
     F: FnMut() -> bool,
 {
     match search {
-        SourceBlockSearch::Full => plan_source_with_splits(block, alignment, options, expired),
+        SourceBlockSearch::Full => {
+            plan_source_with_splits(block, alignment, options, plan_cache, expired)
+        }
         SourceBlockSearch::Narrow {
             allow_individual_prune,
         } => {
@@ -1999,9 +2117,13 @@ where
             // complete candidate with the ordinary table selector instead of
             // starting another extended floor on every remaining block.
             let plan = if expired() {
-                plan_block(block, alignment, options, || true)
+                lookup_block_cached(block, alignment, options, plan_cache)
+                    .unwrap_or_else(|| plan_block(block, alignment, options, || true))
             } else {
-                plan_block_with_floor(block, alignment, options, true)
+                let mut floor_options = options.clone();
+                floor_options.exhaustive = false;
+                let base = plan_block_cached(block, alignment, &floor_options, plan_cache);
+                improve_plan_with_floor(block, alignment, &floor_options, true, base)
             };
             vec![plan]
         }
@@ -2090,6 +2212,7 @@ fn plan_source_with_splits<F>(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
 ) -> Vec<PlannedBlock>
 where
@@ -2099,15 +2222,27 @@ where
         || block.plain.len() < 128
         || (!options.exhaustive && block.plain.len() < 32_768)
     {
-        return vec![plan_block_with_search(block, alignment, options, expired)];
+        let plan = match lookup_block_cached(block, alignment, options, plan_cache) {
+            Some(base) => {
+                plan_block_with_complete_base_search(block, alignment, options, base, expired)
+            }
+            None => plan_block_with_search(block, alignment, options, expired),
+        };
+        return vec![plan];
     }
 
     let base = if options.exhaustive {
-        plan_block(block, alignment, options, &mut *expired)
+        lookup_block_cached(block, alignment, options, plan_cache)
+            .unwrap_or_else(|| plan_block(block, alignment, options, &mut *expired))
     } else {
         // Default mode retains its established whole-block token search before
         // the seven inexpensive eighth probes.
-        plan_block_with_search(block, alignment, options, expired)
+        match lookup_block_cached(block, alignment, options, plan_cache) {
+            Some(base) => {
+                plan_block_with_complete_base_search(block, alignment, options, base, expired)
+            }
+            None => plan_block_with_search(block, alignment, options, expired),
+        }
     };
     let complete_base = options
         .exhaustive
@@ -2165,9 +2300,14 @@ where
             break;
         }
         let boundaries = [start, split, end];
-        let Some(candidate) =
-            plan_structural_ranges(&composite, &boundaries, alignment, options, expired)
-        else {
+        let Some(candidate) = plan_structural_ranges(
+            &composite,
+            &boundaries,
+            alignment,
+            options,
+            plan_cache,
+            expired,
+        ) else {
             continue;
         };
         let candidate_bits = total_bits(&candidate);
@@ -2214,6 +2354,7 @@ where
                         &boundaries,
                         alignment,
                         options,
+                        plan_cache,
                         expired,
                     );
                     if let Some(candidate) = candidate {
@@ -2261,9 +2402,14 @@ where
                 } else {
                     [start, outer, inner, end]
                 };
-                let Some(candidate) =
-                    plan_structural_ranges(&composite, &boundaries, alignment, options, expired)
-                else {
+                let Some(candidate) = plan_structural_ranges(
+                    &composite,
+                    &boundaries,
+                    alignment,
+                    options,
+                    plan_cache,
+                    expired,
+                ) else {
                     return best;
                 };
                 let candidate_bits = total_bits(&candidate);
@@ -2334,6 +2480,7 @@ fn plan_structural_ranges<F>(
     boundaries: &[Cut],
     mut alignment: u8,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
 ) -> Option<Vec<PlannedBlock>>
 where
@@ -2348,7 +2495,8 @@ where
             return None;
         }
         let range = make_range(composite, pair[0], pair[1])?;
-        let plan = plan_block(&range, alignment, options, &mut *expired);
+        let plan = lookup_block_cached(&range, alignment, options, plan_cache)
+            .unwrap_or_else(|| plan_block(&range, alignment, options, &mut *expired));
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
         plans.push(plan);
     }
@@ -3030,6 +3178,7 @@ fn boundary_dp<F>(
     start_alignment: u8,
     options: &Options,
     allow_regroup: bool,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
     progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>>
@@ -3079,8 +3228,15 @@ where
             if expired() {
                 return None;
             }
-            let Some(edge) = prepare_edge(blocks, composite, start, end, options, &mut *expired)
-            else {
+            let Some(edge) = prepare_edge(
+                blocks,
+                composite,
+                start,
+                end,
+                options,
+                plan_cache,
+                &mut *expired,
+            ) else {
                 continue;
             };
 
@@ -3289,6 +3445,7 @@ fn prepare_edge<F>(
     start: Cut,
     end: Cut,
     options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
     expired: &mut F,
 ) -> Option<PreparedEdge>
 where
@@ -3300,7 +3457,9 @@ where
     // memory proportional to cuts × alignments rather than to the input.
     if let Some(source_index) = exact_source(composite, start, end) {
         let block = &blocks[source_index];
-        let reusable = plan_reusable_block(block, options, expired);
+        let reusable = plan_cache
+            .lookup_reusable(block, options)
+            .unwrap_or_else(|| plan_reusable_block(block, options, expired));
         return Some(PreparedEdge {
             plain_len: block.plain.len(),
             source_type: block.source_type,
@@ -3313,7 +3472,9 @@ where
     let range = make_range(composite, start, end)?;
     // Keep ordinary fixed/dynamic pricing ahead of the optional shared-table
     // probe, preserving the established deadline priority.
-    let reusable = plan_reusable_block(&range, options, &mut *expired);
+    let reusable = plan_cache
+        .lookup_reusable(&range, options)
+        .unwrap_or_else(|| plan_reusable_block(&range, options, &mut *expired));
     let source_range = overlapping_source_range(composite, start, end);
     let source_spans = &composite.sources[source_range.clone()];
     let whole_sources = source_spans.first().is_some_and(|first| {
@@ -3925,18 +4086,26 @@ mod tests {
             exhaustive: true,
             ..Options::default()
         };
-        let floor = plan_block_with_floor(&block, 3, &options, true);
-        let short = plan_block_with_short_family_floor(&block, 3, &options);
+        let mut expected_cache = CanonicalPlanCache::new();
+        let floor = plan_block_with_floor_cached(&block, 3, &options, true, &mut expected_cache);
+        let short =
+            plan_block_with_short_family_floor_cached(&block, 3, &options, &mut expected_cache);
         let expected = if short.bits < floor.bits {
             short
         } else {
             floor
         };
 
-        let actual = mandatory_token_floor_plan(std::slice::from_ref(&block), 3, &options)
-            .expect("one valid block always has a complete floor")
-            .pop()
-            .expect("one source block produces one plan");
+        let mut actual_cache = CanonicalPlanCache::new();
+        let actual = mandatory_token_floor_plan(
+            std::slice::from_ref(&block),
+            3,
+            &options,
+            &mut actual_cache,
+        )
+        .expect("one valid block always has a complete floor")
+        .pop()
+        .expect("one source block produces one plan");
         assert_same_plan(&actual, &expected);
     }
 
@@ -3993,7 +4162,8 @@ mod tests {
             literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
         ];
         let options = Options::default();
-        let plans = source_aligned_huffman_floor(&blocks, 0, &options).unwrap();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let plans = source_aligned_huffman_floor(&blocks, 0, &options, &mut plan_cache).unwrap();
 
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].plain.len(), 2_400);
@@ -4018,6 +4188,65 @@ mod tests {
         .unwrap();
         assert_eq!(deadline_safe.len(), 1);
         assert_eq!(deadline_safe[0].plain.len(), 2_400);
+    }
+
+    #[test]
+    fn canonical_cache_reuses_source_intervals_across_routes() {
+        let blocks = [
+            literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
+            literal_block(&vec![b'b'; 800], SourceBlockType::Dynamic),
+            literal_block(&vec![b'c'; 800], SourceBlockType::Dynamic),
+        ];
+        let options = Options::default();
+        let mut plan_cache = CanonicalPlanCache::new();
+
+        source_aligned_huffman_floor(&blocks, 0, &options, &mut plan_cache).unwrap();
+        let after_source_aligned = plan_cache.stats();
+        let mandatory = mandatory_token_floor_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
+        let after_mandatory = plan_cache.stats();
+
+        assert_eq!(
+            after_mandatory.hits - after_source_aligned.hits,
+            blocks.len()
+        );
+        assert_eq!(after_mandatory.inserts, after_source_aligned.inserts);
+        let decoded: Vec<_> = mandatory
+            .iter()
+            .flat_map(|plan| plan.plain.iter().copied())
+            .collect();
+        assert_eq!(
+            decoded,
+            blocks
+                .iter()
+                .flat_map(|block| block.plain.iter().copied())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn floor_search_caches_only_the_bounded_header_policy() {
+        let block = literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic);
+        let exhaustive = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        let mut plan_cache = CanonicalPlanCache::new();
+        let plans = plan_source_with_search(
+            &block,
+            0,
+            &exhaustive,
+            SourceBlockSearch::Floor,
+            &mut plan_cache,
+            &mut || false,
+        );
+        assert_eq!(plans.len(), 1);
+
+        let bounded = Options::default();
+        let before = plan_cache.stats();
+        assert!(lookup_block_cached(&block, 0, &bounded, &mut plan_cache).is_some());
+        let after = plan_cache.stats();
+        assert_eq!(after.hits, before.hits + 1);
+        assert_eq!(after.inserts, before.inserts);
     }
 
     #[test]
@@ -4068,10 +4297,22 @@ mod tests {
             })
             .collect();
         let options = Options::default();
-        let serial =
-            bounded_huffman_grouping(&blocks, &options, BoundedRangePricing::Serial).unwrap();
-        let parallel =
-            bounded_huffman_grouping(&blocks, &options, BoundedRangePricing::Parallel).unwrap();
+        let mut serial_cache = CanonicalPlanCache::new();
+        let serial = bounded_huffman_grouping(
+            &blocks,
+            &options,
+            BoundedRangePricing::Serial,
+            &mut serial_cache,
+        )
+        .unwrap();
+        let mut parallel_cache = CanonicalPlanCache::new();
+        let parallel = bounded_huffman_grouping(
+            &blocks,
+            &options,
+            BoundedRangePricing::Parallel,
+            &mut parallel_cache,
+        )
+        .unwrap();
 
         // The same-distance floor can make each synthetic source block as
         // cheap as its grouped form. This test requires identical serial and
@@ -4087,7 +4328,7 @@ mod tests {
         }
 
         let serial_plans = finish_plan(
-            direct_structural_plan(&serial, 0, &options).unwrap(),
+            direct_structural_plan(&serial, 0, &options, &mut serial_cache).unwrap(),
             &options,
         );
         let parallel_plans =
@@ -4156,7 +4397,9 @@ mod tests {
         let blocks: Vec<_> = (0..4)
             .map(|_| literal_block(&vec![b'a'; 512], SourceBlockType::Dynamic))
             .collect();
-        let mandatory = mandatory_token_floor_plan(&blocks, 0, &Options::default()).unwrap();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let mandatory =
+            mandatory_token_floor_plan(&blocks, 0, &Options::default(), &mut plan_cache).unwrap();
         let plans = plan_fragmented_replay(&blocks, 0, &Options::default()).unwrap();
 
         assert_eq!(plans.len(), 1);
@@ -4185,7 +4428,9 @@ mod tests {
 
         assert_eq!(ordinary.len(), 2);
         assert_eq!(exhaustive.len(), 1);
-        let plans = direct_structural_plan(&exhaustive, 0, &Options::default()).unwrap();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let plans =
+            direct_structural_plan(&exhaustive, 0, &Options::default(), &mut plan_cache).unwrap();
         assert_eq!(plans.len(), 1);
     }
 
@@ -4224,11 +4469,13 @@ mod tests {
         assert!(is_fixed_plan(&separate_left));
         assert!(is_fixed_plan(&separate_right));
 
+        let mut plan_cache = CanonicalPlanCache::new();
         let plans = sequential_plan(
             &blocks,
             0,
             &options,
             AdjacentMergeSearch::Local,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4300,11 +4547,13 @@ mod tests {
             })
             .collect();
 
+        let mut plan_cache = CanonicalPlanCache::new();
         let adjacent = sequential_plan(
             &blocks,
             0,
             &options,
             AdjacentMergeSearch::LongRun,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4318,6 +4567,7 @@ mod tests {
             0,
             &options,
             AdjacentMergeSearch::Disabled,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4335,11 +4585,13 @@ mod tests {
             literal_block(&vec![b'a'; 1_000], SourceBlockType::Dynamic),
             literal_block(&vec![b'a'; 1_000], SourceBlockType::Dynamic),
         ];
+        let mut plan_cache = CanonicalPlanCache::new();
         let separate = sequential_plan(
             &blocks,
             0,
             &options,
             AdjacentMergeSearch::Disabled,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4349,6 +4601,7 @@ mod tests {
             0,
             &options,
             AdjacentMergeSearch::LongRun,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4370,7 +4623,8 @@ mod tests {
             literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
             literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
         ];
-        let fallback = direct_structural_plan(&blocks, 0, &options).unwrap();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
         let route = plan_source_no_split_route(&blocks, 0, &options, true, &mut || false)
             .expect("the direct route retains a complete fallback");
 
@@ -4389,7 +4643,8 @@ mod tests {
             literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
             literal_block(&vec![b'a'; 800], SourceBlockType::Dynamic),
         ];
-        let fallback = direct_structural_plan(&blocks, 0, &options).unwrap();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
         let merged = plan_terminal_merge_route(&blocks, 0, &options, &mut || false)
             .expect("equal neighbours have a profitable deterministic merge");
 
@@ -4407,11 +4662,13 @@ mod tests {
             literal_block(&vec![b'a'; 1_000], SourceBlockType::Stored),
             literal_block(&vec![b'a'; 1_000], SourceBlockType::Stored),
         ];
+        let mut plan_cache = CanonicalPlanCache::new();
         let separate = sequential_plan(
             &blocks,
             0,
             &options,
             AdjacentMergeSearch::Disabled,
+            &mut plan_cache,
             &mut || false,
             None,
         )
@@ -4421,6 +4678,7 @@ mod tests {
             0,
             &options,
             AdjacentMergeSearch::LongRun,
+            &mut plan_cache,
             &mut || false,
             None,
         )

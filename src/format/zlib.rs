@@ -220,7 +220,7 @@ mod tests {
             &Options::default(),
             1024,
             true,
-            DefaultFloor::Bounded,
+            DefaultFloor::Shared,
         )
         .unwrap();
         assert_eq!(result.data, input);

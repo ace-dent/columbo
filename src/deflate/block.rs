@@ -2,6 +2,10 @@
 
 //! Planning and emission for one structural Deflate block.
 
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
+
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
@@ -13,6 +17,16 @@ use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
     CODE_LENGTH_ORDER,
 };
+
+/// Route-local ceiling for completed canonical Huffman kernels.
+///
+/// Token vectors are reference-counted rather than copied, but retaining a
+/// transformed route solely as a cache key can otherwise extend its lifetime
+/// indefinitely. Both limits are conservative charges: repeated `Arc`s count
+/// their full token bytes again, keeping peak memory bounded without a second
+/// allocation-identity table.
+const MAX_CANONICAL_PLAN_CACHE_ENTRIES: usize = 512;
+const MAX_CANONICAL_PLAN_CACHE_TOKEN_BYTES: usize = 16 * 1024 * 1024;
 
 /// Return original block bits that remain safe at the requested alignment.
 ///
@@ -75,18 +89,26 @@ pub(crate) fn plan_owned_block(
     }
 }
 
-/// Best fixed, dynamic, or non-stored source representation for one token set.
+/// Best generated fixed or dynamic representation for one token set.
 ///
 /// Huffman payload and header costs do not depend on the block's starting bit
 /// alignment. Stream boundary search can therefore build this comparatively
 /// expensive part once, then compare it with the eight cheap stored-padding
-/// possibilities.
+/// and exact-source possibilities. Exact source ranges deliberately remain
+/// outside this kernel because they refer to one particular compressed input.
 pub(crate) struct ReusableBlockPlan {
     representation: Representation,
     bits: u64,
 }
 
 impl ReusableBlockPlan {
+    fn try_clone(&self) -> Option<Self> {
+        Some(Self {
+            representation: self.representation.try_clone()?,
+            bits: self.bits,
+        })
+    }
+
     /// Return the cheapest aligned bit count without cloning the representation.
     pub(crate) fn bits_at_alignment(
         &self,
@@ -166,7 +188,7 @@ pub(crate) fn plan_reusable_block(
         expired,
     );
 
-    let (mut representation, mut bits) = if dynamic
+    let (representation, bits) = if dynamic
         .as_ref()
         .map_or(true, |candidate| fixed_bits <= candidate.bits)
     {
@@ -177,23 +199,269 @@ pub(crate) fn plan_reusable_block(
         (Representation::Dynamic(dynamic), bits)
     };
 
-    // Exact fixed and dynamic source bits are alignment-independent and retain
-    // the original selector's final tie priority.
-    if let Some(original) = block
-        .original
-        .filter(|original| original.block_type != SourceBlockType::Stored)
-        .and_then(|_| reusable_original_bits(block, 0, options.strict))
-    {
-        if original.len <= bits {
-            representation = Representation::Original(original);
-            bits = original.len;
-        }
-    }
-
     ReusableBlockPlan {
         representation,
         bits,
     }
+}
+
+/// Observability for the route-local canonical plan cache.
+///
+/// These counters are intentionally internal. They let route tests and future
+/// verbose reporting distinguish genuine sharing from a cache that merely
+/// preserves output while never finding an identical state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CanonicalPlanCacheStats {
+    pub(crate) lookups: usize,
+    pub(crate) hits: usize,
+    pub(crate) misses: usize,
+    pub(crate) inserts: usize,
+    pub(crate) collision_checks: usize,
+    pub(crate) saturated: usize,
+    pub(crate) retained_token_bytes: usize,
+}
+
+struct CachedReusablePlan {
+    fingerprint: u64,
+    next_same_hash: Option<usize>,
+    tokens: Arc<Vec<Token>>,
+    literal_frequencies: [u32; 286],
+    distance_frequencies: [u32; 30],
+    original_dynamic: Option<DynamicPlan>,
+    strict: bool,
+    exhaustive: bool,
+    plan: ReusableBlockPlan,
+}
+
+/// Completed canonical fixed/dynamic/header work shared by one planning run.
+///
+/// Hashes only select a short collision chain. Every hit verifies the complete
+/// token spelling, frequencies, source-tree seed and planning policy before a
+/// cached kernel is reused. Deadline-sensitive callers may look up an earlier
+/// completed entry, but only the explicit complete-planning API inserts.
+pub(crate) struct CanonicalPlanCache {
+    first_by_hash: HashMap<u64, usize>,
+    entries: Vec<CachedReusablePlan>,
+    stats: CanonicalPlanCacheStats,
+    max_entries: usize,
+    max_token_bytes: usize,
+}
+
+impl Default for CanonicalPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CanonicalPlanCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            first_by_hash: HashMap::new(),
+            entries: Vec::new(),
+            stats: CanonicalPlanCacheStats::default(),
+            max_entries: MAX_CANONICAL_PLAN_CACHE_ENTRIES,
+            max_token_bytes: MAX_CANONICAL_PLAN_CACHE_TOKEN_BYTES,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(max_entries: usize, max_token_bytes: usize) -> Self {
+        Self {
+            max_entries,
+            max_token_bytes,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> CanonicalPlanCacheStats {
+        self.stats
+    }
+
+    /// Return an exactly matching completed kernel without starting new work.
+    pub(crate) fn lookup_reusable(
+        &mut self,
+        block: &ParsedBlock,
+        options: &Options,
+    ) -> Option<ReusableBlockPlan> {
+        let fingerprint = canonical_plan_fingerprint(block, options);
+        self.lookup_reusable_with_fingerprint(block, options, fingerprint)
+    }
+
+    fn lookup_reusable_with_fingerprint(
+        &mut self,
+        block: &ParsedBlock,
+        options: &Options,
+        fingerprint: u64,
+    ) -> Option<ReusableBlockPlan> {
+        self.stats.lookups = self.stats.lookups.saturating_add(1);
+        let mut candidate = self.first_by_hash.get(&fingerprint).copied();
+        while let Some(index) = candidate {
+            self.stats.collision_checks = self.stats.collision_checks.saturating_add(1);
+            let entry = self.entries.get(index)?;
+            let next = entry.next_same_hash;
+            let matches = entry.fingerprint == fingerprint
+                && entry.strict == options.strict
+                && entry.exhaustive == options.exhaustive
+                && entry.literal_frequencies == block.literal_frequencies
+                && entry.distance_frequencies == block.distance_frequencies
+                && entry.original_dynamic.as_ref() == block.original_dynamic.as_ref()
+                && (Arc::ptr_eq(&entry.tokens, &block.tokens)
+                    || entry.tokens.as_slice() == block.tokens.as_slice());
+            if matches {
+                if let Some(plan) = entry.plan.try_clone() {
+                    self.stats.hits = self.stats.hits.saturating_add(1);
+                    return Some(plan);
+                }
+                break;
+            }
+            candidate = next;
+        }
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        None
+    }
+
+    /// Complete deterministic planning and retain its reusable kernel.
+    pub(crate) fn plan_reusable_complete(
+        &mut self,
+        block: &ParsedBlock,
+        options: &Options,
+    ) -> ReusableBlockPlan {
+        let fingerprint = canonical_plan_fingerprint(block, options);
+        if let Some(plan) = self.lookup_reusable_with_fingerprint(block, options, fingerprint) {
+            return plan;
+        }
+        let plan = plan_reusable_block(block, options, || false);
+        self.insert(block, options, fingerprint, &plan);
+        plan
+    }
+
+    fn insert(
+        &mut self,
+        block: &ParsedBlock,
+        options: &Options,
+        fingerprint: u64,
+        plan: &ReusableBlockPlan,
+    ) {
+        let Some(token_bytes) = block
+            .tokens
+            .capacity()
+            .checked_mul(std::mem::size_of::<Token>())
+        else {
+            self.stats.saturated = self.stats.saturated.saturating_add(1);
+            return;
+        };
+        let Some(retained_token_bytes) = self.stats.retained_token_bytes.checked_add(token_bytes)
+        else {
+            self.stats.saturated = self.stats.saturated.saturating_add(1);
+            return;
+        };
+        if self.entries.len() >= self.max_entries || retained_token_bytes > self.max_token_bytes {
+            self.stats.saturated = self.stats.saturated.saturating_add(1);
+            return;
+        }
+
+        let original_dynamic = match block.original_dynamic.as_ref() {
+            Some(dynamic) => match dynamic.try_clone() {
+                Some(dynamic) => Some(dynamic),
+                None => return,
+            },
+            None => None,
+        };
+        let Some(cached_plan) = plan.try_clone() else {
+            return;
+        };
+        if self.entries.try_reserve(1).is_err() || self.first_by_hash.try_reserve(1).is_err() {
+            return;
+        }
+
+        let next_same_hash = self.first_by_hash.get(&fingerprint).copied();
+        let index = self.entries.len();
+        self.entries.push(CachedReusablePlan {
+            fingerprint,
+            next_same_hash,
+            tokens: Arc::clone(&block.tokens),
+            literal_frequencies: block.literal_frequencies,
+            distance_frequencies: block.distance_frequencies,
+            original_dynamic,
+            strict: options.strict,
+            exhaustive: options.exhaustive,
+            plan: cached_plan,
+        });
+        self.first_by_hash.insert(fingerprint, index);
+        self.stats.inserts = self.stats.inserts.saturating_add(1);
+        self.stats.retained_token_bytes = retained_token_bytes;
+    }
+}
+
+fn canonical_plan_fingerprint(block: &ParsedBlock, options: &Options) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    block.tokens.len().hash(&mut hasher);
+    for token in block.tokens.iter() {
+        token.hash(&mut hasher);
+    }
+    block.literal_frequencies.hash(&mut hasher);
+    block.distance_frequencies.hash(&mut hasher);
+    hash_dynamic_plan(block.original_dynamic.as_ref(), &mut hasher);
+    options.strict.hash(&mut hasher);
+    options.exhaustive.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_dynamic_plan(dynamic: Option<&DynamicPlan>, hasher: &mut impl Hasher) {
+    dynamic.is_some().hash(hasher);
+    let Some(dynamic) = dynamic else {
+        return;
+    };
+    dynamic.literal_lengths.hash(hasher);
+    dynamic.distance_lengths.hash(hasher);
+    dynamic.code_length_lengths.hash(hasher);
+    dynamic.rle.hash(hasher);
+    dynamic.hlit.hash(hasher);
+    dynamic.hdist.hash(hasher);
+    dynamic.hclen.hash(hasher);
+    dynamic.bits.hash(hasher);
+}
+
+/// Plan one block through a completed route-local canonical kernel.
+pub(crate) fn plan_block_cached(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    cache: &mut CanonicalPlanCache,
+) -> PlannedBlock {
+    let (representation, bits) = cache.plan_reusable_complete(block, options).into_alignment(
+        block,
+        alignment,
+        options.strict,
+    );
+    PlannedBlock {
+        tokens: Arc::clone(&block.tokens),
+        plain: Arc::clone(&block.plain),
+        representation,
+        bits,
+        source_type: block.source_type,
+    }
+}
+
+/// Instantiate a cached kernel if a prior deterministic route completed it.
+pub(crate) fn lookup_block_cached(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    cache: &mut CanonicalPlanCache,
+) -> Option<PlannedBlock> {
+    let (representation, bits) =
+        cache
+            .lookup_reusable(block, options)?
+            .into_alignment(block, alignment, options.strict);
+    Some(PlannedBlock {
+        tokens: Arc::clone(&block.tokens),
+        plain: Arc::clone(&block.plain),
+        representation,
+        bits,
+        source_type: block.source_type,
+    })
 }
 
 fn plan_representation(
@@ -389,6 +657,42 @@ fn emit_symbol(writer: &mut BitWriter, tree: &Huffman, symbol: usize) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deflate::model::count_frequencies;
+
+    fn literal_block(bytes: &[u8]) -> ParsedBlock {
+        let tokens: Vec<_> = bytes.iter().copied().map(Token::Literal).collect();
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: Arc::new(tokens),
+            plain: Arc::new(bytes.to_vec()),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    }
+
+    fn assert_same_plan(left: &PlannedBlock, right: &PlannedBlock) {
+        assert_eq!(left.bits, right.bits);
+        assert_eq!(left.tokens, right.tokens);
+        assert_eq!(left.plain, right.plain);
+        assert_eq!(left.source_type, right.source_type);
+        match (&left.representation, &right.representation) {
+            (Representation::Original(left), Representation::Original(right)) => {
+                assert_eq!(left, right);
+            }
+            (Representation::Stored, Representation::Stored)
+            | (Representation::Fixed, Representation::Fixed) => {}
+            (Representation::Dynamic(left), Representation::Dynamic(right)) => {
+                assert_eq!(left, right);
+            }
+            pair => panic!("different representations: {pair:?}"),
+        }
+    }
 
     fn block_with_original(
         block_type: SourceBlockType,
@@ -499,6 +803,169 @@ mod tests {
         );
         assert!(matches!(seven_padding, Representation::Fixed));
         assert_eq!(seven_padding_bits, 244);
+    }
+
+    #[test]
+    fn canonical_cache_hits_for_equal_tokens_with_distinct_arcs() {
+        let first = literal_block(b"canonical interval");
+        let mut second = first.try_clone_shared().unwrap();
+        second.tokens = Arc::new(first.tokens.as_ref().clone());
+        second.plain = Arc::new(first.plain.as_ref().clone());
+        assert!(!Arc::ptr_eq(&first.tokens, &second.tokens));
+
+        let options = Options::default();
+        let mut cache = CanonicalPlanCache::new();
+        let expected = plan_block(&first, 3, &options, || false);
+        let first_cached = plan_block_cached(&first, 3, &options, &mut cache);
+        let second_cached = plan_block_cached(&second, 3, &options, &mut cache);
+
+        assert_same_plan(&first_cached, &expected);
+        assert_same_plan(&second_cached, &expected);
+        assert_eq!(
+            cache.stats(),
+            CanonicalPlanCacheStats {
+                lookups: 2,
+                hits: 1,
+                misses: 1,
+                inserts: 1,
+                collision_checks: 1,
+                saturated: 0,
+                retained_token_bytes: first.tokens.capacity() * std::mem::size_of::<Token>(),
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_cache_verifies_exact_state_after_a_hash_collision() {
+        let first = literal_block(b"first collision state");
+        let second = literal_block(b"second collision state");
+        let options = Options::default();
+        let mut cache = CanonicalPlanCache::new();
+        cache.plan_reusable_complete(&first, &options);
+
+        // Force the first entry into the second state's bucket. Production
+        // hashes are only accelerators, so an exact-state mismatch must still
+        // miss and append a separate entry to the collision chain.
+        let collision = canonical_plan_fingerprint(&second, &options);
+        cache.entries[0].fingerprint = collision;
+        cache.first_by_hash.clear();
+        cache.first_by_hash.insert(collision, 0);
+
+        let expected = plan_block(&second, 5, &options, || false);
+        let actual = plan_block_cached(&second, 5, &options, &mut cache);
+        assert_same_plan(&actual, &expected);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[1].next_same_hash, Some(0));
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.inserts, 2);
+        assert_eq!(stats.collision_checks, 1);
+    }
+
+    #[test]
+    fn canonical_cache_isolates_policy_and_source_tree_seed() {
+        let block = literal_block(b"policy");
+        let relaxed = Options {
+            strict: false,
+            ..Options::default()
+        };
+        let exhaustive = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+
+        let mut cache = CanonicalPlanCache::new();
+        cache.plan_reusable_complete(&block, &Options::default());
+        cache.plan_reusable_complete(&block, &relaxed);
+        cache.plan_reusable_complete(&block, &exhaustive);
+
+        let mut seeded = block.try_clone_shared().unwrap();
+        seeded.original_dynamic =
+            block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1, 1])).original_dynamic;
+        cache.plan_reusable_complete(&seeded, &Options::default());
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 4);
+        assert_eq!(stats.inserts, 4);
+    }
+
+    #[test]
+    fn cached_kernel_layers_current_original_and_alignment() {
+        let mut first = literal_block(b"same generated payload");
+        first.source_type = SourceBlockType::Fixed;
+        first.original = Some(OriginalBits {
+            start: 11,
+            len: 1,
+            alignment: 0,
+            block_type: SourceBlockType::Fixed,
+        });
+        let mut second = first.try_clone_shared().unwrap();
+        second.source_type = SourceBlockType::Dynamic;
+        second.original = Some(OriginalBits {
+            start: 97,
+            len: 2,
+            alignment: 7,
+            block_type: SourceBlockType::Fixed,
+        });
+
+        let options = Options {
+            strict: false,
+            ..Options::default()
+        };
+        let mut cache = CanonicalPlanCache::new();
+        let first_plan = plan_block_cached(&first, 0, &options, &mut cache);
+        let second_plan = plan_block_cached(&second, 5, &options, &mut cache);
+        assert!(matches!(
+            first_plan.representation,
+            Representation::Original(OriginalBits { start: 11, .. })
+        ));
+        assert!(matches!(
+            second_plan.representation,
+            Representation::Original(OriginalBits { start: 97, .. })
+        ));
+        assert_eq!(second_plan.source_type, SourceBlockType::Dynamic);
+        assert_eq!(cache.stats().hits, 1);
+
+        let mut stored = second;
+        stored.source_type = SourceBlockType::Stored;
+        stored.original = Some(OriginalBits {
+            start: 123,
+            len: 1,
+            alignment: 3,
+            block_type: SourceBlockType::Stored,
+        });
+        let aligned = plan_block_cached(&stored, 3, &options, &mut cache);
+        let unaligned = plan_block_cached(&stored, 2, &options, &mut cache);
+        assert!(matches!(
+            aligned.representation,
+            Representation::Original(_)
+        ));
+        assert!(!matches!(
+            unaligned.representation,
+            Representation::Original(_)
+        ));
+    }
+
+    #[test]
+    fn cache_saturation_recomputes_without_changing_the_plan() {
+        let block = literal_block(b"not retained");
+        let options = Options::default();
+        let mut cache = CanonicalPlanCache::with_limits(1, 0);
+
+        let expected = plan_block(&block, 4, &options, || false);
+        let first = plan_block_cached(&block, 4, &options, &mut cache);
+        let second = plan_block_cached(&block, 4, &options, &mut cache);
+        assert_same_plan(&first, &expected);
+        assert_same_plan(&second, &expected);
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 2);
+        assert_eq!(stats.inserts, 0);
+        assert_eq!(stats.saturated, 2);
+        assert_eq!(stats.retained_token_bytes, 0);
     }
 
     #[test]
