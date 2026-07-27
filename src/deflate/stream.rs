@@ -3,10 +3,12 @@
 //! Stream-level Deflate block planning.
 //!
 //! Deflate block boundaries do not affect the decoded bytes or the 32 KiB
-//! history window. A boundary may therefore be removed or moved to any token
-//! boundary without changing a match. Columbo uses that freedom to reduce the
-//! number of headers and to give locally different data separate Huffman
-//! tables. It never discovers new LZ77 matches here.
+//! history window. A boundary may therefore be removed or moved without
+//! changing the decoded stream. At a token boundary the spelling is unchanged;
+//! inside a proven match, each selected edge emits a canonical fragment at the
+//! original distance (or one or two known literals). Columbo uses that freedom
+//! to reduce the number of headers and to give locally different data separate
+//! Huffman tables. It never discovers new LZ77 matches here.
 //!
 //! Stream-level attribution is intentionally narrow: DeflOpt contributes only
 //! the exact fixed/fixed 10-bit coalescing rule. Columbo contributes arbitrary
@@ -30,8 +32,8 @@ use super::block::{
 use super::deft4j::plan_source_block;
 use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
 use super::model::{
-    count_frequencies, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock,
-    Representation, SourceBlockType, Token,
+    canonical_length_encoding, count_frequencies, token_extra_bits, DynamicPlan, OriginalBits,
+    ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
 };
 use super::search::{
     improve_plan_with_deft4j_tree_floor, improve_plan_with_floor,
@@ -94,6 +96,10 @@ const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
 const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
 const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
 const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
+// Seven decoded-eighth probes can each contribute the legacy snapped boundary
+// and one exact inside-match sibling. Compact max mode adds at most fourteen
+// 32-token anchors, so 32 retains the complete bounded set.
+const MAX_SOURCE_SPLIT_CUTS: usize = 32;
 // A compact whole-block beam can otherwise starve its strongest measured
 // split. Larger streams retain the quality-oriented historical ordering:
 // with sufficient max time, independent whole-block work must not be skipped.
@@ -501,7 +507,7 @@ where
     };
     progress.advance(cuts.len().saturating_sub(1));
     let candidate_bits = total_bits(&candidate);
-    progress.checkpoint("Boundary-DP result", candidate_bits, candidate.len());
+    progress.checkpoint("Boundary result", candidate_bits, candidate.len());
     if candidate_bits < fallback_bits {
         Some(finish_plan(candidate, options))
     } else {
@@ -1149,9 +1155,15 @@ fn plan_compact_source_split_floor_cached(
                 source.token_end,
                 source.plain_start,
                 source.plain_end,
+                true,
             )?;
-            cuts.sort_unstable_by_key(|cut| cut.token);
-            cuts.dedup_by_key(|cut| cut.token);
+            cuts.sort_unstable_by_key(|&cut| {
+                (
+                    usize::from(!composite.cut_is_token_boundary(cut)),
+                    cut.plain,
+                )
+            });
+            cuts.dedup_by_key(|cut| cut.plain);
             for split in cuts {
                 let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
                 let left_plan = plan_block_cached(&left, alignment, options, plan_cache);
@@ -2277,6 +2289,7 @@ where
         source.token_end,
         source.plain_start,
         source.plain_end,
+        true,
     )
     .is_none()
     {
@@ -2289,9 +2302,14 @@ where
             }
         }
     }
-    cuts.sort_unstable_by_key(|cut| cut.token);
-    cuts.dedup_by_key(|cut| cut.token);
-    cuts.truncate(24);
+    cuts.sort_unstable_by_key(|&cut| {
+        (
+            usize::from(!composite.cut_is_token_boundary(cut)),
+            cut.plain,
+        )
+    });
+    cuts.dedup_by_key(|cut| cut.plain);
+    cuts.truncate(MAX_SOURCE_SPLIT_CUTS);
 
     // Whole-block max search includes several match-state beams. On compact
     // blocks it can consume the complete deadline before a useful late split
@@ -2324,7 +2342,7 @@ where
         }
     }
 
-    ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.token));
+    ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.plain, split.token));
 
     // Refine the strongest measured boundary before the whole-block beam. On
     // compact streams the unsplit search can consume nearly the full max
@@ -2428,8 +2446,14 @@ where
             if expired() {
                 return best;
             }
-            if let Some(inner) = midpoint_cut(&composite, child_start, child_end) {
-                let boundaries = if inner.token < outer.token {
+            for inner in midpoint_cuts(&composite, child_start, child_end)
+                .into_iter()
+                .flatten()
+            {
+                if expired() {
+                    return best;
+                }
+                let boundaries = if inner.plain < outer.plain {
                     [start, inner, outer, end]
                 } else {
                     [start, outer, inner, end]
@@ -2446,6 +2470,7 @@ where
                 };
                 let candidate_bits = total_bits(&candidate);
                 if candidate_bits < best_bits {
+                    best_bits = candidate_bits;
                     best = candidate;
                 }
             }
@@ -2507,19 +2532,28 @@ fn adaptive_split_is_worth_replay(candidate_bits: u64, established_bits: u64) ->
         .is_some_and(|required_bits| required_bits <= established_bits)
 }
 
-/// Return the legal token boundary immediately before a decoded midpoint.
-fn midpoint_cut(composite: &Composite, start: Cut, end: Cut) -> Option<Cut> {
-    if end.token <= start.token + 1 || end.plain <= start.plain + 1 {
-        return None;
+/// Return the legacy snapped midpoint and an exact inside-match sibling.
+fn midpoint_cuts(composite: &Composite, start: Cut, end: Cut) -> [Option<Cut>; 2] {
+    if end.plain <= start.plain + 1 {
+        return [None, None];
     }
     let target = start.plain + (end.plain - start.plain) / 2;
-    let insertion = composite.token_plain_offsets[start.token..=end.token]
-        .partition_point(|&offset| offset <= target);
-    let token = start.token + insertion.saturating_sub(1);
-    (token > start.token && token < end.token).then(|| Cut {
-        token,
-        plain: composite.token_plain_offsets[token],
-    })
+    let token = composite
+        .token_plain_offsets
+        .partition_point(|&offset| offset <= target)
+        .saturating_sub(1);
+    let snapped = composite
+        .token_plain_offsets
+        .get(token)
+        .copied()
+        .map(|plain| Cut { token, plain })
+        .filter(|cut| start.plain < cut.plain && cut.plain < end.plain);
+    let exact = composite
+        .cut_at_plain(target)
+        .filter(|&cut| !composite.cut_is_token_boundary(cut))
+        .filter(|cut| Some(*cut) != snapped)
+        .filter(|cut| start.plain < cut.plain && cut.plain < end.plain);
+    [snapped, exact]
 }
 
 /// Directly plan consecutive ranges while carrying their exact bit alignment.
@@ -2656,6 +2690,8 @@ struct Composite<'a> {
     plain: Cow<'a, [u8]>,
     /// Decoded offset at every token boundary, including the final boundary.
     token_plain_offsets: Vec<usize>,
+    /// Top-level and inherited source boundaries in decoded coordinates.
+    source_plain_splits: Vec<usize>,
     // Strided cumulative counts over parsed symbols and payload extra bits.
     frequency_checkpoints: Option<Vec<FrequencyCheckpoint>>,
     sources: Vec<SourceSpan>,
@@ -2682,13 +2718,20 @@ impl<'a> Composite<'a> {
         let source_bytes = blocks
             .len()
             .checked_mul(std::mem::size_of::<SourceSpan>())?;
+        let source_split_count = blocks
+            .iter()
+            .try_fold(blocks.len().saturating_sub(1), |total, block| {
+                total.checked_add(block.source_splits.len())
+            })?;
+        let source_split_bytes = source_split_count.checked_mul(std::mem::size_of::<usize>())?;
         let checkpoint_count = token_count
             .checked_div(RANGE_HISTOGRAM_INTERVAL)?
             .checked_add(1)?;
         let base_optional_bytes = payload_bytes
             .checked_mul(3)?
             .checked_add(offset_bytes)?
-            .checked_add(source_bytes)?;
+            .checked_add(source_bytes)?
+            .checked_add(source_split_bytes)?;
         if base_optional_bytes > MAX_COMPOSITE_MODEL_BYTES {
             return None;
         }
@@ -2716,14 +2759,27 @@ impl<'a> Composite<'a> {
 
         let mut sources = Vec::new();
         sources.try_reserve_exact(blocks.len()).ok()?;
+        let mut source_plain_splits = Vec::new();
+        source_plain_splits
+            .try_reserve_exact(source_split_count)
+            .ok()?;
         let mut token_end = 0_usize;
         let mut plain_end = 0_usize;
 
-        for block in blocks {
+        for (block_index, block) in blocks.iter().enumerate() {
             let token_start = token_end;
             let plain_start = plain_end;
             token_end += block.tokens.len();
             plain_end += block.plain.len();
+            for &split in &block.source_splits {
+                if split == 0 || split >= block.plain.len() {
+                    return None;
+                }
+                source_plain_splits.push(plain_start.checked_add(split)?);
+            }
+            if block_index + 1 < blocks.len() {
+                source_plain_splits.push(plain_end);
+            }
             sources.push(SourceSpan {
                 token_start,
                 token_end,
@@ -2732,6 +2788,8 @@ impl<'a> Composite<'a> {
                 source_type: block.source_type,
             });
         }
+        source_plain_splits.sort_unstable();
+        source_plain_splits.dedup();
 
         let mut token_plain_offsets = Vec::new();
         token_plain_offsets
@@ -2772,6 +2830,7 @@ impl<'a> Composite<'a> {
             tokens,
             plain,
             token_plain_offsets,
+            source_plain_splits,
             frequency_checkpoints,
             sources,
         })
@@ -2820,6 +2879,118 @@ impl<'a> Composite<'a> {
         frequencies.literal[256] = frequencies.literal[256].checked_add(1)?;
         Some(frequencies)
     }
+
+    /// Return a canonical cut at one decoded offset.
+    ///
+    /// Exact token boundaries retain their ordinary next-token index. A
+    /// strictly interior offset is accepted only inside a proven match and
+    /// records that containing token's index. Integer offsets cannot fall
+    /// inside a one-byte literal.
+    fn cut_at_plain(&self, plain: usize) -> Option<Cut> {
+        if plain > self.plain.len() {
+            return None;
+        }
+        match self.token_plain_offsets.binary_search(&plain) {
+            Ok(token) => Some(Cut { token, plain }),
+            Err(next) => {
+                let token = next.checked_sub(1)?;
+                let start = *self.token_plain_offsets.get(token)?;
+                let end = *self.token_plain_offsets.get(token.checked_add(1)?)?;
+                matches!(self.tokens.get(token), Some(Token::Match { .. }))
+                    .then_some(Cut { token, plain })
+                    .filter(|_| start < plain && plain < end)
+            }
+        }
+    }
+
+    fn cut_is_token_boundary(&self, cut: Cut) -> bool {
+        self.token_plain_offsets.get(cut.token).copied() == Some(cut.plain)
+    }
+
+    fn cut_is_valid(&self, cut: Cut) -> bool {
+        if self.cut_is_token_boundary(cut) {
+            return true;
+        }
+        let Some(&start) = self.token_plain_offsets.get(cut.token) else {
+            return false;
+        };
+        let Some(next) = cut.token.checked_add(1) else {
+            return false;
+        };
+        let Some(&end) = self.token_plain_offsets.get(next) else {
+            return false;
+        };
+        start < cut.plain
+            && cut.plain < end
+            && matches!(self.tokens.get(cut.token), Some(Token::Match { .. }))
+    }
+
+    /// Token index immediately after every source token touched by `cut`.
+    fn cut_end_token(&self, cut: Cut) -> Option<usize> {
+        self.cut_is_valid(cut).then_some(())?;
+        if self.cut_is_token_boundary(cut) {
+            Some(cut.token)
+        } else {
+            cut.token.checked_add(1)
+        }
+    }
+
+    /// Conservative token count for a materialized decoded range.
+    ///
+    /// Each partial match endpoint can expand one source token into at most
+    /// two literals. The same-token case is intentionally overcharged by one;
+    /// this is only a work-limit guard.
+    fn range_token_count_upper_bound(&self, start: Cut, end: Cut) -> Option<usize> {
+        if !self.cut_is_valid(start) || !self.cut_is_valid(end) || start.plain >= end.plain {
+            return None;
+        }
+        let past_end = self.cut_end_token(end)?;
+        let base = past_end.checked_sub(start.token)?;
+        base.checked_add(usize::from(!self.cut_is_token_boundary(start)))?
+            .checked_add(usize::from(!self.cut_is_token_boundary(end)))
+    }
+
+    /// Materialize one selected boundary edge without rewriting unused cuts.
+    ///
+    /// Complete tokens retain their exact source spelling. A partial match
+    /// fragment of at least three bytes becomes one canonical match at the
+    /// original distance; a one- or two-byte fragment becomes known literals.
+    fn materialize_range_tokens(&self, start: Cut, end: Cut) -> Option<Arc<Vec<Token>>> {
+        if !self.cut_is_valid(start) || !self.cut_is_valid(end) || start.plain >= end.plain {
+            return None;
+        }
+        if self.cut_is_token_boundary(start) && self.cut_is_token_boundary(end) {
+            return try_shared_slice(self.tokens.get(start.token..end.token)?);
+        }
+
+        let past_end = self.cut_end_token(end)?;
+        let source_count = past_end.checked_sub(start.token)?;
+        let capacity = source_count.checked_add(2)?;
+        let mut tokens = Vec::new();
+        tokens.try_reserve_exact(capacity).ok()?;
+
+        for token_index in start.token..past_end {
+            let token = *self.tokens.get(token_index)?;
+            let token_start = *self.token_plain_offsets.get(token_index)?;
+            let token_end = *self.token_plain_offsets.get(token_index.checked_add(1)?)?;
+            let fragment_start = token_start.max(start.plain);
+            let fragment_end = token_end.min(end.plain);
+            if fragment_start >= fragment_end {
+                continue;
+            }
+            if fragment_start == token_start && fragment_end == token_end {
+                tokens.push(token);
+                continue;
+            }
+            let decoded = self.plain.get(fragment_start..fragment_end)?;
+            append_proven_match_fragment(&mut tokens, token, decoded)?;
+        }
+
+        let decoded_len = tokens.iter().try_fold(0_usize, |total, token| {
+            total.checked_add(token.decoded_len())
+        })?;
+        (decoded_len == end.plain.checked_sub(start.plain)?).then(|| Arc::new(tokens))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2828,11 +2999,46 @@ struct Cut {
     plain: usize,
 }
 
+/// Append one source-proven match fragment without searching for a distance.
+fn append_proven_match_fragment(
+    output: &mut Vec<Token>,
+    source: Token,
+    decoded: &[u8],
+) -> Option<()> {
+    let Token::Match {
+        distance,
+        distance_symbol,
+        distance_extra,
+        distance_extra_bits,
+        ..
+    } = source
+    else {
+        return None;
+    };
+    if decoded.len() < 3 {
+        output.extend(decoded.iter().copied().map(Token::Literal));
+        return Some(());
+    }
+    let length: u16 = decoded.len().try_into().ok()?;
+    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(length)?;
+    output.push(Token::Match {
+        length,
+        distance,
+        length_symbol,
+        distance_symbol,
+        length_extra,
+        distance_extra,
+        length_extra_bits,
+        distance_extra_bits,
+    });
+    Some(())
+}
+
 /// Candidate boundaries include Columbo's seven eighth-position probes.
 ///
-/// DeflOpt 2.07 does not split blocks. Columbo adds these probes and snaps a
-/// target inside a match to the preceding token boundary so the match remains
-/// intact.
+/// DeflOpt 2.07 does not split blocks. Columbo retains its legacy snapped
+/// token-boundary probe and now adds an exact sibling when the decoded target
+/// lies inside a proven match.
 fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> Option<Vec<Cut>> {
     let mut cuts = Vec::new();
     add_cut(&mut cuts, composite, 0)?;
@@ -2851,6 +3057,7 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
                 source.token_end,
                 source.plain_start,
                 source.plain_end,
+                false,
             )?;
         }
         if exhaustive && token_count <= 512 {
@@ -2876,6 +3083,7 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
                 last.token_end,
                 first.plain_start,
                 last.plain_end,
+                false,
             )?;
 
             // Pair/group cuts make the union useful when the winning stream
@@ -2891,14 +3099,71 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
                         last.token_end,
                         first.plain_start,
                         last.plain_end,
+                        false,
                     )?;
                 }
             }
         }
     }
 
-    cuts.sort_unstable_by_key(|cut| cut.token);
-    cuts.dedup_by_key(|cut| cut.token);
+    // Preserve every established token-boundary candidate before admitting
+    // optional exact siblings. Otherwise interior cuts can consume the dense
+    // graph's fixed anchor budget and suppress an older route.
+    cuts.sort_unstable_by_key(|cut| cut.plain);
+    cuts.dedup_by_key(|cut| cut.plain);
+
+    let mut inside_cuts = Vec::new();
+    for source in &composite.sources {
+        let token_count = source.token_end - source.token_start;
+        let plain_count = source.plain_end - source.plain_start;
+        if token_count >= 16 && plain_count >= 128 && (exhaustive || plain_count >= 32_768) {
+            add_exact_eighth_cuts(
+                &mut inside_cuts,
+                composite,
+                source.token_start,
+                source.token_end,
+                source.plain_start,
+                source.plain_end,
+            )?;
+        }
+    }
+    if exhaustive && allow_regroup && composite.sources.len() <= MAX_REGROUP_SOURCE_BLOCKS {
+        for (run_start, run_end) in huffman_runs(&composite.sources)? {
+            let first = composite.sources[run_start];
+            let last = composite.sources[run_end - 1];
+            add_exact_eighth_cuts(
+                &mut inside_cuts,
+                composite,
+                first.token_start,
+                last.token_end,
+                first.plain_start,
+                last.plain_end,
+            )?;
+            for start in run_start..run_end {
+                for end in start + 2..=run_end {
+                    let first = composite.sources[start];
+                    let last = composite.sources[end - 1];
+                    add_exact_eighth_cuts(
+                        &mut inside_cuts,
+                        composite,
+                        first.token_start,
+                        last.token_end,
+                        first.plain_start,
+                        last.plain_end,
+                    )?;
+                }
+            }
+        }
+    }
+    inside_cuts.sort_unstable_by_key(|cut| cut.plain);
+    inside_cuts.dedup_by_key(|cut| cut.plain);
+    for cut in inside_cuts {
+        if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
+            break;
+        }
+        push_cut(&mut cuts, composite, cut)?;
+    }
+    cuts.sort_unstable_by_key(|cut| cut.plain);
     Some(cuts)
 }
 
@@ -2909,6 +3174,7 @@ fn add_eighth_cuts(
     token_end: usize,
     plain_start: usize,
     plain_end: usize,
+    include_inside_matches: bool,
 ) -> Option<()> {
     if token_end - token_start < 16 || plain_end - plain_start < 128 {
         return Some(());
@@ -2929,20 +3195,69 @@ fn add_eighth_cuts(
             add_cut(cuts, composite, token)?;
         }
     }
+    if include_inside_matches {
+        add_exact_eighth_cuts(
+            cuts,
+            composite,
+            token_start,
+            token_end,
+            plain_start,
+            plain_end,
+        )?;
+    }
+    Some(())
+}
+
+fn add_exact_eighth_cuts(
+    cuts: &mut Vec<Cut>,
+    composite: &Composite,
+    token_start: usize,
+    token_end: usize,
+    plain_start: usize,
+    plain_end: usize,
+) -> Option<()> {
+    if token_end - token_start < 16 || plain_end - plain_start < 128 {
+        return Some(());
+    }
+    let plain_len = plain_end - plain_start;
+    for eighth in 1..8 {
+        let target = plain_start + plain_len * eighth / 8;
+        if let Some(exact) = composite
+            .cut_at_plain(target)
+            .filter(|&cut| !composite.cut_is_token_boundary(cut))
+        {
+            push_optional_cut(cuts, composite, exact)?;
+        }
+    }
     Some(())
 }
 
 fn add_cut(cuts: &mut Vec<Cut>, composite: &Composite, token: usize) -> Option<()> {
     if let Some(&plain) = composite.token_plain_offsets.get(token) {
-        // Returning `None` only abandons this optional boundary search. The
-        // complete sequential plan built before it remains available.
-        if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
-            return None;
-        }
-        cuts.try_reserve(1).ok()?;
-        cuts.push(Cut { token, plain });
+        push_cut(cuts, composite, Cut { token, plain })?;
     }
     Some(())
+}
+
+fn push_cut(cuts: &mut Vec<Cut>, composite: &Composite, cut: Cut) -> Option<()> {
+    if !composite.cut_is_valid(cut) || cuts.iter().any(|existing| existing.plain == cut.plain) {
+        return Some(());
+    }
+    // Returning `None` only abandons this optional boundary search. The
+    // complete sequential plan built before it remains available.
+    if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
+        return None;
+    }
+    cuts.try_reserve(1).ok()?;
+    cuts.push(cut);
+    Some(())
+}
+
+fn push_optional_cut(cuts: &mut Vec<Cut>, composite: &Composite, cut: Cut) -> Option<()> {
+    if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
+        return Some(());
+    }
+    push_cut(cuts, composite, cut)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2972,6 +3287,9 @@ fn add_adaptive_split_cut<F>(
 where
     F: FnMut() -> bool,
 {
+    if !composite.cut_is_token_boundary(start) || !composite.cut_is_token_boundary(end) {
+        return Some(());
+    }
     let token_count = end.token.checked_sub(start.token)?;
     let plain_count = end.plain.checked_sub(start.plain)?;
     if !(ADAPTIVE_SPLIT_MIN_TOKENS..=MAX_MERGED_TOKENS).contains(&token_count)
@@ -3196,7 +3514,7 @@ impl PlanTemplate {
 
     fn instantiate(&self, composite: &Composite, start: Cut, end: Cut) -> Option<PlannedBlock> {
         Some(PlannedBlock {
-            tokens: try_shared_slice(&composite.tokens[start.token..end.token])?,
+            tokens: composite.materialize_range_tokens(start, end)?,
             plain: try_shared_slice(&composite.plain[start.plain..end.plain])?,
             representation: self.representation.try_clone()?,
             bits: self.bits,
@@ -3347,7 +3665,7 @@ fn edge_allowed(
     exhaustive: bool,
     allow_regroup: bool,
 ) -> bool {
-    if start.token >= end.token || start.plain >= end.plain {
+    if !composite.cut_is_valid(start) || !composite.cut_is_valid(end) || start.plain >= end.plain {
         return false;
     }
     let source_range = overlapping_source_range(composite, start, end);
@@ -3359,10 +3677,12 @@ fn edge_allowed(
         // The original Columbo C default route tests one boundary at a time:
         // a candidate is a prefix or suffix, not an arbitrary middle slice.
         // --max may combine several remembered cuts through the full DP.
-        return exhaustive || start.token == first.token_start || end.token == first.token_end;
+        return exhaustive || start.plain == first.plain_start || end.plain == first.plain_end;
     }
 
-    let token_count = end.token - start.token;
+    let Some(token_count) = composite.range_token_count_upper_bound(start, end) else {
+        return false;
+    };
     let plain_count = end.plain - start.plain;
     if token_count > MAX_MERGED_TOKENS || plain_count > MAX_MERGED_PLAIN {
         return false;
@@ -3373,8 +3693,8 @@ fn edge_allowed(
     let all_huffman = sources
         .iter()
         .all(|source| source.source_type != SourceBlockType::Stored);
-    let whole_sources = start.token == first.token_start
-        && end.token == sources.last().expect("the range is nonempty").token_end;
+    let whole_sources = start.plain == first.plain_start
+        && end.plain == sources.last().expect("the range is nonempty").plain_end;
 
     if all_stored {
         return whole_sources && plain_count <= 65_535;
@@ -3395,7 +3715,7 @@ fn edge_allowed(
         // belong to the broader --max DP.
         return sources
             .iter()
-            .any(|source| start.token == source.token_start || end.token == source.token_end);
+            .any(|source| start.plain == source.plain_start || end.plain == source.plain_end);
     }
     if whole_sources && plain_count <= 512 {
         return true;
@@ -3413,10 +3733,10 @@ fn edge_allowed(
 fn overlapping_source_range(composite: &Composite, start: Cut, end: Cut) -> std::ops::Range<usize> {
     let first = composite
         .sources
-        .partition_point(|source| source.token_end <= start.token);
+        .partition_point(|source| source.plain_end <= start.plain);
     let past_last = composite
         .sources
-        .partition_point(|source| source.token_start < end.token);
+        .partition_point(|source| source.plain_start < end.plain);
     first..past_last
 }
 
@@ -3499,10 +3819,11 @@ fn prepare_edge<F>(
 where
     F: FnMut() -> bool,
 {
-    // Boundary DP is deliberately token-preserving. Match-to-literal spelling
-    // searches run in the complete sequential pass and again after every
-    // accepted structural replay; retaining them in each DP state would make
-    // memory proportional to cuts × alignments rather than to the input.
+    // Boundary planning preserves complete tokens. An edge ending or beginning
+    // inside one proven match deterministically materializes only that endpoint
+    // fragment at the original distance (or as one or two known literals).
+    // Broader match-to-literal searches remain in the sequential and replay
+    // passes so memory does not grow with cuts × alignments.
     if let Some(source_index) = exact_source(composite, start, end) {
         let block = &blocks[source_index];
         let reusable = plan_cache
@@ -3526,8 +3847,8 @@ where
     let source_range = overlapping_source_range(composite, start, end);
     let source_spans = &composite.sources[source_range.clone()];
     let whole_sources = source_spans.first().is_some_and(|first| {
-        start.token == first.token_start
-            && end.token == source_spans.last().expect("first was present").token_end
+        start.plain == first.plain_start
+            && end.plain == source_spans.last().expect("first was present").plain_end
     });
     let shared_dynamic = if whole_sources && source_spans.len() > 1 {
         shared_dynamic_plan(&blocks[source_range], &range.tokens, options.strict)
@@ -3556,18 +3877,23 @@ fn exact_source(composite: &Composite, start: Cut, end: Cut) -> Option<usize> {
     }
     let index = range.start;
     let source = composite.sources[index];
-    (source.token_start == start.token
-        && source.token_end == end.token
+    (composite.cut_is_token_boundary(start)
+        && composite.cut_is_token_boundary(end)
         && source.plain_start == start.plain
         && source.plain_end == end.plain)
         .then_some(index)
 }
 
 fn make_range(composite: &Composite, start: Cut, end: Cut) -> Option<ParsedBlock> {
-    let tokens = try_shared_slice(&composite.tokens[start.token..end.token])?;
-    let frequencies = composite.range_frequencies(start.token, end.token)?;
-    let literal_frequencies = frequencies.literal;
-    let distance_frequencies = frequencies.distance;
+    let token_boundary_range =
+        composite.cut_is_token_boundary(start) && composite.cut_is_token_boundary(end);
+    let tokens = composite.materialize_range_tokens(start, end)?;
+    let (literal_frequencies, distance_frequencies) = if token_boundary_range {
+        let frequencies = composite.range_frequencies(start.token, end.token)?;
+        (frequencies.literal, frequencies.distance)
+    } else {
+        count_frequencies(&tokens)
+    };
     let source_range = overlapping_source_range(composite, start, end);
     let sources = &composite.sources[source_range];
     let source_type = sources
@@ -3575,14 +3901,18 @@ fn make_range(composite: &Composite, start: Cut, end: Cut) -> Option<ParsedBlock
         .map(|source| source.source_type)
         .reduce(merged_source_type)
         .unwrap_or(SourceBlockType::Dynamic);
+    let first_split = composite
+        .source_plain_splits
+        .partition_point(|&split| split <= start.plain);
+    let past_last_split = composite
+        .source_plain_splits
+        .partition_point(|&split| split < end.plain);
     let mut source_splits = Vec::new();
     source_splits
-        .try_reserve_exact(sources.len().saturating_sub(1))
+        .try_reserve_exact(past_last_split.checked_sub(first_split)?)
         .ok()?;
-    for source in sources {
-        if source.plain_end > start.plain && source.plain_end < end.plain {
-            source_splits.push(source.plain_end.checked_sub(start.plain)?);
-        }
+    for &split in &composite.source_plain_splits[first_split..past_last_split] {
+        source_splits.push(split.checked_sub(start.plain)?);
     }
 
     Some(ParsedBlock {
@@ -3901,6 +4231,439 @@ mod tests {
             source_splits: Vec::new(),
             source_type: SourceBlockType::Dynamic,
         }
+    }
+
+    fn overlapping_match_block(length: u16) -> ParsedBlock {
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(length).expect("a legal Deflate match length");
+        let tokens = vec![
+            Token::Literal(b'a'),
+            Token::Match {
+                length,
+                distance: 1,
+                length_symbol,
+                distance_symbol: 0,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            },
+        ];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![b'a'; usize::from(length) + 1].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    }
+
+    fn seven_inside_eighths_block() -> ParsedBlock {
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(15).unwrap();
+        let mut tokens = vec![Token::Literal(b'a'), Token::Literal(b'a')];
+        for match_index in 0..7 {
+            tokens.push(Token::Match {
+                length: 15,
+                distance: 1,
+                length_symbol,
+                distance_symbol: 0,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            });
+            if match_index != 6 {
+                tokens.push(Token::Literal(b'a'));
+            }
+        }
+        tokens.extend((0..15).map(|_| Token::Literal(b'a')));
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![b'a'; 128].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    }
+
+    fn periodic_distance_three_block() -> ParsedBlock {
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(258).unwrap();
+        let tokens = vec![
+            Token::Literal(b'a'),
+            Token::Literal(b'b'),
+            Token::Literal(b'c'),
+            Token::Match {
+                length: 258,
+                distance: 3,
+                length_symbol,
+                distance_symbol: 2,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            },
+        ];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: tokens.into(),
+            plain: (0..261)
+                .map(|index| b"abc"[index % 3])
+                .collect::<Vec<_>>()
+                .into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    }
+
+    #[test]
+    fn decoded_cuts_distinguish_token_boundaries_and_match_interiors() {
+        let block = overlapping_match_block(10);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+
+        assert_eq!(composite.cut_at_plain(0), Some(Cut { token: 0, plain: 0 }));
+        assert_eq!(composite.cut_at_plain(1), Some(Cut { token: 1, plain: 1 }));
+        assert_eq!(composite.cut_at_plain(4), Some(Cut { token: 1, plain: 4 }));
+        assert_eq!(
+            composite.cut_at_plain(11),
+            Some(Cut {
+                token: 2,
+                plain: 11,
+            })
+        );
+        assert!(composite.cut_at_plain(12).is_none());
+        assert!(composite.cut_is_token_boundary(Cut { token: 1, plain: 1 }));
+        assert!(!composite.cut_is_token_boundary(Cut { token: 1, plain: 4 }));
+    }
+
+    #[test]
+    fn every_inside_match_cut_uses_canonical_same_distance_fragments() {
+        let block = overlapping_match_block(258);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let start = Cut { token: 0, plain: 0 };
+        let end = Cut {
+            token: 2,
+            plain: 259,
+        };
+
+        for offset in 1..258_usize {
+            let cut = composite.cut_at_plain(1 + offset).expect("an interior cut");
+            let left = composite.materialize_range_tokens(start, cut).unwrap();
+            let right = composite.materialize_range_tokens(cut, end).unwrap();
+            let decoded_len: usize = left
+                .iter()
+                .chain(right.iter())
+                .map(|token| token.decoded_len())
+                .sum();
+            assert_eq!(decoded_len, 259, "offset {offset}");
+
+            for token in left.iter().chain(right.iter()) {
+                match *token {
+                    Token::Literal(value) => assert_eq!(value, b'a', "offset {offset}"),
+                    Token::Match {
+                        length,
+                        distance,
+                        length_symbol,
+                        distance_symbol,
+                        length_extra,
+                        distance_extra,
+                        length_extra_bits,
+                        distance_extra_bits,
+                    } => {
+                        assert_eq!(distance, 1, "offset {offset}");
+                        assert_eq!(distance_symbol, 0, "offset {offset}");
+                        assert_eq!(distance_extra, 0, "offset {offset}");
+                        assert_eq!(distance_extra_bits, 0, "offset {offset}");
+                        assert_eq!(
+                            (length_symbol, length_extra, length_extra_bits),
+                            canonical_length_encoding(length).unwrap(),
+                            "offset {offset}"
+                        );
+                    }
+                }
+            }
+
+            let left_fragment = offset;
+            if left_fragment < 3 {
+                assert!(left[1..]
+                    .iter()
+                    .all(|token| matches!(token, Token::Literal(b'a'))));
+            } else {
+                assert!(matches!(
+                    left.last(),
+                    Some(Token::Match { length, .. }) if usize::from(*length) == left_fragment
+                ));
+            }
+            let right_fragment = 258 - offset;
+            if right_fragment < 3 {
+                assert!(right
+                    .iter()
+                    .all(|token| matches!(token, Token::Literal(b'a'))));
+            } else {
+                assert!(matches!(
+                    right.as_slice(),
+                    [Token::Match { length, .. }] if usize::from(*length) == right_fragment
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn same_match_middle_ranges_materialize_literals_or_one_match() {
+        let block = overlapping_match_block(20);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let start = composite.cut_at_plain(5).unwrap();
+
+        for (length, expected_tokens) in [(1, 1), (2, 2), (3, 1), (11, 1)] {
+            let end = composite.cut_at_plain(5 + length).unwrap();
+            let tokens = composite.materialize_range_tokens(start, end).unwrap();
+            assert_eq!(tokens.len(), expected_tokens);
+            assert_eq!(
+                tokens
+                    .iter()
+                    .map(|token| token.decoded_len())
+                    .sum::<usize>(),
+                length
+            );
+            if length < 3 {
+                assert!(tokens
+                    .iter()
+                    .all(|token| matches!(token, Token::Literal(b'a'))));
+            } else {
+                assert!(matches!(
+                    tokens.as_slice(),
+                    [Token::Match {
+                        length: match_length,
+                        distance: 1,
+                        ..
+                    }] if usize::from(*match_length) == length
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn an_inside_overlap_cut_emits_two_valid_deflate_blocks() {
+        let block = overlapping_match_block(258);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let boundaries = [
+            Cut { token: 0, plain: 0 },
+            composite.cut_at_plain(100).unwrap(),
+            Cut {
+                token: 2,
+                plain: 259,
+            },
+        ];
+        let options = Options::default();
+        let mut plan_cache = CanonicalPlanCache::new();
+        let plans = plan_structural_ranges(
+            &composite,
+            &boundaries,
+            0,
+            &options,
+            &mut plan_cache,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 2);
+
+        let mut writer = BitWriter::default();
+        for (index, plan) in plans.iter().enumerate() {
+            emit_block(&mut writer, &[], plan, index + 1 == plans.len()).unwrap();
+        }
+        assert_eq!(writer.bit_position(), total_bits(&plans));
+        let encoded = writer.into_bytes();
+        let reparsed = parse_stream(&encoded, 259).unwrap();
+        assert_eq!(reparsed.decoded_size, 259);
+        assert!(reparsed
+            .blocks
+            .iter()
+            .flat_map(|block| block.plain.iter())
+            .all(|&byte| byte == b'a'));
+    }
+
+    #[test]
+    fn inside_cuts_preserve_a_nonuniform_overlapping_distance() {
+        let block = periodic_distance_three_block();
+        let expected = Arc::clone(&block.plain);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let boundaries = [
+            Cut { token: 0, plain: 0 },
+            composite.cut_at_plain(4).unwrap(),
+            composite.cut_at_plain(259).unwrap(),
+            Cut {
+                token: 4,
+                plain: 261,
+            },
+        ];
+        let mut plan_cache = CanonicalPlanCache::new();
+        let plans = plan_structural_ranges(
+            &composite,
+            &boundaries,
+            0,
+            &Options::default(),
+            &mut plan_cache,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 3);
+
+        let mut writer = BitWriter::default();
+        for (index, plan) in plans.iter().enumerate() {
+            emit_block(&mut writer, &[], plan, index + 1 == plans.len()).unwrap();
+        }
+        assert_eq!(writer.bit_position(), total_bits(&plans));
+        let encoded = writer.into_bytes();
+        let reparsed = parse_stream(&encoded, expected.len() as u64).unwrap();
+        let decoded: Vec<_> = reparsed
+            .blocks
+            .iter()
+            .flat_map(|block| block.plain.iter().copied())
+            .collect();
+        assert_eq!(decoded, expected.as_slice());
+    }
+
+    #[test]
+    fn interior_edge_templates_reconstruct_the_exact_priced_tokens() {
+        let block = overlapping_match_block(258);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let whole_start = Cut { token: 0, plain: 0 };
+        let inside = composite.cut_at_plain(100).unwrap();
+        let whole_end = Cut {
+            token: 2,
+            plain: 259,
+        };
+        let options = Options::default();
+        let mut plan_cache = CanonicalPlanCache::new();
+
+        for (start, end) in [(whole_start, inside), (inside, whole_end)] {
+            let expected = make_range(&composite, start, end).unwrap();
+            for alignment in [0, 3, 7] {
+                let edge = prepare_edge(
+                    &blocks,
+                    &composite,
+                    start,
+                    end,
+                    &options,
+                    &mut plan_cache,
+                    &mut || false,
+                )
+                .unwrap();
+                let template = edge.plan(alignment);
+                let plan = template.instantiate(&composite, start, end).unwrap();
+                assert_eq!(plan.tokens.as_slice(), expected.tokens.as_slice());
+                assert_eq!(plan.plain.as_slice(), expected.plain.as_slice());
+                assert_eq!(plan.bits, template.bits);
+
+                let mut writer = BitWriter::default();
+                writer.write(0, alignment).unwrap();
+                emit_block(&mut writer, &[], &plan, true).unwrap();
+                assert_eq!(writer.bit_position() - u64::from(alignment), template.bits);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_multi_source_ranges_keep_relative_source_splits() {
+        let left = overlapping_match_block(20);
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(10).unwrap();
+        let right_tokens = vec![
+            Token::Match {
+                length: 10,
+                distance: 1,
+                length_symbol,
+                distance_symbol: 0,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            },
+            Token::Literal(b'a'),
+        ];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&right_tokens);
+        let right = ParsedBlock {
+            tokens: right_tokens.into(),
+            plain: vec![b'a'; 11].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        };
+        let blocks = [left, right];
+        let composite = Composite::new(&blocks).unwrap();
+        let left_inside = composite.cut_at_plain(10).unwrap();
+        let right_inside = composite.cut_at_plain(25).unwrap();
+        let stream_end = Cut {
+            token: 4,
+            plain: 32,
+        };
+
+        assert_eq!(
+            overlapping_source_range(&composite, right_inside, stream_end),
+            1..2
+        );
+        assert_eq!(exact_source(&composite, right_inside, stream_end), None);
+        assert!(make_range(&composite, right_inside, stream_end)
+            .unwrap()
+            .source_splits
+            .is_empty());
+
+        assert_eq!(
+            overlapping_source_range(&composite, left_inside, right_inside),
+            0..2
+        );
+        let cross_source = make_range(&composite, left_inside, right_inside).unwrap();
+        assert_eq!(cross_source.source_splits, [11]);
+        assert_eq!(cross_source.plain.len(), 15);
+    }
+
+    #[test]
+    fn range_materialization_projects_inherited_source_splits() {
+        let mut block = literal_block(b"abcdefghijkl", SourceBlockType::Dynamic);
+        block.source_splits = vec![4, 9];
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let range = make_range(
+            &composite,
+            Cut { token: 2, plain: 2 },
+            Cut {
+                token: 12,
+                plain: 12,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(range.source_splits, [2, 7]);
     }
 
     #[test]
@@ -4737,7 +5500,7 @@ mod tests {
     }
 
     #[test]
-    fn eighth_target_snaps_before_a_crossing_match() {
+    fn eighth_target_keeps_snap_and_adds_exact_inside_match_cut() {
         let mut block = literal_block(&[0; 128], SourceBlockType::Dynamic);
         block.tokens = vec![
             Token::Literal(0),
@@ -4758,11 +5521,16 @@ mod tests {
         let blocks = [block];
         let composite = Composite::new(&blocks).unwrap();
         let mut cuts = Vec::new();
-        add_eighth_cuts(&mut cuts, &composite, 0, 69, 0, 128).unwrap();
+        add_eighth_cuts(&mut cuts, &composite, 0, 69, 0, 128, true).unwrap();
 
-        // The first target is decoded offset 16, inside the 60-byte match. The
-        // legal preceding boundary is after the first literal at offset one.
+        // The first target is decoded offset 16, inside the 60-byte match.
+        // Retain the legacy boundary after the first literal and add an exact
+        // sibling that materializes only the selected edge fragments.
         assert!(cuts.contains(&Cut { token: 1, plain: 1 }));
+        assert!(cuts.contains(&Cut {
+            token: 1,
+            plain: 16,
+        }));
     }
 
     #[test]
@@ -4771,7 +5539,7 @@ mod tests {
         let blocks = [block];
         let composite = Composite::new(&blocks).unwrap();
         let mut cuts = Vec::new();
-        add_eighth_cuts(&mut cuts, &composite, 0, 128, 0, 128).unwrap();
+        add_eighth_cuts(&mut cuts, &composite, 0, 128, 0, 128, true).unwrap();
 
         // The original Columbo C probe treats decoded offset 16 as the
         // inclusive end of the token beginning at offset 15, so the split
@@ -4787,7 +5555,7 @@ mod tests {
     }
 
     #[test]
-    fn midpoint_refinement_snaps_before_a_crossing_match() {
+    fn midpoint_refinement_keeps_snap_and_adds_exact_inside_match_cut() {
         let mut block = literal_block(&[0; 128], SourceBlockType::Dynamic);
         block.tokens = Arc::new((0..10).map(|_| Token::Literal(0)).collect());
         Arc::make_mut(&mut block.tokens).push(Token::Match {
@@ -4805,7 +5573,7 @@ mod tests {
 
         let blocks = [block];
         let composite = Composite::new(&blocks).unwrap();
-        let midpoint = midpoint_cut(
+        let midpoints = midpoint_cuts(
             &composite,
             Cut { token: 0, plain: 0 },
             Cut {
@@ -4814,15 +5582,42 @@ mod tests {
             },
         );
 
-        // Decoded offset 64 lies inside the 100-byte match, so the last legal
-        // boundary before it is the one after the ten leading literals.
+        // Decoded offset 64 lies inside the 100-byte match. Keep the prior
+        // token boundary and add the exact proven-submatch sibling.
         assert_eq!(
-            midpoint,
-            Some(Cut {
-                token: 10,
-                plain: 10,
-            })
+            midpoints,
+            [
+                Some(Cut {
+                    token: 10,
+                    plain: 10,
+                }),
+                Some(Cut {
+                    token: 10,
+                    plain: 64,
+                }),
+            ]
         );
+    }
+
+    #[test]
+    fn exact_siblings_do_not_displace_legacy_cuts_at_the_graph_limit() {
+        let block = seven_inside_eighths_block();
+        let blocks = vec![block; 128];
+        let composite = Composite::new(&blocks).unwrap();
+        let cuts = choose_cuts(&composite, true, false).unwrap();
+
+        // Each source contributes seven distinct snapped and seven distinct
+        // exact eighths, plus the 129 shared source endpoints. Counting raw
+        // duplicate endpoint pushes would exceed the 2,048-anchor limit.
+        assert_eq!(cuts.len(), 1_921);
+        assert!(cuts.contains(&Cut {
+            token: 3_812,
+            plain: 16_258,
+        }));
+        assert!(cuts.contains(&Cut {
+            token: 3_812,
+            plain: 16_272,
+        }));
     }
 
     #[test]

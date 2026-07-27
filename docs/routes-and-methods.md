@@ -39,7 +39,7 @@ flowchart TD
     SCHED --> HEADER["🟡 Huffman and header routes<br/>DeflOpt- and Defluff-inspired"]
     SCHED --> TOKEN["🟢 Same-distance normalization<br/>🟡 targeted proven-submatch search<br/>Columbo"]
     SCHED --> SOURCE["🟡 Source-order, merge, and grouping routes<br/>Columbo / deft4j-inspired"]
-    SCHED --> BOUNDARY["🔴 Token, split, and boundary routes<br/>Columbo"]
+    SCHED --> BOUNDARY["🔴 Token, split, and boundary routes<br/>including cuts inside proven matches · Columbo"]
     SCHED --> MAX["🔴 Wider source-max and replay routes<br/>max mode · Columbo"]
 
     MODEL --> CACHE["🟢 Route-local canonical plan cache<br/>exact-verified and bounded"]
@@ -85,7 +85,7 @@ flowchart LR
     BASE --> RUNS["🟢 Same-distance match-run<br/>coalescing and repacking"]
     RUNS --> SUB["🟡 Targeted proven-submatch<br/>resegmentation"]
     SUB --> GROUP["🟡 Source-order, adjacent-merge,<br/>and cheap grouping candidates"]
-    GROUP --> TS["🔴 Bounded token, split,<br/>and boundary search when eligible"]
+    GROUP --> TS["🔴 Bounded token, split, and boundary search<br/>including exact cuts inside proven matches"]
     TS --> TM["🟡 Terminal tree tightening<br/>and exact comparison"]
     TM --> WIN["Best candidate"]
 
@@ -122,7 +122,7 @@ flowchart TD
     SMAX --> SPLIT["🔴 Token, split, shared-table,<br/>and regroup search"]
     SMAX --> ADAPT["🟡 Bounded adaptive split probe<br/>max mode"]
 
-    SUBMATCH --> GLOBAL["🔴 Source-aligned and global<br/>boundary search"]
+    SUBMATCH --> GLOBAL["🔴 Source-aligned and global boundary search<br/>including exact cuts inside proven matches"]
     EXPAND --> GLOBAL
     SPLIT --> GLOBAL
     ADAPT --> GLOBAL
@@ -250,6 +250,34 @@ alignment. It replaces the incumbent only when the complete Deflate block is
 strictly smaller. Relaxed mode may additionally price the existing
 compatibility spelling of length 258.
 
+## Inside-match boundary polishing
+
+🟡 A decoded boundary target can fall inside a match even when no token
+boundary exists there. Columbo now retains the established snapped
+token-boundary candidate and adds an exact sibling at the decoded target. It
+does not pre-split every source token or search arbitrary decoded positions:
+only an edge selected for exact pricing is materialized.
+
+For each selected edge, a partial match of 3–258 bytes becomes one canonical
+match at the source match's proven distance. A one- or two-byte remainder
+becomes the corresponding known literals. Complete tokens keep their source
+spelling. This permits a block boundary inside an overlapping match without
+searching the history window or introducing a different distance.
+
+Default mode adds exact siblings to the seven decoded-eighth probes for an
+eligible source block and to its existing bounded runner-up midpoint
+refinement. Combined-run and group probes keep their cheaper token-boundary
+behavior. Max mode enables exact siblings for those wider probes within the
+existing cut, token, decoded-size, and deadline limits. The boundary graph
+carries the actual starting bit residue, so stored-block padding and every
+fixed, dynamic, or source representation are compared at their true alignment.
+The retained candidate must still be a strict complete-stream improvement.
+
+| Mode | Indicator | Search policy |
+| --- | --- | --- |
+| Default | 🟡 | Adds exact siblings to eligible per-source decoded-eighth probes and bounded runner-up midpoint refinement while retaining every snapped candidate. |
+| Max | 🔴 | Also enables exact siblings for combined runs and groups under the shared deadline and existing graph limits. |
+
 ## Scheduling and observability
 
 🟡 The normal comparison floor is a complete, selectable candidate rather than
@@ -287,6 +315,8 @@ plan. Verbose and quiet runs use identical optimization and memory policies.
 | Match-to-literal alternatives | Replaces selected existing matches with their decoded literals when complete repricing finds a gain. | 🔴 | **Columbo**; deft4j-compatible variants retain deft4j attribution where applicable |
 | Targeted proven-submatch resegmentation | Searches a bounded ranked set inside already-proved source matches. | 🟡 | **Columbo** |
 | Wider and repeated proven-submatch resegmentation | Widens the graph search in max mode and repeats strict winners to stability or a cap. | 🔴 | **Columbo** |
+| Bounded inside-match boundary polishing | Retains snapped per-source probes and also prices their exact cuts inside proven matches, spelling each selected fragment canonically at the same distance or as one or two known literals. | 🟡 | **Columbo** |
+| Wider inside-match boundary polishing | In max mode, extends exact inside-match siblings to combined runs and groups under the shared deadline and graph limits. | 🔴 | **Columbo** |
 | Candidate-family and cumulative expansion | Evaluates related match expansions together rather than only in isolation. | 🔴 | **Columbo** |
 | Source-aligned floor | Prices at most 36 contiguous source ranges across at most eight blocks, then selects a grouping before wider searches. | 🟡 | **Columbo** |
 | Bounded lookahead grouping | Considers spans of up to 16 across as many as 128 source blocks, commits the strict best saving at each position, and continues after the chosen group. | 🟡 | **Columbo** |
@@ -345,7 +375,8 @@ code from these programs.
 - Coalesce or repartition same-distance match runs.
 - Replace selected existing matches with their decoded literals.
 - Resegment proven matches at their original distance.
-- Merge, split, and regroup blocks.
+- Merge, split, and regroup blocks, including bounded boundaries inside proven
+  matches.
 - Compare exact output sizes.
 
 ### Outside Columbo
@@ -357,5 +388,6 @@ code from these programs.
 
 Proven-submatch resegmentation does not search the history window or invent a
 distance. Every generated match remains inside an interval already proved by
-the source token and retains that token's distance. Cuts inside matches for
-block-boundary polishing remain a separate future method.
+the source token and retains that token's distance. Inside-match boundary
+polishing obeys the same constraint: it only divides a proven source match at
+an exact decoded boundary, then prices the resulting complete block layout.
