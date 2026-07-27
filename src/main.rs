@@ -30,7 +30,18 @@ struct Command {
     format: Format,
     options: Options,
     input: PathBuf,
-    output: PathBuf,
+    destination: Destination,
+}
+
+enum Destination {
+    File(PathBuf),
+    DryRun,
+}
+
+impl Destination {
+    fn is_dry_run(&self) -> bool {
+        matches!(self, Self::DryRun)
+    }
 }
 
 enum ParsedCommand {
@@ -84,6 +95,10 @@ fn run() -> std::result::Result<(), u8> {
         }
     };
 
+    execute(command)
+}
+
+fn execute(command: Command) -> std::result::Result<(), u8> {
     let total_started = command.options.verbose.then(Instant::now);
     let read_started = command.options.verbose.then(Instant::now);
     let input = match read_file(&command.input, command.options.max_input_bytes) {
@@ -128,28 +143,46 @@ fn run() -> std::result::Result<(), u8> {
         }
     };
 
-    let write_started = command.options.verbose.then(Instant::now);
-    if write_file(&command.output, &optimized.data).is_err() {
-        eprintln!("could not write {:?}", command.output);
-        return Err(1);
-    }
-    let write_elapsed = write_started.map_or(Duration::ZERO, |started| started.elapsed());
+    let write_elapsed = match &command.destination {
+        Destination::File(output) => {
+            let write_started = command.options.verbose.then(Instant::now);
+            if write_file(output, &optimized.data).is_err() {
+                eprintln!("could not write {:?}", output);
+                return Err(1);
+            }
+            write_started.map_or(Duration::ZERO, |started| started.elapsed())
+        }
+        Destination::DryRun => Duration::ZERO,
+    };
 
     if optimized.timed_out {
-        eprintln!(
-            "Timeout triggered after {} seconds; wrote best output found so far.",
-            command.options.timeout.as_secs()
-        );
+        if command.destination.is_dry_run() {
+            eprintln!(
+                "Timeout triggered after {} seconds; reporting best result found so far.",
+                command.options.timeout.as_secs()
+            );
+        } else {
+            eprintln!(
+                "Timeout triggered after {} seconds; wrote best output found so far.",
+                command.options.timeout.as_secs()
+            );
+        }
     }
     if command.options.verbose {
         print_verbose_result(
-            &command.output,
+            &command.destination,
             input.len(),
             optimized.data.len(),
             read_elapsed,
             optimize_elapsed,
             write_elapsed,
             total_started.map_or(Duration::ZERO, |started| started.elapsed()),
+        );
+    } else if command.destination.is_dry_run() {
+        eprintln!(
+            "{} -> {} bytes (dry run; no output written)",
+            input.len(),
+            optimized.data.len()
         );
     } else {
         eprintln!("{} -> {} bytes", input.len(), optimized.data.len());
@@ -176,18 +209,23 @@ fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Dur
     } else {
         "relaxed"
     };
+    let dry_run = if command.destination.is_dry_run() {
+        " · dry run"
+    } else {
+        ""
+    };
     if command.options.exhaustive {
         println!(
-            "Mode     max · {strictness} · {} file-wide budget",
-            format_elapsed(command.options.timeout)
+            "Mode     max · {strictness}{dry_run} · {} file-wide budget",
+            format_elapsed(command.options.timeout),
         );
     } else {
-        println!("Mode     normal · {strictness}");
+        println!("Mode     normal · {strictness}{dry_run}");
     }
 }
 
 fn print_verbose_result(
-    output: &Path,
+    destination: &Destination,
     input_bytes: usize,
     output_bytes: usize,
     read_elapsed: Duration,
@@ -195,22 +233,36 @@ fn print_verbose_result(
     write_elapsed: Duration,
     total_elapsed: Duration,
 ) {
-    let output_name = output.file_name().unwrap_or(output.as_os_str());
     println!();
     println!("Result");
-    println!("  Output  {:?}", output_name);
+    match destination {
+        Destination::File(output) => {
+            let output_name = output.file_name().unwrap_or(output.as_os_str());
+            println!("  Output  {:?}", output_name);
+        }
+        Destination::DryRun => println!("  Output  not written · dry run"),
+    }
     println!(
         "  Size    {input_bytes} → {output_bytes} {} · {}",
         plural_bytes(output_bytes),
         describe_byte_change(input_bytes, output_bytes)
     );
-    println!(
-        "  Time    {} total · read {} · optimize {} · write {}",
-        format_elapsed(total_elapsed),
-        format_elapsed(read_elapsed),
-        format_elapsed(optimize_elapsed),
-        format_elapsed(write_elapsed)
-    );
+    if destination.is_dry_run() {
+        println!(
+            "  Time    {} total · read {} · optimize {}",
+            format_elapsed(total_elapsed),
+            format_elapsed(read_elapsed),
+            format_elapsed(optimize_elapsed),
+        );
+    } else {
+        println!(
+            "  Time    {} total · read {} · optimize {} · write {}",
+            format_elapsed(total_elapsed),
+            format_elapsed(read_elapsed),
+            format_elapsed(optimize_elapsed),
+            format_elapsed(write_elapsed)
+        );
+    }
 }
 
 fn format_elapsed(duration: Duration) -> String {
@@ -277,6 +329,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
     let arguments: Vec<OsString> = arguments.into_iter().collect();
     let mut options = Options::default();
     let mut format = Format::Auto;
+    let mut dry_run = false;
     let mut index = 0_usize;
 
     while index < arguments.len() && starts_with_dash(&arguments[index]) {
@@ -286,6 +339,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             "--raw" => format = Format::Raw,
             "-v" | "--verbose" => options.verbose = true,
             "-m" | "--max" => options.exhaustive = true,
+            "-d" | "--dry-run" => dry_run = true,
             "--strip" => options.strip_metadata = true,
             "-t" | "--timeout" => {
                 index += 1;
@@ -320,15 +374,29 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
         index += 1;
     }
 
-    if arguments.len() - index != 2 {
+    let positional = arguments.len() - index;
+    let destination = if dry_run {
+        match positional {
+            1 => Destination::DryRun,
+            2 => {
+                return Err(CliError::message(
+                    "--dry-run does not accept an output filename",
+                    true,
+                ));
+            }
+            _ => return Err(CliError::usage()),
+        }
+    } else if positional == 2 {
+        Destination::File(PathBuf::from(&arguments[index + 1]))
+    } else {
         return Err(CliError::usage());
-    }
+    };
 
     Ok(ParsedCommand::Run(Command {
         format,
         options,
         input: PathBuf::from(&arguments[index]),
-        output: PathBuf::from(&arguments[index + 1]),
+        destination,
     }))
 }
 
@@ -376,6 +444,7 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         "\"Just One More Thing\" - optimize the last few bytes in Deflate streams."
     )?;
     writeln!(output, "usage: {} [options] input output", PROGRAM_NAME)?;
+    writeln!(output, "       {} --dry-run [options] input", PROGRAM_NAME)?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
     writeln!(output, "  -h, --help             show this help and exit")?;
@@ -386,6 +455,10 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         "  -m, --max              enable slower byte-seeking searches"
+    )?;
+    writeln!(
+        output,
+        "  -d, --dry-run          fully optimize and report savings without writing output"
     )?;
     writeln!(
         output,
@@ -743,6 +816,42 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_requires_one_input_and_rejects_an_output() {
+        for command in [
+            parsed_command(["-d", "in"]),
+            parsed_command(["--dry-run", "in"]),
+            parsed_command(["-d", "-d", "in"]),
+        ] {
+            assert_eq!(command.input, Path::new("in"));
+            assert!(command.destination.is_dry_run());
+        }
+        assert!(matches!(
+            parsed_command(["in", "out"]).destination,
+            Destination::File(path) if path == Path::new("out")
+        ));
+
+        let output_error =
+            match parse_args(["--dry-run", "in", "out"].into_iter().map(OsString::from)) {
+                Err(error) => error,
+                Ok(_) => panic!("dry-run output filename should fail"),
+            };
+        assert_eq!(
+            output_error.message.as_deref(),
+            Some("--dry-run does not accept an output filename")
+        );
+        assert!(output_error.show_usage);
+
+        for arguments in [vec!["--dry-run"], vec!["in"]] {
+            let error = match parse_args(arguments.into_iter().map(OsString::from)) {
+                Err(error) => error,
+                Ok(_) => panic!("missing positional argument should fail"),
+            };
+            assert!(error.message.is_none());
+            assert!(error.show_usage);
+        }
+    }
+
+    #[test]
     fn retired_cli_flags_are_rejected() {
         for option in [
             "--png",
@@ -781,6 +890,9 @@ mod tests {
         assert!(!help.contains("--gzip"));
         assert!(!help.contains("--zip"));
         assert!(help.contains("usage: columbo [options] input output"));
+        assert!(help.contains("columbo --dry-run [options] input"));
+        assert!(help.contains("-d, --dry-run"));
+        assert!(help.contains("without writing output"));
         assert!(help.contains("Advanced:"));
         assert!(help.contains("--raw"));
         assert!(help.contains("live route timings, bit gains, and block choices"));
@@ -819,6 +931,25 @@ mod tests {
             Err(ReadError::TooLarge)
         );
         assert_eq!(read_bounded(Cursor::new(b"abc"), 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn dry_run_optimizes_without_creating_an_output() {
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        fs::write(&input, [0x03, 0x00]).unwrap();
+
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input: input.clone(),
+            destination: Destination::DryRun,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&input).unwrap(), [0x03, 0x00]);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -907,24 +1038,21 @@ mod tests {
     }
 
     fn parsed_options<const N: usize>(arguments: [&str; N]) -> Options {
+        parsed_command(arguments).options
+    }
+
+    fn parsed_command<const N: usize>(arguments: [&str; N]) -> Command {
         let parsed = match parse_args(arguments.into_iter().map(OsString::from)) {
             Ok(parsed) => parsed,
             Err(_) => panic!("expected valid command arguments"),
         };
         match parsed {
-            ParsedCommand::Run(command) => command.options,
+            ParsedCommand::Run(command) => command,
             ParsedCommand::Help => panic!("expected a runnable command"),
         }
     }
 
     fn parsed_format<const N: usize>(arguments: [&str; N]) -> Format {
-        let parsed = match parse_args(arguments.into_iter().map(OsString::from)) {
-            Ok(parsed) => parsed,
-            Err(_) => panic!("expected valid command arguments"),
-        };
-        match parsed {
-            ParsedCommand::Run(command) => command.format,
-            ParsedCommand::Help => panic!("expected a runnable command"),
-        }
+        parsed_command(arguments).format
     }
 }

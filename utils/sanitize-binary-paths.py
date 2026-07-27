@@ -24,6 +24,11 @@ WINDOWS_SEPARATOR = b"\\"
 # contain absolute paths that would trigger the repository privacy audit.
 COMPILER_PREFIX = UNIX_SEPARATOR.join((b"", b"rustc", b""))
 REDACTED_COMPILER_PREFIX = b"rustc_/"
+HOMEBREW_PREFIX = UNIX_SEPARATOR.join((b"", b"opt", b"homebrew", b""))
+REDACTED_HOMEBREW_PREFIX = UNIX_SEPARATOR.join((b"", b"rust-sysroot", b""))
+RUST_LIBRARY_SOURCE_MARKER = UNIX_SEPARATOR.join(
+    (b"", b"lib", b"rustlib", b"src", b"rust", b"library", b"")
+)
 UNIX_LIBRARY_MARKER = UNIX_SEPARATOR.join((b"", b"library", b""))
 WINDOWS_LIBRARY_MARKER = WINDOWS_SEPARATOR.join((b"", b"library", b""))
 PRIVATE_PATH_MARKERS = {
@@ -90,6 +95,26 @@ def compiler_path_offsets(data: bytes) -> list[int]:
         cursor = offset + len(COMPILER_PREFIX)
 
 
+def homebrew_rust_path_offsets(data: bytes) -> list[int]:
+    """Locate Homebrew Rust source paths and reject other prefix uses."""
+
+    offsets: list[int] = []
+    cursor = 0
+    while True:
+        offset = data.find(HOMEBREW_PREFIX, cursor)
+        if offset < 0:
+            return offsets
+
+        # Stable Homebrew toolchains may retain their installed standard
+        # library source root. Do not rewrite the same prefix in a linked
+        # library name or any unrelated runtime path.
+        context = data[offset : offset + 128]
+        if RUST_LIBRARY_SOURCE_MARKER not in context:
+            raise ValueError("Homebrew prefix appeared outside a Rust source path")
+        offsets.append(offset)
+        cursor = offset + len(HOMEBREW_PREFIX)
+
+
 def audit(data: bytes, *, require_redacted: bool) -> int:
     """Return the number of compiler paths, rejecting private build roots."""
 
@@ -107,12 +132,15 @@ def audit(data: bytes, *, require_redacted: bool) -> int:
 
 
 def redact_compiler_paths(data: bytes) -> bytes:
-    """Replace only validated compiler source-path prefixes."""
+    """Replace only validated compiler and sysroot source-path prefixes."""
 
     sanitized = bytearray(data)
     for offset in compiler_path_offsets(data):
         end = offset + len(COMPILER_PREFIX)
         sanitized[offset:end] = REDACTED_COMPILER_PREFIX
+    for offset in homebrew_rust_path_offsets(data):
+        end = offset + len(HOMEBREW_PREFIX)
+        sanitized[offset:end] = REDACTED_HOMEBREW_PREFIX
     return bytes(sanitized)
 
 
@@ -150,12 +178,16 @@ def main(arguments: list[str]) -> int:
             raise ValueError(f"executable does not exist: {path}")
 
         original = path.read_bytes()
-        compiler_paths = audit(original, require_redacted=check_only)
         if check_only:
+            audit(original, require_redacted=True)
             return 0
 
         if len(COMPILER_PREFIX) != len(REDACTED_COMPILER_PREFIX):
             raise AssertionError("compiler path replacement must preserve binary size")
+        if len(HOMEBREW_PREFIX) != len(REDACTED_HOMEBREW_PREFIX):
+            raise AssertionError("sysroot path replacement must preserve binary size")
+        compiler_paths = len(compiler_path_offsets(original))
+        compiler_paths += len(homebrew_rust_path_offsets(original))
         sanitized = redact_compiler_paths(original)
         audit(sanitized, require_redacted=True)
         if len(sanitized) != len(original):
