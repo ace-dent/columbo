@@ -341,7 +341,12 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     &deadline,
                     completed_floor,
                 )?;
-                let suppress_later_source_max = floor_seeded.is_some();
+                // A floor-seeded grouping is a strong early incumbent, not a
+                // proof that the independent source routes are dominated.
+                // Max mode should keep searching whenever its caller supplied
+                // time; suppress duplicate work only after that budget is
+                // already exhausted.
+                let suppress_later_source_max = floor_seeded.is_some() && deadline.expired();
                 BoundedPhaseCandidates {
                     floor: Some(floor),
                     floor_seeded,

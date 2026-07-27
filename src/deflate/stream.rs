@@ -94,6 +94,11 @@ const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
 const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
 const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
 const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
+// A compact whole-block beam can otherwise starve its strongest measured
+// split. Larger streams retain the quality-oriented historical ordering:
+// with sufficient max time, independent whole-block work must not be skipped.
+const EARLY_MAX_SPLIT_MIN_TOKENS: usize = 2_048;
+const EARLY_MAX_SPLIT_TOKENS: usize = 3_000;
 // A marginal adaptive split can unlock another whole-stream replay whose cost
 // dwarfs the saving. Require four bytes at the Deflate level before allowing
 // this optional route to alter the established max result.
@@ -2319,9 +2324,36 @@ where
         }
     }
 
-    // Secure all established exact candidates before spending remaining max
-    // time on adaptive discovery. If the new search reaches the deadline, the
-    // eighth/32-token floor above remains available.
+    ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.token));
+
+    // Refine the strongest measured boundary before the whole-block beam. On
+    // compact streams the unsplit search can consume nearly the full max
+    // budget even though its complete comparison floor is already secured.
+    // Trying one evidence-ranked split first prevents that duplicate work from
+    // starving the most likely two-block result; the remaining splits retain
+    // their established order below.
+    let mut refined_splits = 0;
+    if options.exhaustive
+        && (EARLY_MAX_SPLIT_MIN_TOKENS..=EARLY_MAX_SPLIT_TOKENS).contains(&block.tokens.len())
+        && !expired()
+    {
+        if let Some(&(_, split)) = ranked_splits.first() {
+            if let Some(candidate) =
+                plan_searched_split(&composite, start, split, end, alignment, options, expired)
+            {
+                let candidate_bits = total_bits(&candidate);
+                if candidate_bits < best_bits {
+                    best_bits = candidate_bits;
+                    best = candidate;
+                }
+            }
+            refined_splits = 1;
+        }
+    }
+
+    // All direct split prices are now safe; compact streams also retain their
+    // strongest refined split. Continue with the independent whole-block
+    // token-spelling family while time remains.
     if options.exhaustive && !expired() {
         let searched_base = match complete_base {
             Some(base) => {
@@ -2374,7 +2406,6 @@ where
         }
     }
 
-    ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.token));
     if !options.exhaustive {
         // A locally second-best first split can expose the best stream after
         // its larger child is split again. The winning first split already gets
@@ -2429,29 +2460,45 @@ where
     // promising split children while time remains. Ranking by direct cost
     // makes max mode deterministic and gives plausible boundaries the first
     // search slots.
-    for (_, split) in ranked_splits {
+    for (_, split) in ranked_splits.into_iter().skip(refined_splits) {
         if expired() {
             break;
         }
-        let Some(left) = make_range(&composite, start, split) else {
+        let Some(candidate) =
+            plan_searched_split(&composite, start, split, end, alignment, options, expired)
+        else {
             continue;
         };
-        let left_plan = plan_block_with_search(&left, alignment, options, expired);
-        if expired() {
-            break;
-        }
-        let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
-        let Some(right) = make_range(&composite, split, end) else {
-            continue;
-        };
-        let right_plan = plan_block_with_search(&right, right_alignment, options, expired);
-        let candidate_bits = left_plan.bits + right_plan.bits;
+        let candidate_bits = total_bits(&candidate);
         if candidate_bits < best_bits {
             best_bits = candidate_bits;
-            best = vec![left_plan, right_plan];
+            best = candidate;
         }
     }
     best
+}
+
+fn plan_searched_split<F>(
+    composite: &Composite<'_>,
+    start: Cut,
+    split: Cut,
+    end: Cut,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+) -> Option<Vec<PlannedBlock>>
+where
+    F: FnMut() -> bool,
+{
+    let left = make_range(composite, start, split)?;
+    let left_plan = plan_block_with_search(&left, alignment, options, expired);
+    if expired() {
+        return None;
+    }
+    let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
+    let right = make_range(composite, split, end)?;
+    let right_plan = plan_block_with_search(&right, right_alignment, options, expired);
+    Some(vec![left_plan, right_plan])
 }
 
 fn adaptive_split_is_worth_replay(candidate_bits: u64, established_bits: u64) -> bool {
