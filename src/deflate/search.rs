@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-//! Token-preserving structural searches.
+//! Proven-LZ77 structural searches.
 //!
-//! These routes never discover new LZ77 matches. They selectively spell an
-//! existing match as its already-decoded literals, then rebuild the Huffman
-//! representation. Equal-cost token transformations are useful intermediate
-//! states because their changed frequencies can make the next tree smaller.
+//! These routes never search the history window or choose a new distance. They
+//! selectively spell an existing match as its already-decoded literals, or
+//! move boundaries inside an adjacent run already proven at one distance, then
+//! rebuild the Huffman representation. Equal-cost token transformations are
+//! useful intermediate states because their changed frequencies can make the
+//! next tree smaller.
 //!
 //! Names identify recovered primitives precisely. DeflOpt and Defluff labels
 //! apply only to behavior mapped to those programs; bounded floors, cumulative
@@ -25,8 +27,8 @@ use super::huffman::{
     make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    count_frequencies, try_clone_slice, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
-    Token,
+    canonical_length_encoding, count_frequencies, try_clone_slice, DynamicPlan, ParsedBlock,
+    PlannedBlock, Representation, Token,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 
@@ -45,12 +47,471 @@ const COMPACT_SHORT_BAND_MAX_PLAIN: usize = 80_000;
 const COMPACT_SHORT_BAND_ENDS: [u16; 6] = [257, 258, 259, 260, 262, 264];
 const TABLE_REPLAY_MAX_TOKENS: usize = 100_000;
 const TABLE_REPLAY_PASSES: usize = 4;
+// The exhaustive deficit DP can require 257 layers. Default mode keeps the
+// exact cost search for ordinary runs, but uses a legal minimum-token fallback
+// once a run would make this cheap candidate family disproportionate.
+const DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE: usize = 16;
 // These source-tree probes are part of the deadline-independent compact floor.
 // Keep only a small, ranked set so a many-frame container cannot spend its
 // shared budget rebuilding every nearly identical local candidate.
 // Ranked single-match trials are a Columbo extension. deft4j expands every
 // eligible match together in its strict and no-larger recode operations.
 const COLUMBO_SINGLE_MATCH_TRIALS: usize = 8;
+
+/// Source-only diagnostics for adjacent matches that reuse one distance.
+///
+/// These values describe the parsed input, not the number of candidates later
+/// visited by merged and replayed routes. Keeping that distinction prevents
+/// verbose corpus measurements from depending on search order or timeout.
+/// Adjacent source blocks are treated as one token stream, so an empty block
+/// is not an artificial barrier; stored bytes and other literals naturally
+/// terminate a match run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SameDistanceOpportunities {
+    pub(crate) runs: usize,
+    pub(crate) matches: usize,
+    pub(crate) decoded_bytes: usize,
+    pub(crate) coalescible_runs: usize,
+    pub(crate) repartition_runs: usize,
+    pub(crate) tokens_removable: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SameDistanceRun {
+    start: usize,
+    end: usize,
+    decoded_bytes: usize,
+    first: Token,
+}
+
+fn same_distance_run_at(tokens: &[Token], start: usize) -> Option<SameDistanceRun> {
+    let first = *tokens.get(start)?;
+    let Token::Match {
+        length, distance, ..
+    } = first
+    else {
+        return None;
+    };
+    let mut decoded_bytes = usize::from(length);
+    let mut end = start + 1;
+    while let Some(Token::Match {
+        length,
+        distance: next_distance,
+        ..
+    }) = tokens.get(end)
+    {
+        if *next_distance != distance {
+            break;
+        }
+        decoded_bytes = decoded_bytes.checked_add(usize::from(*length))?;
+        end += 1;
+    }
+    (end >= start + 2).then_some(SameDistanceRun {
+        start,
+        end,
+        decoded_bytes,
+        first,
+    })
+}
+
+pub(crate) fn same_distance_opportunities(blocks: &[ParsedBlock]) -> SameDistanceOpportunities {
+    let mut opportunities = SameDistanceOpportunities::default();
+    let mut run_distance = None;
+    let mut run_matches = 0_usize;
+    let mut run_bytes = 0_usize;
+    for block in blocks {
+        for token in block.tokens.iter() {
+            match *token {
+                Token::Match {
+                    length, distance, ..
+                } if run_distance == Some(distance) => {
+                    run_matches = run_matches.saturating_add(1);
+                    run_bytes = run_bytes.saturating_add(usize::from(length));
+                }
+                Token::Match {
+                    length, distance, ..
+                } => {
+                    record_same_distance_opportunity(&mut opportunities, run_matches, run_bytes);
+                    run_distance = Some(distance);
+                    run_matches = 1;
+                    run_bytes = usize::from(length);
+                }
+                Token::Literal(_) => {
+                    record_same_distance_opportunity(&mut opportunities, run_matches, run_bytes);
+                    run_distance = None;
+                    run_matches = 0;
+                    run_bytes = 0;
+                }
+            }
+        }
+    }
+    record_same_distance_opportunity(&mut opportunities, run_matches, run_bytes);
+    opportunities
+}
+
+fn record_same_distance_opportunity(
+    opportunities: &mut SameDistanceOpportunities,
+    matches: usize,
+    decoded_bytes: usize,
+) {
+    if matches < 2 {
+        return;
+    }
+    let minimum_matches = decoded_bytes.saturating_add(257) / 258;
+    opportunities.runs = opportunities.runs.saturating_add(1);
+    opportunities.matches = opportunities.matches.saturating_add(matches);
+    opportunities.decoded_bytes = opportunities.decoded_bytes.saturating_add(decoded_bytes);
+    opportunities.tokens_removable = opportunities
+        .tokens_removable
+        .saturating_add(matches.saturating_sub(minimum_matches));
+    if decoded_bytes <= 258 {
+        opportunities.coalescible_runs = opportunities.coalescible_runs.saturating_add(1);
+    } else if matches > minimum_matches
+        || 258_usize
+            .saturating_mul(minimum_matches)
+            .saturating_sub(decoded_bytes)
+            != 0
+    {
+        opportunities.repartition_runs = opportunities.repartition_runs.saturating_add(1);
+    }
+}
+
+/// Add one deterministic same-distance run candidate to an existing plan.
+///
+/// This wrapper deliberately uses the ordinary header policy even when called
+/// from a max-mode structural floor. The full search invokes the shared inner
+/// helper with its own policy and deadline.
+pub(crate) fn improve_plan_with_same_distance_floor(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    mut best: PlannedBlock,
+) -> PlannedBlock {
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    consider_same_distance_runs(block, alignment, &floor_options, &mut || false, &mut best);
+    best
+}
+
+fn consider_same_distance_runs<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) where
+    F: FnMut() -> bool,
+{
+    if block.tokens.len() < 2 || expired() {
+        return;
+    }
+    let literal_lengths: &[u8] = match &best.representation {
+        Representation::Dynamic(dynamic) => &dynamic.literal_lengths,
+        Representation::Fixed => &FIXED_LITERAL_CODE_LENGTHS,
+        Representation::Original(_) | Representation::Stored => block
+            .original_literal_lengths
+            .as_ref()
+            .map_or(&FIXED_LITERAL_CODE_LENGTHS, |lengths| lengths),
+    };
+    let Some(repacked) = repack_same_distance_runs(
+        &block.tokens,
+        block.plain.len(),
+        literal_lengths,
+        options.exhaustive,
+        expired,
+    ) else {
+        return;
+    };
+
+    // Price the canonical candidate first. Its planned token storage is
+    // reference-counted, so relaxed mode can derive an alias sibling lazily
+    // without retaining or eagerly allocating a second large token vector.
+    let Some(candidate) = plan_tokens(block, repacked, alignment, options, expired) else {
+        return;
+    };
+    let canonical_tokens = Arc::clone(&candidate.tokens);
+    if candidate.bits < best.bits {
+        *best = candidate;
+    }
+    if !options.strict
+        && !expired()
+        && canonical_tokens.iter().any(|token| {
+            matches!(
+                token,
+                Token::Match {
+                    length: 258,
+                    length_symbol: 285,
+                    ..
+                }
+            )
+        })
+    {
+        if let Some(aliased) = rewrite_258_symbols(&canonical_tokens, block.plain.len(), true) {
+            consider_tokens(block, aliased, alignment, options, expired, best);
+        }
+    }
+}
+
+/// Repartition every maximal adjacent run that uses one semantic distance.
+///
+/// If a run decodes `S` bytes, `ceil(S / 258)` is both legal and no larger
+/// than its source match count. The first source match proves the distance is
+/// valid at the run start; every later byte follows the same backward relation,
+/// including overlapping copies. Moving only those internal boundaries is
+/// therefore lossless and never searches the history window.
+fn repack_same_distance_runs<F>(
+    tokens: &[Token],
+    decoded_bytes: usize,
+    literal_lengths: &[u8],
+    exhaustive: bool,
+    expired: &mut F,
+) -> Option<Vec<Token>>
+where
+    F: FnMut() -> bool,
+{
+    let mut output_count = tokens.len();
+    let mut decoded_total = 0_usize;
+    let mut max_active = 0_usize;
+    let mut max_deficit = 0_usize;
+    let mut has_run = false;
+    let mut index = 0_usize;
+    while index < tokens.len() {
+        if let Some(run) = same_distance_run_at(tokens, index) {
+            has_run = true;
+            decoded_total = decoded_total.checked_add(run.decoded_bytes)?;
+            let source_matches = run.end - run.start;
+            let output_matches = run.decoded_bytes.checked_add(257)?.checked_div(258)?;
+            output_count = output_count.checked_sub(source_matches.checked_sub(output_matches)?)?;
+            let deficit = 258_usize
+                .checked_mul(output_matches)?
+                .checked_sub(run.decoded_bytes)?;
+            debug_assert!(deficit <= 257);
+            // A run of at most 258 bytes becomes one canonical match directly;
+            // an already-minimal all-258 run is unchanged. Neither case needs
+            // to allocate or traverse the deficit DP.
+            let active = output_matches.min(deficit);
+            if run.decoded_bytes > 258
+                && deficit != 0
+                && (exhaustive || active <= DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE)
+            {
+                max_active = max_active.max(active);
+                max_deficit = max_deficit.max(deficit);
+            }
+            index = run.end;
+        } else {
+            decoded_total = decoded_total.checked_add(tokens[index].decoded_len())?;
+            index += 1;
+        }
+    }
+    if !has_run || decoded_total != decoded_bytes {
+        return None;
+    }
+
+    let partitioner = if max_active == 0 {
+        None
+    } else {
+        Some(SameDistancePartitioner::new(
+            literal_lengths,
+            max_active,
+            max_deficit,
+            expired,
+        )?)
+    };
+    let mut output = new_token_candidate(output_count, decoded_bytes)?;
+    let mut changed = false;
+    index = 0;
+    while index < tokens.len() {
+        let Some(run) = same_distance_run_at(tokens, index) else {
+            output.push(tokens[index]);
+            index += 1;
+            continue;
+        };
+        let output_matches = run.decoded_bytes.checked_add(257)?.checked_div(258)?;
+        let deficit = 258_usize
+            .checked_mul(output_matches)?
+            .checked_sub(run.decoded_bytes)?;
+        let output_start = output.len();
+        if run.decoded_bytes <= 258 {
+            output.push(repacked_match(
+                run.first,
+                run.decoded_bytes.try_into().ok()?,
+            )?);
+        } else if deficit == 0 {
+            for _ in 0..output_matches {
+                output.push(repacked_match(run.first, 258)?);
+            }
+        } else {
+            let active = output_matches.min(deficit);
+            if exhaustive || active <= DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE {
+                let lengths = partitioner.as_ref()?.active_lengths(active, deficit)?;
+                for _ in 0..output_matches.checked_sub(active)? {
+                    output.push(repacked_match(run.first, 258)?);
+                }
+                for length in lengths {
+                    output.push(repacked_match(run.first, length)?);
+                }
+            } else {
+                append_minimum_token_fallback(&mut output, run.first, output_matches, deficit)?;
+            }
+        }
+        changed |= output[output_start..] != tokens[run.start..run.end];
+        index = run.end;
+    }
+    debug_assert_eq!(output.len(), output_count);
+    changed.then_some(output)
+}
+
+/// Append a legal minimum-token partition without running the cost DP.
+///
+/// The total deficit is at most 257, so at most two shortened matches are
+/// needed when each match may contribute up to 255 deficit bytes (length 3).
+/// Exact stream pricing still decides whether this bounded default candidate
+/// is useful.
+fn append_minimum_token_fallback(
+    output: &mut Vec<Token>,
+    source: Token,
+    output_matches: usize,
+    deficit: usize,
+) -> Option<()> {
+    debug_assert!((1..=257).contains(&deficit));
+    let shortened = deficit.checked_add(254)?.checked_div(255)?;
+    for _ in 0..output_matches.checked_sub(shortened)? {
+        output.push(repacked_match(source, 258)?);
+    }
+    let mut remaining = deficit;
+    for slots_left in (1..=shortened).rev() {
+        let reserved = 255_usize.checked_mul(slots_left.checked_sub(1)?)?;
+        let token_deficit = remaining.saturating_sub(reserved);
+        output.push(repacked_match(
+            source,
+            258_u16.checked_sub(token_deficit.try_into().ok()?)?,
+        )?);
+        remaining = remaining.checked_sub(token_deficit)?;
+    }
+    (remaining == 0).then_some(())
+}
+
+struct SameDistancePartitioner {
+    choices: Vec<u16>,
+    width: usize,
+    max_active: usize,
+}
+
+impl SameDistancePartitioner {
+    /// Build a DP over the deficit from an all-length-258 partition.
+    ///
+    /// With the minimum number of output matches the total deficit is at most
+    /// 257 bytes, regardless of run length. At most `deficit` matches can have
+    /// a non-zero deficit, so long runs add no DP depth.
+    fn new<F>(
+        literal_lengths: &[u8],
+        max_active: usize,
+        max_deficit: usize,
+        expired: &mut F,
+    ) -> Option<Self>
+    where
+        F: FnMut() -> bool,
+    {
+        let width = max_deficit.checked_add(1)?;
+        let choice_count = max_active.checked_add(1)?.checked_mul(width)?;
+        let mut choices = Vec::new();
+        choices.try_reserve_exact(choice_count).ok()?;
+        choices.resize(choice_count, u16::MAX);
+
+        let mut cost_by_deficit = [0_u32; 256];
+        for (deficit, cost) in cost_by_deficit.iter_mut().enumerate() {
+            let length = 258_u16.checked_sub(deficit as u16)?;
+            let (symbol, _, extra_bits) = canonical_length_encoding(length)?;
+            *cost = estimated_length(literal_lengths, usize::from(symbol))
+                .checked_add(u64::from(extra_bits))?
+                .try_into()
+                .ok()?;
+        }
+
+        let mut previous = [u32::MAX; 258];
+        let mut current = [u32::MAX; 258];
+        previous[0] = 0;
+        for slot in 1..=max_active {
+            if expired() {
+                return None;
+            }
+            current[..width].fill(u32::MAX);
+            for used_deficit in 0..=max_deficit {
+                if used_deficit & 31 == 0 && expired() {
+                    return None;
+                }
+                let mut best_cost = u32::MAX;
+                let mut best_deficit = u16::MAX;
+                for token_deficit in 0..=used_deficit.min(255) {
+                    let prefix = previous[used_deficit - token_deficit];
+                    if prefix == u32::MAX {
+                        continue;
+                    }
+                    let candidate = prefix.checked_add(cost_by_deficit[token_deficit])?;
+                    if candidate < best_cost {
+                        best_cost = candidate;
+                        best_deficit = token_deficit as u16;
+                    }
+                }
+                current[used_deficit] = best_cost;
+                choices[slot * width + used_deficit] = best_deficit;
+            }
+            previous = current;
+        }
+
+        Some(Self {
+            choices,
+            width,
+            max_active,
+        })
+    }
+
+    fn active_lengths(&self, active: usize, deficit: usize) -> Option<Vec<u16>> {
+        if active > self.max_active || deficit >= self.width {
+            return None;
+        }
+        let mut lengths = Vec::new();
+        lengths.try_reserve_exact(active).ok()?;
+        let mut remaining = deficit;
+        for slot in (1..=active).rev() {
+            let token_deficit = *self.choices.get(slot * self.width + remaining)?;
+            if token_deficit == u16::MAX {
+                return None;
+            }
+            remaining = remaining.checked_sub(usize::from(token_deficit))?;
+            lengths.push(258_u16.checked_sub(token_deficit)?);
+        }
+        if remaining != 0 {
+            return None;
+        }
+        lengths.sort_unstable_by(|left, right| right.cmp(left));
+        Some(lengths)
+    }
+}
+
+fn repacked_match(source: Token, length: u16) -> Option<Token> {
+    let Token::Match {
+        distance,
+        distance_symbol,
+        distance_extra,
+        distance_extra_bits,
+        ..
+    } = source
+    else {
+        return None;
+    };
+    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(length)?;
+    Some(Token::Match {
+        length,
+        distance,
+        length_symbol,
+        distance_symbol,
+        length_extra,
+        distance_extra,
+        length_extra_bits,
+        distance_extra_bits,
+    })
+}
 
 /// Complete the cheap token-preserving floor even when a container's shared
 /// search deadline has already elapsed.
@@ -106,6 +567,13 @@ pub(crate) fn improve_plan_with_floor(
     }
 
     let mut never_expired = || false;
+    consider_same_distance_runs(
+        block,
+        alignment,
+        &floor_options,
+        &mut never_expired,
+        &mut best,
+    );
     if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
         if normalized.as_slice() != block.tokens.as_slice() {
             consider_tokens(
@@ -512,6 +980,7 @@ pub(crate) fn plan_block_with_short_family_floor(
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     let base = plan_block(block, alignment, &floor_options, || false);
+    let base = improve_plan_with_same_distance_floor(block, alignment, &floor_options, base);
     improve_plan_with_short_family_floor(block, &floor_options, base)
 }
 
@@ -1000,6 +1469,10 @@ where
     // with Defluff's limiter. Price both before optional byte-seeking work.
     let feedback_seeds = feedback_tree_seeds(block, options.strict);
     consider_feedback_seed_trees(block, options, &feedback_seeds, &mut best);
+    if expired() {
+        return best;
+    }
+    consider_same_distance_runs(block, alignment, options, expired, &mut best);
     if expired() {
         return best;
     }
@@ -2219,7 +2692,53 @@ fn individual_prune_seed_lengths(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deflate::model::{token_extra_bits, OriginalBits, SourceBlockType};
+    use crate::deflate::model::{
+        token_extra_bits, OriginalBits, SourceBlockType, LENGTH_BASE, LENGTH_EXTRA_BITS,
+    };
+
+    fn test_match(
+        length: u16,
+        distance: u16,
+        distance_symbol: u8,
+        distance_extra: u16,
+        distance_extra_bits: u8,
+    ) -> Token {
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(length).expect("test length is legal");
+        Token::Match {
+            length,
+            distance,
+            length_symbol,
+            distance_symbol,
+            length_extra,
+            distance_extra,
+            length_extra_bits,
+            distance_extra_bits,
+        }
+    }
+
+    fn test_repack(
+        tokens: &[Token],
+        decoded_bytes: usize,
+        literal_lengths: &[u8],
+        exhaustive: bool,
+    ) -> Option<Vec<Token>> {
+        repack_same_distance_runs(
+            tokens,
+            decoded_bytes,
+            literal_lengths,
+            exhaustive,
+            &mut || false,
+        )
+    }
+
+    fn test_partitioner(
+        literal_lengths: &[u8],
+        max_active: usize,
+        max_deficit: usize,
+    ) -> Option<SameDistancePartitioner> {
+        SameDistancePartitioner::new(literal_lengths, max_active, max_deficit, &mut || false)
+    }
 
     #[test]
     fn the_258_alias_rewrite_is_bidirectional_but_explicit() {
@@ -2249,6 +2768,284 @@ mod tests {
         let normalized = rewrite_258_symbols(&aliased, 258, false)
             .expect("the bounded one-token normalization fits");
         assert_eq!(normalized, [canonical]);
+    }
+
+    #[test]
+    fn generated_match_lengths_are_canonical() {
+        for length in 3..=258 {
+            let (symbol, extra, extra_bits) =
+                canonical_length_encoding(length).expect("every Deflate match length is legal");
+            let index = usize::from(symbol - 257);
+            assert_eq!(LENGTH_BASE[index] + extra, length);
+            assert_eq!(LENGTH_EXTRA_BITS[index], extra_bits);
+            assert!(extra < (1_u16 << extra_bits).max(1));
+            if length == 258 {
+                assert_eq!((symbol, extra, extra_bits), (285, 0, 0));
+            }
+        }
+        assert!(canonical_length_encoding(2).is_none());
+        assert!(canonical_length_encoding(259).is_none());
+    }
+
+    #[test]
+    fn same_distance_stats_count_maximal_runs() {
+        let tokens = vec![
+            Token::Literal(b'x'),
+            test_match(3, 1, 0, 0, 0),
+            test_match(4, 1, 0, 0, 0),
+            test_match(5, 2, 1, 0, 0),
+            Token::Literal(b'y'),
+            test_match(130, 3, 2, 0, 0),
+            test_match(130, 3, 2, 0, 0),
+            // Distances five and six share symbol four, but are not one run.
+            test_match(3, 5, 4, 0, 1),
+            test_match(3, 6, 4, 1, 1),
+        ];
+        let plain_len: usize = tokens.iter().map(|token| token.decoded_len()).sum();
+        let block = short_family_test_block(tokens, vec![0; plain_len]);
+
+        assert_eq!(
+            same_distance_opportunities(&[block]),
+            SameDistanceOpportunities {
+                runs: 2,
+                matches: 4,
+                decoded_bytes: 267,
+                coalescible_runs: 1,
+                repartition_runs: 1,
+                tokens_removable: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn same_distance_stats_join_source_blocks_but_skip_unchanged_minimum_runs() {
+        let first = short_family_test_block(vec![test_match(100, 1, 0, 0, 0)], vec![0; 100]);
+        let empty = short_family_test_block(Vec::new(), Vec::new());
+        let last = short_family_test_block(
+            vec![
+                test_match(158, 1, 0, 0, 0),
+                Token::Literal(b'x'),
+                test_match(258, 2, 1, 0, 0),
+                test_match(258, 2, 1, 0, 0),
+            ],
+            vec![0; 675],
+        );
+
+        assert_eq!(
+            same_distance_opportunities(&[first, empty, last]),
+            SameDistanceOpportunities {
+                runs: 2,
+                matches: 4,
+                decoded_bytes: 774,
+                coalescible_runs: 1,
+                repartition_runs: 0,
+                tokens_removable: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn same_distance_repacking_coalesces_a_short_run() {
+        let source = [test_match(3, 5, 4, 0, 1), test_match(4, 5, 4, 0, 1)];
+        let repacked = test_repack(&source, 7, &FIXED_LITERAL_CODE_LENGTHS, false).unwrap();
+        assert_eq!(
+            repacked,
+            [Token::Match {
+                length: 7,
+                distance: 5,
+                length_symbol: 261,
+                distance_symbol: 4,
+                length_extra: 0,
+                distance_extra: 0,
+                length_extra_bits: 0,
+                distance_extra_bits: 1,
+            }]
+        );
+
+        let canonical_258 = [test_match(100, 1, 0, 0, 0), test_match(158, 1, 0, 0, 0)];
+        assert!(matches!(
+            test_repack(&canonical_258, 258, &FIXED_LITERAL_CODE_LENGTHS, false,)
+                .unwrap()
+                .as_slice(),
+            [Token::Match {
+                length: 258,
+                length_symbol: 285,
+                length_extra: 0,
+                length_extra_bits: 0,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn direct_same_distance_coalescing_does_not_enter_the_dp() {
+        let source = [test_match(100, 1, 0, 0, 0), test_match(158, 1, 0, 0, 0)];
+        let mut dp_must_not_poll = || -> bool { panic!("direct coalescing entered the DP") };
+        let repacked = repack_same_distance_runs(
+            &source,
+            258,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            false,
+            &mut dp_must_not_poll,
+        )
+        .unwrap();
+        assert_eq!(repacked.len(), 1);
+    }
+
+    #[test]
+    fn default_repacking_bounds_pathological_dp_depth_and_max_polls_deadline() {
+        let source = vec![test_match(257, 1, 0, 0, 0); 257];
+        let decoded_bytes = 257 * 257;
+        let mut default_must_not_poll = || -> bool { panic!("default fallback entered the DP") };
+        let repacked = repack_same_distance_runs(
+            &source,
+            decoded_bytes,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            false,
+            &mut default_must_not_poll,
+        )
+        .unwrap();
+        assert_eq!(repacked.len(), 257);
+        assert_eq!(
+            repacked
+                .iter()
+                .map(|token| token.decoded_len())
+                .sum::<usize>(),
+            decoded_bytes
+        );
+
+        let mut polls = 0_usize;
+        let mut expires_during_dp = || {
+            polls += 1;
+            polls > 3
+        };
+        assert!(repack_same_distance_runs(
+            &source,
+            decoded_bytes,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            true,
+            &mut expires_during_dp,
+        )
+        .is_none());
+        assert!(polls > 3);
+    }
+
+    #[test]
+    fn same_distance_partitioning_handles_small_remainders() {
+        for total in [259_usize, 260] {
+            let left = total / 2;
+            let source = [
+                test_match(left as u16, 1, 0, 0, 0),
+                test_match((total - left) as u16, 1, 0, 0, 0),
+            ];
+            let repacked = test_repack(&source, total, &FIXED_LITERAL_CODE_LENGTHS, false).unwrap();
+            assert_eq!(repacked.len(), 2);
+            assert!(repacked
+                .iter()
+                .all(|token| (3..=258).contains(&token.decoded_len())));
+            assert_eq!(
+                repacked
+                    .iter()
+                    .map(|token| token.decoded_len())
+                    .sum::<usize>(),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn same_distance_partitioning_is_legal_for_all_small_totals() {
+        let partitioner = test_partitioner(&FIXED_LITERAL_CODE_LENGTHS, 16, 257).unwrap();
+        for total in 6_usize..=4_096 {
+            let matches = total.div_ceil(258);
+            let deficit = 258 * matches - total;
+            let active = matches.min(deficit);
+            let active_lengths = partitioner.active_lengths(active, deficit).unwrap();
+            let lengths = std::iter::repeat(258_u16)
+                .take(matches - active)
+                .chain(active_lengths)
+                .collect::<Vec<_>>();
+            assert_eq!(lengths.len(), matches, "total {total}");
+            assert!(
+                lengths.iter().all(|length| (3..=258).contains(length)),
+                "total {total}: {lengths:?}"
+            );
+            assert_eq!(
+                lengths.iter().copied().map(usize::from).sum::<usize>(),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn same_distance_partitioning_uses_huffman_costs() {
+        let mut prefer_258 = [15_u8; 286];
+        prefer_258[284] = 15;
+        prefer_258[285] = 1;
+        let first = test_partitioner(&prefer_258, 2, 6)
+            .unwrap()
+            .active_lengths(2, 6)
+            .unwrap();
+
+        let mut avoid_258 = [15_u8; 286];
+        avoid_258[284] = 1;
+        avoid_258[285] = 15;
+        let second = test_partitioner(&avoid_258, 2, 6)
+            .unwrap()
+            .active_lengths(2, 6)
+            .unwrap();
+
+        assert_eq!(first, [258, 252]);
+        assert_eq!(second, [257, 253]);
+    }
+
+    #[test]
+    fn same_distance_repacking_respects_barriers_and_strict_comparison() {
+        let tokens = vec![
+            Token::Literal(b'a'),
+            test_match(3, 1, 0, 0, 0),
+            test_match(4, 2, 1, 0, 0),
+            Token::Literal(b'b'),
+            test_match(3, 1, 0, 0, 0),
+        ];
+        assert!(test_repack(&tokens, 12, &FIXED_LITERAL_CODE_LENGTHS, false).is_none());
+
+        let already_minimal = [test_match(258, 1, 0, 0, 0); 2];
+        assert!(test_repack(&already_minimal, 516, &FIXED_LITERAL_CODE_LENGTHS, false,).is_none());
+
+        let redundant_exact_multiple = [
+            test_match(100, 1, 0, 0, 0),
+            test_match(158, 1, 0, 0, 0),
+            test_match(258, 1, 0, 0, 0),
+        ];
+        assert_eq!(
+            test_repack(
+                &redundant_exact_multiple,
+                516,
+                &FIXED_LITERAL_CODE_LENGTHS,
+                false,
+            )
+            .unwrap(),
+            [test_match(258, 1, 0, 0, 0); 2]
+        );
+
+        let source = vec![
+            Token::Literal(b'a'),
+            test_match(3, 1, 0, 0, 0),
+            test_match(4, 1, 0, 0, 0),
+        ];
+        let block = short_family_test_block(source.clone(), vec![b'a'; 8]);
+        let incumbent = PlannedBlock {
+            tokens: source.into(),
+            plain: block.plain.clone(),
+            representation: Representation::Fixed,
+            bits: 0,
+            source_type: SourceBlockType::Fixed,
+        };
+        let retained =
+            improve_plan_with_same_distance_floor(&block, 0, &Options::default(), incumbent);
+        assert_eq!(retained.bits, 0);
+        assert_eq!(retained.tokens, block.tokens);
     }
 
     #[test]

@@ -34,11 +34,12 @@ use super::model::{
 };
 use super::search::{
     improve_plan_with_deft4j_tree_floor, improve_plan_with_floor,
-    improve_plan_with_short_family_floor, plan_block_with_complete_base_search,
-    plan_block_with_floor, plan_block_with_narrow_search, plan_block_with_search,
-    plan_block_with_seeded_narrow_search, plan_block_with_short_family_floor,
-    replay_extended_floor, replay_table_ladder, score_short_family_frequencies,
-    tighten_terminal_plan, try_clone_planned_block, ShortFamilyStats,
+    improve_plan_with_same_distance_floor, improve_plan_with_short_family_floor,
+    plan_block_with_complete_base_search, plan_block_with_floor, plan_block_with_narrow_search,
+    plan_block_with_search, plan_block_with_seeded_narrow_search,
+    plan_block_with_short_family_floor, replay_extended_floor, replay_table_ladder,
+    score_short_family_frequencies, tighten_terminal_plan, try_clone_planned_block,
+    ShortFamilyStats,
 };
 
 // The original Columbo C implementation tries its default long-merge route in
@@ -802,6 +803,7 @@ fn source_aligned_huffman_floor_with_limit(
             // range also feeds the additive recode families below, so retain
             // its ordinary plan instead of rebuilding it in every helper.
             let mut recode_base = None;
+            let mut singleton_same_distance = None;
             let template = if end_index - start_index > 1 {
                 let range = make_range(&composite, start, end)?;
                 let base = plan_block(&range, start_alignment, &structural_options, || false);
@@ -819,28 +821,64 @@ fn source_aligned_huffman_floor_with_limit(
                 recode_base = Some((range, base));
                 selected
             } else {
-                PlanTemplate::from_planned(plan_block(
-                    &blocks[start_index],
+                let block = &blocks[start_index];
+                let base = plan_block(block, start_alignment, &structural_options, || false);
+                let selected = PlanTemplate::try_from_planned(&base)?;
+                singleton_same_distance = Some(improve_plan_with_same_distance_floor(
+                    block,
                     start_alignment,
                     &structural_options,
-                    || false,
-                ))
+                    base,
+                ));
+                selected
             };
             let mut candidate_bits = template.bits;
             let mut candidate_is_stored = matches!(template.representation, Representation::Stored);
             let mut candidate_plan = SourceAlignedPlan::Template(template);
 
-            // deft4j rebuilds a merged range before pruning matches. Price its
-            // tree candidate, and Columbo's separate cumulative-family bands,
-            // only after forming the range: per-source tables cannot reproduce
-            // merged frequencies. Every helper enforces model limits.
+            // A singleton edge can participate in the globally best source
+            // segmentation, so carry its normalized token spelling in this
+            // DP instead of relying on the separate all-singleton floor.
+            if let Some(recode) = singleton_same_distance {
+                if !matches!(recode.representation, Representation::Stored)
+                    && recode.bits < candidate_bits
+                {
+                    candidate_bits = recode.bits;
+                    candidate_is_stored = false;
+                    candidate_plan = SourceAlignedPlan::Recode(recode);
+                }
+            }
+
+            // Same-distance runs can cross an erased source boundary, while
+            // deft4j rebuilds a merged range before pruning matches. Price
+            // those candidates, and Columbo's separate cumulative-family
+            // bands, only after forming the range: per-source tables cannot
+            // reproduce the merged state. Every helper enforces model limits.
             if let Some((range, base)) = recode_base {
-                // All three recode families start from the same ordinary
+                let is_large_whole_stream = start_index == 0
+                    && end_index == blocks.len()
+                    && range.plain.len() >= WHOLE_STREAM_RECODE_MIN_PLAIN;
+                // All four recode families start from the same ordinary
                 // stored/fixed/dynamic price. Build it once and clone only
                 // the small representation metadata; tokens and decoded
                 // bytes remain shared through their `Arc`s. Each helper
                 // still receives an independent base, preserving the old
                 // candidate and tie order below.
+                // The complete large-stream floor starts with this same
+                // normalization, so do not build and replay an identical
+                // standalone seed for that one range.
+                let same_distance = (!is_large_whole_stream)
+                    .then(|| {
+                        try_clone_planned_block(&base).map(|base| {
+                            improve_plan_with_same_distance_floor(
+                                &range,
+                                start_alignment,
+                                &structural_options,
+                                base,
+                            )
+                        })
+                    })
+                    .flatten();
                 let deft4j = try_clone_planned_block(&base).map(|base| {
                     improve_plan_with_deft4j_tree_floor(
                         &range,
@@ -856,9 +894,6 @@ fn source_aligned_huffman_floor_with_limit(
                 // being seen.
                 // Limiting this to the full range avoids multiplying that
                 // work across every possible source-aligned subrange.
-                let is_large_whole_stream = start_index == 0
-                    && end_index == blocks.len()
-                    && range.plain.len() >= WHOLE_STREAM_RECODE_MIN_PLAIN;
                 let (short_family, whole_stream) = if is_large_whole_stream {
                     let short_family = try_clone_planned_block(&base).map(|base| {
                         improve_plan_with_short_family_floor(&range, &structural_options, base)
@@ -880,6 +915,7 @@ fn source_aligned_huffman_floor_with_limit(
                     (short_family, None)
                 };
                 let replay_seed_bits = [
+                    same_distance.as_ref().map(|plan| plan.bits),
                     deft4j.as_ref().map(|plan| plan.bits),
                     short_family.as_ref().map(|plan| plan.bits),
                     whole_stream.as_ref().map(|plan| plan.bits),
@@ -887,7 +923,10 @@ fn source_aligned_huffman_floor_with_limit(
                 .into_iter()
                 .flatten()
                 .fold(candidate_bits, u64::min);
-                for mut recode in [deft4j, short_family, whole_stream].into_iter().flatten() {
+                for mut recode in [same_distance, deft4j, short_family, whole_stream]
+                    .into_iter()
+                    .flatten()
+                {
                     // A changed tree can expose another strict spelling
                     // win. Complete every near-tied full-stream seed before
                     // comparing it: a temporarily dearer table can be the
@@ -2949,14 +2988,6 @@ struct PlanTemplate {
 }
 
 impl PlanTemplate {
-    fn from_planned(plan: PlannedBlock) -> Self {
-        Self {
-            representation: plan.representation,
-            bits: plan.bits,
-            source_type: plan.source_type,
-        }
-    }
-
     /// Retain a lightweight structural template while another candidate
     /// family takes ownership of the complete base plan.
     fn try_from_planned(plan: &PlannedBlock) -> Option<Self> {
@@ -4042,7 +4073,9 @@ mod tests {
         let parallel =
             bounded_huffman_grouping(&blocks, &options, BoundedRangePricing::Parallel).unwrap();
 
-        assert!(serial.len() < blocks.len());
+        // The same-distance floor can make each synthetic source block as
+        // cheap as its grouped form. This test requires identical serial and
+        // parallel decisions, whether or not a merge remains profitable.
         assert_eq!(parallel.len(), serial.len());
         for (parallel, serial) in parallel.iter().zip(&serial) {
             assert_eq!(parallel.tokens, serial.tokens);

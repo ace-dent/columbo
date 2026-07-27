@@ -27,6 +27,27 @@ pub(crate) const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
+/// Return the canonical RFC 1951 symbol and extra fields for a match length.
+///
+/// The arithmetic range of symbol 284 also reaches 258, but RFC 1951 assigns
+/// that value to symbol 285. Columbo accepts the former spelling only as an
+/// explicit relaxed-mode compatibility extension, so structural rewrites must
+/// never create it implicitly.
+pub(crate) fn canonical_length_encoding(length: u16) -> Option<(u16, u16, u8)> {
+    if length == 258 {
+        return Some((285, 0, 0));
+    }
+    for index in 0..28 {
+        let base = LENGTH_BASE[index];
+        let extra_bits = LENGTH_EXTRA_BITS[index];
+        let span = 1_u16 << extra_bits;
+        if (base..base + span).contains(&length) {
+            return Some((257 + index as u16, length - base, extra_bits));
+        }
+    }
+    None
+}
+
 pub(crate) const DISTANCE_BASE: [u16; 30] = [
     1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
     2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,

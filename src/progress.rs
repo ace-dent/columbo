@@ -70,6 +70,16 @@ pub(crate) struct CandidateProgress {
     pub(crate) profitable: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SameDistanceProgress {
+    pub(crate) runs: usize,
+    pub(crate) matches: usize,
+    pub(crate) decoded_bytes: usize,
+    pub(crate) coalescible_runs: usize,
+    pub(crate) repartition_runs: usize,
+    pub(crate) tokens_removable: usize,
+}
+
 pub(crate) struct StreamProgress {
     pub(crate) blocks: usize,
     pub(crate) compressed_bytes: usize,
@@ -154,6 +164,35 @@ impl Progress {
             format_duration(elapsed),
             blocks,
             plural(blocks, "block", "blocks")
+        );
+    }
+
+    pub(crate) fn same_distance_opportunities(self, report: SameDistanceProgress) {
+        if !self.enabled {
+            return;
+        }
+        if report.runs == 0 {
+            println!(
+                "  S{} Matches · no adjacent same-distance runs in the joined source token stream",
+                self.stream_id
+            );
+            return;
+        }
+        println!(
+            "  S{} Matches · joined source token stream · {} {} / {} {} / {} decoded {} · {} direct {} · {} {} · up to {} removable {}",
+            self.stream_id,
+            report.runs,
+            plural(report.runs, "run", "runs"),
+            report.matches,
+            plural(report.matches, "match", "matches"),
+            report.decoded_bytes,
+            plural(report.decoded_bytes, "byte", "bytes"),
+            report.coalescible_runs,
+            plural(report.coalescible_runs, "coalesce", "coalesces"),
+            report.repartition_runs,
+            plural(report.repartition_runs, "repartition", "repartitions"),
+            report.tokens_removable,
+            plural(report.tokens_removable, "token", "tokens"),
         );
     }
 
