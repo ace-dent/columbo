@@ -21,6 +21,7 @@ const PROGRAM_VERSION: &str = concat!(
     ".",
     env!("CARGO_PKG_VERSION_MINOR")
 );
+const PROGRAM_STAGE: &str = "Beta";
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -162,7 +163,7 @@ fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Dur
         .file_name()
         .unwrap_or(command.input.as_os_str());
     println!();
-    println!("{PROGRAM_NAME} v{PROGRAM_VERSION} · verbose");
+    println!("{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · verbose");
     println!("────────────────────────");
     println!(
         "Input    {:?} · {input_bytes} {} · read {}",
@@ -368,7 +369,7 @@ fn strict_error() -> CliError {
 fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
-        "🕵🏻‍♂️  \x1b[1m{PROGRAM_NAME} v{PROGRAM_VERSION} alpha\x1b[0m"
+        "🕵🏻‍♂️  \x1b[1m{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE}\x1b[0m"
     )?;
     writeln!(
         output,
