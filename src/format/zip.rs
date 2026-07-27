@@ -521,7 +521,13 @@ fn build_local_entry(
             source_payload,
             options,
             u64::from(entry.uncompressed_size),
-            DefaultFloor::Shared,
+            // Every ZIP member must finish its ordinary route before max-only
+            // work. A bounded floor can expire part-way through a large
+            // member and let `--max` return a worse archive than normal mode.
+            // Max benchmarks reserve the measured normal runtime before their
+            // extra search allowance, so completing this floor spends that
+            // reserved work without repeating a second whole-archive pass.
+            DefaultFloor::Complete,
         )
         .map_err(|error| {
             if error.message().contains("internal memory safety") {
