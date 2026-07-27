@@ -629,8 +629,9 @@ fn direct_structural_plan(
 /// Very fragmented streams are handled by collection first; running even a
 /// small token pass hundreds of times would spend the container deadline on
 /// bookkeeping. For normal block counts this Columbo floor gives every
-/// ZIP/APNG member strict source/fixed, exact-Defluff-tree, and hybrid-tree
-/// feedback candidates before optional search.
+/// ZIP/APNG member strict source/fixed, same-distance, targeted proven-submatch,
+/// exact-Defluff-tree, and hybrid-tree feedback candidates before optional
+/// search.
 fn mandatory_token_floor_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,

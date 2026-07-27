@@ -3,8 +3,9 @@
 //! Proven-LZ77 structural searches.
 //!
 //! These routes never search the history window or choose a new distance. They
-//! selectively spell an existing match as its already-decoded literals, or
-//! move boundaries inside an adjacent run already proven at one distance, then
+//! selectively spell an existing match as its already-decoded literals,
+//! resegment one match into literals and same-distance submatches, or move
+//! boundaries inside an adjacent run already proven at one distance, then
 //! rebuild the Huffman representation. Equal-cost token transformations are
 //! useful intermediate states because their changed frequencies can make the
 //! next tree smaller.
@@ -14,6 +15,7 @@
 //! length-family bands, match groups, queues, and repeated replay are Columbo
 //! compositions, even when they use a recovered primitive internally.
 
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 use crate::Options;
@@ -28,7 +30,7 @@ use super::huffman::{
 };
 use super::model::{
     canonical_length_encoding, count_frequencies, try_clone_slice, DynamicPlan, ParsedBlock,
-    PlannedBlock, Representation, Token,
+    PlannedBlock, Representation, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 
@@ -51,6 +53,24 @@ const TABLE_REPLAY_PASSES: usize = 4;
 // exact cost search for ordinary runs, but uses a legal minimum-token fallback
 // once a run would make this cheap candidate family disproportionate.
 const DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE: usize = 16;
+// Default mode exact-prices one combined candidate from a short ranked list.
+// Compact blocks may also try a few single-match siblings, while max mode
+// widens to every match in the explicitly bounded full-graph band.
+const DEFAULT_PROVEN_SUBMATCH_TARGETS: usize = 8;
+const DEFAULT_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS: usize = 4;
+const DEFAULT_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL: usize = 2;
+const MAX_PROVEN_SUBMATCH_TARGETS: usize = 32;
+const MAX_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS: usize = 8;
+const MAX_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL: usize = 4;
+const MAX_PROVEN_SUBMATCH_FULL_TOKENS: usize = 12_000;
+const MAX_PROVEN_SUBMATCH_FULL_PLAIN: usize = 80_000;
+const MAX_PROVEN_SUBMATCH_FULL_MATCHES: usize = 512;
+const MAX_PROVEN_SUBMATCH_ELIMINATION_MATCHES: usize = 64;
+const MAX_PROVEN_SUBMATCH_PASSES: usize = 12;
+const PROVEN_SUBMATCH_RARE_FREQUENCY: u32 = 2;
+const PROVEN_SUBMATCH_EXPENSIVE_CODE_BITS: u8 = 9;
+const PROVEN_SUBMATCH_TRANSITION_BYTES: u16 = 2;
+const PROVEN_SUBMATCH_BOUNDARY_RADIUS: usize = 8;
 // These source-tree probes are part of the deadline-independent compact floor.
 // Keep only a small, ranked set so a many-frame container cannot spend its
 // shared budget rebuilding every nearly identical local candidate.
@@ -513,16 +533,959 @@ fn repacked_match(source: Token, length: u16) -> Option<Token> {
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProvenSubmatchChoice {
+    End,
+    Literal(u8),
+    Match(Token),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProvenSubmatchRank {
+    highest: bool,
+    rare: bool,
+    near_boundary: bool,
+    transition: bool,
+    expensive: bool,
+    code_bits: u8,
+    frequency: u32,
+    token_index: usize,
+}
+
+impl ProvenSubmatchRank {
+    fn key(self) -> (bool, bool, bool, bool, bool, Reverse<u8>, u32, usize) {
+        (
+            !self.highest,
+            !self.rare,
+            !self.near_boundary,
+            !self.transition,
+            !self.expensive,
+            Reverse(self.code_bits),
+            self.frequency,
+            self.token_index,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProvenSubmatchTarget {
+    token_index: usize,
+    plain_offset: usize,
+    source: Token,
+    rank: ProvenSubmatchRank,
+}
+
+struct ProvenSubmatchRewrite {
+    token_index: usize,
+    replacement: Vec<Token>,
+    estimated_saving: i64,
+    rank: ProvenSubmatchRank,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProvenSubmatchRestriction {
+    None,
+    Symbol(u16),
+    SourceSymbol,
+}
+
+/// Add subranges already proved by each existing match.
+///
+/// This is not match finding: every generated match retains the source
+/// distance and stays inside the source match's decoded interval. Default mode
+/// exact-prices one bounded set of rare, header-expensive, transition-adjacent
+/// or boundary-near matches. Max mode widens compact blocks to every match and
+/// repeats only strict winners until their token spelling stabilizes.
+fn consider_proven_submatches<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) where
+    F: FnMut() -> bool,
+{
+    let model_is_bounded = if options.exhaustive {
+        best.tokens.len() <= SHORT_FAMILY_MAX_TOKENS
+            && block.plain.len() <= MANDATORY_FLOOR_MAX_PLAIN
+    } else {
+        best.tokens.len() <= MANDATORY_FLOOR_MAX_TOKENS
+            && block.plain.len() <= MANDATORY_FLOOR_MAX_PLAIN
+    };
+    if !model_is_bounded || expired() {
+        return;
+    }
+
+    for pass in 0..MAX_PROVEN_SUBMATCH_PASSES {
+        if expired() {
+            return;
+        }
+        let pass_tokens = Arc::clone(&best.tokens);
+        let (literal_lengths, distance_lengths) = proven_submatch_seed_lengths(block, best);
+        let (literal_frequencies, _) = count_frequencies(&pass_tokens);
+        let match_count = pass_tokens
+            .iter()
+            .filter(|token| matches!(token, Token::Match { .. }))
+            .count();
+        if match_count == 0 {
+            return;
+        }
+        let full_graph = options.exhaustive
+            && pass_tokens.len() <= MAX_PROVEN_SUBMATCH_FULL_TOKENS
+            && block.plain.len() <= MAX_PROVEN_SUBMATCH_FULL_PLAIN
+            && match_count <= MAX_PROVEN_SUBMATCH_FULL_MATCHES;
+
+        let Some(targets) = select_proven_submatch_targets(
+            &pass_tokens,
+            block.plain.len(),
+            &block.source_splits,
+            &literal_frequencies,
+            &literal_lengths,
+            full_graph,
+            options.exhaustive,
+            expired,
+        ) else {
+            return;
+        };
+        let Some(mut payload_rewrites) = build_proven_submatch_rewrites(
+            &targets,
+            &block.plain,
+            &literal_lengths,
+            &distance_lengths,
+            ProvenSubmatchRestriction::None,
+            expired,
+        ) else {
+            return;
+        };
+        // The source edge intentionally wins estimated payload ties. Build a
+        // second, source-symbol-free path so exact header pricing can still
+        // accept a tie or small payload penalty that removes an expensive
+        // code-length entry.
+        let Some(mut symbol_free_rewrites) = build_proven_submatch_rewrites(
+            &targets,
+            &block.plain,
+            &literal_lengths,
+            &distance_lengths,
+            ProvenSubmatchRestriction::SourceSymbol,
+            expired,
+        ) else {
+            return;
+        };
+
+        // A few single-match siblings keep one locally useful resegmentation
+        // from being hidden by other graph choices. The combined candidate
+        // below remains the main default route.
+        let compact_for_trials =
+            pass_tokens.len() <= 4_000 && block.plain.len() <= MAX_PROVEN_SUBMATCH_FULL_PLAIN;
+        let individual_limit = if compact_for_trials {
+            if options.exhaustive {
+                MAX_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS
+            } else {
+                DEFAULT_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS
+            }
+        } else {
+            0
+        };
+        let mut priced_candidates = Vec::new();
+        let priced_candidate_limit = individual_limit.saturating_mul(2).saturating_add(3);
+        if priced_candidates
+            .try_reserve_exact(priced_candidate_limit)
+            .is_err()
+        {
+            return;
+        }
+        if consider_proven_submatch_rewrite_family(
+            block,
+            &pass_tokens,
+            alignment,
+            options,
+            individual_limit,
+            &mut payload_rewrites,
+            &mut priced_candidates,
+            expired,
+            best,
+        )
+        .is_none()
+        {
+            return;
+        }
+        symbol_free_rewrites.sort_by_key(|rewrite| rewrite.token_index);
+        if !same_proven_submatch_rewrites(&payload_rewrites, &symbol_free_rewrites)
+            && consider_proven_submatch_rewrite_family(
+                block,
+                &pass_tokens,
+                alignment,
+                options,
+                individual_limit,
+                &mut symbol_free_rewrites,
+                &mut priced_candidates,
+                expired,
+                best,
+            )
+            .is_none()
+        {
+            return;
+        }
+
+        // Per-symbol target caps deliberately keep one common symbol from
+        // starving other opportunities. This separate candidate still removes
+        // the highest symbol from every occurrence when that complete
+        // header-oriented rewrite fits its explicit bound.
+        if !expired() {
+            consider_highest_length_symbol_elimination(
+                block,
+                &pass_tokens,
+                alignment,
+                options,
+                &literal_lengths,
+                &distance_lengths,
+                &mut priced_candidates,
+                expired,
+                best,
+            );
+        }
+
+        if !options.exhaustive
+            || best.tokens.as_slice() == pass_tokens.as_slice()
+            || pass + 1 == MAX_PROVEN_SUBMATCH_PASSES
+        {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_proven_submatch_rewrite_family<F>(
+    block: &ParsedBlock,
+    source: &[Token],
+    alignment: u8,
+    options: &Options,
+    individual_limit: usize,
+    rewrites: &mut [ProvenSubmatchRewrite],
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) -> Option<()>
+where
+    F: FnMut() -> bool,
+{
+    if individual_limit != 0 && !rewrites.is_empty() {
+        let mut order = Vec::new();
+        order.try_reserve_exact(rewrites.len()).ok()?;
+        order.extend(0..rewrites.len());
+        order.sort_by_key(|&index| {
+            (
+                Reverse(rewrites[index].estimated_saving),
+                rewrites[index].rank.key(),
+            )
+        });
+        for index in order.into_iter().take(individual_limit) {
+            if expired() {
+                return None;
+            }
+            let Some(tokens) = apply_proven_submatch_rewrites(
+                source,
+                block.plain.len(),
+                std::slice::from_ref(&rewrites[index]),
+            ) else {
+                continue;
+            };
+            consider_unique_proven_submatch_tokens(
+                block,
+                tokens,
+                alignment,
+                options,
+                priced_candidates,
+                expired,
+                best,
+            );
+        }
+    }
+
+    // With one rewrite, the combined candidate is exactly the individual
+    // candidate already priced above. Avoid rebuilding the same Huffman table
+    // twice in the deadline-independent default floor.
+    if should_price_combined_proven_submatch_candidate(rewrites.len(), individual_limit) {
+        if expired() {
+            return None;
+        }
+        rewrites.sort_by_key(|rewrite| rewrite.token_index);
+        if let Some(tokens) = apply_proven_submatch_rewrites(source, block.plain.len(), rewrites) {
+            consider_unique_proven_submatch_tokens(
+                block,
+                tokens,
+                alignment,
+                options,
+                priced_candidates,
+                expired,
+                best,
+            );
+        }
+    }
+    Some(())
+}
+
+fn should_price_combined_proven_submatch_candidate(
+    rewrite_count: usize,
+    individual_limit: usize,
+) -> bool {
+    rewrite_count > 1 || (rewrite_count == 1 && individual_limit == 0)
+}
+
+fn same_proven_submatch_rewrites(
+    left: &[ProvenSubmatchRewrite],
+    right: &[ProvenSubmatchRewrite],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.token_index == right.token_index && left.replacement == right.replacement
+        })
+}
+
+fn proven_submatch_seed_lengths(block: &ParsedBlock, best: &PlannedBlock) -> (Vec<u8>, Vec<u8>) {
+    plan_lengths(best)
+        .or_else(|| {
+            Some((
+                block.original_literal_lengths.as_ref()?.to_vec(),
+                block.original_distance_lengths.as_ref()?.to_vec(),
+            ))
+        })
+        .unwrap_or_else(fixed_lengths)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_proven_submatch_targets<F>(
+    tokens: &[Token],
+    decoded_bytes: usize,
+    source_splits: &[usize],
+    literal_frequencies: &[u32; 286],
+    literal_lengths: &[u8],
+    full_graph: bool,
+    exhaustive: bool,
+    expired: &mut F,
+) -> Option<Vec<ProvenSubmatchTarget>>
+where
+    F: FnMut() -> bool,
+{
+    let highest_symbol = tokens
+        .iter()
+        .filter_map(|token| match *token {
+            Token::Match { length_symbol, .. } => Some(length_symbol),
+            Token::Literal(_) => None,
+        })
+        .max();
+    let target_limit = if full_graph {
+        tokens
+            .iter()
+            .filter(|token| matches!(token, Token::Match { length, .. } if *length >= 4))
+            .count()
+    } else if exhaustive {
+        MAX_PROVEN_SUBMATCH_TARGETS
+    } else {
+        DEFAULT_PROVEN_SUBMATCH_TARGETS
+    };
+    let per_symbol_limit = if exhaustive {
+        MAX_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL
+    } else {
+        DEFAULT_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL
+    };
+    let mut targets = Vec::new();
+    targets.try_reserve_exact(target_limit).ok()?;
+    let mut plain_offset = 0_usize;
+
+    for (token_index, &token) in tokens.iter().enumerate() {
+        if token_index & 1_023 == 0 && expired() {
+            return None;
+        }
+        let end = plain_offset.checked_add(token.decoded_len())?;
+        if end > decoded_bytes {
+            return None;
+        }
+        let Token::Match {
+            length,
+            length_symbol,
+            ..
+        } = token
+        else {
+            plain_offset = end;
+            continue;
+        };
+        if length < 4 {
+            plain_offset = end;
+            continue;
+        }
+
+        let frequency = literal_frequencies[usize::from(length_symbol)];
+        let code_bits = literal_lengths
+            .get(usize::from(length_symbol))
+            .copied()
+            .unwrap_or(0);
+        let transition = length_near_code_transition(length, length_symbol);
+        let rank = ProvenSubmatchRank {
+            highest: highest_symbol == Some(length_symbol),
+            rare: frequency <= PROVEN_SUBMATCH_RARE_FREQUENCY,
+            near_boundary: match_near_source_split(plain_offset, end, source_splits),
+            transition,
+            expensive: code_bits >= PROVEN_SUBMATCH_EXPENSIVE_CODE_BITS || code_bits == 0,
+            code_bits,
+            frequency,
+            token_index,
+        };
+        let targeted =
+            rank.highest || rank.rare || rank.near_boundary || rank.transition || rank.expensive;
+        if full_graph || exhaustive || targeted {
+            let target = ProvenSubmatchTarget {
+                token_index,
+                plain_offset,
+                source: token,
+                rank,
+            };
+            if full_graph {
+                targets.push(target);
+            } else {
+                insert_ranked_proven_submatch_target(
+                    &mut targets,
+                    target,
+                    target_limit,
+                    per_symbol_limit,
+                );
+            }
+        }
+        plain_offset = end;
+    }
+    (plain_offset == decoded_bytes).then_some(targets)
+}
+
+fn length_near_code_transition(length: u16, length_symbol: u16) -> bool {
+    let Some(index) = length_symbol.checked_sub(257).map(usize::from) else {
+        return false;
+    };
+    let Some(&base) = DEFLATE_LENGTH_BASE.get(index) else {
+        return false;
+    };
+    let near_lower = length.saturating_sub(base) <= PROVEN_SUBMATCH_TRANSITION_BYTES;
+    let near_upper = DEFLATE_LENGTH_BASE
+        .get(index + 1)
+        .is_some_and(|&next_base| {
+            next_base.saturating_sub(length) <= PROVEN_SUBMATCH_TRANSITION_BYTES
+        });
+    near_lower || near_upper
+}
+
+fn insert_ranked_proven_submatch_target(
+    targets: &mut Vec<ProvenSubmatchTarget>,
+    target: ProvenSubmatchTarget,
+    limit: usize,
+    per_symbol_limit: usize,
+) {
+    if limit == 0 || per_symbol_limit == 0 {
+        return;
+    }
+    let key = target.rank.key();
+    let Token::Match {
+        length_symbol: target_symbol,
+        ..
+    } = target.source
+    else {
+        return;
+    };
+    let mut matching_count = 0_usize;
+    let mut worst_match = None;
+    for (index, existing) in targets.iter().enumerate() {
+        if matches!(
+            existing.source,
+            Token::Match { length_symbol, .. } if length_symbol == target_symbol
+        ) {
+            matching_count += 1;
+            if worst_match.map_or(true, |(_, worst_key)| existing.rank.key() > worst_key) {
+                worst_match = Some((index, existing.rank.key()));
+            }
+        }
+    }
+    if matching_count >= per_symbol_limit {
+        let Some((worst_index, worst_key)) = worst_match else {
+            return;
+        };
+        if key >= worst_key {
+            return;
+        }
+        targets.remove(worst_index);
+    }
+    let position = targets
+        .iter()
+        .position(|existing| key < existing.rank.key())
+        .unwrap_or(targets.len());
+    if targets.len() < limit {
+        targets.insert(position, target);
+    } else if position < limit {
+        targets.pop();
+        targets.insert(position, target);
+    }
+}
+
+fn match_near_source_split(start: usize, end: usize, source_splits: &[usize]) -> bool {
+    let lower = start.saturating_sub(PROVEN_SUBMATCH_BOUNDARY_RADIUS);
+    let upper = end.saturating_add(PROVEN_SUBMATCH_BOUNDARY_RADIUS);
+    let first = source_splits.partition_point(|&split| split < lower);
+    source_splits
+        .get(first)
+        .is_some_and(|&split| split <= upper)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_proven_submatch_rewrites<F>(
+    targets: &[ProvenSubmatchTarget],
+    plain: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    restriction: ProvenSubmatchRestriction,
+    expired: &mut F,
+) -> Option<Vec<ProvenSubmatchRewrite>>
+where
+    F: FnMut() -> bool,
+{
+    let mut rewrites = Vec::new();
+    rewrites.try_reserve_exact(targets.len()).ok()?;
+    for target in targets {
+        if expired() {
+            return None;
+        }
+        let length = target.source.decoded_len();
+        let end = target.plain_offset.checked_add(length)?;
+        let decoded = plain.get(target.plain_offset..end)?;
+        let forbidden_length_symbol = match restriction {
+            ProvenSubmatchRestriction::None => None,
+            ProvenSubmatchRestriction::Symbol(symbol) => Some(symbol),
+            ProvenSubmatchRestriction::SourceSymbol => match target.source {
+                Token::Match { length_symbol, .. } => Some(length_symbol),
+                Token::Literal(_) => return None,
+            },
+        };
+        let replacement = solve_proven_submatch(
+            target.source,
+            decoded,
+            literal_lengths,
+            distance_lengths,
+            forbidden_length_symbol,
+            expired,
+        );
+        if expired() {
+            return None;
+        }
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        let source_bits =
+            estimated_match_token_bits(target.source, literal_lengths, distance_lengths)?;
+        let replacement_bits =
+            estimated_tokens_bits(&replacement, literal_lengths, distance_lengths)?;
+        rewrites.push(ProvenSubmatchRewrite {
+            token_index: target.token_index,
+            replacement,
+            estimated_saving: i64::try_from(source_bits)
+                .ok()?
+                .checked_sub(i64::try_from(replacement_bits).ok()?)?,
+            rank: target.rank,
+        });
+    }
+    Some(rewrites)
+}
+
+fn solve_proven_submatch<F>(
+    source: Token,
+    decoded: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    forbidden_length_symbol: Option<u16>,
+    expired: &mut F,
+) -> Option<Vec<Token>>
+where
+    F: FnMut() -> bool,
+{
+    let Token::Match {
+        length,
+        length_symbol,
+        ..
+    } = source
+    else {
+        return None;
+    };
+    if usize::from(length) != decoded.len() || decoded.len() > 258 || decoded.len() < 3 {
+        return None;
+    }
+    if expired() {
+        return None;
+    }
+
+    let mut costs = [u64::MAX; 259];
+    let mut choices = [ProvenSubmatchChoice::End; 259];
+    costs[decoded.len()] = 0;
+    let mut visited_edges = 0_usize;
+
+    for start in (0..decoded.len()).rev() {
+        let mut best_cost = u64::MAX;
+        let mut best_choice = ProvenSubmatchChoice::End;
+
+        // Retain the exact source token as the first whole-span edge. Strict
+        // comparisons below preserve it on an estimated-cost tie.
+        if start == 0 && forbidden_length_symbol != Some(length_symbol) {
+            best_cost = estimated_match_token_bits(source, literal_lengths, distance_lengths)?;
+            best_choice = ProvenSubmatchChoice::Match(source);
+        }
+
+        let literal_cost = estimated_length(literal_lengths, usize::from(decoded[start]))
+            .checked_add(costs[start + 1])?;
+        if literal_cost < best_cost {
+            best_cost = literal_cost;
+            best_choice = ProvenSubmatchChoice::Literal(decoded[start]);
+        }
+
+        for match_length in 3..=decoded.len() - start {
+            visited_edges = visited_edges.checked_add(1)?;
+            if visited_edges & 31 == 0 && expired() {
+                return None;
+            }
+            let match_length: u16 = match_length.try_into().ok()?;
+            let token = repacked_match(source, match_length)?;
+            let Token::Match { length_symbol, .. } = token else {
+                return None;
+            };
+            if forbidden_length_symbol == Some(length_symbol) {
+                continue;
+            }
+            let end = start.checked_add(usize::from(match_length))?;
+            let candidate = estimated_match_token_bits(token, literal_lengths, distance_lengths)?
+                .checked_add(costs[end])?;
+            if candidate < best_cost {
+                best_cost = candidate;
+                best_choice = ProvenSubmatchChoice::Match(token);
+            }
+        }
+        costs[start] = best_cost;
+        choices[start] = best_choice;
+    }
+    if expired() {
+        return None;
+    }
+
+    let mut token_count = 0_usize;
+    let mut at = 0_usize;
+    while at < decoded.len() {
+        at = match choices[at] {
+            ProvenSubmatchChoice::End => return None,
+            ProvenSubmatchChoice::Literal(_) => at.checked_add(1)?,
+            ProvenSubmatchChoice::Match(token) => at.checked_add(token.decoded_len())?,
+        };
+        token_count = token_count.checked_add(1)?;
+    }
+    if at != decoded.len() {
+        return None;
+    }
+
+    let mut replacement = new_token_candidate(token_count, decoded.len())?;
+    at = 0;
+    while at < decoded.len() {
+        match choices[at] {
+            ProvenSubmatchChoice::End => return None,
+            ProvenSubmatchChoice::Literal(value) => {
+                replacement.push(Token::Literal(value));
+                at += 1;
+            }
+            ProvenSubmatchChoice::Match(token) => {
+                replacement.push(token);
+                at = at.checked_add(token.decoded_len())?;
+            }
+        }
+    }
+    if replacement.as_slice() == std::slice::from_ref(&source) {
+        None
+    } else {
+        Some(replacement)
+    }
+}
+
+fn estimated_match_token_bits(
+    token: Token,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> Option<u64> {
+    let Token::Match {
+        length_symbol,
+        distance_symbol,
+        length_extra_bits,
+        distance_extra_bits,
+        ..
+    } = token
+    else {
+        return None;
+    };
+    estimated_length(literal_lengths, usize::from(length_symbol))
+        .checked_add(u64::from(length_extra_bits))?
+        .checked_add(estimated_length(
+            distance_lengths,
+            usize::from(distance_symbol),
+        ))?
+        .checked_add(u64::from(distance_extra_bits))
+}
+
+fn estimated_tokens_bits(
+    tokens: &[Token],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> Option<u64> {
+    tokens.iter().try_fold(0_u64, |bits, &token| {
+        bits.checked_add(match token {
+            Token::Literal(value) => estimated_length(literal_lengths, usize::from(value)),
+            Token::Match { .. } => {
+                estimated_match_token_bits(token, literal_lengths, distance_lengths)?
+            }
+        })
+    })
+}
+
+fn apply_proven_submatch_rewrites(
+    source: &[Token],
+    decoded_bytes: usize,
+    rewrites: &[ProvenSubmatchRewrite],
+) -> Option<Vec<Token>> {
+    if rewrites.is_empty() {
+        return None;
+    }
+    let mut output_count = source.len();
+    let mut previous = None;
+    for rewrite in rewrites {
+        if rewrite.token_index >= source.len()
+            || previous.is_some_and(|index| rewrite.token_index <= index)
+        {
+            return None;
+        }
+        let source_length = source[rewrite.token_index].decoded_len();
+        let replacement_length = rewrite
+            .replacement
+            .iter()
+            .try_fold(0_usize, |total, token| {
+                total.checked_add(token.decoded_len())
+            })?;
+        if replacement_length != source_length {
+            return None;
+        }
+        output_count = output_count
+            .checked_sub(1)?
+            .checked_add(rewrite.replacement.len())?;
+        previous = Some(rewrite.token_index);
+    }
+
+    let mut output = new_token_candidate(output_count, decoded_bytes)?;
+    let mut rewrite_index = 0_usize;
+    for (token_index, &token) in source.iter().enumerate() {
+        if rewrites
+            .get(rewrite_index)
+            .is_some_and(|rewrite| rewrite.token_index == token_index)
+        {
+            output.extend_from_slice(&rewrites[rewrite_index].replacement);
+            rewrite_index += 1;
+        } else {
+            output.push(token);
+        }
+    }
+    (rewrite_index == rewrites.len()).then_some(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_highest_length_symbol_elimination<F>(
+    block: &ParsedBlock,
+    tokens: &[Token],
+    alignment: u8,
+    options: &Options,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) where
+    F: FnMut() -> bool,
+{
+    let Some(highest_symbol) = tokens
+        .iter()
+        .filter_map(|token| match *token {
+            Token::Match { length_symbol, .. } => Some(length_symbol),
+            Token::Literal(_) => None,
+        })
+        .max()
+    else {
+        return;
+    };
+    let limit = if options.exhaustive {
+        MAX_PROVEN_SUBMATCH_ELIMINATION_MATCHES
+    } else {
+        DEFAULT_PROVEN_SUBMATCH_TARGETS
+    };
+    let occurrence_count = tokens
+        .iter()
+        .filter(|token| {
+            matches!(
+                token,
+                Token::Match {
+                    length_symbol,
+                    ..
+                } if *length_symbol == highest_symbol
+            )
+        })
+        .count();
+    if occurrence_count == 0 || occurrence_count > limit {
+        return;
+    }
+
+    let mut targets = Vec::new();
+    if targets.try_reserve_exact(occurrence_count).is_err() {
+        return;
+    }
+    let mut plain_offset = 0_usize;
+    for (token_index, &token) in tokens.iter().enumerate() {
+        if token_index & 1_023 == 0 && expired() {
+            return;
+        }
+        let end = match plain_offset.checked_add(token.decoded_len()) {
+            Some(end) if end <= block.plain.len() => end,
+            _ => return,
+        };
+        if matches!(
+            token,
+            Token::Match {
+                length_symbol,
+                ..
+            } if length_symbol == highest_symbol
+        ) {
+            targets.push(ProvenSubmatchTarget {
+                token_index,
+                plain_offset,
+                source: token,
+                rank: ProvenSubmatchRank {
+                    highest: true,
+                    rare: occurrence_count <= PROVEN_SUBMATCH_RARE_FREQUENCY as usize,
+                    near_boundary: match_near_source_split(plain_offset, end, &block.source_splits),
+                    transition: false,
+                    expensive: true,
+                    code_bits: literal_lengths
+                        .get(usize::from(highest_symbol))
+                        .copied()
+                        .unwrap_or(0),
+                    frequency: occurrence_count.try_into().unwrap_or(u32::MAX),
+                    token_index,
+                },
+            });
+        }
+        plain_offset = end;
+    }
+    if plain_offset != block.plain.len() {
+        return;
+    }
+    let Some(mut rewrites) = build_proven_submatch_rewrites(
+        &targets,
+        &block.plain,
+        literal_lengths,
+        distance_lengths,
+        ProvenSubmatchRestriction::Symbol(highest_symbol),
+        expired,
+    ) else {
+        return;
+    };
+    if rewrites.len() != occurrence_count {
+        return;
+    }
+    rewrites.sort_by_key(|rewrite| rewrite.token_index);
+    if let Some(candidate) = apply_proven_submatch_rewrites(tokens, block.plain.len(), &rewrites) {
+        consider_unique_proven_submatch_tokens(
+            block,
+            candidate,
+            alignment,
+            options,
+            priced_candidates,
+            expired,
+            best,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_unique_proven_submatch_tokens<F>(
+    block: &ParsedBlock,
+    tokens: Vec<Token>,
+    alignment: u8,
+    options: &Options,
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) where
+    F: FnMut() -> bool,
+{
+    if priced_candidates
+        .iter()
+        .any(|candidate| candidate.as_slice() == tokens.as_slice())
+    {
+        return;
+    }
+    if let Some(planned_tokens) =
+        consider_proven_submatch_tokens(block, tokens, alignment, options, expired, best)
+    {
+        // Capacity is preflighted once per pass. If an unusual allocator
+        // failure still prevents retaining the exact identity witness, exact
+        // pricing remains correct; only duplicate suppression is lost.
+        if priced_candidates.try_reserve(1).is_ok() {
+            priced_candidates.push(planned_tokens);
+        }
+    }
+}
+
+fn consider_proven_submatch_tokens<F>(
+    block: &ParsedBlock,
+    tokens: Vec<Token>,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+    best: &mut PlannedBlock,
+) -> Option<Arc<Vec<Token>>>
+where
+    F: FnMut() -> bool,
+{
+    let candidate = plan_tokens(block, tokens, alignment, options, expired)?;
+    let canonical_tokens = Arc::clone(&candidate.tokens);
+    if candidate.bits < best.bits {
+        *best = candidate;
+    }
+
+    // Generated length 258 is canonical. Relaxed mode retains the explicit
+    // non-standard sibling only when complete exact pricing proves it smaller.
+    if !options.strict
+        && !expired()
+        && canonical_tokens.iter().any(|token| {
+            matches!(
+                token,
+                Token::Match {
+                    length: 258,
+                    length_symbol: 285,
+                    ..
+                }
+            )
+        })
+    {
+        if let Some(alias) = rewrite_258_symbols(&canonical_tokens, block.plain.len(), true) {
+            consider_tokens(block, alias, alignment, options, expired, best);
+        }
+    }
+    Some(canonical_tokens)
+}
+
 /// Complete the cheap token-preserving floor even when a container's shared
 /// search deadline has already elapsed.
 ///
 /// This is intentionally much smaller than [`plan_block_with_search`]: it
-/// prices strict match-to-literal rewrites against the source, best, and fixed
-/// trees exactly once. Compact block lists may request Columbo's `extended`
-/// feedback-tree/replay floor. There are no beams, match-group combinations,
-/// or newly discovered LZ77 matches. The bound lets ZIP/APNG give every member
-/// one useful pass before optional search time is concentrated on harder
-/// streams.
+/// prices same-distance runs and a bounded set of match-to-literal or
+/// proven-submatch rewrites against the source, best, and fixed trees. Compact
+/// block lists may request Columbo's `extended` feedback-tree/replay floor.
+/// There are no beams, match-group combinations, or newly discovered LZ77
+/// matches. The bound lets ZIP/APNG give every member one useful pass before
+/// optional search time is concentrated on harder streams.
 pub(crate) fn plan_block_with_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -568,6 +1531,13 @@ pub(crate) fn improve_plan_with_floor(
 
     let mut never_expired = || false;
     consider_same_distance_runs(
+        block,
+        alignment,
+        &floor_options,
+        &mut never_expired,
+        &mut best,
+    );
+    consider_proven_submatches(
         block,
         alignment,
         &floor_options,
@@ -1474,6 +2444,10 @@ where
         return best;
     }
     consider_same_distance_runs(block, alignment, options, expired, &mut best);
+    if expired() {
+        return best;
+    }
+    consider_proven_submatches(block, alignment, options, expired, &mut best);
     if expired() {
         return best;
     }
@@ -2741,6 +3715,89 @@ mod tests {
         SameDistancePartitioner::new(literal_lengths, max_active, max_deficit, &mut || false)
     }
 
+    fn decode_test_tokens(tokens: &[Token]) -> Option<Vec<u8>> {
+        let decoded_len = tokens.iter().try_fold(0_usize, |total, token| {
+            total.checked_add(token.decoded_len())
+        })?;
+        let mut decoded = Vec::new();
+        decoded.try_reserve_exact(decoded_len).ok()?;
+        for &token in tokens {
+            match token {
+                Token::Literal(value) => decoded.push(value),
+                Token::Match {
+                    length, distance, ..
+                } => {
+                    let distance = usize::from(distance);
+                    if distance == 0 || distance > decoded.len() {
+                        return None;
+                    }
+                    for _ in 0..length {
+                        let source = decoded.len().checked_sub(distance)?;
+                        let value = *decoded.get(source)?;
+                        decoded.push(value);
+                    }
+                }
+            }
+        }
+        Some(decoded)
+    }
+
+    fn assert_proven_submatch_rewrite(source: Token, replacement: &[Token], expected: &[Token]) {
+        assert_eq!(replacement, expected);
+        let seed: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        let mut source_tokens = seed.clone();
+        source_tokens.push(source);
+        let mut rewritten_tokens = seed;
+        rewritten_tokens.extend_from_slice(replacement);
+        assert_eq!(
+            decode_test_tokens(&source_tokens),
+            decode_test_tokens(&rewritten_tokens)
+        );
+
+        let Token::Match {
+            distance,
+            distance_symbol,
+            distance_extra,
+            distance_extra_bits,
+            ..
+        } = source
+        else {
+            panic!("the test source must be a match");
+        };
+        for token in replacement {
+            if let Token::Match {
+                length,
+                distance: rewritten_distance,
+                length_symbol,
+                distance_symbol: rewritten_distance_symbol,
+                length_extra,
+                distance_extra: rewritten_distance_extra,
+                length_extra_bits,
+                distance_extra_bits: rewritten_distance_extra_bits,
+            } = *token
+            {
+                assert_eq!(
+                    (length_symbol, length_extra, length_extra_bits),
+                    canonical_length_encoding(length).unwrap()
+                );
+                assert_eq!(
+                    (
+                        rewritten_distance,
+                        rewritten_distance_symbol,
+                        rewritten_distance_extra,
+                        rewritten_distance_extra_bits,
+                    ),
+                    (
+                        distance,
+                        distance_symbol,
+                        distance_extra,
+                        distance_extra_bits,
+                    )
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_258_alias_rewrite_is_bidirectional_but_explicit() {
         let canonical = Token::Match {
@@ -2786,6 +3843,395 @@ mod tests {
         }
         assert!(canonical_length_encoding(2).is_none());
         assert!(canonical_length_encoding(259).is_none());
+    }
+
+    #[test]
+    fn proven_submatch_graph_can_keep_a_literal_prefix_and_suffix_match() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let decoded = b"abcdefabcdefabcde";
+        let mut literal_lengths = [0_u8; 286];
+        literal_lengths[usize::from(b'a')] = 1;
+        for &byte in b"bcdef" {
+            literal_lengths[usize::from(byte)] = 10;
+        }
+        literal_lengths[267] = 1;
+        literal_lengths[268] = 15;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[4] = 1;
+
+        let replacement = solve_proven_submatch(
+            source,
+            decoded,
+            &literal_lengths,
+            &distance_lengths,
+            None,
+            &mut || false,
+        )
+        .unwrap();
+        assert_proven_submatch_rewrite(
+            source,
+            &replacement,
+            &[Token::Literal(b'a'), test_match(16, 6, 4, 1, 1)],
+        );
+    }
+
+    #[test]
+    fn proven_submatch_graph_can_keep_a_prefix_match_and_literal_suffix() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let decoded = b"abcdefabcdefabcde";
+        let mut literal_lengths = [0_u8; 286];
+        for &byte in b"abcdf" {
+            literal_lengths[usize::from(byte)] = 10;
+        }
+        literal_lengths[usize::from(b'e')] = 1;
+        literal_lengths[267] = 1;
+        literal_lengths[268] = 15;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[4] = 1;
+
+        let replacement = solve_proven_submatch(
+            source,
+            decoded,
+            &literal_lengths,
+            &distance_lengths,
+            None,
+            &mut || false,
+        )
+        .unwrap();
+        assert_proven_submatch_rewrite(
+            source,
+            &replacement,
+            &[test_match(16, 6, 4, 1, 1), Token::Literal(b'e')],
+        );
+    }
+
+    #[test]
+    fn proven_submatch_graph_can_emit_multiple_matches_at_the_proven_distance() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let decoded = b"abcdefabcdefabcde";
+        let mut literal_lengths = [0_u8; 286];
+        literal_lengths.fill(15);
+        literal_lengths[262] = 1;
+        literal_lengths[263] = 1;
+        literal_lengths[268] = 15;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[4] = 1;
+
+        let replacement = solve_proven_submatch(
+            source,
+            decoded,
+            &literal_lengths,
+            &distance_lengths,
+            None,
+            &mut || false,
+        )
+        .unwrap();
+        assert_proven_submatch_rewrite(
+            source,
+            &replacement,
+            &[test_match(8, 6, 4, 1, 1), test_match(9, 6, 4, 1, 1)],
+        );
+    }
+
+    #[test]
+    fn proven_submatch_source_symbol_free_path_exposes_payload_ties() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let decoded = b"abcdefabcdefabcde";
+        let mut literal_lengths = [0_u8; 286];
+        literal_lengths.fill(15);
+        literal_lengths[usize::from(b'a')] = 1;
+        literal_lengths[267] = 4;
+        literal_lengths[268] = 5;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[4] = 1;
+
+        // Both spellings cost seven estimated payload bits. The exact source
+        // remains the deterministic unrestricted winner.
+        assert!(solve_proven_submatch(
+            source,
+            decoded,
+            &literal_lengths,
+            &distance_lengths,
+            None,
+            &mut || false,
+        )
+        .is_none());
+
+        let replacement = solve_proven_submatch(
+            source,
+            decoded,
+            &literal_lengths,
+            &distance_lengths,
+            Some(268),
+            &mut || false,
+        )
+        .unwrap();
+        assert_proven_submatch_rewrite(
+            source,
+            &replacement,
+            &[Token::Literal(b'a'), test_match(16, 6, 4, 1, 1)],
+        );
+    }
+
+    #[test]
+    fn proven_submatch_graph_handles_overlap_and_deadline_expiry() {
+        let source = test_match(258, 1, 0, 0, 0);
+        let decoded = [b'A'; 258];
+        let mut literal_lengths = [0_u8; 286];
+        literal_lengths[usize::from(b'A')] = 1;
+        literal_lengths[285] = 15;
+        let mut distance_lengths = [0_u8; 30];
+        distance_lengths[0] = 1;
+        let replacement = solve_proven_submatch(
+            source,
+            &decoded,
+            &literal_lengths,
+            &distance_lengths,
+            Some(285),
+            &mut || false,
+        )
+        .unwrap();
+        let seed = [Token::Literal(b'A')];
+        let mut source_tokens = seed.to_vec();
+        source_tokens.push(source);
+        let mut rewritten_tokens = seed.to_vec();
+        rewritten_tokens.extend_from_slice(&replacement);
+        assert_eq!(
+            decode_test_tokens(&source_tokens),
+            decode_test_tokens(&rewritten_tokens)
+        );
+
+        let mut checks = 0_usize;
+        let expired = solve_proven_submatch(
+            source,
+            &decoded,
+            &literal_lengths,
+            &distance_lengths,
+            None,
+            &mut || {
+                checks += 1;
+                checks > 2
+            },
+        );
+        assert!(expired.is_none());
+        assert!(checks > 2);
+    }
+
+    #[test]
+    fn proven_submatch_default_selection_is_ranked_and_bounded() {
+        let common = test_match(39, 1, 0, 0, 0);
+        let highest = test_match(258, 1, 0, 0, 0);
+        let mut tokens = vec![common; 12];
+        tokens.push(highest);
+        let decoded_bytes: usize = tokens.iter().map(|token| token.decoded_len()).sum();
+        let (literal_frequencies, _) = count_frequencies(&tokens);
+
+        let default = select_proven_submatch_targets(
+            &tokens,
+            decoded_bytes,
+            &[],
+            &literal_frequencies,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            false,
+            false,
+            &mut || false,
+        )
+        .unwrap();
+        assert!(default.len() <= DEFAULT_PROVEN_SUBMATCH_TARGETS);
+        assert_eq!(default[0].token_index, 12);
+        assert!(default.iter().all(|target| target.token_index == 12));
+
+        let exhaustive = select_proven_submatch_targets(
+            &tokens,
+            decoded_bytes,
+            &[],
+            &literal_frequencies,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            true,
+            true,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(exhaustive.len(), tokens.len());
+        assert_eq!(
+            exhaustive
+                .iter()
+                .map(|target| target.token_index)
+                .collect::<Vec<_>>(),
+            (0..tokens.len()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn proven_submatch_transition_targeting_checks_both_code_edges() {
+        let symbol = match test_match(39, 1, 0, 0, 0) {
+            Token::Match { length_symbol, .. } => length_symbol,
+            Token::Literal(_) => unreachable!(),
+        };
+        assert!(length_near_code_transition(37, symbol));
+        assert!(!length_near_code_transition(38, symbol));
+        assert!(!length_near_code_transition(40, symbol));
+        assert!(length_near_code_transition(41, symbol));
+    }
+
+    #[test]
+    fn proven_submatch_selection_reserves_space_across_length_symbols() {
+        let common_highest = test_match(258, 1, 0, 0, 0);
+        let rare_lower = test_match(17, 1, 0, 0, 0);
+        let mut tokens = vec![common_highest; 12];
+        tokens.push(rare_lower);
+        let decoded_bytes: usize = tokens.iter().map(|token| token.decoded_len()).sum();
+        let (literal_frequencies, _) = count_frequencies(&tokens);
+
+        let targets = select_proven_submatch_targets(
+            &tokens,
+            decoded_bytes,
+            &[],
+            &literal_frequencies,
+            &FIXED_LITERAL_CODE_LENGTHS,
+            false,
+            false,
+            &mut || false,
+        )
+        .unwrap();
+        assert!(targets.len() <= DEFAULT_PROVEN_SUBMATCH_TARGETS);
+        assert!(targets.iter().any(|target| target.token_index == 12));
+        assert!(
+            targets
+                .iter()
+                .filter(|target| {
+                    matches!(
+                        target.source,
+                        Token::Match {
+                            length_symbol: 285,
+                            ..
+                        }
+                    )
+                })
+                .count()
+                <= DEFAULT_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL
+        );
+    }
+
+    #[test]
+    fn proven_submatch_single_rewrite_skips_a_duplicate_combined_price() {
+        assert!(!should_price_combined_proven_submatch_candidate(0, 0));
+        assert!(!should_price_combined_proven_submatch_candidate(1, 1));
+        assert!(!should_price_combined_proven_submatch_candidate(1, 4));
+        assert!(should_price_combined_proven_submatch_candidate(1, 0));
+        assert!(should_price_combined_proven_submatch_candidate(2, 1));
+    }
+
+    #[test]
+    fn proven_submatch_materialization_rejects_invalid_rewrite_sets() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let tokens = [source, source];
+        let rank = ProvenSubmatchRank {
+            highest: false,
+            rare: false,
+            near_boundary: false,
+            transition: false,
+            expensive: false,
+            code_bits: 0,
+            frequency: 0,
+            token_index: 0,
+        };
+        let first = ProvenSubmatchRewrite {
+            token_index: 0,
+            replacement: vec![source],
+            estimated_saving: 0,
+            rank,
+        };
+        let duplicate = ProvenSubmatchRewrite {
+            token_index: 0,
+            replacement: vec![source],
+            estimated_saving: 0,
+            rank,
+        };
+        assert!(apply_proven_submatch_rewrites(&tokens, 34, &[first, duplicate]).is_none());
+
+        let wrong_length = ProvenSubmatchRewrite {
+            token_index: 0,
+            replacement: vec![test_match(16, 6, 4, 1, 1)],
+            estimated_saving: 0,
+            rank,
+        };
+        assert!(apply_proven_submatch_rewrites(&tokens, 34, &[wrong_length]).is_none());
+    }
+
+    #[test]
+    fn proven_submatch_adoption_requires_a_strict_exact_bit_win() {
+        let source = test_match(17, 6, 4, 1, 1);
+        let mut source_tokens: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        source_tokens.push(source);
+        let plain = decode_test_tokens(&source_tokens).unwrap();
+        let block = short_family_test_block(source_tokens.clone(), plain);
+
+        let mut candidate_tokens: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        candidate_tokens.push(Token::Literal(b'a'));
+        candidate_tokens.push(test_match(16, 6, 4, 1, 1));
+        assert_eq!(
+            decode_test_tokens(&source_tokens),
+            decode_test_tokens(&candidate_tokens)
+        );
+
+        let options = Options::default();
+        let candidate =
+            plan_tokens(&block, candidate_tokens.clone(), 0, &options, &mut || false).unwrap();
+        let incumbent = |bits| PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            representation: Representation::Fixed,
+            bits,
+            source_type: SourceBlockType::Fixed,
+        };
+
+        let mut tie = incumbent(candidate.bits);
+        let _ = consider_proven_submatch_tokens(
+            &block,
+            candidate_tokens.clone(),
+            0,
+            &options,
+            &mut || false,
+            &mut tie,
+        );
+        assert_eq!(tie.tokens.as_slice(), source_tokens);
+
+        let mut strict_win = incumbent(candidate.bits + 1);
+        let _ = consider_proven_submatch_tokens(
+            &block,
+            candidate_tokens.clone(),
+            0,
+            &options,
+            &mut || false,
+            &mut strict_win,
+        );
+        assert_eq!(strict_win.bits, candidate.bits);
+        assert_eq!(strict_win.tokens.as_slice(), candidate_tokens);
+
+        let mut priced_candidates = Vec::new();
+        let mut deduplicated = incumbent(candidate.bits + 1);
+        consider_unique_proven_submatch_tokens(
+            &block,
+            candidate_tokens.clone(),
+            0,
+            &options,
+            &mut priced_candidates,
+            &mut || false,
+            &mut deduplicated,
+        );
+        assert_eq!(priced_candidates.len(), 1);
+        consider_unique_proven_submatch_tokens(
+            &block,
+            candidate_tokens,
+            0,
+            &options,
+            &mut priced_candidates,
+            &mut || false,
+            &mut deduplicated,
+        );
+        assert_eq!(priced_candidates.len(), 1);
+        assert_eq!(deduplicated.bits, candidate.bits);
     }
 
     #[test]

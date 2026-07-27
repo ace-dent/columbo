@@ -1124,6 +1124,7 @@ fn rewritten_input<'a>(
 /// Small inputs can safely share their immutable parsed blocks across worker
 /// threads. Larger inputs use the same fixed route order serially, preventing
 /// otherwise bounded per-route arenas from adding up to an excessive peak.
+#[allow(clippy::too_many_arguments)]
 fn build_bounded_phase_candidates(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2527,6 +2528,168 @@ mod tests {
                     ]
                 )
         ));
+    }
+
+    #[test]
+    fn default_route_resegments_a_proven_match_without_changing_its_distance() {
+        let input = [
+            0x65, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0x6c, 0xf4, 0x2f, 0xe5, 0x3f,
+            0x41, 0x29, 0xa5, 0x94, 0x72, 0x06,
+        ];
+        let source = parse_stream(&input, 120).unwrap();
+        assert_eq!(source.meaningful_bits, 156);
+        let source_matches = source
+            .blocks
+            .iter()
+            .flat_map(|block| block.tokens.iter())
+            .filter_map(|token| match *token {
+                Token::Match {
+                    length, distance, ..
+                } => Some((length, distance)),
+                Token::Literal(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut expected_source_matches = vec![(16, 1); 6];
+        expected_source_matches.push((17, 1));
+        assert_eq!(source_matches, expected_source_matches);
+
+        for strict in [true, false] {
+            let options = Options {
+                strict,
+                ..Options::default()
+            };
+            let optimized = optimize_raw(&input, &options).unwrap();
+            assert!(optimized.info.deflate_bits <= 151);
+            assert!(optimized.info.deflate_bits < source.meaningful_bits);
+            assert!(optimized.data.len() < input.len());
+
+            let reparsed = parse_stream(&optimized.data, 120).unwrap();
+            assert_eq!(reparsed.decoded_size, source.decoded_size);
+            assert_eq!(reparsed.crc32, source.crc32);
+            assert_eq!(reparsed.adler32, source.adler32);
+            let tokens = reparsed
+                .blocks
+                .iter()
+                .flat_map(|block| block.tokens.iter())
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tokens
+                    .iter()
+                    .filter(|token| matches!(token, Token::Literal(b'A')))
+                    .count(),
+                8
+            );
+            assert_eq!(
+                tokens
+                    .iter()
+                    .filter(|token| {
+                        matches!(
+                            token,
+                            Token::Match {
+                                length: 16,
+                                distance: 1,
+                                length_symbol: 267,
+                                ..
+                            }
+                        )
+                    })
+                    .count(),
+                7
+            );
+            assert!(matches!(
+                tokens.as_slice(),
+                [
+                    ..,
+                    Token::Literal(b'A'),
+                    Token::Match {
+                        length: 16,
+                        distance: 1,
+                        length_symbol: 267,
+                        ..
+                    }
+                ]
+            ));
+
+            let repeated = optimize_raw(&optimized.data, &options).unwrap();
+            assert_eq!(repeated.info.deflate_bits, optimized.info.deflate_bits);
+            assert_eq!(repeated.data, optimized.data);
+        }
+    }
+
+    #[test]
+    fn default_route_exact_prices_a_nonhighest_source_symbol_tie() {
+        let input = [
+            0x75, 0xc1, 0x41, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x21, 0x6d, 0xf8, 0x37, 0xb5, 0x7f,
+            0x97, 0x03, 0xcb, 0xb2, 0x3c, 0x82, 0x20, 0x08, 0x0e,
+        ];
+        let source = parse_stream(&input, 166).unwrap();
+        assert_eq!(source.meaningful_bits, 181);
+        assert_eq!(source.blocks.len(), 1);
+        assert_eq!(source.blocks[0].literal_frequencies[268], 1);
+        assert_eq!(source.blocks[0].literal_frequencies[270], 4);
+        assert_eq!(
+            source.blocks[0]
+                .tokens
+                .iter()
+                .filter(|token| {
+                    matches!(
+                        token,
+                        Token::Match {
+                            length: 16,
+                            distance: 1,
+                            ..
+                        }
+                    )
+                })
+                .count(),
+            3
+        );
+
+        let optimized = optimize_raw(&input, &Options::default()).unwrap();
+        assert_eq!(optimized.info.deflate_bits, 178);
+        assert_eq!(optimized.data.len(), input.len());
+        let reparsed = parse_stream(&optimized.data, 166).unwrap();
+        assert_eq!(reparsed.decoded_size, source.decoded_size);
+        assert_eq!(reparsed.crc32, source.crc32);
+        assert_eq!(reparsed.adler32, source.adler32);
+        assert_eq!(reparsed.blocks.len(), 1);
+        assert_eq!(reparsed.blocks[0].literal_frequencies[268], 0);
+        assert_eq!(reparsed.blocks[0].literal_frequencies[270], 4);
+        assert_eq!(
+            reparsed.blocks[0]
+                .tokens
+                .iter()
+                .filter(|token| matches!(token, Token::Literal(b'A')))
+                .count(),
+            10
+        );
+        assert_eq!(
+            reparsed.blocks[0]
+                .tokens
+                .iter()
+                .filter(|token| {
+                    matches!(
+                        token,
+                        Token::Match {
+                            length: 16,
+                            distance: 1,
+                            length_symbol: 267,
+                            length_extra: 1,
+                            length_extra_bits: 1,
+                            distance_symbol: 0,
+                            distance_extra: 0,
+                            distance_extra_bits: 0,
+                        }
+                    )
+                })
+                .count(),
+            4
+        );
+
+        let repeated = optimize_raw(&optimized.data, &Options::default()).unwrap();
+        assert_eq!(repeated.info.deflate_bits, optimized.info.deflate_bits);
+        assert_eq!(repeated.data, optimized.data);
     }
 
     #[test]
