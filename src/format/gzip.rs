@@ -28,6 +28,8 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     let mut member_count = 0_usize;
     let mut decoded_remaining = options.max_decoded_bytes;
     let mut timed_out = false;
+    let mut source_deflate_bits = 0_u64;
+    let mut output_deflate_bits = 0_u64;
 
     // RFC 1952 explicitly permits concatenated members. Each has an
     // independently checksummed Deflate stream, so parse and optimize them in
@@ -96,6 +98,12 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             ));
         }
         decoded_remaining -= raw.info.size;
+        source_deflate_bits = source_deflate_bits
+            .checked_add(raw.info.source_deflate_bits)
+            .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))?;
+        output_deflate_bits = output_deflate_bits
+            .checked_add(raw.info.deflate_bits)
+            .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))?;
 
         let trailer_start = payload_start
             .checked_add(raw.consumed)
@@ -139,12 +147,16 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     if output.len() > input.len() && !options.strict {
         output.clear();
         try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
+        output_deflate_bits = source_deflate_bits;
     }
 
-    Ok(Optimization {
-        data: output,
+    Ok(Optimization::from_metrics(
+        input.len(),
+        output,
+        source_deflate_bits,
+        output_deflate_bits,
         timed_out,
-    })
+    ))
 }
 
 fn read_u16(input: &[u8], position: usize, message: &'static str) -> Result<u16> {
@@ -167,6 +179,15 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    fn same_byte_bit_win_member() -> Vec<u8> {
+        let decoded = [b'A'; 168];
+        let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        member.extend_from_slice(super::super::SAME_BYTE_BIT_WIN_RAW);
+        member.extend_from_slice(&crc32_update(0, &decoded).to_le_bytes());
+        member.extend_from_slice(&(decoded.len() as u32).to_le_bytes());
+        member
+    }
 
     fn empty_member(flags: u8) -> Vec<u8> {
         let mut member = vec![0x1f, 0x8b, 8, flags, 0, 0, 0, 0, 0, 255];
@@ -218,6 +239,17 @@ mod tests {
         input.extend(empty_member(0));
         let result = optimize(&input, &Options::default()).unwrap();
         assert_eq!(result.data, input);
+    }
+
+    #[test]
+    fn concatenated_members_aggregate_same_byte_bit_savings() {
+        let member = same_byte_bit_win_member();
+        let mut input = member.clone();
+        input.extend_from_slice(&member);
+        let optimized = optimize(&input, &Options::default()).unwrap();
+
+        assert_eq!(optimized.data.len(), input.len());
+        assert_eq!(optimized.bits_saved, 2);
     }
 
     #[test]

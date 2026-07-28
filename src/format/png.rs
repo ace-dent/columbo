@@ -90,6 +90,13 @@ struct FrameOptimization {
     info: Option<RawInfo>,
 }
 
+#[derive(Clone, Debug)]
+struct CompressedBodyOptimization {
+    replacement: Option<Vec<u8>>,
+    source_deflate_bits: u64,
+    output_deflate_bits: u64,
+}
+
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
@@ -158,7 +165,8 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             }
             Err(error) => return Err(error),
         };
-        quick_replacements[index] = replacement;
+        quick_replacements[index] =
+            replacement.filter(|replacement| replacement.replacement.is_some());
 
         // A non-winning quick probe is retried later with the stream's normal
         // search allowance. Charge its decoded bytes only on that definitive
@@ -175,6 +183,16 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 
     let (optimized_idat, optimized_frames) =
         optimize_image_streams(&parsed.idat, &parsed.fdat_frames, options, &mut budget)?;
+    let mut source_deflate_bits = frame_source_bits(&optimized_idat)?;
+    let mut output_deflate_bits = frame_output_bits(&optimized_idat)?;
+    for frame in &optimized_frames {
+        source_deflate_bits = source_deflate_bits
+            .checked_add(frame_source_bits(frame)?)
+            .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
+        output_deflate_bits = output_deflate_bits
+            .checked_add(frame_output_bits(frame)?)
+            .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
+    }
 
     // An unknown unsafe-to-copy ancillary chunk may depend on the exact
     // critical image representation. Its contract is unknowable, so after
@@ -183,10 +201,13 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     if !options.strip_metadata && parsed.has_unknown_unsafe_ancillary {
         let data =
             try_clone_bytes(input).ok_or_else(|| Error::new("could not allocate PNG output"))?;
-        return Ok(Optimization {
+        return Ok(Optimization::from_metrics(
+            input.len(),
             data,
-            timed_out: budget.timed_out,
-        });
+            source_deflate_bits,
+            source_deflate_bits,
+            budget.timed_out,
+        ));
     }
 
     let mut output = Vec::new();
@@ -209,7 +230,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                 if !idat_written {
                     // IDAT boundaries are only packetization. Coalescing them
                     // saves twelve bytes for every redundant chunk.
-                    append_chunk(&mut output, *b"IDAT", &optimized_idat)?;
+                    append_chunk(&mut output, *b"IDAT", &optimized_idat.data)?;
                     idat_written = true;
                 }
             }
@@ -243,11 +264,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                 }
             }
             b"zTXt" | b"iTXt" | b"iCCP" => {
-                let replacement = if let Some(body) = &quick_replacements[index] {
-                    Some(
-                        try_clone_bytes(body)
-                            .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?,
-                    )
+                let replacement = if let Some(replacement) = &quick_replacements[index] {
+                    try_clone_compressed_body(replacement)
+                        .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?
                 } else {
                     optimize_compressed_body(
                         chunk.kind,
@@ -256,11 +275,18 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                         DefaultFloor::Shared,
                         &mut budget,
                     )?
+                    .expect("compressed PNG metadata has a recognized zlib offset")
                 };
+                source_deflate_bits = source_deflate_bits
+                    .checked_add(replacement.source_deflate_bits)
+                    .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
+                output_deflate_bits = output_deflate_bits
+                    .checked_add(replacement.output_deflate_bits)
+                    .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
                 append_chunk(
                     &mut output,
                     chunk.kind,
-                    replacement.as_deref().unwrap_or(chunk.data),
+                    replacement.replacement.as_deref().unwrap_or(chunk.data),
                 )?;
             }
             _ => {
@@ -275,12 +301,16 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     if output.len() > input.len() && !options.strict {
         output.clear();
         output.extend_from_slice(input);
+        output_deflate_bits = source_deflate_bits;
     }
 
-    Ok(Optimization {
-        data: output,
-        timed_out: budget.timed_out,
-    })
+    Ok(Optimization::from_metrics(
+        input.len(),
+        output,
+        source_deflate_bits,
+        output_deflate_bits,
+        budget.timed_out,
+    ))
 }
 
 fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
@@ -824,7 +854,7 @@ fn optimize_image_streams(
     frames: &[Vec<u8>],
     options: &Options,
     budget: &mut DecodeBudget,
-) -> Result<(Vec<u8>, Vec<FrameOptimization>)> {
+) -> Result<(FrameOptimization, Vec<FrameOptimization>)> {
     let representatives = frame_representatives(frames)?;
     let mut representative_weights = Vec::new();
     representative_weights
@@ -935,7 +965,12 @@ fn optimize_image_streams(
             budget.timed_out = true;
         }
         match job {
-            ImageJob::Idat => optimized_idat = Some(result.data),
+            ImageJob::Idat => {
+                optimized_idat = Some(FrameOptimization {
+                    data: result.data,
+                    info: result.info,
+                });
+            }
             ImageJob::Frame(index) => {
                 optimized[index] = Some(FrameOptimization {
                     data: result.data,
@@ -1023,6 +1058,35 @@ fn try_clone_frame(frame: &FrameOptimization) -> Option<FrameOptimization> {
     Some(FrameOptimization {
         data: try_clone_bytes(&frame.data)?,
         info: frame.info.clone(),
+    })
+}
+
+fn frame_source_bits(frame: &FrameOptimization) -> Result<u64> {
+    frame
+        .info
+        .as_ref()
+        .map(|info| info.source_deflate_bits)
+        .ok_or_else(|| Error::new("valid PNG image stream has no Deflate information"))
+}
+
+fn frame_output_bits(frame: &FrameOptimization) -> Result<u64> {
+    frame
+        .info
+        .as_ref()
+        .map(|info| info.deflate_bits)
+        .ok_or_else(|| Error::new("valid PNG image stream has no Deflate information"))
+}
+
+fn try_clone_compressed_body(
+    optimized: &CompressedBodyOptimization,
+) -> Option<CompressedBodyOptimization> {
+    Some(CompressedBodyOptimization {
+        replacement: match optimized.replacement.as_deref() {
+            Some(data) => Some(try_clone_bytes(data)?),
+            None => None,
+        },
+        source_deflate_bits: optimized.source_deflate_bits,
+        output_deflate_bits: optimized.output_deflate_bits,
     })
 }
 
@@ -1189,8 +1253,15 @@ where
                     let Some(replacement) = try_clone_bytes(&best_data) else {
                         continue;
                     };
+                    let source_deflate_bits = frames[member]
+                        .info
+                        .as_ref()
+                        .expect("an exact-reuse member has decoded stream information")
+                        .source_deflate_bits;
+                    let mut replacement_info = best_info.clone();
+                    replacement_info.source_deflate_bits = source_deflate_bits;
                     frames[member].data = replacement;
-                    frames[member].info = Some(best_info.clone());
+                    frames[member].info = Some(replacement_info);
                 }
             }
         }
@@ -1313,23 +1384,39 @@ fn optimize_compressed_body(
     options: &Options,
     default_floor: DefaultFloor,
     budget: &mut DecodeBudget,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<CompressedBodyOptimization>> {
     let Some(zlib_offset) = compressed_zlib_offset(kind, data) else {
         return Ok(None);
     };
     let optimized = optimize_png_zlib(&data[zlib_offset..], options, true, default_floor, budget)?;
-    if zlib_offset + optimized.data.len() >= data.len() && !options.strict {
-        return Ok(None);
-    }
+    let source_deflate_bits = optimized
+        .info
+        .as_ref()
+        .map_or(0, |info| info.source_deflate_bits);
+    let output_deflate_bits = optimized.info.as_ref().map_or(0, |info| info.deflate_bits);
     let body_len = zlib_offset
         .checked_add(optimized.data.len())
         .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
+    if !options.strict
+        && (body_len > data.len()
+            || (body_len == data.len() && output_deflate_bits >= source_deflate_bits))
+    {
+        return Ok(Some(CompressedBodyOptimization {
+            replacement: None,
+            source_deflate_bits,
+            output_deflate_bits: source_deflate_bits,
+        }));
+    }
     let mut body = Vec::new();
     body.try_reserve_exact(body_len)
         .map_err(|_| Error::new("could not allocate PNG compressed metadata"))?;
     body.extend_from_slice(&data[..zlib_offset]);
     body.extend_from_slice(&optimized.data);
-    Ok(Some(body))
+    Ok(Some(CompressedBodyOptimization {
+        replacement: Some(body),
+        source_deflate_bits,
+        output_deflate_bits,
+    }))
 }
 
 fn compressed_zlib_offset(kind: [u8; 4], data: &[u8]) -> Option<usize> {
@@ -1526,6 +1613,19 @@ mod tests {
     }
 
     #[test]
+    fn idat_reports_same_byte_bit_savings() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IDAT", &super::super::same_byte_bit_win_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let optimized = optimize(&input, &Options::default()).unwrap();
+
+        assert_eq!(optimized.data.len(), input.len());
+        assert_eq!(optimized.bits_saved, 1);
+    }
+
+    #[test]
     fn bounded_max_deadline_still_returns_a_valid_png() {
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &ihdr()));
@@ -1705,6 +1805,43 @@ mod tests {
     }
 
     #[test]
+    fn cross_frame_reuse_preserves_each_members_source_bit_count() {
+        let source = stored_zlib(&[0, 0]);
+        let optimized = zlib::optimize_embedded(
+            &source,
+            &Options::default(),
+            2,
+            false,
+            DefaultFloor::Complete,
+        )
+        .unwrap();
+        assert!(optimized.data.len() < source.len());
+        let best_info = optimized.info.unwrap();
+        let mut source_info = best_info.clone();
+        source_info.source_deflate_bits = 101;
+        source_info.deflate_bits = 101;
+        let mut donor_info = best_info;
+        donor_info.source_deflate_bits = 202;
+        let donor_bits = donor_info.deflate_bits;
+        let mut frames = vec![
+            FrameOptimization {
+                data: source,
+                info: Some(source_info),
+            },
+            FrameOptimization {
+                data: optimized.data,
+                info: Some(donor_info),
+            },
+        ];
+
+        reuse_best_exact_frames(&mut frames, &mut || false);
+
+        let replaced = frames[0].info.as_ref().unwrap();
+        assert_eq!(replaced.source_deflate_bits, 101);
+        assert_eq!(replaced.deflate_bits, donor_bits);
+    }
+
+    #[test]
     fn exact_frame_reuse_stops_when_its_deadline_is_spent() {
         let summary = RawInfo {
             size: 2,
@@ -1874,7 +2011,7 @@ mod tests {
 
             assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(optimized_frames.len(), frames.len());
-            assert!(optimized_idat.len() <= source_idat.len());
+            assert!(optimized_idat.data.len() <= source_idat.len());
             assert!(optimized_frames
                 .iter()
                 .zip(&source_lengths)
@@ -2018,6 +2155,36 @@ mod tests {
         };
         let result = optimize(&input, &options).unwrap();
         parse(&result.data).unwrap();
+    }
+
+    #[test]
+    fn compressed_metadata_contributes_same_byte_bit_savings_in_both_policies() {
+        let mut metadata = b"Comment\0\0".to_vec();
+        // This source is one bit behind strict output and three bits behind
+        // relaxed output, without changing the byte length.
+        metadata.extend_from_slice(&super::super::same_byte_bit_win_zlib());
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"zTXt", &metadata));
+        input.extend(chunk(
+            *b"IDAT",
+            &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for strict in [true, false] {
+            let optimized = optimize(
+                &input,
+                &Options {
+                    strict,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+
+            assert_eq!(optimized.data.len(), input.len());
+            assert_eq!(optimized.bits_saved, if strict { 1 } else { 3 });
+        }
     }
 
     #[test]

@@ -35,10 +35,17 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         false,
         DefaultFloor::Complete,
     )?;
-    Ok(Optimization {
-        data: optimized.data,
-        timed_out: optimized.timed_out,
-    })
+    let info = optimized
+        .info
+        .as_ref()
+        .expect("a validated top-level zlib stream has raw information");
+    Ok(Optimization::from_metrics(
+        input.len(),
+        optimized.data,
+        info.source_deflate_bits,
+        info.deflate_bits,
+        optimized.timed_out,
+    ))
 }
 
 /// Optimize a zlib stream embedded in another container.
@@ -75,7 +82,7 @@ pub(super) fn optimize_embedded(
     // A zlib stream is exactly: two-byte header, raw Deflate data, Adler-32.
     // Keep both wrapper fields byte-for-byte so Columbo only changes Deflate.
     let raw_input = &input[2..input.len() - 4];
-    let raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
+    let mut raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
 
     // Raw parsing always completes one stream. Any bytes left before the
     // wrapper checksum therefore make a top-level zlib stream malformed.
@@ -83,6 +90,7 @@ pub(super) fn optimize_embedded(
     // an optional ancillary chunk into a whole-file error.
     if raw.consumed != raw_input.len() {
         if lenient_header {
+            raw.info.deflate_bits = raw.info.source_deflate_bits;
             return Ok(StreamOptimization {
                 data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
                 info: Some(raw.info),
@@ -95,6 +103,7 @@ pub(super) fn optimize_embedded(
     let advertised_window = 1_u32 << ((input[0] >> 4) + 8);
     if u32::from(raw.info.max_distance) > advertised_window {
         if lenient_header {
+            raw.info.deflate_bits = raw.info.source_deflate_bits;
             return Ok(StreamOptimization {
                 data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
                 info: Some(raw.info),
@@ -126,6 +135,7 @@ pub(super) fn optimize_embedded(
     if data.len() > input.len() && !options.strict {
         data.clear();
         try_append_bytes(&mut data, input, OUTPUT_ALLOCATION_ERROR)?;
+        raw.info.deflate_bits = raw.info.source_deflate_bits;
     }
 
     Ok(StreamOptimization {
@@ -160,6 +170,15 @@ pub(super) fn has_recognizable_header(input: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_byte_deflate_win_reports_bits_saved() {
+        let input = super::super::same_byte_bit_win_zlib();
+        let optimized = optimize(&input, &Options::default()).unwrap();
+
+        assert_eq!(optimized.data.len(), input.len());
+        assert_eq!(optimized.bits_saved, 1);
+    }
 
     #[test]
     fn rejects_preset_dictionary_header() {
@@ -224,6 +243,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.data, input);
-        assert_eq!(result.info.unwrap().size, 0);
+        let info = result.info.unwrap();
+        assert_eq!(info.size, 0);
+        assert_eq!(info.deflate_bits, info.source_deflate_bits);
     }
 }

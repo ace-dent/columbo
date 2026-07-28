@@ -34,7 +34,8 @@ struct Command {
 }
 
 enum Destination {
-    File(PathBuf),
+    InPlace,
+    Explicit(PathBuf),
     DryRun,
 }
 
@@ -42,6 +43,42 @@ impl Destination {
     fn is_dry_run(&self) -> bool {
         matches!(self, Self::DryRun)
     }
+
+    fn output_path<'a>(&'a self, input: &'a Path) -> Option<&'a Path> {
+        match self {
+            Self::InPlace => Some(input),
+            Self::Explicit(path) => Some(path),
+            Self::DryRun => None,
+        }
+    }
+
+    fn overwrites_input(&self, input: &Path) -> bool {
+        match self {
+            Self::InPlace => true,
+            Self::Explicit(path) => paths_refer_to_same_file(input, path),
+            Self::DryRun => false,
+        }
+    }
+}
+
+enum OutputAction {
+    DryRun,
+    WrittenOptimized(PathBuf),
+    CopiedOriginal(PathBuf),
+    Preserved(PathBuf),
+}
+
+impl OutputAction {
+    fn wrote_file(&self) -> bool {
+        matches!(self, Self::WrittenOptimized(_) | Self::CopiedOriginal(_))
+    }
+}
+
+struct ExecutionTimings {
+    read: Duration,
+    optimize: Duration,
+    write: Duration,
+    total: Duration,
 }
 
 enum ParsedCommand {
@@ -99,6 +136,7 @@ fn run() -> std::result::Result<(), u8> {
 }
 
 fn execute(command: Command) -> std::result::Result<(), u8> {
+    let overwrites_input = command.destination.overwrites_input(&command.input);
     let total_started = command.options.verbose.then(Instant::now);
     let read_started = command.options.verbose.then(Instant::now);
     let input = match read_file(&command.input, command.options.max_input_bytes) {
@@ -143,51 +181,125 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
         }
     };
 
-    let write_elapsed = match &command.destination {
-        Destination::File(output) => {
-            let write_started = command.options.verbose.then(Instant::now);
-            if write_file(output, &optimized.data).is_err() {
-                eprintln!("could not write {:?}", output);
+    let write_started = command.options.verbose.then(Instant::now);
+    let output_action = match command.destination.output_path(&command.input) {
+        None => OutputAction::DryRun,
+        Some(output) if optimized.bits_saved != 0 => {
+            let written = if overwrites_input {
+                write_file_if_unchanged(output, &input, &optimized.data)
+            } else {
+                write_file(output, &optimized.data).map(|()| true)
+            };
+            match written {
+                Ok(true) => {}
+                Ok(false) => {
+                    eprintln!(
+                        "input changed while it was being optimized; left {:?} unchanged",
+                        output
+                    );
+                    return Err(1);
+                }
+                Err(_) => {
+                    eprintln!("could not write {:?}", output);
+                    return Err(1);
+                }
+            }
+            OutputAction::WrittenOptimized(output.to_path_buf())
+        }
+        Some(output) if matches!(&command.destination, Destination::InPlace) => {
+            OutputAction::Preserved(output.to_path_buf())
+        }
+        Some(output) => match output_entry_exists(output) {
+            Ok(true) => OutputAction::Preserved(output.to_path_buf()),
+            Ok(false) => match write_new_file(output, &input) {
+                Ok(true) => OutputAction::CopiedOriginal(output.to_path_buf()),
+                // Another writer won the race after the existence check.
+                Ok(false) => OutputAction::Preserved(output.to_path_buf()),
+                Err(_) => {
+                    eprintln!("could not write {:?}", output);
+                    return Err(1);
+                }
+            },
+            Err(_) => {
+                eprintln!("could not inspect {:?}", output);
                 return Err(1);
             }
-            write_started.map_or(Duration::ZERO, |started| started.elapsed())
-        }
-        Destination::DryRun => Duration::ZERO,
+        },
+    };
+    let write_elapsed = if output_action.wrote_file() {
+        write_started.map_or(Duration::ZERO, |started| started.elapsed())
+    } else {
+        Duration::ZERO
     };
 
     if optimized.timed_out {
-        if command.destination.is_dry_run() {
-            eprintln!(
+        match &output_action {
+            OutputAction::DryRun => eprintln!(
                 "Timeout triggered after {} seconds; reporting best result found so far.",
                 command.options.timeout.as_secs()
-            );
-        } else {
-            eprintln!(
+            ),
+            OutputAction::WrittenOptimized(_) => eprintln!(
                 "Timeout triggered after {} seconds; wrote best output found so far.",
                 command.options.timeout.as_secs()
-            );
+            ),
+            OutputAction::CopiedOriginal(_) | OutputAction::Preserved(_) => eprintln!(
+                "Timeout triggered after {} seconds; no smaller output was written.",
+                command.options.timeout.as_secs()
+            ),
         }
     }
     if command.options.verbose {
         print_verbose_result(
-            &command.destination,
+            &output_action,
             input.len(),
             optimized.data.len(),
-            read_elapsed,
-            optimize_elapsed,
-            write_elapsed,
-            total_started.map_or(Duration::ZERO, |started| started.elapsed()),
-        );
-    } else if command.destination.is_dry_run() {
-        eprintln!(
-            "{} -> {} bytes (dry run; no output written)",
-            input.len(),
-            optimized.data.len()
+            optimized.bits_saved,
+            &ExecutionTimings {
+                read: read_elapsed,
+                optimize: optimize_elapsed,
+                write: write_elapsed,
+                total: total_started.map_or(Duration::ZERO, |started| started.elapsed()),
+            },
         );
     } else {
-        eprintln!("{} -> {} bytes", input.len(), optimized.data.len());
+        print_quiet_result(
+            &output_action,
+            input.len(),
+            optimized.data.len(),
+            optimized.bits_saved,
+        );
     }
     Ok(())
+}
+
+fn print_quiet_result(
+    action: &OutputAction,
+    input_bytes: usize,
+    optimized_bytes: usize,
+    bits_saved: u64,
+) {
+    match action {
+        OutputAction::DryRun => {
+            eprintln!("{input_bytes} -> {optimized_bytes} bytes (dry run; no output written)")
+        }
+        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => eprintln!(
+            "{input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
+            plural_u64(bits_saved, "bit", "bits")
+        ),
+        OutputAction::WrittenOptimized(_) => {
+            eprintln!("{input_bytes} -> {optimized_bytes} bytes");
+        }
+        OutputAction::CopiedOriginal(output) => eprintln!(
+            "{input_bytes} -> {input_bytes} bytes \
+             (no savings; copied original to {:?})",
+            output
+        ),
+        OutputAction::Preserved(output) => eprintln!(
+            "{input_bytes} -> {input_bytes} bytes \
+             (no savings; left {:?} unchanged)",
+            output
+        ),
+    }
 }
 
 fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Duration) {
@@ -225,43 +337,64 @@ fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Dur
 }
 
 fn print_verbose_result(
-    destination: &Destination,
+    action: &OutputAction,
     input_bytes: usize,
     output_bytes: usize,
-    read_elapsed: Duration,
-    optimize_elapsed: Duration,
-    write_elapsed: Duration,
-    total_elapsed: Duration,
+    bits_saved: u64,
+    timings: &ExecutionTimings,
 ) {
     println!();
     println!("Result");
-    match destination {
-        Destination::File(output) => {
+    match action {
+        OutputAction::WrittenOptimized(output) => {
             let output_name = output.file_name().unwrap_or(output.as_os_str());
             println!("  Output  {:?}", output_name);
         }
-        Destination::DryRun => println!("  Output  not written · dry run"),
+        OutputAction::CopiedOriginal(output) => {
+            let output_name = output.file_name().unwrap_or(output.as_os_str());
+            println!("  Output  {:?} · original copied · no savings", output_name);
+        }
+        OutputAction::Preserved(output) => {
+            let output_name = output.file_name().unwrap_or(output.as_os_str());
+            println!("  Output  {:?} · preserved · no savings", output_name);
+        }
+        OutputAction::DryRun => println!("  Output  not written · dry run"),
     }
     println!(
         "  Size    {input_bytes} → {output_bytes} {} · {}",
         plural_bytes(output_bytes),
-        describe_byte_change(input_bytes, output_bytes)
+        describe_optimization_change(input_bytes, output_bytes, bits_saved)
     );
-    if destination.is_dry_run() {
+    if !action.wrote_file() {
         println!(
             "  Time    {} total · read {} · optimize {}",
-            format_elapsed(total_elapsed),
-            format_elapsed(read_elapsed),
-            format_elapsed(optimize_elapsed),
+            format_elapsed(timings.total),
+            format_elapsed(timings.read),
+            format_elapsed(timings.optimize),
         );
     } else {
         println!(
             "  Time    {} total · read {} · optimize {} · write {}",
-            format_elapsed(total_elapsed),
-            format_elapsed(read_elapsed),
-            format_elapsed(optimize_elapsed),
-            format_elapsed(write_elapsed)
+            format_elapsed(timings.total),
+            format_elapsed(timings.read),
+            format_elapsed(timings.optimize),
+            format_elapsed(timings.write)
         );
+    }
+}
+
+fn describe_optimization_change(
+    input_bytes: usize,
+    output_bytes: usize,
+    bits_saved: u64,
+) -> String {
+    if input_bytes == output_bytes && bits_saved != 0 {
+        format!(
+            "saved {bits_saved} meaningful {}",
+            plural_u64(bits_saved, "bit", "bits")
+        )
+    } else {
+        describe_byte_change(input_bytes, output_bytes)
     }
 }
 
@@ -325,14 +458,42 @@ fn plural_bytes(count: usize) -> &'static str {
     }
 }
 
+fn plural_u64(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
+
 fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCommand, CliError> {
     let arguments: Vec<OsString> = arguments.into_iter().collect();
     let mut options = Options::default();
     let mut format = Format::Auto;
     let mut dry_run = false;
+    let mut output = None;
+    let mut positional = Vec::new();
+    let mut parse_options = true;
     let mut index = 0_usize;
 
-    while index < arguments.len() && starts_with_dash(&arguments[index]) {
+    while index < arguments.len() {
+        if parse_options && arguments[index] == OsStr::new("--") {
+            parse_options = false;
+            index += 1;
+            continue;
+        }
+        if !parse_options || !starts_with_dash(&arguments[index]) {
+            positional.push(arguments[index].clone());
+            index += 1;
+            continue;
+        }
+
+        if let Some(value) = equals_output_value(&arguments[index]) {
+            set_output(&mut output, value)?;
+            index += 1;
+            continue;
+        }
+
         let argument = arguments[index].to_string_lossy();
         match argument.as_ref() {
             "-h" | "--help" => return Ok(ParsedCommand::Help),
@@ -340,6 +501,14 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             "-v" | "--verbose" => options.verbose = true,
             "-m" | "--max" => options.exhaustive = true,
             "-d" | "--dry-run" => dry_run = true,
+            "--out" => {
+                index += 1;
+                let value = arguments.get(index).ok_or_else(output_error)?;
+                if starts_with_dash(value) {
+                    return Err(output_error());
+                }
+                set_output(&mut output, value.clone())?;
+            }
             "--strip" => options.strip_metadata = true,
             "-t" | "--timeout" => {
                 index += 1;
@@ -374,30 +543,89 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
         index += 1;
     }
 
-    let positional = arguments.len() - index;
-    let destination = if dry_run {
-        match positional {
-            1 => Destination::DryRun,
-            2 => {
+    let (input, destination) = if dry_run {
+        match positional.as_slice() {
+            [input] => (PathBuf::from(input), Destination::DryRun),
+            [_, _] => {
                 return Err(CliError::message(
-                    "--dry-run does not accept an output filename",
+                    "--dry-run does not accept a positional output filename; \
+                     --out is ignored in dry-run mode",
                     true,
                 ));
             }
             _ => return Err(CliError::usage()),
         }
-    } else if positional == 2 {
-        Destination::File(PathBuf::from(&arguments[index + 1]))
     } else {
-        return Err(CliError::usage());
+        match positional.as_slice() {
+            [input] => {
+                let destination = output.map_or(Destination::InPlace, Destination::Explicit);
+                (PathBuf::from(input), destination)
+            }
+            [input, legacy_output] if output.is_none() => (
+                PathBuf::from(input),
+                Destination::Explicit(PathBuf::from(legacy_output)),
+            ),
+            [_, _] => {
+                return Err(CliError::message(
+                    "--out cannot be combined with a positional output filename",
+                    true,
+                ));
+            }
+            _ => return Err(CliError::usage()),
+        }
     };
 
     Ok(ParsedCommand::Run(Command {
         format,
         options,
-        input: PathBuf::from(&arguments[index]),
+        input,
         destination,
     }))
+}
+
+fn set_output(output: &mut Option<PathBuf>, value: OsString) -> Result<(), CliError> {
+    if output.is_some() {
+        return Err(CliError::message("--out may only be specified once", false));
+    }
+    if value.is_empty() {
+        return Err(output_error());
+    }
+    *output = Some(PathBuf::from(value));
+    Ok(())
+}
+
+#[cfg(unix)]
+fn equals_output_value(argument: &OsStr) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    argument
+        .as_bytes()
+        .strip_prefix(b"--out=")
+        .map(|value| OsString::from_vec(value.to_vec()))
+}
+
+#[cfg(windows)]
+fn equals_output_value(argument: &OsStr) -> Option<OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const PREFIX: &[u16] = &[
+        b'-' as u16,
+        b'-' as u16,
+        b'o' as u16,
+        b'u' as u16,
+        b't' as u16,
+        b'=' as u16,
+    ];
+    let encoded: Vec<u16> = argument.encode_wide().collect();
+    encoded.strip_prefix(PREFIX).map(OsString::from_wide)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn equals_output_value(argument: &OsStr) -> Option<OsString> {
+    argument
+        .to_string_lossy()
+        .strip_prefix("--out=")
+        .map(OsString::from)
 }
 
 fn starts_with_dash(value: &OsStr) -> bool {
@@ -434,6 +662,10 @@ fn strict_error() -> CliError {
     CliError::message("--strict requires 0 or 1", false)
 }
 
+fn output_error() -> CliError {
+    CliError::message("--out requires an output filename", false)
+}
+
 fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
@@ -443,7 +675,11 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "\"Just One More Thing\" - optimize the last few bytes in Deflate streams."
     )?;
-    writeln!(output, "usage: {} [options] input output", PROGRAM_NAME)?;
+    writeln!(
+        output,
+        "usage: {} [options] [--out file] input",
+        PROGRAM_NAME
+    )?;
     writeln!(output, "       {} --dry-run [options] input", PROGRAM_NAME)?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
@@ -459,6 +695,10 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         "  -d, --dry-run          fully optimize and report savings without writing output"
+    )?;
+    writeln!(
+        output,
+        "      --out <file>       write to file instead of optimizing input in place"
     )?;
     writeln!(
         output,
@@ -492,6 +732,11 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
         output,
         "By default, PNG/GZIP/ZIP metadata and comments are preserved."
     )?;
+    writeln!(
+        output,
+        "Existing files are replaced only when byte size decreases or at least one"
+    )?;
+    writeln!(output, "meaningful Deflate bit is saved.")?;
     writeln!(
         output,
         "Input and decoded Deflate data are limited to 1 GiB."
@@ -554,6 +799,69 @@ fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     commit_temporary_output(path, &mut temporary, file)
 }
 
+/// Recheck that an input still contains the snapshot that was optimized. The
+/// comparison happens after staging, immediately before the atomic rename, so
+/// a long optimization cannot silently discard a newer source version. Like
+/// any portable path check followed by rename, a very small race remains.
+fn write_file_if_unchanged(path: &Path, expected: &[u8], bytes: &[u8]) -> io::Result<bool> {
+    let (mut temporary, file) = stage_private_output(path, bytes)?;
+    if !file_contents_equal(path, expected)? {
+        return Ok(false);
+    }
+    commit_temporary_output(path, &mut temporary, file)?;
+    Ok(true)
+}
+
+fn file_contents_equal(path: &Path, expected: &[u8]) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if file.metadata()?.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+
+    let mut buffer = [0_u8; READ_BUFFER_BYTES];
+    let mut position = 0_usize;
+    while position < expected.len() {
+        let count = file.read(&mut buffer)?;
+        if count == 0 || expected[position..].get(..count) != Some(&buffer[..count]) {
+            return Ok(false);
+        }
+        position += count;
+    }
+    Ok(file.read(&mut buffer[..1])? == 0)
+}
+
+/// Install a synced sibling only if no directory entry exists at `path`.
+///
+/// A hard link provides an atomic no-clobber commit: unlike `rename`, it fails
+/// when another process creates the destination between the caller's
+/// existence check and this commit. The sibling lives on the same filesystem,
+/// so a successful link cannot fail because of a cross-device boundary.
+fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let (mut temporary, file) = stage_private_output(path, bytes)?;
+    drop(file);
+    match fs::hard_link(&temporary.path, path) {
+        Ok(()) => {
+            fs::remove_file(&temporary.path)?;
+            temporary.committed = true;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn output_entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Write and sync a collision-safe sibling before replacing the destination.
 ///
 /// Unix builds force mode `0600` throughout staging. Keeping this phase
@@ -580,9 +888,9 @@ fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<(TemporaryOutpu
     let mut opened = None;
     for _ in 0..TEMP_FILE_ATTEMPTS {
         let sequence = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let temporary_name =
-            OsString::from(format!(".columbo-{}-{sequence}.tmp", std::process::id()));
-        let temporary_path = parent.join(temporary_name);
+        let Some(temporary_path) = temporary_output_candidate(path, parent, sequence) else {
+            continue;
+        };
         match create_temporary_output(&temporary_path) {
             Ok(file) => {
                 opened = Some((temporary_path, file));
@@ -602,6 +910,32 @@ fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<(TemporaryOutpu
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok((temporary, file))
+}
+
+fn temporary_output_candidate(path: &Path, parent: &Path, sequence: u64) -> Option<PathBuf> {
+    let temporary_name = OsString::from(format!(".columbo-{}-{sequence}.tmp", std::process::id()));
+    let candidate = parent.join(temporary_name);
+    (candidate.file_name() != path.file_name()).then_some(candidate)
+}
+
+fn paths_refer_to_same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if let (Ok(left), Ok(right)) = (fs::metadata(left), fs::metadata(right)) {
+            return left.dev() == right.dev() && left.ino() == right.ino();
+        }
+    }
+
+    matches!(
+        (fs::canonicalize(left), fs::canonicalize(right)),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 /// Atomically install a synced private sibling.
@@ -789,15 +1123,15 @@ mod tests {
 
     #[test]
     fn strict_mode_defaults_on_and_accepts_only_zero_or_one() {
-        assert!(parsed_options(["in", "out"]).strict);
-        assert!(!parsed_options(["--strict", "0", "in", "out"]).strict);
-        assert!(!parsed_options(["--strict=0", "in", "out"]).strict);
-        assert!(parsed_options(["--strict", "1", "in", "out"]).strict);
-        assert!(parsed_options(["--strict=1", "in", "out"]).strict);
+        assert!(parsed_options(["in"]).strict);
+        assert!(!parsed_options(["--strict", "0", "in"]).strict);
+        assert!(!parsed_options(["--strict=0", "in"]).strict);
+        assert!(parsed_options(["--strict", "1", "in"]).strict);
+        assert!(parsed_options(["--strict=1", "in"]).strict);
 
         for arguments in [
-            vec!["--strict", "2", "in", "out"],
-            vec!["--strict", "true", "in", "out"],
+            vec!["--strict", "2", "in"],
+            vec!["--strict", "true", "in"],
             vec!["--strict"],
         ] {
             let error = match parse_args(arguments.into_iter().map(OsString::from)) {
@@ -810,25 +1144,119 @@ mod tests {
 
     #[test]
     fn verbose_flags_enable_progress_reporting() {
-        assert!(!parsed_options(["in", "out"]).verbose);
-        assert!(parsed_options(["-v", "in", "out"]).verbose);
-        assert!(parsed_options(["--verbose", "in", "out"]).verbose);
+        assert!(!parsed_options(["in"]).verbose);
+        assert!(parsed_options(["-v", "in"]).verbose);
+        assert!(parsed_options(["--verbose", "in"]).verbose);
     }
 
     #[test]
-    fn dry_run_requires_one_input_and_rejects_an_output() {
+    fn output_defaults_in_place_and_accepts_oxipng_forms() {
+        let default = parsed_command(["in"]);
+        assert_eq!(default.input, Path::new("in"));
+        assert!(matches!(default.destination, Destination::InPlace));
+
+        for command in [
+            parsed_command(["--out", "out", "in"]),
+            parsed_command(["in", "--out", "out"]),
+            parsed_command(["--out=out", "in"]),
+        ] {
+            assert_eq!(command.input, Path::new("in"));
+            assert!(matches!(
+                command.destination,
+                Destination::Explicit(path) if path == Path::new("out")
+            ));
+        }
+
+        // Retain the old positional destination as a compatibility alias,
+        // while all help and repository tooling use --out.
+        assert!(matches!(
+            parsed_command(["in", "out"]).destination,
+            Destination::Explicit(path) if path == Path::new("out")
+        ));
+        assert!(matches!(
+            parsed_command(["--out=-output", "in"]).destination,
+            Destination::Explicit(path) if path == Path::new("-output")
+        ));
+        assert_eq!(parsed_command(["--", "-input"]).input, Path::new("-input"));
+    }
+
+    #[test]
+    fn output_option_rejects_ambiguous_or_missing_values() {
+        let cases = [
+            (
+                vec!["--out", "one", "--out", "two", "in"],
+                "--out may only be specified once",
+            ),
+            (
+                vec!["--out=one", "--out=two", "in"],
+                "--out may only be specified once",
+            ),
+            (
+                vec!["--out", "out", "in", "legacy"],
+                "--out cannot be combined with a positional output filename",
+            ),
+            (vec!["--out"], "--out requires an output filename"),
+            (
+                vec!["--out", "--dry-run", "in"],
+                "--out requires an output filename",
+            ),
+            (
+                vec!["--out", "--help", "in"],
+                "--out requires an output filename",
+            ),
+            (
+                vec!["--out", "-output", "in"],
+                "--out requires an output filename",
+            ),
+            (
+                vec!["--out", "-", "in"],
+                "--out requires an output filename",
+            ),
+            (vec!["--out=", "in"], "--out requires an output filename"),
+        ];
+        for (arguments, expected) in cases {
+            let error = match parse_args(arguments.into_iter().map(OsString::from)) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid output arguments should fail"),
+            };
+            assert_eq!(error.message.as_deref(), Some(expected));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn equals_form_preserves_a_non_utf8_output_path() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        let parsed = match parse_args([
+            OsString::from_vec(b"--out=\xff".to_vec()),
+            OsString::from("in"),
+        ]) {
+            Ok(parsed) => parsed,
+            Err(_) => panic!("non-UTF-8 output path should parse"),
+        };
+        let command = match parsed {
+            ParsedCommand::Run(command) => command,
+            ParsedCommand::Help => panic!("expected run command"),
+        };
+        let Destination::Explicit(output) = command.destination else {
+            panic!("expected explicit output");
+        };
+        assert_eq!(output.as_os_str().as_bytes(), b"\xff");
+    }
+
+    #[test]
+    fn dry_run_accepts_out_but_rejects_a_legacy_positional_output() {
         for command in [
             parsed_command(["-d", "in"]),
             parsed_command(["--dry-run", "in"]),
             parsed_command(["-d", "-d", "in"]),
+            parsed_command(["--dry-run", "--out", "ignored", "in"]),
+            parsed_command(["in", "--out=ignored", "--dry-run"]),
         ] {
             assert_eq!(command.input, Path::new("in"));
             assert!(command.destination.is_dry_run());
         }
-        assert!(matches!(
-            parsed_command(["in", "out"]).destination,
-            Destination::File(path) if path == Path::new("out")
-        ));
 
         let output_error =
             match parse_args(["--dry-run", "in", "out"].into_iter().map(OsString::from)) {
@@ -837,11 +1265,14 @@ mod tests {
             };
         assert_eq!(
             output_error.message.as_deref(),
-            Some("--dry-run does not accept an output filename")
+            Some(
+                "--dry-run does not accept a positional output filename; \
+                 --out is ignored in dry-run mode"
+            )
         );
         assert!(output_error.show_usage);
 
-        for arguments in [vec!["--dry-run"], vec!["in"]] {
+        for arguments in [vec!["--dry-run"], Vec::new()] {
             let error = match parse_args(arguments.into_iter().map(OsString::from)) {
                 Err(error) => error,
                 Ok(_) => panic!("missing positional argument should fail"),
@@ -862,11 +1293,7 @@ mod tests {
             "--allow-258-alias",
             "--inspect",
         ] {
-            let error = match parse_args([
-                OsString::from(option),
-                OsString::from("in"),
-                OsString::from("out"),
-            ]) {
+            let error = match parse_args([OsString::from(option), OsString::from("in")]) {
                 Err(error) => error,
                 Ok(_) => panic!("retired option should fail"),
             };
@@ -889,10 +1316,13 @@ mod tests {
         assert!(!help.contains("--zlib"));
         assert!(!help.contains("--gzip"));
         assert!(!help.contains("--zip"));
-        assert!(help.contains("usage: columbo [options] input output"));
+        assert!(help.contains("usage: columbo [options] [--out file] input"));
         assert!(help.contains("columbo --dry-run [options] input"));
         assert!(help.contains("-d, --dry-run"));
+        assert!(help.contains("--out <file>"));
+        assert!(help.contains("instead of optimizing input in place"));
         assert!(help.contains("without writing output"));
+        assert!(help.contains("meaningful Deflate bit is saved"));
         assert!(help.contains("Advanced:"));
         assert!(help.contains("--raw"));
         assert!(help.contains("live route timings, bit gains, and block choices"));
@@ -915,13 +1345,13 @@ mod tests {
 
     #[test]
     fn input_format_defaults_to_auto() {
-        assert_eq!(parsed_format(["in", "out"]), Format::Auto);
+        assert_eq!(parsed_format(["in"]), Format::Auto);
     }
 
     #[test]
     fn raw_is_an_idempotent_advanced_override() {
-        assert_eq!(parsed_format(["--raw", "in", "out"]), Format::Raw);
-        assert_eq!(parsed_format(["--raw", "--raw", "in", "out"]), Format::Raw);
+        assert_eq!(parsed_format(["--raw", "in"]), Format::Raw);
+        assert_eq!(parsed_format(["in", "--raw", "--raw"]), Format::Raw);
     }
 
     #[test]
@@ -952,6 +1382,115 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn no_gain_in_place_preserves_the_original_directory_entry() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        fs::write(&input, [0x03, 0x00]).unwrap();
+        let inode = fs::symlink_metadata(&input).unwrap().ino();
+
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input: input.clone(),
+            destination: Destination::InPlace,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&input).unwrap(), [0x03, 0x00]);
+        assert_eq!(fs::symlink_metadata(&input).unwrap().ino(), inode);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn no_gain_preserves_an_existing_explicit_output() {
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        let output = directory.join("output.deflate");
+        fs::write(&input, [0x03, 0x00]).unwrap();
+        fs::write(&output, b"existing output").unwrap();
+
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input,
+            destination: Destination::Explicit(output.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(output).unwrap(), b"existing output");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn no_gain_creates_a_missing_explicit_output_from_the_original() {
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        let output = directory.join("output.deflate");
+        fs::write(&input, [0x03, 0x00]).unwrap();
+
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input,
+            destination: Destination::Explicit(output.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(output).unwrap(), [0x03, 0x00]);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn equal_byte_output_with_a_one_bit_gain_replaces_in_place() {
+        let source = [
+            0x75, 0xc0, 0x41, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x21, 0x6d, 0xf8, 0x37, 0xb5, 0x7f,
+            0x97, 0x03, 0xcb, 0xb2, 0x3c, 0x82, 0x20, 0x08, 0x0e,
+        ];
+        let expected = optimize(&source, Format::Raw, &Options::default()).unwrap();
+        assert_eq!(expected.data.len(), source.len());
+        assert_eq!(expected.bits_saved, 1);
+
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        fs::write(&input, source).unwrap();
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input: input.clone(),
+            destination: Destination::InPlace,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(input).unwrap(), expected.data);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn padding_only_rewrite_without_a_meaningful_saving_does_not_replace_in_place() {
+        let source = [0x03, 0xfc];
+        let optimized = optimize(&source, Format::Raw, &Options::default()).unwrap();
+        assert_eq!(optimized.bits_saved, 0);
+
+        let directory = unique_test_directory();
+        let input = directory.join("input.deflate");
+        fs::write(&input, source).unwrap();
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            input: input.clone(),
+            destination: Destination::InPlace,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(input).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn output_commit_replaces_an_existing_file() {
         let directory = unique_test_directory();
@@ -960,6 +1499,54 @@ mod tests {
 
         write_file(&output, b"new").unwrap();
         assert_eq!(fs::read(&output).unwrap(), b"new");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guarded_commit_refuses_to_replace_a_changed_input_snapshot() {
+        let directory = unique_test_directory();
+        let output = directory.join("output.bin");
+        fs::write(&output, b"newer source").unwrap();
+
+        assert!(!write_file_if_unchanged(&output, b"old source", b"optimized").unwrap());
+        assert_eq!(fs::read(&output).unwrap(), b"newer source");
+        assert!(write_file_if_unchanged(&output, b"newer source", b"optimized").unwrap());
+        assert_eq!(fs::read(&output).unwrap(), b"optimized");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn staging_skips_a_candidate_equal_to_the_requested_output() {
+        let directory = unique_test_directory();
+        let sequence = 12_345;
+        let name = format!(".columbo-{}-{sequence}.tmp", std::process::id());
+        let output = directory.join(&name);
+
+        assert_eq!(
+            temporary_output_candidate(&output, &directory, sequence),
+            None
+        );
+        assert_eq!(
+            temporary_output_candidate(Path::new(&name), Path::new("."), sequence),
+            None
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn no_clobber_commit_creates_only_a_missing_destination() {
+        let directory = unique_test_directory();
+        let output = directory.join("output.bin");
+
+        assert!(write_new_file(&output, b"first").unwrap());
+        assert_eq!(fs::read(&output).unwrap(), b"first");
+        assert!(!write_new_file(&output, b"second").unwrap());
+        assert_eq!(fs::read(&output).unwrap(), b"first");
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
 
         fs::remove_dir_all(directory).unwrap();

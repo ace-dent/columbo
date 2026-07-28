@@ -38,6 +38,8 @@ struct Entry {
     flags: u16,
     skip: bool,
     strip_extra: bool,
+    source_deflate_bits: u64,
+    output_deflate_bits: u64,
 }
 
 /// Recognize both ordinary archives and ZIP-family inputs that should receive
@@ -129,6 +131,16 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         }
         timed_out |= build_local_entry(input, central_offset, &mut entries[index], &call_options)?;
     }
+    let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.source_deflate_bits)
+    });
+    let source_deflate_bits =
+        source_deflate_bits.ok_or_else(|| Error::new("ZIP Deflate bit count is too large"))?;
+    let output_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
+        total.checked_add(entry.output_deflate_bits)
+    });
+    let mut output_deflate_bits =
+        output_deflate_bits.ok_or_else(|| Error::new("ZIP Deflate bit count is too large"))?;
 
     // Local records need not appear in central-directory order. Rewrite them
     // by physical offset so self-extracting prefixes and inter-record padding
@@ -226,12 +238,16 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     if output.len() > input.len() && !options.strict {
         output.clear();
         try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
+        output_deflate_bits = source_deflate_bits;
     }
 
-    Ok(Optimization {
-        data: output,
+    Ok(Optimization::from_metrics(
+        input.len(),
+        output,
+        source_deflate_bits,
+        output_deflate_bits,
         timed_out,
-    })
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -466,6 +482,8 @@ fn parse_central_entries(
                 && compressed_size == 0
                 && uncompressed_size == 0,
             strip_extra: strip_metadata && understood,
+            source_deflate_bits: 0,
+            output_deflate_bits: 0,
         });
         position += record_size;
     }
@@ -545,9 +563,12 @@ fn build_local_entry(
             return Err(Error::new("ZIP deflate member CRC or size mismatch"));
         }
         timed_out = raw.timed_out;
+        entry.source_deflate_bits = raw.info.source_deflate_bits;
+        entry.output_deflate_bits = raw.info.source_deflate_bits;
         if raw.data.len() <= source_payload.len() || options.strict {
             entry.compressed_size_after = u32::try_from(raw.data.len())
                 .map_err(|_| Error::new("ZIP local entry too large"))?;
+            entry.output_deflate_bits = raw.info.deflate_bits;
             payload = raw.data;
         }
     }
@@ -731,6 +752,8 @@ mod tests {
             flags: 0,
             skip: false,
             strip_extra: false,
+            source_deflate_bits: 0,
+            output_deflate_bits: 0,
         }
     }
 
@@ -953,6 +976,8 @@ mod tests {
             flags: FLAG_DATA_DESCRIPTOR,
             skip: false,
             strip_extra: false,
+            source_deflate_bits: 0,
+            output_deflate_bits: 0,
         };
         let mut descriptor = Vec::new();
         descriptor.extend_from_slice(&DATA_DESCRIPTOR.to_le_bytes());
@@ -1012,6 +1037,23 @@ mod tests {
 
         assert!(result.data.len() <= input.len());
         optimize(&result.data, &Options::default()).unwrap();
+    }
+
+    #[test]
+    fn deflated_member_reports_same_byte_bit_savings() {
+        let decoded = [b'A'; 168];
+        let input = single_entry_archive(
+            8,
+            super::super::SAME_BYTE_BIT_WIN_RAW,
+            crc32_update(0, &decoded),
+            decoded.len() as u32,
+            false,
+            false,
+        );
+        let optimized = optimize(&input, &Options::default()).unwrap();
+
+        assert_eq!(optimized.data.len(), input.len());
+        assert_eq!(optimized.bits_saved, 1);
     }
 
     #[test]
