@@ -21,7 +21,20 @@ include = [
     "/src/*.rs",
     "/src/**/*.rs",
     "/tests/public_api.rs",
+    "/tests/corpus.rs",
 ]
+
+# Synthetic gzip/zlib/zip inputs for the corpus integration tests. The real
+# PNG/text corpus lives outside the source tree (see tests/corpus.rs for the
+# override via COLUMBO_CORPUS), so only the encoder for synthetic inputs is
+# needed at build time.
+[dev-dependencies]
+criterion = { version = "0.5.1", default-features = false }
+flate2 = "1.0"
+
+[[bench]]
+name = "benchmark"
+harness = false
 
 [profile.release]
 # Distribution builds prioritize runtime performance. Full LTO was neutral to
