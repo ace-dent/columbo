@@ -52,7 +52,7 @@ pub(crate) struct BlockProgress {
     pub(crate) tokens: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct BlockReport {
     pub(crate) blocks: Vec<BlockProgress>,
     pub(crate) total_blocks: usize,

@@ -86,18 +86,11 @@ const PARALLEL_ROUTE_MAX_COMPRESSED: usize = 8 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_MODEL: usize = 64 * 1_024 * 1_024;
 // A small ordinary floor is cheap enough to establish before launching the
-// heavier source graphs, and its selected blocks give the floor-seeded max
-// descendant a deterministic starting point. Above this work class, overlap
-// avoids spending most of a short file budget serially. The 768 KiB boundary
-// is the broad-corpus transition between those two scheduling costs.
+// heavier source graphs. Above this class, overlap preserves max-search wall
+// time unless the floor's decoded work is itself large enough to cause working
+// set contention. The match-work check at the call site also prebuilds floors
+// whose source graph cannot reliably finish inside the initial four-fifths.
 const PREBUILD_BOUNDED_FLOOR_MAX_DECODED: u64 = 768 * 1_024;
-// The ordinary floor and source graphs repeatedly scan token/plain buffers.
-// Above two MiB of decoded data, overlapping the floor with two graph routes
-// makes their shared working set and CPU demand large enough that the floor's
-// max descendant can become unreachable inside the initial phase. Establish
-// that reusable floor first, then parallelize its independent descendants.
-// The work model supplies the scheduling rationale; two MiB is the calibrated
-// transition retained from broad PNG corpus sampling.
 const CONCURRENT_BOUNDED_FLOOR_MAX_DECODED: u64 = 2 * 1_024 * 1_024;
 // The configured timeout is a soft scheduling boundary. An active route may
 // finish its current candidate within ten percent plus one second. This avoids
@@ -304,46 +297,42 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         .iter()
         .filter(|block| !block.plain.is_empty())
         .count();
-    // A one-block PNG may acquire useful new boundaries only through its
-    // ordinary floor. Small floors are cheap enough to establish
-    // deterministically; large working sets also need the non-duplicated floor
-    // first so its max descendant is not starved by cache/CPU contention.
-    // Medium multi-block inputs can share the initial wall clock. Container
-    // members have already received a proportional outer allowance, so their
-    // default floor uses that allowance directly rather than nesting another
-    // fractional cutoff.
+    // A single scheduled PNG promises that max retains the complete ordinary
+    // result. Prebuild compact, very large, one-block, or match-dense floors;
+    // their exact Default route either is a cheap dependency or cannot
+    // reliably finish inside the concurrent phase's reserved four-fifths.
+    // Medium multi-block floors instead remain in the existing parallel phase,
+    // where their completed ordinary candidate is still retained while max
+    // preserves enough wall time for independent source routes.
     let prebuild_floor_first = options.exhaustive
         && match default_floor {
             DefaultFloor::CompleteThenBounded => {
                 prebuild_bounded_floor(source_nonempty_blocks, parsed.decoded_size)
+                    || source_run_match_count_exceeds(&blocks, PROVEN_SUBMATCH_FULL_MATCH_LIMIT)
             }
-            // A container already apportioned this member a file-wide share.
-            // Nesting another fractional phase inside it can stop the ordinary
-            // floor even when the member's hard/grace allowance would finish
-            // the exact default result.
             DefaultFloor::Shared => true,
             DefaultFloor::Complete => false,
         };
     let guaranteed_floor_step =
         prebuild_floor_first.then(|| progress.start("Normal comparison floor"));
+    let mut complete_default_candidate = None;
     let mut guaranteed_floor_candidate = if prebuild_floor_first {
-        Some(
-            if default_floor != DefaultFloor::Shared
-                && (parsed.decoded_size > CONCURRENT_BOUNDED_FLOOR_MAX_DECODED
-                    || source_run_match_count_exceeds(&blocks, PROVEN_SUBMATCH_FULL_MATCH_LIMIT))
-            {
-                build_bounded_comparison_floor_candidate(source, options, &mut || {
-                    deadline.expired()
-                })?
-            } else {
-                build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
-            },
-        )
+        Some(if default_floor == DefaultFloor::CompleteThenBounded {
+            let floors =
+                build_complete_default_floor_candidate(source, options, &deadline, progress)?;
+            complete_default_candidate = Some(floors.complete);
+            floors.max_seed
+        } else {
+            build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
+        })
     } else {
         None
     };
     if let Some(step) = guaranteed_floor_step {
-        step.finish(guaranteed_floor_candidate.as_ref().map(|candidate| {
+        let reported_floor = complete_default_candidate
+            .as_ref()
+            .or(guaranteed_floor_candidate.as_ref());
+        step.finish(reported_floor.map(|candidate| {
             candidate_progress(
                 candidate,
                 source.meaningful_bits,
@@ -822,6 +811,15 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         replace_optional_if_smaller(&mut deft4j_candidate, narrow);
     }
 
+    // Bounded max routes deliberately retain their historical ordinary seed:
+    // a smaller complete Default floor can occupy a different search basin.
+    // Compare that independent floor only after those descendants finish, so
+    // max gets both the established Default result and its original routes
+    // without recomputing the shared base candidate.
+    if let Some(complete_default) = complete_default_candidate {
+        replace_optional_if_smaller(&mut bounded_floor_candidate, complete_default);
+    }
+
     let needs_initial_floor = bounded_floor_candidate.is_none();
     let initial_step = needs_initial_floor.then(|| {
         progress.start(if options.exhaustive {
@@ -861,49 +859,9 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             candidate.is_strictly_smaller_than_source(source),
         )));
     }
-    // Proven-before-feedback has a distinct compact fixed point from the
-    // ordinary endpoint ordering. Retain both as complete candidates whenever
-    // the source contains a proved match and the whole sibling is within its
-    // explicit token/plain work bounds.
-    if !options.exhaustive
-        && compact_source_has_bounded_match_preserving_feedback(source)
-        && deadline.can_start_route()
-    {
-        let step = progress.start("Columbo match-preserving feedback");
-        let contender =
-            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
-        step.finish(contender.as_ref().map(|candidate| {
-            candidate_progress(
-                candidate,
-                source.meaningful_bits,
-                candidate.is_strictly_smaller_than_source(source),
-            )
-        }));
-        if let Some(contender) = contender {
-            candidate.replace_if_smaller(contender);
-        }
-    }
-    if !options.exhaustive
-        && compact_source_has_bounded_integrated_proven_feedback(source)
-        && deadline.can_start_route()
-    {
-        let step = progress.start("Columbo integrated proven feedback");
-        let contender = build_compact_integrated_proven_feedback_candidate(
-            source,
-            options,
-            &candidate,
-            &mut || deadline.expired(),
-        )?;
-        step.finish(contender.as_ref().map(|candidate| {
-            candidate_progress(
-                candidate,
-                source.meaningful_bits,
-                candidate.is_strictly_smaller_than_source(source),
-            )
-        }));
-        if let Some(contender) = contender {
-            candidate.replace_if_smaller(contender);
-        }
+    if !options.exhaustive {
+        candidate =
+            improve_default_floor_with_feedback(source, options, &deadline, progress, candidate)?;
     }
     // Any separately completed topology floor is consumed by the bounded phase
     // and returned as `bounded_floor_candidate`.
@@ -1298,6 +1256,7 @@ struct StreamIdentity {
     adler32: u32,
 }
 
+#[derive(Clone)]
 struct Candidate {
     data: Vec<u8>,
     bits: u64,
@@ -2121,29 +2080,93 @@ where
         .map(|candidate| candidate.named("Normal floor"))
 }
 
-/// Establish a high-work max-mode floor without repeating an optional lineage.
+/// Add the bounded siblings that form the complete ordinary-mode floor.
 ///
-/// Proven-submatch work is still available in the max/default-refinement
-/// descendants. On a large or match-dense model, running it in this comparison
-/// floor as well can consume the file budget or select a weaker replay basin
-/// before any max-only route begins.
-fn build_bounded_comparison_floor_candidate<F>(
+/// These routes are deliberately shared by a normal invocation and the floor
+/// established at the start of a single-stream PNG max invocation. Keeping the
+/// sequence in one helper prevents max from approximating Default with only
+/// its first route and losing a completed byte or bit saving.
+fn improve_default_floor_with_feedback(
     source: CandidateInput<'_>,
     options: &Options,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    deadline: &Deadline,
+    progress: Progress,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    debug_assert!(!options.exhaustive);
+
+    // Proven-before-feedback has a distinct compact fixed point from the
+    // ordinary endpoint ordering. Retain both as complete candidates whenever
+    // the source contains a proved match and the whole sibling is within its
+    // explicit token/plain work bounds.
+    if compact_source_has_bounded_match_preserving_feedback(source) && deadline.can_start_route() {
+        let step = progress.start("Columbo match-preserving feedback");
+        let contender =
+            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
+        step.finish(contender.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(contender) = contender {
+            candidate.replace_if_smaller(contender);
+        }
+    }
+    if compact_source_has_bounded_integrated_proven_feedback(source) && deadline.can_start_route() {
+        let step = progress.start("Columbo integrated proven feedback");
+        let contender = build_compact_integrated_proven_feedback_candidate(
+            source,
+            options,
+            &candidate,
+            &mut || deadline.expired(),
+        )?;
+        step.finish(contender.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(contender) = contender {
+            candidate.replace_if_smaller(contender);
+        }
+    }
+    Ok(candidate)
+}
+
+/// Establish the exact ordinary result before starting single-PNG max routes.
+///
+/// The benchmark grants max the measured Default time plus additional search
+/// time. Reusing the finished floor both honors that contract and lets later
+/// max descendants start from its already selected blocks instead of repeating
+/// the ordinary route.
+struct CompleteDefaultFloor {
+    /// The ordinary base used by the established bounded max lineage.
+    max_seed: Candidate,
+    /// The complete result produced by the same routes as Default mode.
+    complete: Candidate,
+}
+
+fn build_complete_default_floor_candidate(
+    source: CandidateInput<'_>,
+    options: &Options,
+    deadline: &Deadline,
+    progress: Progress,
+) -> Result<CompleteDefaultFloor> {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    build_candidate_without_proven_lineage(
+    let candidate = build_candidate(
         source,
         &floor_options,
         DEFAULT_RAW_REPLAY_LIMIT,
-        expired,
-    )
-    .map(|candidate| candidate.named("Normal floor"))
+        &mut || deadline.expired(),
+    )?;
+    let max_seed = candidate.clone().named("Normal floor");
+    let complete =
+        improve_default_floor_with_feedback(source, &floor_options, deadline, progress, candidate)?;
+    Ok(CompleteDefaultFloor { max_seed, complete })
 }
 
 /// Reuse a completed ordinary-mode floor when PNG scheduling already made it.
@@ -2755,24 +2778,6 @@ where
     F: FnMut() -> bool,
 {
     build_candidate_with_proven_policy(source, options, replay_limit, true, expired)
-}
-
-/// Build a max-mode comparison floor while deferring its optional sibling.
-///
-/// The caller retains this complete ordinary candidate before starting a
-/// max/default-refinement lineage that includes proven-submatch work. Avoiding
-/// it here prevents the same route family from consuming the shared deadline
-/// twice.
-fn build_candidate_without_proven_lineage<F>(
-    source: CandidateInput<'_>,
-    options: &Options,
-    replay_limit: usize,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
-    build_candidate_with_proven_policy(source, options, replay_limit, false, expired)
 }
 
 /// Build the compact proven-before-feedback comparison candidate.
@@ -4434,7 +4439,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_floor_prebuild_follows_topology_and_work() {
+    fn bounded_floor_prebuild_uses_topology_and_route_work() {
         assert!(prebuild_bounded_floor(1, 1));
         assert!(prebuild_bounded_floor(
             2,
@@ -4479,6 +4484,64 @@ mod tests {
             std::slice::from_ref(&block),
             PROVEN_SUBMATCH_FULL_MATCH_LIMIT
         ));
+    }
+
+    #[test]
+    fn complete_png_floor_reuses_the_full_default_route_sequence() {
+        let input = [
+            0x65, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0x6c, 0xf4, 0x2f, 0xe5, 0x3f,
+            0x41, 0x29, 0xa5, 0x94, 0x72, 0x06,
+        ];
+        let parsed = parse_stream(&input, 120).unwrap();
+        let source = CandidateInput {
+            compressed: &input,
+            blocks: &parsed.blocks,
+            meaningful_bits: parsed.meaningful_bits,
+            decoded_limit: 120,
+            identity: StreamIdentity {
+                decoded_size: parsed.decoded_size,
+                crc32: parsed.crc32,
+                adler32: parsed.adler32,
+            },
+        };
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::MAX,
+            ..Options::default()
+        };
+        let deadline = Deadline {
+            started: Instant::now(),
+            duration: Duration::MAX,
+            state: AtomicU8::new(0),
+        };
+        let base = build_bounded_floor_candidate(source, &options, &mut || false).unwrap();
+        let complete = build_complete_default_floor_candidate(
+            source,
+            &options,
+            &deadline,
+            Progress::begin(
+                &options,
+                deadline.started,
+                StreamProgress {
+                    blocks: parsed.source_block_count,
+                    compressed_bytes: input.len(),
+                    decoded_bytes: parsed.decoded_size,
+                    empty_blocks: parsed.source_empty_block_count,
+                    meaningful_bits: parsed.meaningful_bits,
+                    parse_elapsed: Duration::ZERO,
+                },
+            ),
+        )
+        .unwrap()
+        .complete;
+        let ordinary = optimize_raw(&input, &Options::default()).unwrap();
+
+        assert!(
+            complete.data.len() < base.data.len()
+                || (complete.data.len() == base.data.len() && complete.bits <= base.bits)
+        );
+        assert_eq!(complete.data, ordinary.data);
+        assert_eq!(complete.bits, ordinary.info.deflate_bits);
     }
 
     #[test]
