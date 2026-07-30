@@ -4,7 +4,7 @@ use crate::checksum::crc32_update;
 use crate::deflate::{optimize_raw_prefix_with_floor, DefaultFloor};
 use crate::{Error, Optimization, Options, Result};
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     scale_duration, try_append_bytes, try_copy_bytes, try_vec_with_capacity, SearchDeadline,
@@ -60,6 +60,59 @@ pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
 }
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    if !options.exhaustive {
+        return optimize_once(input, options, DefaultFloor::Complete);
+    }
+
+    // Max benchmarks and interactive runs allocate one file-wide allowance,
+    // normally measured default time plus an extra search budget. Preserve
+    // that contract explicitly: establish the complete default archive once,
+    // then use only the actual remainder to refine its already-smaller Deflate
+    // members. The second phase starts from the finished floor and therefore
+    // uses `Shared` raw floors instead of rebuilding default work per member.
+    let started = Instant::now();
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    let mut floor = optimize_once(input, &floor_options, DefaultFloor::Complete)?;
+    let remaining = options.timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        floor.timed_out = true;
+        return Ok(floor);
+    }
+
+    let mut max_options = options.clone();
+    max_options.timeout = remaining;
+    let mut refined = optimize_once(&floor.data, &max_options, DefaultFloor::Shared)?;
+    let refined_wins = refined.data.len() < floor.data.len()
+        || (refined.data.len() == floor.data.len() && refined.bits_saved != 0);
+    if !refined_wins {
+        floor.timed_out |= refined.timed_out;
+        return Ok(floor);
+    }
+
+    refined.bits_saved = combined_savings(input.len(), &floor, &refined);
+    refined.timed_out |= floor.timed_out;
+    Ok(refined)
+}
+
+fn combined_savings(original_bytes: usize, floor: &Optimization, refined: &Optimization) -> u64 {
+    match original_bytes.cmp(&refined.data.len()) {
+        std::cmp::Ordering::Greater => u64::try_from(original_bytes - refined.data.len())
+            .map_or(u64::MAX, |bytes| bytes.saturating_mul(8)),
+        // When both phases retain the original byte length, each public
+        // metric is a meaningful Deflate-bit improvement over its own input.
+        std::cmp::Ordering::Equal if floor.data.len() == original_bytes => {
+            floor.bits_saved.saturating_add(refined.bits_saved)
+        }
+        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => 0,
+    }
+}
+
+fn optimize_once(
+    input: &[u8],
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+) -> Result<Optimization> {
     let deadline = SearchDeadline::new(options);
     let eocd_offset = find_end_of_central_directory(input)
         .ok_or_else(|| Error::new("ZIP end of central directory not found"))?;
@@ -129,7 +182,13 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             call_options.timeout =
                 schedule.timeout_for(options.timeout, deadline.remaining(), &entries[index]);
         }
-        timed_out |= build_local_entry(input, central_offset, &mut entries[index], &call_options)?;
+        timed_out |= build_local_entry(
+            input,
+            central_offset,
+            &mut entries[index],
+            &call_options,
+            raw_default_floor,
+        )?;
     }
     let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
         total.checked_add(entry.source_deflate_bits)
@@ -330,13 +389,15 @@ fn entry_is_optimizable(entry: &Entry) -> bool {
 /// member inherits the actual remainder, so time unused by the earlier slices
 /// is not lost even when several members tie for largest. Nearly incompressible
 /// archives use their small amount of compression slack as the weight;
-/// otherwise four huge stored-like members would crowd useful work on small,
-/// compressible entries out of the schedule.
+/// otherwise huge stored-like members would crowd useful work on small,
+/// compressible entries out of the schedule. The proportional denominator
+/// counts every member once. Counting the reserved largest member twice can
+/// truncate another member's ordinary comparison floor, making max worse than
+/// normal even though the largest route later has unused search time.
 #[derive(Clone, Copy)]
 struct ZipSchedule {
     largest_size: u32,
     reserved_largest_offset: usize,
-    largest_weight: f64,
     total_weight: f64,
     use_effective_weights: bool,
 }
@@ -364,18 +425,13 @@ impl ZipSchedule {
                     >= u64::from(entry.uncompressed_size) * 98
         });
         let mut total_weight = 0.0_f64;
-        let mut largest_weight = 0.0_f64;
         for entry in entries.iter().filter(|entry| entry_is_optimizable(entry)) {
             let weight = zip_stream_weight(entry, use_effective_weights);
             total_weight += weight;
-            if entry.compressed_size_before == largest_size {
-                largest_weight = largest_weight.max(weight);
-            }
         }
         Self {
             largest_size,
             reserved_largest_offset,
-            largest_weight,
             total_weight,
             use_effective_weights,
         }
@@ -392,17 +448,19 @@ impl ZipSchedule {
             return headroom;
         }
         let weight = zip_stream_weight(entry, self.use_effective_weights);
-        let denominator = self.total_weight + self.largest_weight;
-        if weight <= 0.0 || denominator <= 0.0 {
+        if weight <= 0.0 || self.total_weight <= 0.0 {
             return Duration::ZERO;
         }
-        scale_duration(configured, weight / denominator).min(headroom)
+        scale_duration(configured, weight / self.total_weight).min(headroom)
     }
 }
 
 fn zip_stream_weight(entry: &Entry, effective: bool) -> f64 {
     if !effective {
-        return f64::from(entry.compressed_size_before);
+        // Deflate planning repeatedly scans decoded bytes and their token
+        // model. Compressed size can badly underweight an efficient member
+        // whose optimization work is comparable to a larger neighbour.
+        return f64::from(entry.uncompressed_size.max(1));
     }
     let slack = entry
         .uncompressed_size
@@ -501,6 +559,7 @@ fn build_local_entry(
     central_offset: usize,
     entry: &mut Entry,
     options: &Options,
+    default_floor: DefaultFloor,
 ) -> Result<bool> {
     let position = entry.local_offset_before;
     let layout = local_entry_layout(input, central_offset, entry)?;
@@ -539,13 +598,7 @@ fn build_local_entry(
             source_payload,
             options,
             u64::from(entry.uncompressed_size),
-            // Every ZIP member must finish its ordinary route before max-only
-            // work. A bounded floor can expire part-way through a large
-            // member and let `--max` return a worse archive than normal mode.
-            // Max benchmarks reserve the measured normal runtime before their
-            // extra search allowance, so completing this floor spends that
-            // reserved work without repeating a second whole-archive pass.
-            DefaultFloor::Complete,
+            default_floor,
         )
         .map_err(|error| {
             if error.message().contains("internal memory safety") {
@@ -853,7 +906,7 @@ mod tests {
     #[test]
     fn max_schedule_reserves_the_remainder_for_one_largest_member() {
         let mut small = ordering_entry(8, 100, 0);
-        small.uncompressed_size = 200;
+        small.uncompressed_size = 300;
         let mut largest = ordering_entry(8, 1_000, 1);
         largest.uncompressed_size = 2_000;
         let entries = [small, largest];
@@ -861,7 +914,7 @@ mod tests {
 
         assert_eq!(
             schedule.timeout_for(Duration::from_secs(10), Duration::from_secs(8), &entries[0]),
-            Duration::from_secs_f64(10.0 * 100.0 / 2_100.0)
+            Duration::from_secs_f64(10.0 * 300.0 / 2_300.0)
         );
         assert_eq!(
             schedule.timeout_for(Duration::from_secs(10), Duration::from_secs(8), &entries[1]),
@@ -884,7 +937,7 @@ mod tests {
                 Duration::from_secs(10),
                 &entries[0]
             ),
-            Duration::from_secs_f64(10.0 / 3.0)
+            Duration::from_secs(5)
         );
         assert_eq!(
             schedule.timeout_for(Duration::from_secs(10), Duration::from_secs(6), &entries[1]),
@@ -1074,6 +1127,54 @@ mod tests {
         assert!(result.timed_out);
         assert!(result.data.len() < input.len());
         optimize(&result.data, &Options::default()).unwrap();
+    }
+
+    #[test]
+    fn max_retains_the_complete_default_archive() {
+        let deflate = [0x01, 0x02, 0x00, 0xfd, 0xff, b'x', b'y'];
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"xy"), 2, false, false);
+        let default = optimize(&input, &Options::default()).unwrap();
+        let max = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::from_secs(1),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(max.data.len() <= default.data.len());
+        if max.data.len() == default.data.len() {
+            assert!(max.bits_saved >= default.bits_saved);
+        }
+    }
+
+    #[test]
+    fn two_phase_savings_are_relative_to_the_original_archive() {
+        let floor = Optimization {
+            data: vec![0; 9],
+            bits_saved: 8,
+            timed_out: false,
+        };
+        let refined = Optimization {
+            data: vec![0; 8],
+            bits_saved: 8,
+            timed_out: false,
+        };
+        assert_eq!(combined_savings(10, &floor, &refined), 16);
+
+        let equal_floor = Optimization {
+            data: vec![0; 10],
+            bits_saved: 3,
+            timed_out: false,
+        };
+        let equal_refined = Optimization {
+            data: vec![0; 10],
+            bits_saved: 5,
+            timed_out: false,
+        };
+        assert_eq!(combined_savings(10, &equal_floor, &equal_refined), 8);
     }
 
     #[test]

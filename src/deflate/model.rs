@@ -253,6 +253,7 @@ pub(crate) struct ParsedStream {
     pub(crate) max_distance: u16,
     pub(crate) source_block_count: usize,
     pub(crate) source_empty_block_count: usize,
+    #[cfg(test)]
     pub(crate) source_trailing_empty_block_count: usize,
 }
 

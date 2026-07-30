@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::progress::{
     BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress, RouteProgress,
@@ -11,18 +11,24 @@ use crate::progress::{
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
-use super::block::emit_block;
+use super::block::{emit_block, plan_block};
 use super::deft4j::plan_source_blocks;
 use super::header::plan_columbo_quad_lengthen_candidate;
 use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
 };
 use super::parse::{parse_stream, parsed_model_bytes};
-use super::search::{rewrite_258_symbols, same_distance_opportunities};
+use super::search::{
+    compact_proven_submatch_route_eligible, improve_plan_with_integrated_proven_floor,
+    improve_plan_with_short_family_floor, plan_block_with_integrated_proven_search,
+    rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+};
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,
-    plan_compact_source_split_floor, plan_fragmented_replay, plan_source_no_split_route,
-    plan_stream, plan_stream_with_progress, plan_terminal_merge_route,
+    plan_compact_source_split_floor, plan_compact_source_split_floor_until, plan_fragmented_replay,
+    plan_integrated_proven_source_route, plan_proven_submatch_route, plan_source_no_split_route,
+    plan_stream, plan_stream_from_established_floor, plan_stream_with_progress,
+    plan_terminal_merge_route,
 };
 
 // Long source-block chains can need one pass to establish profitable adjacent
@@ -31,22 +37,14 @@ use super::stream::{
 // the complete stream, so the extra slot cannot oscillate or grow the output.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
 const MAX_RAW_REPLAY_LIMIT: usize = 8;
-// A tiny single Huffman block can still benefit from the source-ordered deft4j
-// candidate graph: its selected token spelling can expose a second win to
-// ordinary refinement. Keep that extra route within the same 4 KiB
-// compact-stream band used by the original Columbo C implementation. On larger
-// one-block streams it can consume the deadline before broader routes that
-// already have stronger incumbents. These thresholds are Columbo scheduling
-// policy, not limits in deft4j itself.
-const DEFT4J_SINGLE_BLOCK_MAX_COMPRESSED: usize = 4_096;
 const DEFT4J_MULTI_BLOCK_MIN_HUFFMAN_BLOCKS: usize = 2;
 const DEFT4J_SOURCE_LIST_MAX_BLOCKS: usize = 128;
 const WEAK_DEFT4J_GAIN_BASIS_POINTS: u64 = 200;
-const NARROW_SOURCE_MIN_COMPRESSED: usize = 32 * 1_024;
+// The no-split sibling is bounded above because its per-block searches retain
+// route-local state. No lower size bound is needed: on compact multi-block
+// streams it cheaply reaches later blocks that a broad source-order graph may
+// not visit before the deadline.
 const NARROW_SOURCE_MAX_COMPRESSED: usize = 512 * 1_024;
-const TERMINAL_MERGE_MIN_COMPRESSED: usize = 100_001;
-const LEGACY_GROUPING_MIN_SOURCE_BLOCKS: usize = 13;
-const LEGACY_GROUPING_MAX_SOURCE_BLOCKS: usize = 32;
 // A completed compact deft4j-derived seed may expose useful eighth-position
 // child splits after the timed route has settled its tokens and source joins.
 // Keep this deterministic Columbo floor tightly bounded: it finishes at most
@@ -55,20 +53,67 @@ const COMPACT_SPLIT_FLOOR_MAX_COMPRESSED: usize = 16 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_DECODED: u64 = 128 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_BLOCKS: usize = 4;
 const COMPACT_SPLIT_FLOOR_MAX_TOKENS: usize = 16 * 1024;
-// The original Columbo C quad-lengthening move fills the one-block gap between
-// the tiny deft4j route and larger generic max work. Keep its post-route trial
-// band narrow so normal mode and broader streams pay no finished-tree cost.
-const COMPACT_QUAD_MIN_COMPRESSED: usize = 4_097;
+// The original Columbo C quad-lengthening move is a bounded one-block header
+// floor. Its upper model limits avoid turning it into another general search;
+// no corpus-derived lower size or token threshold is needed.
 const COMPACT_QUAD_MAX_COMPRESSED: usize = 8 * 1_024;
 const COMPACT_QUAD_MAX_DECODED: u64 = 128 * 1_024;
-const COMPACT_QUAD_MIN_TOKENS: usize = 701;
 const COMPACT_QUAD_MAX_TOKENS: usize = 4_096;
+// A complementary source-root beam remains cheap on very small token graphs,
+// even when proven feedback has already improved the ordinary floor. Retain
+// both basins through a 2,048-token graph; above it, the extra beam competes
+// materially with the richer floor-derived route.
+const COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS: usize = 2_048;
+// The compact proven-feedback route is itself limited to 4,000 tokens and
+// exact-prices only a capped set of candidate siblings. In the upper
+// three-eighths of that work class, run one broad source-token owner instead
+// of two long workers. Source max retains the wider state graph, and its
+// deterministic finalization still applies proven feedback to a winning
+// compact header rewrite. The restart still requires either a proved
+// same-distance
+// repartition or enough decoded data to span RFC 1951's maximum stored-block
+// payload; without either topology, the floor lineage retains the only
+// structurally motivated basin. Smaller graphs retain the cheaper proven
+// lineage unless multiple independent repartitions justify source max.
+const COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS: usize = 4_000;
+const COMPACT_SINGLE_SOURCE_ROUTE_MIN_TOKENS: usize =
+    COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS * 5 / 8;
+const DEFLATE_MAX_STORED_BLOCK_PLAIN: u64 = 65_535;
 // Parallel routes shorten a container's wall-clock search without making its
 // peak memory proportional to every individually valid route budget. Larger
 // streams retain the same candidates, but evaluate them serially.
 const PARALLEL_ROUTE_MAX_COMPRESSED: usize = 8 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_MODEL: usize = 64 * 1_024 * 1_024;
+// A small ordinary floor is cheap enough to establish before launching the
+// heavier source graphs, and its selected blocks give the floor-seeded max
+// descendant a deterministic starting point. Above this work class, overlap
+// avoids spending most of a short file budget serially. The 768 KiB boundary
+// is the broad-corpus transition between those two scheduling costs.
+const PREBUILD_BOUNDED_FLOOR_MAX_DECODED: u64 = 768 * 1_024;
+// The ordinary floor and source graphs repeatedly scan token/plain buffers.
+// Above two MiB of decoded data, overlapping the floor with two graph routes
+// makes their shared working set and CPU demand large enough that the floor's
+// max descendant can become unreachable inside the initial phase. Establish
+// that reusable floor first, then parallelize its independent descendants.
+// The work model supplies the scheduling rationale; two MiB is the calibrated
+// transition retained from broad PNG corpus sampling.
+const CONCURRENT_BOUNDED_FLOOR_MAX_DECODED: u64 = 2 * 1_024 * 1_024;
+// The configured timeout is a soft scheduling boundary. An active route may
+// finish its current candidate within ten percent plus one second. This avoids
+// discarding a completed saving at the timer edge while keeping the caller's
+// total wall-clock overrun predictable.
+const TIMEOUT_GRACE_DIVISOR: u32 = 10;
+const TIMEOUT_GRACE_BASE: Duration = Duration::from_secs(1);
+// Independent bounded routes run concurrently, while their best result can
+// feed a later sequential refinement. Give the primary independent routes
+// four fifths of the soft time remaining when they start. The reserved fifth
+// plus global route grace keeps follow-up reachable, while allowing a
+// nearly complete floor-seeded candidate to finish instead of discarding its
+// late strict improvements. This is a route-class allocation, independent of
+// file size and the user's absolute timeout.
+const INITIAL_BOUNDED_PHASE_NUMERATOR: u32 = 4;
+const INITIAL_BOUNDED_PHASE_DENOMINATOR: u32 = 5;
 
 /// Facts collected while decoding the source stream. Container handlers use
 /// these values to validate their checksums without inflating a second time.
@@ -93,12 +138,14 @@ pub(crate) struct RawOptimization {
 
 /// Decide whether max mode must finish its ordinary-mode comparison floor.
 ///
-/// A standalone stream uses [`DefaultFloor::Complete`] so `--max` cannot lose
-/// an optimization found by normal mode. A single scheduled PNG image uses
-/// [`DefaultFloor::CompleteThenBounded`]: it establishes that same incumbent,
-/// then spends only the remaining file budget on PNG's bounded max routes.
-/// Multi-stream containers use [`DefaultFloor::Shared`], which also prevents a
-/// tiny single-block deft4j route from consuming time needed by later members.
+/// A standalone stream uses [`DefaultFloor::Complete`] to try the ordinary
+/// route before max-only work. A single scheduled PNG image uses
+/// [`DefaultFloor::CompleteThenBounded`] for the same ordering before PNG's
+/// bounded max routes. Both still observe the hard deadline: with sufficient
+/// time they retain the ordinary result, while a short run may fall back to
+/// any earlier complete candidate. Multi-stream containers use
+/// [`DefaultFloor::Shared`] so one member cannot consume time needed by later
+/// members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
     Complete,
@@ -253,27 +300,48 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         decoded_limit,
         identity,
     };
-    // A standalone PNG must retain the genuine normal-mode result while still
-    // allowing the historical bounded max routes to use the remaining file
-    // budget. Establishing this incumbent first keeps the complete-floor
-    // guarantee without letting that floor starve all max-only work.
-    let guaranteed_floor_step = (options.exhaustive
-        && default_floor == DefaultFloor::CompleteThenBounded)
-        .then(|| progress.start("Normal comparison floor"));
-    let mut guaranteed_floor_candidate =
-        if options.exhaustive && default_floor == DefaultFloor::CompleteThenBounded {
-            let mut floor_options = options.clone();
-            floor_options.exhaustive = false;
-            let mut never_expires = || false;
-            Some(build_candidate(
-                source,
-                &floor_options,
-                DEFAULT_RAW_REPLAY_LIMIT,
-                &mut never_expires,
-            )?)
-        } else {
-            None
+    let source_nonempty_blocks = blocks
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    // A one-block PNG may acquire useful new boundaries only through its
+    // ordinary floor. Small floors are cheap enough to establish
+    // deterministically; large working sets also need the non-duplicated floor
+    // first so its max descendant is not starved by cache/CPU contention.
+    // Medium multi-block inputs can share the initial wall clock. Container
+    // members have already received a proportional outer allowance, so their
+    // default floor uses that allowance directly rather than nesting another
+    // fractional cutoff.
+    let prebuild_floor_first = options.exhaustive
+        && match default_floor {
+            DefaultFloor::CompleteThenBounded => {
+                prebuild_bounded_floor(source_nonempty_blocks, parsed.decoded_size)
+            }
+            // A container already apportioned this member a file-wide share.
+            // Nesting another fractional phase inside it can stop the ordinary
+            // floor even when the member's hard/grace allowance would finish
+            // the exact default result.
+            DefaultFloor::Shared => true,
+            DefaultFloor::Complete => false,
         };
+    let guaranteed_floor_step =
+        prebuild_floor_first.then(|| progress.start("Normal comparison floor"));
+    let mut guaranteed_floor_candidate = if prebuild_floor_first {
+        Some(
+            if default_floor != DefaultFloor::Shared
+                && (parsed.decoded_size > CONCURRENT_BOUNDED_FLOOR_MAX_DECODED
+                    || source_run_match_count_exceeds(&blocks, PROVEN_SUBMATCH_FULL_MATCH_LIMIT))
+            {
+                build_bounded_comparison_floor_candidate(source, options, &mut || {
+                    deadline.expired()
+                })?
+            } else {
+                build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
+            },
+        )
+    } else {
+        None
+    };
     if let Some(step) = guaranteed_floor_step {
         step.finish(guaranteed_floor_candidate.as_ref().map(|candidate| {
             candidate_progress(
@@ -286,32 +354,33 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let compact_quad_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && compact_quad_source_eligible(original.len(), parsed.decoded_size, &blocks);
-    let deft4j_eligible = options.exhaustive
-        && deft4j_source_route_eligible(
-            &blocks,
-            original.len(),
-            default_floor.allows_single_block_deft4j(),
+    let compact_proven_feedback_eligible = options.exhaustive
+        && default_floor.uses_bounded_png_routes()
+        && source.blocks.len() == 1
+        && compact_proven_submatch_route_eligible(
+            &source.blocks[0].tokens,
+            source.blocks[0].plain.len(),
         );
+    let deft4j_eligible = options.exhaustive
+        && deft4j_source_route_eligible(&blocks, default_floor.allows_single_block_deft4j());
 
-    // Bounded PNG routes normally share the parsed stream. The audited legacy
-    // block-count band instead follows its floor with one deterministic
-    // Columbo grouping, avoiding duplicate work that cannot finish before the
-    // same deadline. Generic-only streams run source max beside their full
-    // floor lineage so current gains remain selectable. Complete standalone
-    // floors keep their unbounded order.
+    // Bounded PNG routes share the parsed stream and one deadline. Streams
+    // without a specialized source sibling run source max beside the floor
+    // lineage; multi-block floors may also receive one deterministic Columbo
+    // grouping pass. Standalone streams keep the same route order without
+    // overlapping their larger working sets.
     let run_narrow_source = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && narrow_source_route_eligible(&blocks, original.len());
     let parallel_routes =
         options.exhaustive && default_floor.is_bounded() && parallel_route_is_bounded(source);
     let png_policy = if default_floor.uses_bounded_png_routes() && parallel_routes {
+        let floor_exposes_new_states = guaranteed_floor_candidate
+            .as_ref()
+            .is_some_and(|floor| floor_exposes_new_search_states(&blocks, &floor.plans));
         bounded_png_max_policy(
-            blocks
-                .iter()
-                .filter(|block| !block.plain.is_empty())
-                .count(),
-            parsed.source_empty_block_count,
-            parsed.source_trailing_empty_block_count,
+            source_nonempty_blocks,
+            floor_exposes_new_states,
             deft4j_eligible,
             run_narrow_source,
         )
@@ -321,11 +390,9 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let bounded_step = (options.exhaustive && default_floor.is_bounded())
         .then(|| progress.start("Bounded comparison routes"));
     let bounded_candidates = if options.exhaustive && default_floor.is_bounded() {
-        // A single-image PNG has already finished this exact ordinary-mode
-        // floor above. Continue that candidate's retained plans instead of
-        // rebuilding them inside the bounded phase. Apart from avoiding
-        // duplicate work, this gives the max-only descendants the same wall
-        // time that historical bounded PNG scheduling made available.
+        // A one-block topology probe has already finished this exact floor.
+        // Reuse it; multi-block streams build the same floor concurrently with
+        // their independent source routes inside the bounded phase.
         let completed_floor = guaranteed_floor_candidate.take();
         match png_policy {
             BoundedPngMaxPolicy::GenericParallel => build_bounded_generic_max_candidates(
@@ -335,37 +402,23 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 progress,
                 completed_floor,
             )?,
-            BoundedPngMaxPolicy::LegacyGrouping => {
-                let (floor, floor_seeded) = build_bounded_floor_grouping_lineage(
-                    source,
-                    options,
-                    &deadline,
-                    completed_floor,
-                )?;
-                // A floor-seeded grouping is a strong early incumbent, not a
-                // proof that the independent source routes are dominated.
-                // Max mode should keep searching whenever its caller supplied
-                // time; suppress duplicate work only after that budget is
-                // already exhausted.
-                let suppress_later_source_max = floor_seeded.is_some() && deadline.expired();
-                BoundedPhaseCandidates {
-                    floor: Some(floor),
-                    floor_seeded,
-                    suppress_later_source_max,
-                    suppress_later_optional_routes: suppress_later_source_max,
-                    ..BoundedPhaseCandidates::default()
-                }
-            }
-            BoundedPngMaxPolicy::Standard | BoundedPngMaxPolicy::CoarseExpansion => {
-                let run_deft4j = deft4j_eligible && !deadline.expired();
+            BoundedPngMaxPolicy::Standard | BoundedPngMaxPolicy::FloorExpansion => {
+                let run_deft4j = deft4j_eligible && deadline.can_start_route();
+                let run_source_max = parallel_routes
+                    && png_policy == BoundedPngMaxPolicy::FloorExpansion
+                    && compact_parallel_source_max_work_class(source);
+                let run_proven_feedback = run_source_max && compact_proven_feedback_eligible;
                 build_bounded_phase_candidates(
                     source,
                     options,
-                    png_policy == BoundedPngMaxPolicy::CoarseExpansion,
+                    png_policy == BoundedPngMaxPolicy::FloorExpansion,
                     run_deft4j,
                     run_narrow_source,
+                    run_source_max,
+                    run_proven_feedback,
                     parallel_routes,
                     &deadline,
+                    progress,
                     completed_floor,
                 )?
             }
@@ -378,7 +431,8 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let mut deft4j_candidate = bounded_candidates.deft4j;
     let mut narrow_candidate = bounded_candidates.narrow;
     let mut source_max_candidate = bounded_candidates.source_max;
-    let suppress_later_source_max = bounded_candidates.suppress_later_source_max;
+    let mut proven_feedback_candidate = bounded_candidates.proven_feedback;
+    let mut suppress_later_source_max = bounded_candidates.suppress_later_source_max;
     let suppress_later_optional_routes = bounded_candidates.suppress_later_optional_routes;
     if let Some(step) = bounded_step {
         step.finish_phase();
@@ -388,6 +442,10 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             ("deft4j-derived source", deft4j_candidate.as_ref()),
             ("No-split source", narrow_candidate.as_ref()),
             ("Columbo source max", source_max_candidate.as_ref()),
+            (
+                "Columbo proven-feedback",
+                proven_feedback_candidate.as_ref(),
+            ),
         ] {
             if let Some(candidate) = candidate {
                 progress.candidate(
@@ -400,6 +458,45 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 );
             }
         }
+    }
+    // A compact one-block stream has one additional fixed point when proven
+    // resegmentation feeds later table feedback before the normal endpoint
+    // ordering. Price that bounded sibling before the general source-max graph
+    // can consume the shared deadline. The completed normal floor remains an
+    // independent fallback.
+    let run_proven_feedback = compact_proven_feedback_eligible
+        && proven_feedback_candidate.is_none()
+        && deadline.can_start_route();
+    let proven_feedback_step =
+        run_proven_feedback.then(|| progress.start("Columbo proven-feedback floor"));
+    if run_proven_feedback {
+        proven_feedback_candidate =
+            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
+    }
+    if let Some(step) = proven_feedback_step {
+        step.finish(proven_feedback_candidate.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+    }
+    // The completed compact routes provide a direct scheduling signal for
+    // source max. If proven-before-feedback supplies only a bit-level win,
+    // continue that state order in the one expensive beam to seek the next
+    // byte boundary. Once that bounded lineage already wins a byte, retain it
+    // and spend the beam on complementary ordinary states instead. A tie also
+    // selects ordinary states. Larger blocks use the integrated order
+    // independently inside the stream planner.
+    let integrated_compact_source_max = proven_feedback_candidate
+        .as_ref()
+        .zip(bounded_floor_candidate.as_ref())
+        .is_some_and(|(proven, normal)| {
+            proven.data.len() == normal.data.len() && proven.bits < normal.bits
+        });
+    if let Some(proven_feedback) = proven_feedback_candidate {
+        replace_optional_if_smaller(&mut bounded_floor_candidate, proven_feedback);
     }
     let seed_weak_deft4j = default_floor.uses_bounded_png_routes()
         && deft4j_candidate.as_ref().is_some_and(|deft4j| {
@@ -416,6 +513,38 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         // reparses another complete candidate.
         floor.plans.clear();
     }
+    // A completed floor-seeded max route may end at a different header/token
+    // fixed point from source max. Finish the same bounded quad cleanup on
+    // that exact parent before releasing it. This is deterministic finalization
+    // of an already completed candidate, so it remains valid after the soft
+    // deadline and cannot discard the parent when no quad improvement exists.
+    if compact_quad_eligible {
+        if let Some(seeded) = &mut floor_seeded_candidate {
+            // A one-block source may become a multi-block floor after the max
+            // descendant. Those new boundaries admit the same deterministic
+            // split floor used for compact source lists, and the original
+            // one-block routes cannot reconstruct that parent state.
+            if let Some(split) = refine_with_compact_source_split_floor_until(
+                seeded,
+                options,
+                decoded_limit,
+                identity,
+                &mut || deadline.expired(),
+            )? {
+                seeded.replace_if_smaller(split);
+            }
+            if let Some(mut quad) =
+                refine_with_compact_quad_floor(seeded, options, decoded_limit, identity)?
+            {
+                if let Some(feedback) =
+                    refine_with_compact_proven_feedback(&quad, options, decoded_limit, identity)?
+                {
+                    quad.replace_if_smaller(feedback);
+                }
+                seeded.replace_if_smaller(quad);
+            }
+        }
+    }
     if let Some(seeded) = &mut floor_seeded_candidate {
         seeded.plans.clear();
     }
@@ -431,61 +560,225 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     if let Some(source_max) = &mut source_max_candidate {
         source_max.plans.clear();
     }
-    let run_bounded_refinement = default_floor.is_bounded() && !deadline.expired();
+    let run_bounded_refinement = default_floor.is_bounded() && deadline.can_start_route();
     let refinement_step = (run_bounded_refinement
         && (seed_weak_deft4j || deft4j_candidate.is_some()))
     .then(|| progress.start("deft4j-derived refinement"));
+    let run_compact_split_floor = default_floor.uses_bounded_png_routes() && seed_weak_deft4j;
+    let compact_split_step =
+        run_compact_split_floor.then(|| progress.start("Columbo compact split floor"));
+    // Split pricing is not monotone in the parent stream's encoded size: two
+    // independently rewritten block topologies can have opposite local
+    // ordering after new cuts are inserted. Preserve the ordinary,
+    // floor-seeded, and direct deft4j parents while collapsing exact encoded
+    // duplicates.
+    let compact_split_normal_parent = run_compact_split_floor
+        .then_some(bounded_floor_candidate.as_ref())
+        .flatten();
+    let compact_split_seeded_parent = run_compact_split_floor
+        .then_some(floor_seeded_candidate.as_ref())
+        .flatten()
+        .filter(|seeded| {
+            compact_split_normal_parent.map_or(true, |normal| normal.data != seeded.data)
+        });
+    let compact_split_deft4j_parent = if run_compact_split_floor {
+        deft4j_candidate.as_ref().filter(|deft4j| {
+            [compact_split_normal_parent, compact_split_seeded_parent]
+                .into_iter()
+                .flatten()
+                .all(|seed| seed.data != deft4j.data)
+        })
+    } else {
+        None
+    };
+    let compact_split_normal_seed = compact_split_normal_parent
+        .map(|candidate| prepare_compact_source_split_seed(candidate, decoded_limit, identity))
+        .transpose()?
+        .flatten();
+    let compact_split_seeded_seed = compact_split_seeded_parent
+        .map(|candidate| prepare_compact_source_split_seed(candidate, decoded_limit, identity))
+        .transpose()?
+        .flatten();
+    let compact_split_deft4j_seed = compact_split_deft4j_parent
+        .map(|candidate| prepare_compact_source_split_seed(candidate, decoded_limit, identity))
+        .transpose()?
+        .flatten();
+    let mut compact_split_attempted = false;
+    let mut compact_split_candidate = None;
     if run_bounded_refinement {
-        if seed_weak_deft4j {
-            if let Some(floor) = bounded_floor_candidate
-                .as_ref()
-                .filter(|floor| floor.is_strictly_smaller_than_source(source))
-            {
-                if let Some(mut seeded) = build_deft4j_seed_candidate(
-                    floor,
+        let run_concurrent_source_max = options.exhaustive
+            && default_floor.uses_bounded_png_routes()
+            && parallel_routes
+            && source_max_candidate.is_none()
+            && !suppress_later_source_max
+            && deadline.can_start_route();
+        let run_concurrent_compact_split = compact_split_normal_seed.is_some()
+            || compact_split_seeded_seed.is_some()
+            || compact_split_deft4j_seed.is_some();
+        let (concurrent_source_max, attempted_compact_split, concurrent_compact_split) =
+            if run_concurrent_source_max || run_concurrent_compact_split {
+                thread::scope(
+                    |scope| -> Result<(Option<Candidate>, bool, Option<Candidate>)> {
+                        let source_worker = run_concurrent_source_max
+                            .then(|| {
+                                thread::Builder::new()
+                                    .name("columbo-source-max-follow-up".into())
+                                    .spawn_scoped(scope, || {
+                                        run_route_with_cancellation(&deadline, || {
+                                            build_source_max_candidate(
+                                                source,
+                                                options,
+                                                progress,
+                                                &deadline,
+                                                integrated_compact_source_max,
+                                                &mut || deadline.route_should_stop(),
+                                            )
+                                        })
+                                    })
+                                    .ok()
+                            })
+                            .flatten();
+                        let compact_worker = run_concurrent_compact_split
+                            .then(|| {
+                                thread::Builder::new()
+                                    .name("columbo-compact-split-lineages".into())
+                                    .spawn_scoped(scope, || {
+                                        run_route_with_cancellation(&deadline, || {
+                                            build_prepared_compact_source_split_floors(
+                                                [
+                                                    compact_split_normal_seed.as_ref(),
+                                                    compact_split_seeded_seed.as_ref(),
+                                                    compact_split_deft4j_seed.as_ref(),
+                                                ],
+                                                options,
+                                                decoded_limit,
+                                                identity,
+                                                &deadline,
+                                            )
+                                        })
+                                    })
+                                    .ok()
+                            })
+                            .flatten();
+                        let refinement = refine_bounded_deft4j_lineage(
+                            source,
+                            options,
+                            decoded_limit,
+                            identity,
+                            default_floor,
+                            &deadline,
+                            bounded_floor_candidate.as_ref(),
+                            narrow_candidate.as_ref(),
+                            seed_weak_deft4j,
+                            run_concurrent_compact_split,
+                            &mut deft4j_candidate,
+                        );
+                        if refinement.is_err() {
+                            deadline.cancel_routes();
+                        }
+                        // A genuinely different refined topology is another
+                        // split parent. Price it while source max is still
+                        // running when soft time remains, or unconditionally
+                        // when it strictly improves every early parent.
+                        // Exact encoded identity proves duplicate work.
+                        let dependent_split = if refinement.is_ok() && run_compact_split_floor {
+                            deft4j_candidate.as_ref().and_then(|deft4j| {
+                                let duplicates_early_seed = [
+                                    compact_split_normal_seed.as_ref(),
+                                    compact_split_seeded_seed.as_ref(),
+                                    compact_split_deft4j_seed.as_ref(),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .any(|seed| seed.data == deft4j.data);
+                                let improves_early_seeds = [
+                                    compact_split_normal_seed.as_ref(),
+                                    compact_split_seeded_seed.as_ref(),
+                                    compact_split_deft4j_seed.as_ref(),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .all(|seed| {
+                                    is_strictly_better(
+                                        deft4j.data.len(),
+                                        deft4j.bits,
+                                        seed.data.len(),
+                                        seed.bits,
+                                    )
+                                });
+                                (!duplicates_early_seed
+                                    && (improves_early_seeds || deadline.can_start_route()))
+                                .then(|| {
+                                    refine_with_compact_source_split_floor(
+                                        deft4j,
+                                        options,
+                                        decoded_limit,
+                                        identity,
+                                    )
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        let source_max = match source_worker {
+                            Some(worker) => match worker.join() {
+                                Ok(result) => Some(result?),
+                                Err(payload) => std::panic::resume_unwind(payload),
+                            },
+                            None => None,
+                        };
+                        let attempted_compact_split =
+                            run_concurrent_compact_split || dependent_split.is_some();
+                        // A failed worker spawn falls back to the same bounded
+                        // pass on this thread while source max is still joined.
+                        let early_split = match compact_worker {
+                            Some(worker) => match worker.join() {
+                                Ok(result) => result,
+                                Err(payload) => std::panic::resume_unwind(payload),
+                            },
+                            None => build_prepared_compact_source_split_floors(
+                                [
+                                    compact_split_normal_seed.as_ref(),
+                                    compact_split_seeded_seed.as_ref(),
+                                    compact_split_deft4j_seed.as_ref(),
+                                ],
+                                options,
+                                decoded_limit,
+                                identity,
+                                &deadline,
+                            ),
+                        };
+                        refinement?;
+                        let mut compact_split = early_split?;
+                        if let Some(result) = dependent_split {
+                            if let Some(candidate) = result? {
+                                replace_optional_if_smaller(&mut compact_split, candidate);
+                            }
+                        }
+                        Ok((source_max, attempted_compact_split, compact_split))
+                    },
+                )?
+            } else {
+                refine_bounded_deft4j_lineage(
+                    source,
                     options,
                     decoded_limit,
                     identity,
-                    default_floor.allows_single_block_deft4j(),
-                    &mut || deadline.expired(),
-                )? {
-                    if !deadline.expired() {
-                        let refined = refine_with_default_planner(
-                            &seeded,
-                            options,
-                            decoded_limit,
-                            identity,
-                            &mut || deadline.expired(),
-                        )?;
-                        seeded.replace_if_smaller(refined);
-                    }
-                    let narrow_already_wins = narrow_candidate
-                        .as_ref()
-                        .is_some_and(|narrow| narrow.is_strictly_smaller_than(&seeded));
-                    if !narrow_already_wins
-                        && !deadline.expired()
-                        && (TERMINAL_MERGE_MIN_COMPRESSED..=NARROW_SOURCE_MAX_COMPRESSED)
-                            .contains(&seeded.data.len())
-                    {
-                        if let Some(terminal) = refine_with_terminal_merge(
-                            &seeded,
-                            options,
-                            decoded_limit,
-                            identity,
-                            &mut || deadline.expired(),
-                        )? {
-                            seeded.replace_if_smaller(terminal);
-                        }
-                    }
-                    replace_optional_if_smaller(&mut deft4j_candidate, seeded);
-                }
-            }
-        } else if let Some(deft4j) = deft4j_candidate.as_ref() {
-            let refined =
-                refine_with_default_planner(deft4j, options, decoded_limit, identity, &mut || {
-                    deadline.expired()
-                })?;
-            replace_optional_if_smaller(&mut deft4j_candidate, refined);
+                    default_floor,
+                    &deadline,
+                    bounded_floor_candidate.as_ref(),
+                    narrow_candidate.as_ref(),
+                    seed_weak_deft4j,
+                    false,
+                    &mut deft4j_candidate,
+                )?;
+                (None, false, None)
+            };
+        compact_split_attempted = attempted_compact_split;
+        compact_split_candidate = concurrent_compact_split;
+        if let Some(source_max) = concurrent_source_max {
+            source_max_candidate = Some(source_max);
+            suppress_later_source_max = true;
         }
     }
     if let Some(step) = refinement_step {
@@ -497,24 +790,28 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             )
         }));
     }
-    if default_floor.uses_bounded_png_routes() && seed_weak_deft4j {
-        let compact_split_step = progress.start("Columbo compact split floor");
-        let compact_split = match deft4j_candidate.as_ref() {
+    // This deterministic structural cleanup normally runs in the deft4j
+    // lineage beside source max. If that concurrent phase could not run,
+    // finish it serially so scheduling cannot discard a bounded saving.
+    if run_compact_split_floor && !compact_split_attempted {
+        compact_split_candidate = match deft4j_candidate.as_ref() {
             Some(deft4j) => {
                 refine_with_compact_source_split_floor(deft4j, options, decoded_limit, identity)?
             }
             None => None,
         };
-        compact_split_step.finish(compact_split.as_ref().map(|candidate| {
+    }
+    if let Some(step) = compact_split_step {
+        step.finish(compact_split_candidate.as_ref().map(|candidate| {
             candidate_progress(
                 candidate,
                 source.meaningful_bits,
                 candidate.is_strictly_smaller_than_source(source),
             )
         }));
-        if let Some(split) = compact_split {
-            replace_optional_if_smaller(&mut deft4j_candidate, split);
-        }
+    }
+    if let Some(split) = compact_split_candidate {
+        replace_optional_if_smaller(&mut deft4j_candidate, split);
     }
     if let Some(deft4j) = &mut deft4j_candidate {
         // Keep only the encoded incumbent for comparison and later routes;
@@ -536,22 +833,18 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let mut candidate = if let Some(floor) = bounded_floor_candidate {
         floor
     } else if options.exhaustive {
-        // Max mode starts from the genuine normal-mode result. Standalone
-        // streams finish that floor so --max cannot lose to normal mode;
-        // locally scheduled container streams keep it within their allotted
-        // time. Either way, elapsed floor time advances the same deadline.
+        // Max mode tries the genuine normal-mode route first. Its best complete
+        // candidate remains the comparison floor, but the hard deadline may
+        // stop an unusually slow route before all of its replay work finishes.
         let mut floor_options = options.clone();
         floor_options.exhaustive = false;
         match default_floor {
-            DefaultFloor::Complete => {
-                let mut never_expires = || false;
-                build_candidate(
-                    source,
-                    &floor_options,
-                    DEFAULT_RAW_REPLAY_LIMIT,
-                    &mut never_expires,
-                )?
-            }
+            DefaultFloor::Complete => build_candidate(
+                source,
+                &floor_options,
+                DEFAULT_RAW_REPLAY_LIMIT,
+                &mut || deadline.expired(),
+            )?,
             DefaultFloor::CompleteThenBounded | DefaultFloor::Shared => {
                 build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
             }
@@ -568,10 +861,54 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             candidate.is_strictly_smaller_than_source(source),
         )));
     }
-    // The complete standalone PNG floor is consumed by the bounded phase and
-    // returned as `bounded_floor_candidate`; other policies never create it.
+    // Proven-before-feedback has a distinct compact fixed point from the
+    // ordinary endpoint ordering. Retain both as complete candidates whenever
+    // the source contains a proved match and the whole sibling is within its
+    // explicit token/plain work bounds.
+    if !options.exhaustive
+        && compact_source_has_bounded_match_preserving_feedback(source)
+        && deadline.can_start_route()
+    {
+        let step = progress.start("Columbo match-preserving feedback");
+        let contender =
+            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
+        step.finish(contender.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(contender) = contender {
+            candidate.replace_if_smaller(contender);
+        }
+    }
+    if !options.exhaustive
+        && compact_source_has_bounded_integrated_proven_feedback(source)
+        && deadline.can_start_route()
+    {
+        let step = progress.start("Columbo integrated proven feedback");
+        let contender = build_compact_integrated_proven_feedback_candidate(
+            source,
+            options,
+            &candidate,
+            &mut || deadline.expired(),
+        )?;
+        step.finish(contender.as_ref().map(|candidate| {
+            candidate_progress(
+                candidate,
+                source.meaningful_bits,
+                candidate.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(contender) = contender {
+            candidate.replace_if_smaller(contender);
+        }
+    }
+    // Any separately completed topology floor is consumed by the bounded phase
+    // and returned as `bounded_floor_candidate`.
     debug_assert!(guaranteed_floor_candidate.is_none());
-    if deft4j_eligible && default_floor == DefaultFloor::Complete && !deadline.expired() {
+    if deft4j_eligible && default_floor == DefaultFloor::Complete && deadline.can_start_route() {
         let deft4j_step = progress.start("deft4j-derived source route");
         deft4j_candidate =
             build_deft4j_source_candidate(source, options, &mut || deadline.expired())?;
@@ -591,24 +928,16 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     if let Some(deft4j) = &mut deft4j_candidate {
         deft4j.plans.clear();
     }
-    let mut deft4j_lineage = false;
     if let Some(deft4j) = deft4j_candidate {
-        deft4j_lineage = candidate.replace_if_smaller(deft4j);
+        candidate.replace_if_smaller(deft4j);
     }
 
     // A 4,096-token collection can start slightly larger but converge to a
     // better fragmented-stream layout after strict replays. It is additive to
-    // the normal-mode comparison floor above: a short container slice must not
-    // spend its whole budget here before securing that floor. The collection
-    // seed itself remains deadline-independent and can still win when there is
-    // no time left for its optional replay rounds. Its 64-source-block minimum
-    // also keeps it outside the audited 13-to-32-block legacy corpus band.
-    let run_fragmented = options.exhaustive
-        && !suppress_later_optional_routes
-        // Once the source-ordered deft4j route has won and spent the deadline,
-        // another source-derived seed cannot receive any replay work. Avoid
-        // that duplicate post-deadline collection.
-        && (!deft4j_lineage || !deadline.expired());
+    // the normal-mode comparison floor above, and starts only while the soft
+    // deadline still permits a new independent route.
+    let run_fragmented =
+        options.exhaustive && !suppress_later_optional_routes && deadline.can_start_route();
     let fragmented_step = run_fragmented.then(|| progress.start("Columbo fragmented collection"));
     let mut fragmented_candidate = if run_fragmented {
         fragmented_collect_seed(&blocks, 0, options)
@@ -655,20 +984,58 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         // Generic max also explores source-boundary and table families outside
         // deft4j's source-ordered graph. Run it before a rewritten seed can
         // spend the remainder on one large merged block.
-        if let Some(max_candidate) = source_max_candidate {
+        let source_max = if let Some(max_candidate) = source_max_candidate {
+            Some(max_candidate)
+        } else {
+            let run_source_max = !suppress_later_source_max && deadline.can_start_route();
+            if run_source_max {
+                Some(build_source_max_candidate(
+                    source,
+                    options,
+                    progress,
+                    &deadline,
+                    integrated_compact_source_max,
+                    &mut || deadline.expired(),
+                )?)
+            } else {
+                None
+            }
+        };
+        if let Some(mut max_candidate) = source_max {
+            // A locally smaller proven-feedback endpoint can hide the bounded
+            // quad-header win reachable from source max. Finish that cheap
+            // lineage-specific cleanup before comparing complete streams.
+            if compact_quad_eligible {
+                let quad_step = progress.start("Columbo source-max quad floor");
+                let mut quad = refine_with_compact_quad_floor(
+                    &max_candidate,
+                    options,
+                    decoded_limit,
+                    identity,
+                )?;
+                if let Some(candidate) = quad.as_mut() {
+                    if let Some(feedback) = refine_with_compact_proven_feedback(
+                        candidate,
+                        options,
+                        decoded_limit,
+                        identity,
+                    )? {
+                        candidate.replace_if_smaller(feedback);
+                    }
+                }
+                quad_step.finish(quad.as_ref().map(|quad| {
+                    candidate_progress(
+                        quad,
+                        source.meaningful_bits,
+                        quad.is_strictly_smaller_than_source(source),
+                    )
+                }));
+                if let Some(quad) = quad {
+                    max_candidate.replace_if_smaller(quad);
+                }
+            }
             source_max_stabilized_incumbent = candidate.is_encoding_stabilized_by(&max_candidate);
             candidate.replace_if_smaller(max_candidate);
-        } else {
-            let run_source_max = !suppress_later_source_max && !deadline.expired();
-            if run_source_max {
-                let max_candidate =
-                    build_source_max_candidate(source, options, progress, &deadline, &mut || {
-                        deadline.expired()
-                    })?;
-                source_max_stabilized_incumbent =
-                    candidate.is_encoding_stabilized_by(&max_candidate);
-                candidate.replace_if_smaller(max_candidate);
-            }
         }
 
         // A winning source restart can own another full plan graph. Only its
@@ -690,7 +1057,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         let run_seeded = seed_selected
             && !max_seed_is_stable
             && !suppress_later_optional_routes
-            && !deadline.expired();
+            && deadline.can_start_route();
         let seeded_step = run_seeded.then(|| progress.start("Columbo rewritten-seed refinement"));
         if run_seeded {
             // Rewritten match choices and boundaries can expose later max
@@ -712,7 +1079,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         }
     }
 
-    if compact_quad_eligible {
+    if compact_quad_eligible && deadline.can_start_route() {
         let quad_step = progress.start("Columbo compact quad floor");
         let quad = refine_with_compact_quad_floor(&candidate, options, decoded_limit, identity)?;
         quad_step.finish(quad.as_ref().map(|quad| {
@@ -791,11 +1158,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     })
 }
 
-fn deft4j_source_route_eligible(
-    blocks: &[ParsedBlock],
-    compressed_len: usize,
-    allow_single_block: bool,
-) -> bool {
+fn deft4j_source_route_eligible(blocks: &[ParsedBlock], allow_single_block: bool) -> bool {
     let mut nonempty = 0_usize;
     let mut huffman = 0_usize;
     for block in blocks.iter().filter(|block| !block.plain.is_empty()) {
@@ -808,18 +1171,14 @@ fn deft4j_source_route_eligible(
         }
     }
     match nonempty {
-        1 => {
-            allow_single_block
-                && huffman == 1
-                && compressed_len <= DEFT4J_SINGLE_BLOCK_MAX_COMPRESSED
-        }
+        1 => allow_single_block && huffman == 1,
         2..=DEFT4J_SOURCE_LIST_MAX_BLOCKS => huffman >= DEFT4J_MULTI_BLOCK_MIN_HUFFMAN_BLOCKS,
         _ => false,
     }
 }
 
 fn narrow_source_route_eligible(blocks: &[ParsedBlock], compressed_len: usize) -> bool {
-    (NARROW_SOURCE_MIN_COMPRESSED..=NARROW_SOURCE_MAX_COMPRESSED).contains(&compressed_len)
+    compressed_len <= NARROW_SOURCE_MAX_COMPRESSED
         && (2..=DEFT4J_SOURCE_LIST_MAX_BLOCKS).contains(
             &blocks
                 .iter()
@@ -840,9 +1199,7 @@ fn compact_quad_source_eligible(
     decoded_size: u64,
     blocks: &[ParsedBlock],
 ) -> bool {
-    if !(COMPACT_QUAD_MIN_COMPRESSED..=COMPACT_QUAD_MAX_COMPRESSED).contains(&compressed_len)
-        || decoded_size > COMPACT_QUAD_MAX_DECODED
-    {
+    if compressed_len > COMPACT_QUAD_MAX_COMPRESSED || decoded_size > COMPACT_QUAD_MAX_DECODED {
         return false;
     }
     let mut nonempty = blocks.iter().filter(|block| !block.plain.is_empty());
@@ -851,42 +1208,62 @@ fn compact_quad_source_eligible(
     };
     nonempty.next().is_none()
         && block.source_type == SourceBlockType::Dynamic
-        && (COMPACT_QUAD_MIN_TOKENS..=COMPACT_QUAD_MAX_TOKENS).contains(&block.tokens.len())
+        && block.tokens.len() <= COMPACT_QUAD_MAX_TOKENS
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum BoundedPngMaxPolicy {
     #[default]
     Standard,
-    CoarseExpansion,
-    LegacyGrouping,
+    FloorExpansion,
     GenericParallel,
 }
 
-/// Choose the bounded PNG route family from the audited source topology.
+/// Choose the bounded PNG route family from available independent work.
 ///
 /// Generic streams have no specialized source sibling, so source max remains
-/// available even when their block count overlaps the legacy band.
+/// available beside the floor lineage. A multi-block source retains its broad
+/// floor continuation. A one-block source receives that continuation only when
+/// the completed ordinary floor exposed a new block boundary or token spelling.
+/// Those are search states which the original-source siblings cannot explore,
+/// so this is an algorithmic capability gate rather than a size band.
 fn bounded_png_max_policy(
     nonempty_blocks: usize,
-    source_empty_blocks: usize,
-    source_trailing_empty_blocks: usize,
+    floor_exposes_new_states: bool,
     deft4j_eligible: bool,
     narrow_eligible: bool,
 ) -> BoundedPngMaxPolicy {
-    let has_trailing_empty_pair_only =
-        source_empty_blocks == 2 && source_trailing_empty_blocks == 2;
     if !deft4j_eligible && !narrow_eligible {
         BoundedPngMaxPolicy::GenericParallel
-    } else if (LEGACY_GROUPING_MIN_SOURCE_BLOCKS..=LEGACY_GROUPING_MAX_SOURCE_BLOCKS)
-        .contains(&nonempty_blocks)
-        && !has_trailing_empty_pair_only
-    {
-        BoundedPngMaxPolicy::LegacyGrouping
-    } else if (2..=4).contains(&nonempty_blocks) {
-        BoundedPngMaxPolicy::CoarseExpansion
+    } else if nonempty_blocks >= 2 || floor_exposes_new_states {
+        BoundedPngMaxPolicy::FloorExpansion
     } else {
         BoundedPngMaxPolicy::Standard
+    }
+}
+
+/// Whether reparsing the completed floor gives max search a genuinely new seed.
+///
+/// Compare only meaningful blocks: encoders commonly append empty flush
+/// blocks, but those cannot create token-search states. Different non-empty
+/// boundaries or different token spellings can. The latter matters even for a
+/// one-block input because a normal-floor repartition may reach a fixed point
+/// that source-order max cannot reconstruct before its deadline.
+fn floor_exposes_new_search_states(source: &[ParsedBlock], floor: &[PlannedBlock]) -> bool {
+    let mut source = source.iter().filter(|block| !block.plain.is_empty());
+    let mut floor = floor.iter().filter(|block| !block.plain.is_empty());
+    loop {
+        match (source.next(), floor.next()) {
+            (Some(source_block), Some(floor_block)) => {
+                if source_block.plain.len() != floor_block.plain.len()
+                    || source_block.tokens.as_slice() != floor_block.tokens.as_slice()
+                {
+                    return true;
+                }
+            }
+            (None, None) => return false,
+            _ => return true,
+        }
     }
 }
 
@@ -897,6 +1274,16 @@ fn has_multiple_nonempty_blocks(blocks: &[ParsedBlock]) -> bool {
         .take(2)
         .count()
         == 2
+}
+
+fn source_run_match_count_exceeds(blocks: &[ParsedBlock], limit: usize) -> bool {
+    same_distance_opportunities(blocks).matches > limit
+}
+
+fn prebuild_bounded_floor(nonempty_blocks: usize, decoded_size: u64) -> bool {
+    nonempty_blocks <= 1
+        || decoded_size <= PREBUILD_BOUNDED_FLOOR_MAX_DECODED
+        || decoded_size > CONCURRENT_BOUNDED_FLOOR_MAX_DECODED
 }
 
 fn deft4j_gain_is_below(source_bits: u64, candidate_bits: u64, basis_points: u64) -> bool {
@@ -998,13 +1385,20 @@ fn build_source_max_candidate<F>(
     options: &Options,
     progress: Progress,
     deadline: &Deadline,
+    integrated_compact_proven: bool,
     expired: &mut F,
 ) -> Result<Candidate>
 where
     F: FnMut() -> bool,
 {
     if !progress.enabled() {
-        let candidate = build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)?;
+        let candidate = build_candidate_from_established_floor(
+            source,
+            options,
+            MAX_RAW_REPLAY_LIMIT,
+            integrated_compact_proven,
+            expired,
+        )?;
         return Ok(if candidate.route == "Original source" {
             candidate
         } else {
@@ -1012,7 +1406,14 @@ where
         });
     }
 
-    build_source_max_candidate_verbose(source, options, progress, deadline, expired)
+    build_source_max_candidate_verbose(
+        source,
+        options,
+        progress,
+        deadline,
+        integrated_compact_proven,
+        expired,
+    )
 }
 
 /// Keep the telemetry-heavy planner monomorphized only once. The generic
@@ -1023,6 +1424,7 @@ fn build_source_max_candidate_verbose(
     options: &Options,
     progress: Progress,
     deadline: &Deadline,
+    integrated_compact_proven: bool,
     expired: &mut dyn FnMut() -> bool,
 ) -> Result<Candidate> {
     let (step, details) = progress.start_detailed(
@@ -1032,6 +1434,9 @@ fn build_source_max_candidate_verbose(
     );
     let mut monitored_expired = || {
         details.heartbeat();
+        if deadline.soft_expired() {
+            details.finalizing_after_soft_deadline(timeout_grace(deadline.duration));
+        }
         let should_stop = expired();
         if should_stop && deadline.was_triggered() {
             details.deadline_reached();
@@ -1042,6 +1447,7 @@ fn build_source_max_candidate_verbose(
         source,
         options,
         MAX_RAW_REPLAY_LIMIT,
+        integrated_compact_proven,
         &mut monitored_expired,
         &details,
     ) {
@@ -1077,6 +1483,199 @@ fn replace_optional_if_smaller(incumbent: &mut Option<Candidate>, contender: Can
     wins
 }
 
+fn compact_source_has_bounded_match_preserving_feedback(source: CandidateInput<'_>) -> bool {
+    let [block] = source.blocks else {
+        return false;
+    };
+    compact_proven_submatch_route_eligible(&block.tokens, block.plain.len())
+}
+
+fn compact_source_has_bounded_integrated_proven_feedback(source: CandidateInput<'_>) -> bool {
+    if !(2..=COMPACT_SPLIT_FLOOR_MAX_BLOCKS).contains(&source.blocks.len())
+        || source.compressed.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED
+        || source.identity.decoded_size > COMPACT_SPLIT_FLOOR_MAX_DECODED
+    {
+        return false;
+    }
+    let Some(token_count) = source.blocks.iter().try_fold(0_usize, |total, block| {
+        total.checked_add(block.tokens.len())
+    }) else {
+        return false;
+    };
+    token_count <= COMPACT_SPLIT_FLOOR_MAX_TOKENS
+        && source
+            .blocks
+            .iter()
+            .any(|block| compact_proven_submatch_route_eligible(&block.tokens, block.plain.len()))
+}
+
+/// Whether two independent max beams can safely share the initial wall clock.
+///
+/// This uses the compact structural route's existing compressed/decoded work
+/// bounds. In that class, overlapping original-source max with floor-seeded
+/// max has a small predictable memory cost. One-block inputs use the ordinary
+/// aggregate bound. A short multi-block list is also safe when its total
+/// decoded work stays within that bound per non-empty source block, the
+/// complete token graph stays compact, and multiple proved repartitions
+/// justify starting source max before the dependent deft4j refinement. Larger
+/// streams retain the sequential schedule.
+fn compact_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
+    if source.compressed.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED {
+        return false;
+    }
+    let nonempty_blocks = source
+        .blocks
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    if nonempty_blocks == 1 {
+        return source.identity.decoded_size <= COMPACT_SPLIT_FLOOR_MAX_DECODED
+            || (source_token_count(source)
+                .is_some_and(|tokens| tokens <= COMPACT_SPLIT_FLOOR_MAX_TOKENS)
+                && same_distance_opportunities(source.blocks).repartition_runs >= 2);
+    }
+    let decoded_limit = u64::try_from(nonempty_blocks)
+        .ok()
+        .and_then(|blocks| COMPACT_SPLIT_FLOOR_MAX_DECODED.checked_mul(blocks));
+    (2..=COMPACT_SPLIT_FLOOR_MAX_BLOCKS).contains(&nonempty_blocks)
+        && decoded_limit.is_some_and(|limit| source.identity.decoded_size <= limit)
+        && source_token_count(source).is_some_and(|tokens| tokens <= COMPACT_SPLIT_FLOOR_MAX_TOKENS)
+        && same_distance_opportunities(source.blocks).repartition_runs >= 2
+}
+
+fn compact_complementary_source_max_is_cheap(source: CandidateInput<'_>) -> bool {
+    source_token_count(source)
+        .is_some_and(|tokens| tokens <= COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS)
+}
+
+fn compact_single_source_route_work_class(source: CandidateInput<'_>) -> bool {
+    source_token_count(source).is_some_and(|tokens| {
+        (COMPACT_SINGLE_SOURCE_ROUTE_MIN_TOKENS..=COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS)
+            .contains(&tokens)
+    })
+}
+
+fn source_token_count(source: CandidateInput<'_>) -> Option<usize> {
+    source.blocks.iter().try_fold(0_usize, |total, block| {
+        total.checked_add(block.tokens.len())
+    })
+}
+
+fn repartition_graph_covers_source_blocks(blocks: &[ParsedBlock], repartition_runs: usize) -> bool {
+    let mut nonempty_blocks = 0_usize;
+    for block in blocks.iter().filter(|block| !block.plain.is_empty()) {
+        nonempty_blocks += 1;
+        // Source max must finish each block before it can combine choices
+        // across the list. A block outside the bounded 4,000-token work class
+        // can consume the entire phase by itself, so dense cross-block
+        // opportunities are not yet reachable and cannot justify deferring
+        // the compact dependent lineage.
+        if block.tokens.len() > COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS {
+            return false;
+        }
+    }
+    nonempty_blocks != 0 && repartition_runs >= nonempty_blocks
+}
+
+/// Whether the direct deft4j parent can cheaply finish its dependent split.
+///
+/// The split route already enforces these compressed, decoded, and token
+/// bounds on every prepared parent. Applying the same work model before the
+/// long independent beams keeps this dependency reachable without introducing
+/// a file-name or elapsed-time gate.
+fn compact_dependent_deft4j_work_class(source: CandidateInput<'_>) -> bool {
+    let Some(token_count) = source.blocks.iter().try_fold(0_usize, |total, block| {
+        total.checked_add(block.tokens.len())
+    }) else {
+        return false;
+    };
+    source.compressed.len() <= COMPACT_SPLIT_FLOOR_MAX_COMPRESSED
+        && source.identity.decoded_size <= COMPACT_SPLIT_FLOOR_MAX_DECODED
+        && token_count <= COMPACT_SPLIT_FLOOR_MAX_TOKENS
+        && has_multiple_nonempty_blocks(source.blocks)
+}
+
+fn bounded_refinement_should_stop(deadline: &Deadline, stop_at_soft_deadline: bool) -> bool {
+    if stop_at_soft_deadline {
+        deadline.soft_expired()
+    } else {
+        deadline.expired()
+    }
+}
+
+/// Refine the bounded route family's best deft4j lineage in place.
+///
+/// Keeping this stage in one helper lets the caller evaluate the independent
+/// original-source max route concurrently. Both routes preserve their own
+/// complete incumbents and share only the global cooperative deadline. When
+/// complete compact siblings already cover its parent states, this optional
+/// lineage yields at the soft boundary rather than consuming primary-route
+/// grace.
+#[allow(clippy::too_many_arguments)]
+fn refine_bounded_deft4j_lineage(
+    source: CandidateInput<'_>,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    default_floor: DefaultFloor,
+    deadline: &Deadline,
+    bounded_floor: Option<&Candidate>,
+    narrow_candidate: Option<&Candidate>,
+    seed_weak_deft4j: bool,
+    stop_at_soft_deadline: bool,
+    deft4j_candidate: &mut Option<Candidate>,
+) -> Result<()> {
+    if seed_weak_deft4j {
+        if let Some(floor) =
+            bounded_floor.filter(|floor| floor.is_strictly_smaller_than_source(source))
+        {
+            if let Some(mut seeded) = build_deft4j_seed_candidate(
+                floor,
+                options,
+                decoded_limit,
+                identity,
+                default_floor.allows_single_block_deft4j(),
+                &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+            )? {
+                if deadline.can_start_route() {
+                    let refined = refine_with_default_planner(
+                        &seeded,
+                        options,
+                        decoded_limit,
+                        identity,
+                        &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+                    )?;
+                    seeded.replace_if_smaller(refined);
+                }
+                let narrow_already_wins =
+                    narrow_candidate.is_some_and(|narrow| narrow.is_strictly_smaller_than(&seeded));
+                if !narrow_already_wins
+                    && deadline.can_start_route()
+                    && seeded.data.len() <= NARROW_SOURCE_MAX_COMPRESSED
+                {
+                    if let Some(terminal) = refine_with_terminal_merge(
+                        &seeded,
+                        options,
+                        decoded_limit,
+                        identity,
+                        &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+                    )? {
+                        seeded.replace_if_smaller(terminal);
+                    }
+                }
+                replace_optional_if_smaller(deft4j_candidate, seeded);
+            }
+        }
+    } else if let Some(deft4j) = deft4j_candidate.as_ref() {
+        let refined =
+            refine_with_default_planner(deft4j, options, decoded_limit, identity, &mut || {
+                bounded_refinement_should_stop(deadline, stop_at_soft_deadline)
+            })?;
+        replace_optional_if_smaller(deft4j_candidate, refined);
+    }
+    Ok(())
+}
+
 /// Completed candidates produced by the bounded first phase.
 ///
 /// Optional fields make the later comparison order explicit without relying
@@ -1091,6 +1690,7 @@ struct BoundedPhaseCandidates {
     deft4j: Option<Candidate>,
     narrow: Option<Candidate>,
     source_max: Option<Candidate>,
+    proven_feedback: Option<Candidate>,
     suppress_later_source_max: bool,
     suppress_later_optional_routes: bool,
 }
@@ -1135,24 +1735,132 @@ fn rewritten_input<'a>(
 fn build_bounded_phase_candidates(
     source: CandidateInput<'_>,
     options: &Options,
-    probe_floor_expansion: bool,
+    run_seeded_max: bool,
     run_deft4j: bool,
     run_narrow: bool,
+    run_source_max: bool,
+    run_proven_feedback: bool,
     parallel_routes: bool,
     deadline: &Deadline,
+    progress: Progress,
     completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
-    if !run_deft4j && !run_narrow {
-        let (floor, floor_seeded) = build_bounded_expanding_floor_lineage(
+    let run_source_max = run_source_max && parallel_routes;
+    let run_proven_feedback = run_proven_feedback && parallel_routes;
+    // A one-block floor descendant is the only route which can continue the
+    // floor's newly discovered token spelling. Let that primary route use the
+    // complete file window; reserving a fixed tail for source-order siblings
+    // can stop it just before a byte boundary which those siblings cannot
+    // reach. Multi-block work retains the follow-up reservation because its
+    // independent compact routes cover additional structural parents.
+    let unique_one_block_floor_descendant = run_seeded_max
+        && source
+            .blocks
+            .iter()
+            .filter(|block| !block.plain.is_empty())
+            .count()
+            == 1;
+    // The direct deft4j graph and its ordinary Columbo replay are a compact,
+    // dependent lineage. On one-block inputs, finish that cheap dependency
+    // before launching the long independent beams: returning only the direct
+    // parent and waiting for every long worker can otherwise make its unique
+    // replay fixed point unreachable. A compact multi-block lineage also
+    // finishes its deterministic split descendant here; unlike source max,
+    // that split depends on the refined deft4j parent and cannot usefully run
+    // first. Larger graphs retain the parallel worker because their cost is
+    // not similarly bounded.
+    let repartition_runs = same_distance_opportunities(source.blocks).repartition_runs;
+    // Multiple independent same-distance repartitions create combinations
+    // that only the original-source max graph can explore. Do not spend its
+    // initial wall clock serially completing the dependent deft4j split
+    // lineage when that opportunity graph covers every non-empty source
+    // block. Sparser graphs retain the dependent lineage first: their source
+    // beam cannot combine independent choices across the full block list. The
+    // direct deft4j parent still runs beside source max, and its split
+    // descendant remains available in the later refinement stage.
+    let source_repartition_graph_is_dense =
+        repartition_graph_covers_source_blocks(source.blocks, repartition_runs);
+    let prebuild_compact_split = run_seeded_max
+        && compact_dependent_deft4j_work_class(source)
+        && !source_repartition_graph_is_dense;
+    let prebuild_deft4j = (unique_one_block_floor_descendant || prebuild_compact_split)
+        && run_deft4j
+        && deadline.can_start_route();
+    let mut prebuilt_deft4j = if prebuild_deft4j {
+        build_deft4j_source_candidate(source, options, &mut || deadline.route_should_stop())?
+    } else {
+        None
+    };
+    if let Some(deft4j) = &mut prebuilt_deft4j {
+        if deadline.can_start_route() {
+            let refined = refine_with_default_planner(
+                deft4j,
+                options,
+                source.decoded_limit,
+                source.identity,
+                &mut || deadline.route_should_stop(),
+            )?;
+            deft4j.replace_if_smaller(refined);
+        }
+        if prebuild_compact_split {
+            if let Some(split) = refine_with_compact_source_split_floor(
+                deft4j,
+                options,
+                source.decoded_limit,
+                source.identity,
+            )? {
+                deft4j.replace_if_smaller(split);
+            }
+        }
+    }
+    // Establish the bounded phase window after finishing the cheap dependency,
+    // so its reserved fifth is measured from the actual independent work that
+    // remains rather than being silently consumed by prerequisite work.
+    let route_window = if (run_deft4j || run_narrow || run_source_max || run_proven_feedback)
+        && !unique_one_block_floor_descendant
+    {
+        RouteWindow::reserving_follow_up(deadline)
+    } else {
+        RouteWindow::full(deadline)
+    };
+    let run_deft4j = run_deft4j && !prebuild_deft4j && route_window.can_start_route();
+    let run_narrow = run_narrow && route_window.can_start_route();
+    // Tiny graphs retain both long roots because their complementary search
+    // is cheap and can settle in a different basin. In the capped route's
+    // upper work band, give the broader source-max graph sole ownership of
+    // source-token search rather than making two workers contend for the same
+    // deadline. Multiple independent same-distance repartition runs also keep
+    // source max: their combinations exist only in that original-source
+    // topology. Above these bounds, omit the source-root beam only when proven
+    // feedback actually covers source-token work.
+    let run_complementary_source_max = compact_complementary_source_max_is_cheap(source);
+    let source_restart_has_distinct_topology =
+        repartition_runs != 0 || source.identity.decoded_size > DEFLATE_MAX_STORED_BLOCK_PLAIN;
+    let run_single_source_max = compact_single_source_route_work_class(source)
+        && !run_complementary_source_max
+        && source_restart_has_distinct_topology
+        && run_proven_feedback;
+    let run_source_max = run_source_max
+        && (run_complementary_source_max
+            || run_single_source_max
+            || repartition_runs >= 2
+            || !run_proven_feedback)
+        && route_window.can_start_route();
+    let run_proven_feedback = run_proven_feedback
+        && (!run_single_source_max || !run_source_max)
+        && route_window.can_start_route();
+    if !run_deft4j && !run_narrow && !run_source_max && !run_proven_feedback {
+        let (floor, floor_seeded) = build_bounded_floor_descendants(
             source,
             options,
-            probe_floor_expansion,
-            deadline,
+            run_seeded_max,
+            &route_window,
             completed_floor,
         )?;
         return Ok(BoundedPhaseCandidates {
             floor: Some(floor),
             floor_seeded,
+            deft4j: prebuilt_deft4j,
             ..BoundedPhaseCandidates::default()
         });
     }
@@ -1161,9 +1869,10 @@ fn build_bounded_phase_candidates(
         return build_bounded_phase_candidates_sequential(
             source,
             options,
+            run_seeded_max,
             run_deft4j,
             run_narrow,
-            deadline,
+            &route_window,
             completed_floor,
         );
     }
@@ -1175,7 +1884,7 @@ fn build_bounded_phase_candidates(
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
                         build_deft4j_source_candidate(source, options, &mut || {
-                            deadline.route_should_stop()
+                            route_window.should_stop()
                         })
                     })
                 })
@@ -1187,7 +1896,36 @@ fn build_bounded_phase_candidates(
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
                         build_narrow_source_candidate(source, options, &mut || {
-                            deadline.route_should_stop()
+                            route_window.should_stop()
+                        })
+                    })
+                })
+                .ok()
+        });
+        let source_max_worker = run_source_max.then(|| {
+            thread::Builder::new()
+                .name("columbo-source-max-initial".into())
+                .spawn_scoped(scope, || {
+                    run_route_with_cancellation(deadline, || {
+                        build_source_max_candidate(
+                            source,
+                            options,
+                            progress,
+                            deadline,
+                            false,
+                            &mut || route_window.should_stop(),
+                        )
+                    })
+                })
+                .ok()
+        });
+        let proven_feedback_worker = run_proven_feedback.then(|| {
+            thread::Builder::new()
+                .name("columbo-proven-feedback-initial".into())
+                .spawn_scoped(scope, || {
+                    run_route_with_cancellation(deadline, || {
+                        build_compact_proven_feedback_candidate(source, options, &mut || {
+                            route_window.should_stop()
                         })
                     })
                 })
@@ -1198,32 +1936,57 @@ fn build_bounded_phase_candidates(
         // ordinary deadline check. Join every successfully spawned worker
         // before choosing the fixed deft4j/narrow/floor error order below.
         let floor = run_route_with_cancellation(deadline, || {
-            build_bounded_expanding_floor_lineage(
+            build_bounded_floor_descendants(
                 source,
                 options,
-                probe_floor_expansion,
-                deadline,
+                run_seeded_max,
+                &route_window,
                 completed_floor,
             )
         });
         let deft4j = match deft4j_worker.flatten() {
             Some(worker) => worker.join(),
             None if run_deft4j => Ok(run_route_with_cancellation(deadline, || {
-                build_deft4j_source_candidate(source, options, &mut || deadline.route_should_stop())
+                build_deft4j_source_candidate(source, options, &mut || route_window.should_stop())
             })),
             None => Ok(Ok(None)),
         };
         let narrow = match narrow_worker.flatten() {
             Some(worker) => worker.join(),
             None if run_narrow => Ok(run_route_with_cancellation(deadline, || {
-                build_narrow_source_candidate(source, options, &mut || deadline.route_should_stop())
+                build_narrow_source_candidate(source, options, &mut || route_window.should_stop())
             })),
             None => Ok(Ok(None)),
         };
+        let source_max = match source_max_worker.flatten() {
+            Some(worker) => match worker.join() {
+                Ok(result) => result.map(Some),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            None if run_source_max => run_route_with_cancellation(deadline, || {
+                build_source_max_candidate(source, options, progress, deadline, false, &mut || {
+                    route_window.should_stop()
+                })
+            })
+            .map(Some),
+            None => Ok(None),
+        };
+        let proven_feedback = match proven_feedback_worker.flatten() {
+            Some(worker) => match worker.join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+            None if run_proven_feedback => run_route_with_cancellation(deadline, || {
+                build_compact_proven_feedback_candidate(source, options, &mut || {
+                    route_window.should_stop()
+                })
+            }),
+            None => Ok(None),
+        };
 
-        // A panic still denotes an internal invariant failure. Both joins are
+        // A panic still denotes an internal invariant failure. All joins are
         // complete now, so resuming it cannot strand a sibling worker.
-        let deft4j = match deft4j {
+        let worker_deft4j = match deft4j {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         }?;
@@ -1231,12 +1994,20 @@ fn build_bounded_phase_candidates(
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
         }?;
+        let source_max = source_max?;
+        let proven_feedback = proven_feedback?;
         let (floor, floor_seeded) = floor?;
+        if let Some(worker_deft4j) = worker_deft4j {
+            replace_optional_if_smaller(&mut prebuilt_deft4j, worker_deft4j);
+        }
         Ok(BoundedPhaseCandidates {
             floor: Some(floor),
             floor_seeded,
-            deft4j,
+            deft4j: prebuilt_deft4j,
             narrow,
+            source_max,
+            proven_feedback,
+            suppress_later_source_max: run_source_max,
             ..BoundedPhaseCandidates::default()
         })
     })
@@ -1246,25 +2017,32 @@ fn build_bounded_phase_candidates(
 fn build_bounded_phase_candidates_sequential(
     source: CandidateInput<'_>,
     options: &Options,
+    run_seeded_max: bool,
     run_deft4j: bool,
     run_narrow: bool,
-    deadline: &Deadline,
+    route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
-    let deft4j = if run_deft4j {
-        build_deft4j_source_candidate(source, options, &mut || deadline.expired())?
+    let deft4j = if run_deft4j && route_window.can_start_route() {
+        build_deft4j_source_candidate(source, options, &mut || route_window.should_stop())?
     } else {
         None
     };
-    let narrow = if run_narrow {
-        build_narrow_source_candidate(source, options, &mut || deadline.expired())?
+    let narrow = if run_narrow && route_window.can_start_route() {
+        build_narrow_source_candidate(source, options, &mut || route_window.should_stop())?
     } else {
         None
     };
-    let floor =
-        completed_or_bounded_floor(source, options, completed_floor, &mut || deadline.expired())?;
+    let (floor, floor_seeded) = build_bounded_floor_descendants(
+        source,
+        options,
+        run_seeded_max,
+        route_window,
+        completed_floor,
+    )?;
     Ok(BoundedPhaseCandidates {
         floor: Some(floor),
+        floor_seeded,
         deft4j,
         narrow,
         ..BoundedPhaseCandidates::default()
@@ -1343,6 +2121,31 @@ where
         .map(|candidate| candidate.named("Normal floor"))
 }
 
+/// Establish a high-work max-mode floor without repeating an optional lineage.
+///
+/// Proven-submatch work is still available in the max/default-refinement
+/// descendants. On a large or match-dense model, running it in this comparison
+/// floor as well can consume the file budget or select a weaker replay basin
+/// before any max-only route begins.
+fn build_bounded_comparison_floor_candidate<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    build_candidate_without_proven_lineage(
+        source,
+        &floor_options,
+        DEFAULT_RAW_REPLAY_LIMIT,
+        expired,
+    )
+    .map(|candidate| candidate.named("Normal floor"))
+}
+
 /// Reuse a completed ordinary-mode floor when PNG scheduling already made it.
 ///
 /// Its retained plans have the same shape needed by each bounded continuation,
@@ -1371,99 +2174,89 @@ where
 fn build_bounded_floor_lineage(
     source: CandidateInput<'_>,
     options: &Options,
-    deadline: &Deadline,
+    route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
     let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
-        deadline.route_should_stop()
+        route_window.should_stop()
     })?;
-    continue_bounded_floor_lineage(source, floor, options, deadline)
+    continue_bounded_floor_lineage(source, floor, options, route_window, true)
 }
 
-/// Build the ordinary bounded floor, then apply only Columbo's deterministic
-/// bounded grouping to that rewritten topology.
+/// Continue the selected floor into max search when requested.
 ///
-/// The legacy corpus band benefits from this exact structural continuation;
-/// skipping unrelated max routes avoids both their duplicate work and their
-/// competition for the same PNG deadline.
-fn build_bounded_floor_grouping_lineage(
+/// A rewrite can expose new token/table feedback even when it retains or
+/// reduces the source block count, so topology alone is not a sound dominance
+/// test for this descendant.
+fn build_bounded_floor_descendants(
     source: CandidateInput<'_>,
     options: &Options,
-    deadline: &Deadline,
-    completed_floor: Option<Candidate>,
-) -> Result<(Candidate, Option<Candidate>)> {
-    let mut floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
-        deadline.route_should_stop()
-    })?;
-    let floor_selected = options.strict || floor.is_strictly_smaller_than_source(source);
-    if !floor_selected || deadline.route_should_stop() {
-        return Ok((floor, None));
-    }
-
-    // The grouping route reparses the encoded floor and owns its grouped
-    // tokens, so the earlier token plans need not overlap that model.
-    floor.plans.clear();
-    let seeded =
-        refine_with_bounded_grouping_floor(&floor, options, source.decoded_limit, source.identity)?;
-    Ok((floor, seeded))
-}
-
-/// Continue the historical floor seed only when ordinary planning exposes
-/// additional nonempty blocks from a coarse two-to-four-block source.
-fn build_bounded_expanding_floor_lineage(
-    source: CandidateInput<'_>,
-    options: &Options,
-    probe_expansion: bool,
-    deadline: &Deadline,
+    run_seeded_max: bool,
+    route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
     let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
-        deadline.route_should_stop()
+        route_window.should_stop()
     })?;
-    if !probe_expansion {
-        return Ok((floor, None));
+    if !run_seeded_max {
+        return continue_bounded_floor_lineage(source, floor, options, route_window, false);
     }
 
     // Inspect the plans already retained by the floor. Re-parsing merely to
     // rediscover this topology would spend time and allocate another model.
-    let source_blocks = source
-        .blocks
-        .iter()
-        .filter(|block| !block.plain.is_empty())
-        .count();
-    let floor_blocks = floor
-        .plans
-        .iter()
-        .filter(|plan| !plan.plain.is_empty())
-        .count();
-    if floor_blocks <= source_blocks {
-        return Ok((floor, None));
-    }
-    continue_bounded_floor_lineage(source, floor, options, deadline)
+    continue_bounded_floor_lineage(source, floor, options, route_window, true)
 }
 
 fn continue_bounded_floor_lineage(
     source: CandidateInput<'_>,
     mut floor: Candidate,
     options: &Options,
-    deadline: &Deadline,
+    route_window: &RouteWindow<'_>,
+    run_seeded_max: bool,
 ) -> Result<(Candidate, Option<Candidate>)> {
     let floor_selected = options.strict || floor.is_strictly_smaller_than_source(source);
-    if !floor_selected || deadline.route_should_stop() {
+    if !floor_selected || !route_window.can_start_route() {
         return Ok((floor, None));
     }
 
-    // The seeded parse owns its rewritten tokens. Release the floor plans
-    // before allocating that model so this remains one route arena.
+    // Parse the finished floor once for both independent descendants. The
+    // previous implementation reparsed the same bytes separately for bounded
+    // grouping and max refinement, duplicating validation and model storage.
     floor.plans.clear();
-    let seeded = refine_with_max_planner(
-        &floor,
-        options,
-        source.decoded_limit,
-        source.identity,
-        &mut || deadline.route_should_stop(),
-    )?;
-    Ok((floor, Some(seeded)))
+    let stream = parse_validated_rewrite(&floor.data, source.decoded_limit, source.identity)?;
+    let rewritten = rewritten_input(&floor, &stream, source.decoded_limit, source.identity);
+    let mut descendant = None;
+
+    if run_seeded_max && route_window.can_start_route() {
+        let seeded = build_candidate_from_established_floor(
+            rewritten,
+            options,
+            MAX_RAW_REPLAY_LIMIT,
+            false,
+            &mut || route_window.should_stop(),
+        )?
+        .named("Columbo max refinement");
+        descendant = Some(seeded);
+    } else if has_multiple_nonempty_blocks(&stream.blocks) && route_window.can_start_route() {
+        // The full max planner starts from this same bounded grouping floor.
+        // Run the standalone structural form only when a broader seeded max
+        // descendant is not scheduled; doing both repeats range pricing and
+        // can starve the more capable route.
+        if let Some(plans) = plan_columbo_floor_seeded_bounded_grouping(&stream.blocks, 0, options)
+        {
+            let grouped = build_candidate_from_plans(
+                rewritten,
+                plans,
+                options,
+                0,
+                ReplayPlanner::Full,
+                &mut || route_window.should_stop(),
+            )?
+            .named("Columbo floor-seeded grouping");
+            descendant = Some(grouped);
+        }
+    }
+    Ok((floor, descendant))
 }
 
 /// Preserve source max when no specialized source route is eligible.
@@ -1478,32 +2271,50 @@ fn build_bounded_generic_max_candidates(
     progress: Progress,
     completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
+    let route_window = RouteWindow::full(deadline);
     thread::scope(|scope| {
-        let source_worker = thread::Builder::new()
-            .name("columbo-source-max".into())
-            .spawn_scoped(scope, || {
-                run_route_with_cancellation(deadline, || {
-                    build_source_max_candidate(source, options, progress, deadline, &mut || {
-                        deadline.route_should_stop()
+        let run_source_max = deadline.can_start_route();
+        let source_worker = run_source_max
+            .then(|| {
+                thread::Builder::new()
+                    .name("columbo-source-max".into())
+                    .spawn_scoped(scope, || {
+                        run_route_with_cancellation(deadline, || {
+                            build_source_max_candidate(
+                                source,
+                                options,
+                                progress,
+                                deadline,
+                                false,
+                                &mut || deadline.route_should_stop(),
+                            )
+                        })
                     })
-                })
+                    .ok()
             })
-            .ok();
+            .flatten();
 
         let floor = run_route_with_cancellation(deadline, || {
-            build_bounded_floor_lineage(source, options, deadline, completed_floor)
+            build_bounded_floor_lineage(source, options, &route_window, completed_floor)
         });
         let source_max = match source_worker {
             Some(worker) => match worker.join() {
                 Ok(result) => result.map(Some),
                 Err(payload) => std::panic::resume_unwind(payload),
             },
-            None if !deadline.route_should_stop() => run_route_with_cancellation(deadline, || {
-                build_source_max_candidate(source, options, progress, deadline, &mut || {
-                    deadline.route_should_stop()
+            None if run_source_max && deadline.can_start_route() => {
+                run_route_with_cancellation(deadline, || {
+                    build_source_max_candidate(
+                        source,
+                        options,
+                        progress,
+                        deadline,
+                        false,
+                        &mut || deadline.route_should_stop(),
+                    )
                 })
-            })
-            .map(Some),
+                .map(Some)
+            }
             None => Ok(None),
         };
 
@@ -1583,7 +2394,7 @@ where
     F: FnMut() -> bool,
 {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
-    if !deft4j_source_route_eligible(&stream.blocks, candidate.data.len(), allow_single_block) {
+    if !deft4j_source_route_eligible(&stream.blocks, allow_single_block) {
         return Ok(None);
     }
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
@@ -1622,25 +2433,92 @@ where
 /// no token search, merge search, or replay. Its explicit size, topology, and
 /// token limits make it safe to finish deterministically after the shared
 /// deadline, while the caller keeps the unsplit candidate as a fallback.
-fn refine_with_compact_source_split_floor(
+struct CompactSplitSeed {
+    data: Vec<u8>,
+    bits: u64,
+    stream: ParsedStream,
+}
+
+fn prepare_compact_source_split_seed(
     candidate: &Candidate,
-    options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-) -> Result<Option<Candidate>> {
+) -> Result<Option<CompactSplitSeed>> {
     if candidate.data.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED {
         return Ok(None);
     }
 
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(candidate.data.len())
+        .map_err(|_| Error::new("could not allocate compact route seed"))?;
+    data.extend_from_slice(&candidate.data);
+    let stream = parse_validated_rewrite(&data, decoded_limit, identity)?;
     if !compact_source_split_floor_eligible(identity.decoded_size, &stream.blocks) {
         return Ok(None);
     }
+    Ok(Some(CompactSplitSeed {
+        data,
+        bits: candidate.bits,
+        stream,
+    }))
+}
 
-    let Some(plans) = plan_compact_source_split_floor(&stream.blocks, 0, options) else {
+fn build_prepared_compact_source_split_floor(
+    seed: &CompactSplitSeed,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<Option<Candidate>> {
+    let Some(plans) = plan_compact_source_split_floor(&seed.stream.blocks, 0, options) else {
         return Ok(None);
     };
-    let source = rewritten_input(candidate, &stream, decoded_limit, identity);
+    build_prepared_compact_source_split_floor_from_plans(
+        seed,
+        options,
+        decoded_limit,
+        identity,
+        plans,
+    )
+}
+
+fn build_prepared_compact_source_split_floor_until<F>(
+    seed: &CompactSplitSeed,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    expired: &mut F,
+) -> Result<Option<Candidate>>
+where
+    F: FnMut() -> bool,
+{
+    let Some(plans) =
+        plan_compact_source_split_floor_until(&seed.stream.blocks, 0, options, expired)
+    else {
+        return Ok(None);
+    };
+    build_prepared_compact_source_split_floor_from_plans(
+        seed,
+        options,
+        decoded_limit,
+        identity,
+        plans,
+    )
+}
+
+fn build_prepared_compact_source_split_floor_from_plans(
+    seed: &CompactSplitSeed,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    plans: Vec<PlannedBlock>,
+) -> Result<Option<Candidate>> {
+    let source = CandidateInput {
+        compressed: &seed.data,
+        blocks: &seed.stream.blocks,
+        meaningful_bits: seed.bits,
+        decoded_limit,
+        identity,
+    };
     let mut never_expires = || false;
     build_candidate_from_plans(
         source,
@@ -1651,6 +2529,66 @@ fn refine_with_compact_source_split_floor(
         &mut never_expires,
     )
     .map(|candidate| Some(candidate.named("Columbo compact split floor")))
+}
+
+fn build_prepared_compact_source_split_floors(
+    seeds: [Option<&CompactSplitSeed>; 3],
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    deadline: &Deadline,
+) -> Result<Option<Candidate>> {
+    let mut candidate = None;
+    let mut attempted = false;
+    for seed in seeds.into_iter().flatten() {
+        // Always finish one eligible structural parent. Later independent
+        // parents start only inside the soft schedule; a larger max budget
+        // naturally evaluates all of them.
+        if attempted && !deadline.can_start_route() {
+            break;
+        }
+        attempted = true;
+        if let Some(contender) =
+            build_prepared_compact_source_split_floor(seed, options, decoded_limit, identity)?
+        {
+            replace_optional_if_smaller(&mut candidate, contender);
+        }
+    }
+    Ok(candidate)
+}
+
+fn refine_with_compact_source_split_floor(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<Option<Candidate>> {
+    let Some(seed) = prepare_compact_source_split_seed(candidate, decoded_limit, identity)? else {
+        return Ok(None);
+    };
+    build_prepared_compact_source_split_floor(&seed, options, decoded_limit, identity)
+}
+
+fn refine_with_compact_source_split_floor_until<F>(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    expired: &mut F,
+) -> Result<Option<Candidate>>
+where
+    F: FnMut() -> bool,
+{
+    let Some(seed) = prepare_compact_source_split_seed(candidate, decoded_limit, identity)? else {
+        return Ok(None);
+    };
+    build_prepared_compact_source_split_floor_until(
+        &seed,
+        options,
+        decoded_limit,
+        identity,
+        expired,
+    )
 }
 
 fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]) -> bool {
@@ -1675,10 +2613,9 @@ fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]
 
 /// Apply Columbo's bounded quad-lengthening move to one finished dynamic block.
 ///
-/// The source-level gate admits only the narrow 4–8 KiB gap between the tiny
-/// deft4j route and larger generic work. This post-route helper neither changes
-/// tokens nor replays the result; the encoded incumbent remains an independent
-/// fallback if every legal tree move loses.
+/// The source-level gate is an upper work bound. This post-route helper neither
+/// changes tokens nor replays the result; the encoded incumbent remains an
+/// independent fallback if every legal tree move loses.
 fn refine_with_compact_quad_floor(
     candidate: &Candidate,
     options: &Options,
@@ -1689,8 +2626,7 @@ fn refine_with_compact_quad_floor(
     let [block] = stream.blocks.as_slice() else {
         return Ok(None);
     };
-    if block.source_type != SourceBlockType::Dynamic
-        || !(COMPACT_QUAD_MIN_TOKENS..=COMPACT_QUAD_MAX_TOKENS).contains(&block.tokens.len())
+    if block.source_type != SourceBlockType::Dynamic || block.tokens.len() > COMPACT_QUAD_MAX_TOKENS
     {
         return Ok(None);
     }
@@ -1734,6 +2670,24 @@ fn refine_with_compact_quad_floor(
     .map(|candidate| Some(candidate.named("Columbo compact quad floor")))
 }
 
+/// Stabilize one quad rewrite through the bounded proven-feedback fixed point.
+///
+/// A new Huffman header changes match-to-literal prices; the resulting token
+/// feedback can in turn expose a second header win. The compact route enforces
+/// its own 4,000-token/80-KiB work bounds and applies quad cleanup to its final
+/// seed, so one composition closes this dependency without rerunning max.
+fn refine_with_compact_proven_feedback(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<Option<Candidate>> {
+    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let source = rewritten_input(candidate, &stream, decoded_limit, identity);
+    let mut never_expires = || false;
+    build_compact_proven_feedback_candidate(source, options, &mut never_expires)
+}
+
 /// Apply the full Columbo max planner to a complete rewritten candidate.
 fn refine_with_max_planner<F>(
     candidate: &Candidate,
@@ -1749,31 +2703,6 @@ where
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)
         .map(|candidate| candidate.named("Columbo max refinement"))
-}
-
-/// Apply Columbo's bounded source-grouping floor to a complete rewritten
-/// candidate without entering the broader max planner or replaying its result.
-fn refine_with_bounded_grouping_floor(
-    candidate: &Candidate,
-    options: &Options,
-    decoded_limit: u64,
-    identity: StreamIdentity,
-) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
-    let Some(plans) = plan_columbo_floor_seeded_bounded_grouping(&stream.blocks, 0, options) else {
-        return Ok(None);
-    };
-    let source = rewritten_input(candidate, &stream, decoded_limit, identity);
-    let mut never_expires = || false;
-    build_candidate_from_plans(
-        source,
-        plans,
-        options,
-        0,
-        ReplayPlanner::Full,
-        &mut never_expires,
-    )
-    .map(|candidate| Some(candidate.named("Columbo floor-seeded grouping")))
 }
 
 /// Apply one linear, deterministic merge cleanup to a selected max seed.
@@ -1825,7 +2754,263 @@ fn build_candidate<F>(
 where
     F: FnMut() -> bool,
 {
+    build_candidate_with_proven_policy(source, options, replay_limit, true, expired)
+}
+
+/// Build a max-mode comparison floor while deferring its optional sibling.
+///
+/// The caller retains this complete ordinary candidate before starting a
+/// max/default-refinement lineage that includes proven-submatch work. Avoiding
+/// it here prevents the same route family from consuming the shared deadline
+/// twice.
+fn build_candidate_without_proven_lineage<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    replay_limit: usize,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    build_candidate_with_proven_policy(source, options, replay_limit, false, expired)
+}
+
+/// Build the compact proven-before-feedback comparison candidate.
+///
+/// The bounded floor and full search are separate replay fixed points in
+/// default mode: either immediate plan can reach the smaller final stream.
+/// Max mode runs only the floor here because its later source-max route covers
+/// the remaining full search; repeating the sibling first would consume time
+/// reserved for that broader route. The 4,000-token/80-KiB eligibility band is
+/// enforced by
+/// `compact_proven_submatch_route_eligible` before this helper is called.
+fn build_compact_proven_feedback_candidate<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    expired: &mut F,
+) -> Result<Option<Candidate>>
+where
+    F: FnMut() -> bool,
+{
+    let [block] = source.blocks else {
+        return Ok(None);
+    };
+    if !compact_proven_submatch_route_eligible(&block.tokens, block.plain.len()) || expired() {
+        return Ok(None);
+    }
+    let mut route_options = options.clone();
+    route_options.exhaustive = false;
+    let floor_base = plan_block(block, 0, &route_options, &mut *expired);
+    let floor_plan =
+        improve_plan_with_integrated_proven_floor(block, 0, &route_options, true, floor_base);
+    let floor_plan = improve_plan_with_short_family_floor(block, &route_options, floor_plan);
+    // Stabilize the cheap floor before starting its heavier full-search
+    // sibling. Besides securing an early complete candidate for shared
+    // deadlines, this avoids making a later local search consume time needed
+    // by the floor's distinct replay fixed point.
+    let mut candidate =
+        build_compact_proven_seed_candidate(source, floor_plan, &route_options, options, expired)?;
+    if options.exhaustive || expired() {
+        return Ok(Some(candidate));
+    }
+    // Start the default-only sibling from its own ordinary price. This retains
+    // the full search's established tie order while the floor above remains an
+    // independent complete candidate.
+    let searched_plan =
+        plan_block_with_integrated_proven_search(block, 0, &route_options, &mut *expired);
+    let searched = build_compact_proven_seed_candidate(
+        source,
+        searched_plan,
+        &route_options,
+        options,
+        expired,
+    )?;
+    candidate.replace_if_smaller(searched);
+    Ok(Some(candidate))
+}
+
+/// Stabilize both replay endpoints reachable from one compact seed.
+///
+/// Ordinary replay and repeated proven-before-feedback replay can each win.
+/// Keeping this small helper shared by both seed lineages makes that necessary
+/// comparison explicit without rebuilding the seed plan itself.
+fn build_compact_proven_seed_candidate<F>(
+    source: CandidateInput<'_>,
+    plan: PlannedBlock,
+    route_options: &Options,
+    options: &Options,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    // The first proven-before-feedback pass exposes two distinct replay fixed
+    // points. Ordinary replays can stabilize a better table for some streams,
+    // while preserving the integrated ordering through every replay wins on
+    // others. Both are compact, bounded siblings of the same initial plan.
+    let mut candidate = build_candidate_from_plans(
+        source,
+        vec![plan.clone()],
+        route_options,
+        DEFAULT_RAW_REPLAY_LIMIT,
+        ReplayPlanner::Full,
+        expired,
+    )?
+    .named("Columbo proven-feedback floor");
+    let integrated = build_candidate_from_plans(
+        source,
+        vec![plan],
+        route_options,
+        DEFAULT_RAW_REPLAY_LIMIT,
+        ReplayPlanner::IntegratedProven,
+        expired,
+    )?
+    .named("Columbo proven-feedback floor");
+    candidate.replace_if_smaller(integrated);
+    // Quad cleanup follows each seed lineage independently. Comparing the
+    // pre-quad candidates first can hide a locally dearer seed whose table
+    // exposes the smaller completed quad endpoint.
+    if let Some(quad) =
+        refine_with_compact_quad_floor(&candidate, options, source.decoded_limit, source.identity)?
+    {
+        candidate.replace_if_smaller(quad);
+    }
+    Ok(candidate)
+}
+
+/// Build a compact multi-block proven-before-feedback comparison candidate.
+///
+/// This recreates the integrated floor used before proven resegmentation was
+/// separated into an endpoint lineage, but retains it as an additive complete
+/// stream. The caller enforces the four-block/16-KiB-token work bound.
+fn build_compact_integrated_proven_feedback_candidate<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    incumbent: &Candidate,
+    expired: &mut F,
+) -> Result<Option<Candidate>>
+where
+    F: FnMut() -> bool,
+{
+    if !compact_source_has_bounded_integrated_proven_feedback(source) || expired() {
+        return Ok(None);
+    }
+    let mut route_options = options.clone();
+    route_options.exhaustive = false;
+    let Some(plans) =
+        plan_integrated_proven_source_route(source.blocks, 0, &route_options, &mut *expired)
+    else {
+        return Ok(None);
+    };
+    let integrated_replay_plans = plans.clone();
+    let mut candidate = build_candidate_from_plans(
+        source,
+        plans,
+        &route_options,
+        DEFAULT_RAW_REPLAY_LIMIT,
+        ReplayPlanner::Full,
+        expired,
+    )?
+    .named("Columbo integrated proven feedback");
+    // Ordinary replay is the cheaper historical endpoint and already recovers
+    // many compact multi-block wins. Only follow the second integrated replay
+    // fixed point when that completed candidate did not improve the incumbent;
+    // this keeps the route adaptive without using corpus- or time-based gates.
+    if !candidate.is_strictly_smaller_than(incumbent) && !expired() {
+        let integrated = build_candidate_from_plans(
+            source,
+            integrated_replay_plans,
+            &route_options,
+            DEFAULT_RAW_REPLAY_LIMIT,
+            ReplayPlanner::IntegratedProven,
+            expired,
+        )?
+        .named("Columbo integrated proven feedback");
+        candidate.replace_if_smaller(integrated);
+    }
+    Ok(Some(candidate))
+}
+
+fn build_candidate_with_proven_policy<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    replay_limit: usize,
+    run_proven_lineage: bool,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
     let Some(plans) = plan_stream(source.blocks, 0, options, &mut *expired) else {
+        return source_candidate(source, options);
+    };
+    let mut candidate = build_candidate_from_plans(
+        source,
+        plans,
+        options,
+        replay_limit,
+        ReplayPlanner::Full,
+        expired,
+    )?;
+    if !run_proven_lineage || expired() {
+        return Ok(candidate);
+    }
+
+    // Stabilize proven-submatch resegmentation as an independent lineage.
+    // Selecting an immediate local win inside `plan_stream` can change the
+    // parent token state of later replay and hide a better established fixed
+    // point. Compare the completed route and its endpoint branch as complete
+    // emitted streams.
+    let endpoint_proven = {
+        // Reparse the completed ordinary candidate so any retained original
+        // representations refer to these exact bytes. Re-emitting its plan
+        // list against the earlier source would be invalid after an accepted
+        // replay, because original-bit references are generation-local.
+        let replayed =
+            parse_validated_rewrite(&candidate.data, source.decoded_limit, source.identity)?;
+        let proven_source =
+            rewritten_input(&candidate, &replayed, source.decoded_limit, source.identity);
+        plan_proven_submatch_route(&replayed.blocks, 0, options, &mut *expired)
+            .map(|proven_plans| {
+                build_candidate_from_plans(
+                    proven_source,
+                    proven_plans,
+                    options,
+                    replay_limit,
+                    ReplayPlanner::Full,
+                    expired,
+                )
+            })
+            .transpose()?
+    };
+    if let Some(proven) = endpoint_proven {
+        candidate.replace_if_smaller(proven);
+    }
+    Ok(candidate)
+}
+
+/// Build an additive max candidate after its caller retained the complete
+/// ordinary-mode floor.
+///
+/// This avoids rebuilding the same token-preserving floor inside source max;
+/// the planner still carries a complete structural fallback of its own.
+fn build_candidate_from_established_floor<F>(
+    source: CandidateInput<'_>,
+    options: &Options,
+    replay_limit: usize,
+    integrated_compact_proven: bool,
+    expired: &mut F,
+) -> Result<Candidate>
+where
+    F: FnMut() -> bool,
+{
+    let Some(plans) = plan_stream_from_established_floor(
+        source.blocks,
+        0,
+        options,
+        integrated_compact_proven,
+        &mut *expired,
+    ) else {
         return source_candidate(source, options);
     };
     build_candidate_from_plans(
@@ -1846,14 +3031,22 @@ fn build_candidate_with_progress<F>(
     source: CandidateInput<'_>,
     options: &Options,
     replay_limit: usize,
+    integrated_compact_proven: bool,
     expired: &mut F,
     progress: &RouteProgress,
 ) -> Result<Candidate>
 where
     F: FnMut() -> bool,
 {
-    let Some(plans) = plan_stream_with_progress(source.blocks, 0, options, &mut *expired, progress)
-    else {
+    let Some(plans) = plan_stream_with_progress(
+        source.blocks,
+        0,
+        options,
+        true,
+        integrated_compact_proven,
+        &mut *expired,
+        progress,
+    ) else {
         return source_candidate(source, options);
     };
     build_candidate_from_plans_with_progress(
@@ -1870,6 +3063,7 @@ where
 #[derive(Clone, Copy)]
 enum ReplayPlanner {
     Full,
+    IntegratedProven,
     Fragmented,
 }
 
@@ -1952,11 +3146,36 @@ where
 
         let replay_plans = match replay_planner {
             ReplayPlanner::Full => match progress {
-                Some(progress) => {
-                    plan_stream_with_progress(&replayed.blocks, 0, options, &mut *expired, progress)
-                }
+                Some(progress) => plan_stream_with_progress(
+                    &replayed.blocks,
+                    0,
+                    options,
+                    options.exhaustive,
+                    false,
+                    &mut *expired,
+                    progress,
+                ),
+                None if options.exhaustive => plan_stream_from_established_floor(
+                    &replayed.blocks,
+                    0,
+                    options,
+                    false,
+                    &mut *expired,
+                ),
                 None => plan_stream(&replayed.blocks, 0, options, &mut *expired),
             },
+            ReplayPlanner::IntegratedProven => {
+                if let [block] = replayed.blocks.as_slice() {
+                    Some(vec![plan_block_with_integrated_proven_search(
+                        block,
+                        0,
+                        options,
+                        &mut *expired,
+                    )])
+                } else {
+                    plan_integrated_proven_source_route(&replayed.blocks, 0, options, &mut *expired)
+                }
+            }
             ReplayPlanner::Fragmented => plan_fragmented_replay(&replayed.blocks, 0, options),
         };
         let Some(replay_plans) = replay_plans else {
@@ -2113,6 +3332,7 @@ fn emit_plans(input: &[u8], plans: &[PlannedBlock], strict: bool) -> Result<(Vec
         emit_block(&mut writer, input, plan, index + 1 == plans.len())?;
     }
     let bits = writer.bit_position();
+    debug_assert_eq!(bits, plans.iter().map(|plan| plan.bits).sum::<u64>());
     Ok((writer.into_bytes(), bits))
 }
 
@@ -2219,9 +3439,20 @@ fn block_progress(
 const DEADLINE_TIMED_OUT: u8 = 1;
 const DEADLINE_ROUTES_CANCELLED: u8 = 2;
 
+fn timeout_grace(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        return Duration::ZERO;
+    }
+    TIMEOUT_GRACE_BASE.saturating_add(duration / TIMEOUT_GRACE_DIVISOR)
+}
+
+fn initial_bounded_phase_share(remaining: Duration) -> Duration {
+    remaining.saturating_mul(INITIAL_BOUNDED_PHASE_NUMERATOR) / INITIAL_BOUNDED_PHASE_DENOMINATOR
+}
+
 struct Deadline {
     started: Instant,
-    duration: std::time::Duration,
+    duration: Duration,
     // Timeout and route-cancellation flags share one atomic so a hot search
     // probe performs only one synchronization load. The flags carry no data,
     // so relaxed ordering is sufficient.
@@ -2229,26 +3460,45 @@ struct Deadline {
 }
 
 impl Deadline {
-    fn remaining(&self) -> std::time::Duration {
+    fn remaining(&self) -> Duration {
         self.duration.saturating_sub(self.started.elapsed())
     }
 
-    fn expired(&self) -> bool {
-        if self.state.load(Ordering::Relaxed) & DEADLINE_TIMED_OUT != 0
-            || self.started.elapsed() >= self.duration
-        {
-            self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
-            true
-        } else {
-            false
+    /// Whether another independent route may begin.
+    fn can_start_route(&self) -> bool {
+        if self.soft_expired() {
+            return false;
         }
+        self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED == 0
+    }
+
+    fn soft_expired(&self) -> bool {
+        if self.started.elapsed() < self.duration {
+            return false;
+        }
+        self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
+        true
+    }
+
+    /// Hard stop polled by an active route while it finalizes a candidate.
+    fn expired(&self) -> bool {
+        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
+            return true;
+        }
+        let hard_duration = self.duration.saturating_add(timeout_grace(self.duration));
+        if self.started.elapsed() < hard_duration {
+            return false;
+        }
+        self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
+        true
     }
 
     fn route_should_stop(&self) -> bool {
-        if self.state.load(Ordering::Relaxed) != 0 {
+        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
             return true;
         }
-        if self.started.elapsed() >= self.duration {
+        let hard_duration = self.duration.saturating_add(timeout_grace(self.duration));
+        if self.started.elapsed() >= hard_duration {
             self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
             return true;
         }
@@ -2262,12 +3512,55 @@ impl Deadline {
     }
 
     fn was_triggered(&self) -> bool {
+        self.soft_expired();
         self.state.load(Ordering::Relaxed) & DEADLINE_TIMED_OUT != 0
+    }
+}
+
+/// Cooperative stop boundary for one route phase.
+///
+/// A phase yield does not mark the file as timed out: it merely forwards each
+/// route's complete incumbent to the next stage while the global soft budget
+/// still permits that stage to start.
+struct RouteWindow<'a> {
+    deadline: &'a Deadline,
+    stop_after: Option<Duration>,
+}
+
+impl<'a> RouteWindow<'a> {
+    fn full(deadline: &'a Deadline) -> Self {
+        Self {
+            deadline,
+            stop_after: None,
+        }
+    }
+
+    fn reserving_follow_up(deadline: &'a Deadline) -> Self {
+        let elapsed = deadline.started.elapsed();
+        let initial_share = initial_bounded_phase_share(deadline.remaining());
+        Self {
+            deadline,
+            stop_after: Some(elapsed.saturating_add(initial_share)),
+        }
+    }
+
+    fn can_start_route(&self) -> bool {
+        self.deadline.can_start_route()
+            && self.stop_after.map_or(true, |stop_after| {
+                self.deadline.started.elapsed() < stop_after
+            })
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop_after
+            .is_some_and(|stop_after| self.deadline.started.elapsed() >= stop_after)
+            || self.deadline.route_should_stop()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::*;
@@ -2376,19 +3669,27 @@ mod tests {
         assert_eq!(second.info.deflate_bits, first.info.deflate_bits);
         assert_eq!(second.data, first.data);
 
-        // Max mode always completes the default floor before optional timed
-        // routes. A spent optional budget must therefore retain the same
-        // fixed point without requiring a second executable invocation.
-        let max_options = Options {
+        // A zero-budget max run keeps a complete source fallback instead of
+        // making the comparison floor an unbounded timeout exception.
+        let zero_budget_max = Options {
             exhaustive: true,
             strict: false,
             timeout: Duration::ZERO,
             ..Options::default()
         };
+        let stopped = optimize_raw(&input, &zero_budget_max).unwrap();
+        assert!(stopped.timed_out);
+        assert_eq!(stopped.info.deflate_bits, source.meaningful_bits);
+        assert_eq!(stopped.data, input);
+
+        // With sufficient time, max mode closes the same feedback graph in one
+        // invocation and is itself at a fixed point.
+        let max_options = Options {
+            timeout: Duration::from_secs(1),
+            ..zero_budget_max
+        };
         let maximum = optimize_raw(&input, &max_options).unwrap();
-        assert!(maximum.timed_out);
-        assert_eq!(maximum.info.deflate_bits, first.info.deflate_bits);
-        assert_eq!(maximum.data, first.data);
+        assert!(maximum.info.deflate_bits <= first.info.deflate_bits);
         let repeated_max = optimize_raw(&maximum.data, &max_options).unwrap();
         assert_eq!(repeated_max.data, maximum.data);
     }
@@ -3005,19 +4306,19 @@ mod tests {
 
         let mut quad_block = parsed.blocks[0].clone();
         quad_block.source_type = SourceBlockType::Dynamic;
-        quad_block.tokens = vec![Token::Literal(b'a'); COMPACT_QUAD_MIN_TOKENS].into();
+        quad_block.tokens = vec![Token::Literal(b'a')].into();
         assert!(compact_quad_source_eligible(
-            COMPACT_QUAD_MIN_COMPRESSED,
+            1,
             quad_block.plain.len() as u64,
             std::slice::from_ref(&quad_block),
         ));
         assert!(!compact_quad_source_eligible(
-            COMPACT_QUAD_MIN_COMPRESSED - 1,
+            COMPACT_QUAD_MAX_COMPRESSED + 1,
             quad_block.plain.len() as u64,
             std::slice::from_ref(&quad_block),
         ));
         assert!(!compact_quad_source_eligible(
-            COMPACT_QUAD_MIN_COMPRESSED,
+            1,
             quad_block.plain.len() as u64,
             &[quad_block.clone(), quad_block],
         ));
@@ -3034,11 +4335,7 @@ mod tests {
         ];
         let parsed = parse_stream(&input, 2).unwrap();
         assert_eq!(parsed.source_block_count, 2);
-        assert!(!deft4j_source_route_eligible(
-            &parsed.blocks,
-            input.len(),
-            true
-        ));
+        assert!(!deft4j_source_route_eligible(&parsed.blocks, true));
         assert!(!narrow_source_route_eligible(&parsed.blocks, input.len()));
 
         let options = Options {
@@ -3137,6 +4434,54 @@ mod tests {
     }
 
     #[test]
+    fn bounded_floor_prebuild_follows_topology_and_work() {
+        assert!(prebuild_bounded_floor(1, 1));
+        assert!(prebuild_bounded_floor(
+            2,
+            PREBUILD_BOUNDED_FLOOR_MAX_DECODED
+        ));
+        assert!(!prebuild_bounded_floor(
+            2,
+            PREBUILD_BOUNDED_FLOOR_MAX_DECODED + 1
+        ));
+        assert!(!prebuild_bounded_floor(
+            2,
+            CONCURRENT_BOUNDED_FLOOR_MAX_DECODED
+        ));
+        assert!(prebuild_bounded_floor(
+            2,
+            CONCURRENT_BOUNDED_FLOOR_MAX_DECODED + 1
+        ));
+
+        let source_match = Token::Match {
+            length: 3,
+            distance: 1,
+            length_symbol: 257,
+            distance_symbol: 0,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 0,
+            distance_extra_bits: 0,
+        };
+        let block = ParsedBlock {
+            tokens: Arc::new(vec![source_match; PROVEN_SUBMATCH_FULL_MATCH_LIMIT + 1]),
+            plain: Arc::new(Vec::new()),
+            literal_frequencies: [0; 286],
+            distance_frequencies: [0; 30],
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        };
+        assert!(source_run_match_count_exceeds(
+            std::slice::from_ref(&block),
+            PROVEN_SUBMATCH_FULL_MATCH_LIMIT
+        ));
+    }
+
+    #[test]
     fn route_errors_cancel_siblings_without_marking_a_timeout() {
         let deadline = Deadline {
             started: Instant::now(),
@@ -3161,6 +4506,57 @@ mod tests {
     }
 
     #[test]
+    fn timeout_grace_is_ten_percent_plus_one_second_and_disabled_at_zero() {
+        assert_eq!(timeout_grace(Duration::ZERO), Duration::ZERO);
+        assert_eq!(
+            timeout_grace(Duration::from_secs(10)),
+            TIMEOUT_GRACE_BASE + Duration::from_secs(10) / TIMEOUT_GRACE_DIVISOR
+        );
+        assert_eq!(
+            timeout_grace(Duration::from_secs(4_000)),
+            Duration::from_secs(401)
+        );
+    }
+
+    #[test]
+    fn initial_bounded_routes_leave_one_fifth_for_follow_up_work() {
+        assert_eq!(
+            initial_bounded_phase_share(Duration::from_secs(100)),
+            Duration::from_secs(80)
+        );
+        assert_eq!(
+            initial_bounded_phase_share(Duration::from_secs(10)),
+            Duration::from_secs(8)
+        );
+    }
+
+    #[test]
+    fn soft_deadline_stops_new_routes_before_active_work() {
+        let duration = Duration::from_secs(10);
+        let grace = timeout_grace(duration);
+        let inside_grace = Deadline {
+            started: Instant::now()
+                .checked_sub(duration + grace / 2)
+                .expect("test duration fits in Instant"),
+            duration,
+            state: AtomicU8::new(0),
+        };
+        assert!(!inside_grace.can_start_route());
+        assert!(!inside_grace.expired());
+        assert!(inside_grace.was_triggered());
+
+        let past_hard_deadline = Deadline {
+            started: Instant::now()
+                .checked_sub(duration + grace + Duration::from_millis(1))
+                .expect("test duration fits in Instant"),
+            duration,
+            state: AtomicU8::new(0),
+        };
+        assert!(past_hard_deadline.expired());
+        assert!(past_hard_deadline.was_triggered());
+    }
+
+    #[test]
     fn weak_deft4j_threshold_is_strictly_below_two_percent() {
         assert!(deft4j_gain_is_below(10_000, 9_801, 200));
         assert!(!deft4j_gain_is_below(10_000, 9_800, 200));
@@ -3168,53 +4564,195 @@ mod tests {
     }
 
     #[test]
-    fn bounded_png_max_policy_is_narrow_and_inclusive() {
+    fn bounded_png_max_policy_follows_available_route_families() {
         assert_eq!(
-            bounded_png_max_policy(12, 0, 0, true, true),
-            BoundedPngMaxPolicy::default()
+            bounded_png_max_policy(1, false, true, true),
+            BoundedPngMaxPolicy::Standard
         );
-        for blocks in [13, 32] {
-            assert_eq!(
-                bounded_png_max_policy(blocks, 0, 0, true, true),
-                BoundedPngMaxPolicy::LegacyGrouping
-            );
-        }
         assert_eq!(
-            bounded_png_max_policy(33, 0, 0, true, true),
-            BoundedPngMaxPolicy::default()
+            bounded_png_max_policy(1, true, true, true),
+            BoundedPngMaxPolicy::FloorExpansion
         );
-
-        for blocks in [2, 4] {
+        for blocks in [2, 4, 13, 32, 33] {
             assert_eq!(
-                bounded_png_max_policy(blocks, 0, 0, true, false),
-                BoundedPngMaxPolicy::CoarseExpansion
+                bounded_png_max_policy(blocks, false, true, true),
+                BoundedPngMaxPolicy::FloorExpansion
             );
         }
 
         // Generic-only streams keep source max beside the floor lineage,
-        // including when their block count overlaps the legacy band.
+        // regardless of source block count.
         for blocks in [2, 13] {
             assert_eq!(
-                bounded_png_max_policy(blocks, 0, 0, false, false),
+                bounded_png_max_policy(blocks, false, false, false),
                 BoundedPngMaxPolicy::GenericParallel
             );
         }
+    }
 
-        // A trailing pair that accounts for every empty source block
-        // identifies a source-list topology whose deft4j continuation can
-        // outperform deterministic legacy grouping. Parsing removes those
-        // no-op blocks from the model, but retains both counts for routing.
-        assert_eq!(
-            bounded_png_max_policy(15, 2, 2, true, true),
-            BoundedPngMaxPolicy::Standard
-        );
+    #[test]
+    fn floor_state_probe_detects_token_and_boundary_changes() {
+        fn parsed(tokens: Vec<Token>, plain: Vec<u8>) -> ParsedBlock {
+            ParsedBlock {
+                tokens: Arc::new(tokens),
+                plain: Arc::new(plain),
+                literal_frequencies: [0; 286],
+                distance_frequencies: [0; 30],
+                original_literal_lengths: None,
+                original_distance_lengths: None,
+                original_dynamic: None,
+                original: None,
+                source_splits: Vec::new(),
+                source_type: SourceBlockType::Dynamic,
+            }
+        }
+        fn planned(tokens: Vec<Token>, plain: Vec<u8>) -> PlannedBlock {
+            PlannedBlock {
+                tokens: Arc::new(tokens),
+                plain: Arc::new(plain),
+                representation: Representation::Fixed,
+                bits: 0,
+                source_type: SourceBlockType::Dynamic,
+            }
+        }
 
-        // A source with interleaved empty blocks can also end in an empty
-        // pair. Its useful route remains the legacy grouping.
-        assert_eq!(
-            bounded_png_max_policy(18, 19, 2, true, true),
-            BoundedPngMaxPolicy::LegacyGrouping
-        );
+        let source = [parsed(
+            vec![Token::Literal(b'a'), Token::Literal(b'b')],
+            b"ab".to_vec(),
+        )];
+        let same = [planned(
+            vec![Token::Literal(b'a'), Token::Literal(b'b')],
+            b"ab".to_vec(),
+        )];
+        assert!(!floor_exposes_new_search_states(&source, &same));
+
+        let changed_tokens = [planned(
+            vec![Token::Literal(b'a'), Token::Literal(b'c')],
+            b"ab".to_vec(),
+        )];
+        assert!(floor_exposes_new_search_states(&source, &changed_tokens));
+
+        let changed_boundaries = [
+            planned(vec![Token::Literal(b'a')], b"a".to_vec()),
+            planned(vec![Token::Literal(b'b')], b"b".to_vec()),
+        ];
+        assert!(floor_exposes_new_search_states(
+            &source,
+            &changed_boundaries
+        ));
+    }
+
+    #[test]
+    fn compact_max_scheduling_follows_dependency_topology() {
+        let block = ParsedBlock {
+            tokens: Arc::new(vec![Token::Literal(0)]),
+            plain: Arc::new(vec![0]),
+            literal_frequencies: [0; 286],
+            distance_frequencies: [0; 30],
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        };
+        let compressed = [0_u8];
+        let identity = StreamIdentity {
+            decoded_size: 2,
+            crc32: 0,
+            adler32: 0,
+        };
+        let one_block = [block.clone()];
+        let one_block_source = CandidateInput {
+            compressed: &compressed,
+            blocks: &one_block,
+            meaningful_bits: 1,
+            decoded_limit: 2,
+            identity,
+        };
+        assert!(compact_parallel_source_max_work_class(one_block_source));
+        assert!(compact_complementary_source_max_is_cheap(one_block_source));
+        assert!(!compact_dependent_deft4j_work_class(one_block_source));
+
+        let two_blocks = [block.clone(), block];
+        let two_block_source = CandidateInput {
+            compressed: &compressed,
+            blocks: &two_blocks,
+            meaningful_bits: 1,
+            decoded_limit: 2,
+            identity,
+        };
+        assert!(!compact_parallel_source_max_work_class(two_block_source));
+        assert!(compact_complementary_source_max_is_cheap(two_block_source));
+        assert!(compact_dependent_deft4j_work_class(two_block_source));
+        assert!(!repartition_graph_covers_source_blocks(&two_blocks, 1));
+        assert!(repartition_graph_covers_source_blocks(&two_blocks, 2));
+
+        let large_token_block = ParsedBlock {
+            tokens: Arc::new(vec![
+                Token::Literal(0);
+                COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS + 1
+            ]),
+            ..two_blocks[0].clone()
+        };
+        let large_token_blocks = [large_token_block];
+        let large_token_source = CandidateInput {
+            compressed: &compressed,
+            blocks: &large_token_blocks,
+            meaningful_bits: 1,
+            decoded_limit: 2,
+            identity,
+        };
+        assert!(!compact_complementary_source_max_is_cheap(
+            large_token_source
+        ));
+        assert!(!compact_single_source_route_work_class(large_token_source));
+        assert!(repartition_graph_covers_source_blocks(
+            &large_token_blocks,
+            1
+        ));
+
+        let single_route_token_block = ParsedBlock {
+            tokens: Arc::new(vec![
+                Token::Literal(0);
+                COMPACT_SINGLE_SOURCE_ROUTE_MIN_TOKENS
+            ]),
+            ..large_token_blocks[0].clone()
+        };
+        let single_route_token_blocks = [single_route_token_block];
+        let single_route_token_source = CandidateInput {
+            compressed: &compressed,
+            blocks: &single_route_token_blocks,
+            meaningful_bits: 1,
+            decoded_limit: 2,
+            identity,
+        };
+        assert!(compact_single_source_route_work_class(
+            single_route_token_source
+        ));
+
+        let oversized_token_block = ParsedBlock {
+            tokens: Arc::new(vec![
+                Token::Literal(0);
+                COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS + 1
+            ]),
+            ..large_token_blocks[0].clone()
+        };
+        let oversized_token_blocks = [oversized_token_block];
+        let oversized_token_source = CandidateInput {
+            compressed: &compressed,
+            blocks: &oversized_token_blocks,
+            meaningful_bits: 1,
+            decoded_limit: 2,
+            identity,
+        };
+        assert!(!compact_single_source_route_work_class(
+            oversized_token_source
+        ));
+        assert!(!repartition_graph_covers_source_blocks(
+            &oversized_token_blocks,
+            1
+        ));
     }
 
     #[test]

@@ -92,6 +92,7 @@ fn parse_stream_with_model_limit(
     let mut blocks = Vec::new();
     let mut source_blocks = 0;
     let mut empty_blocks = 0;
+    #[cfg(test)]
     let mut trailing_empty_blocks = 0;
     let mut saw_content = false;
     loop {
@@ -105,7 +106,10 @@ fn parse_stream_with_model_limit(
         source_blocks += 1;
         if block.plain.is_empty() {
             empty_blocks += 1;
-            trailing_empty_blocks += 1;
+            #[cfg(test)]
+            {
+                trailing_empty_blocks += 1;
+            }
 
             // Empty blocks have no effect on decoded bytes or history. Keep
             // one only while the stream might prove entirely empty; once a
@@ -119,7 +123,10 @@ fn parse_stream_with_model_limit(
                 blocks.push(block);
             }
         } else {
-            trailing_empty_blocks = 0;
+            #[cfg(test)]
+            {
+                trailing_empty_blocks = 0;
+            }
             if !saw_content {
                 blocks.clear(); // Drop the provisional all-empty block.
                 saw_content = true;
@@ -140,6 +147,7 @@ fn parse_stream_with_model_limit(
     Ok(ParsedStream {
         source_block_count: source_blocks,
         source_empty_block_count: empty_blocks,
+        #[cfg(test)]
         source_trailing_empty_block_count: trailing_empty_blocks,
         blocks,
         consumed,

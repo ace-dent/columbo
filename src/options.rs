@@ -55,10 +55,12 @@ pub struct Options {
     /// decoders, and the Defluff-derived, non-standard symbol-284 spelling of
     /// length 258.
     pub strict: bool,
-    /// Wall-clock search budget for the whole input file.
+    /// Soft wall-clock scheduling budget for the whole input file.
     ///
     /// Embedded PNG frames, GZIP members, and ZIP entries share this budget;
-    /// validation and the complete no-growth fallback are never skipped.
+    /// no new route starts after it expires. An active route may use ten
+    /// percent plus one second to finalize its best candidate. Validation and
+    /// the complete no-growth fallback are never skipped.
     pub timeout: Duration,
     /// Maximum number of compressed bytes accepted from the supplied file.
     pub max_input_bytes: u64,

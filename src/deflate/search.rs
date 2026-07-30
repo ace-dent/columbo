@@ -16,6 +16,7 @@
 //! compositions, even when they use a recovered primitive internally.
 
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::Options;
@@ -58,13 +59,14 @@ const DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE: usize = 16;
 // widens to every match in the explicitly bounded full-graph band.
 const DEFAULT_PROVEN_SUBMATCH_TARGETS: usize = 8;
 const DEFAULT_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS: usize = 4;
+const COMPACT_PROVEN_SUBMATCH_TOKENS: usize = 4_000;
 const DEFAULT_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL: usize = 2;
 const MAX_PROVEN_SUBMATCH_TARGETS: usize = 32;
 const MAX_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS: usize = 8;
 const MAX_PROVEN_SUBMATCH_TARGETS_PER_SYMBOL: usize = 4;
 const MAX_PROVEN_SUBMATCH_FULL_TOKENS: usize = 12_000;
 const MAX_PROVEN_SUBMATCH_FULL_PLAIN: usize = 80_000;
-const MAX_PROVEN_SUBMATCH_FULL_MATCHES: usize = 512;
+pub(crate) const PROVEN_SUBMATCH_FULL_MATCH_LIMIT: usize = 512;
 const MAX_PROVEN_SUBMATCH_ELIMINATION_MATCHES: usize = 64;
 const MAX_PROVEN_SUBMATCH_PASSES: usize = 12;
 const PROVEN_SUBMATCH_RARE_FREQUENCY: u32 = 2;
@@ -596,6 +598,31 @@ enum ProvenSubmatchRestriction {
 /// exact-prices one bounded set of rare, header-expensive, transition-adjacent
 /// or boundary-near matches. Max mode widens compact blocks to every match and
 /// repeats only strict winners until their token spelling stabilizes.
+pub(crate) fn proven_submatch_route_eligible(
+    tokens: &[Token],
+    plain_len: usize,
+    exhaustive: bool,
+) -> bool {
+    let model_is_bounded = if exhaustive {
+        tokens.len() <= SHORT_FAMILY_MAX_TOKENS && plain_len <= MANDATORY_FLOOR_MAX_PLAIN
+    } else {
+        tokens.len() <= MANDATORY_FLOOR_MAX_TOKENS && plain_len <= MANDATORY_FLOOR_MAX_PLAIN
+    };
+    model_is_bounded
+        && tokens
+            .iter()
+            .any(|token| matches!(token, Token::Match { .. }))
+}
+
+/// Whether the complete proven-feedback sibling has tightly bounded work.
+pub(crate) fn compact_proven_submatch_route_eligible(tokens: &[Token], plain_len: usize) -> bool {
+    tokens.len() <= COMPACT_PROVEN_SUBMATCH_TOKENS
+        && plain_len <= MAX_PROVEN_SUBMATCH_FULL_PLAIN
+        && tokens
+            .iter()
+            .any(|token| matches!(token, Token::Match { .. }))
+}
+
 fn consider_proven_submatches<F>(
     block: &ParsedBlock,
     alignment: u8,
@@ -605,14 +632,9 @@ fn consider_proven_submatches<F>(
 ) where
     F: FnMut() -> bool,
 {
-    let model_is_bounded = if options.exhaustive {
-        best.tokens.len() <= SHORT_FAMILY_MAX_TOKENS
-            && block.plain.len() <= MANDATORY_FLOOR_MAX_PLAIN
-    } else {
-        best.tokens.len() <= MANDATORY_FLOOR_MAX_TOKENS
-            && block.plain.len() <= MANDATORY_FLOOR_MAX_PLAIN
-    };
-    if !model_is_bounded || expired() {
+    if !proven_submatch_route_eligible(&best.tokens, block.plain.len(), options.exhaustive)
+        || expired()
+    {
         return;
     }
 
@@ -633,7 +655,7 @@ fn consider_proven_submatches<F>(
         let full_graph = options.exhaustive
             && pass_tokens.len() <= MAX_PROVEN_SUBMATCH_FULL_TOKENS
             && block.plain.len() <= MAX_PROVEN_SUBMATCH_FULL_PLAIN
-            && match_count <= MAX_PROVEN_SUBMATCH_FULL_MATCHES;
+            && match_count <= PROVEN_SUBMATCH_FULL_MATCH_LIMIT;
 
         let Some(targets) = select_proven_submatch_targets(
             &pass_tokens,
@@ -676,7 +698,7 @@ fn consider_proven_submatches<F>(
         // from being hidden by other graph choices. The combined candidate
         // below remains the main default route.
         let compact_for_trials =
-            pass_tokens.len() <= 4_000 && block.plain.len() <= MAX_PROVEN_SUBMATCH_FULL_PLAIN;
+            compact_proven_submatch_route_eligible(&pass_tokens, block.plain.len());
         let individual_limit = if compact_for_trials {
             if options.exhaustive {
                 MAX_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS
@@ -752,6 +774,25 @@ fn consider_proven_submatches<F>(
             break;
         }
     }
+}
+
+/// Continue one complete block through Columbo's proven-submatch endpoint.
+///
+/// The stream optimizer runs this as an independent candidate lineage. Keeping
+/// it separate prevents an immediate local resegmentation win from replacing a
+/// different token spelling that reaches a better fixed point after replay.
+pub(crate) fn improve_plan_with_proven_submatches<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+    mut best: PlannedBlock,
+) -> PlannedBlock
+where
+    F: FnMut() -> bool,
+{
+    consider_proven_submatches(block, alignment, options, expired, &mut best);
+    best
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1480,12 +1521,14 @@ where
 /// search deadline has already elapsed.
 ///
 /// This is intentionally much smaller than [`plan_block_with_search`]: it
-/// prices same-distance runs and a bounded set of match-to-literal or
-/// proven-submatch rewrites against the source, best, and fixed trees. Compact
-/// block lists may request Columbo's `extended` feedback-tree/replay floor.
-/// There are no beams, match-group combinations, or newly discovered LZ77
-/// matches. The bound lets ZIP/APNG give every member one useful pass before
-/// optional search time is concentrated on harder streams.
+/// prices same-distance runs and a bounded set of match-to-literal rewrites
+/// against the source, best, and fixed trees. Compact block lists may request
+/// Columbo's `extended` feedback-tree/replay floor. Proven-submatch
+/// resegmentation is evaluated separately at stream scope so its replay fixed
+/// point cannot displace this floor. There are no beams, match-group
+/// combinations, or newly discovered LZ77 matches. The bound lets ZIP/APNG
+/// give every member one useful pass before optional search time is
+/// concentrated on harder streams.
 pub(crate) fn plan_block_with_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -1510,6 +1553,33 @@ pub(crate) fn improve_plan_with_floor(
     alignment: u8,
     options: &Options,
     extended: bool,
+    best: PlannedBlock,
+) -> PlannedBlock {
+    improve_plan_with_floor_policy(block, alignment, options, extended, false, best)
+}
+
+/// Compose proven-submatch resegmentation inside the bounded source floor.
+///
+/// The ordinary stream planner uses this only when a preceding same-distance
+/// repartition makes the transformations dependent. A separate compact route
+/// may also use it to preserve the historical integrated-before-feedback fixed
+/// point without letting a local token choice displace the ordinary lineage.
+pub(crate) fn improve_plan_with_integrated_proven_floor(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    extended: bool,
+    best: PlannedBlock,
+) -> PlannedBlock {
+    improve_plan_with_floor_policy(block, alignment, options, extended, true, best)
+}
+
+fn improve_plan_with_floor_policy(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    extended: bool,
+    include_proven: bool,
     mut best: PlannedBlock,
 ) -> PlannedBlock {
     let mut floor_options = options.clone();
@@ -1537,13 +1607,15 @@ pub(crate) fn improve_plan_with_floor(
         &mut never_expired,
         &mut best,
     );
-    consider_proven_submatches(
-        block,
-        alignment,
-        &floor_options,
-        &mut never_expired,
-        &mut best,
-    );
+    if include_proven {
+        consider_proven_submatches(
+            block,
+            alignment,
+            &floor_options,
+            &mut never_expired,
+            &mut best,
+        );
+    }
     if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
         if normalized.as_slice() != block.tokens.as_slice() {
             consider_tokens(
@@ -2321,6 +2393,61 @@ where
     )
 }
 
+/// Search one compact block with proven resegmentation before table feedback.
+///
+/// This preserves a distinct fixed point from the ordinary endpoint ordering.
+/// Max mode runs it as an independent comparison candidate, so the locally
+/// smaller seed cannot displace the completed normal route.
+pub(crate) fn plan_block_with_integrated_proven_search<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    expired: &mut F,
+) -> PlannedBlock
+where
+    F: FnMut() -> bool,
+{
+    plan_block_with_search_policy(
+        block,
+        alignment,
+        options,
+        SearchPolicy {
+            integrated_proven: true,
+            ..SearchPolicy::FULL
+        },
+        SearchBase::Price,
+        expired,
+    )
+}
+
+/// Continue a completed integrated floor through the same proven-first search.
+///
+/// This preserves the historical ordering as an additive comparison route:
+/// the bounded floor establishes feedback-tree seeds, then the full search may
+/// extend them without replacing the ordinary stream lineage.
+pub(crate) fn plan_block_with_complete_integrated_proven_search<F>(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    base: PlannedBlock,
+    expired: &mut F,
+) -> PlannedBlock
+where
+    F: FnMut() -> bool,
+{
+    plan_block_with_search_policy(
+        block,
+        alignment,
+        options,
+        SearchPolicy {
+            integrated_proven: true,
+            ..SearchPolicy::FULL
+        },
+        SearchBase::Complete(base),
+        expired,
+    )
+}
+
 /// Search one complete source block without stream-split or iterative siblings.
 ///
 /// The direct source route uses the same table-feedback ladder as the ordinary
@@ -2348,6 +2475,7 @@ where
             ordered_queue: false,
             replay: false,
             large_source_bands: true,
+            integrated_proven: false,
         },
         SearchBase::Price,
         expired,
@@ -2378,6 +2506,7 @@ where
             ordered_queue: false,
             replay: false,
             large_source_bands: true,
+            integrated_proven: false,
         },
         SearchBase::Additional(seed),
         expired,
@@ -2400,6 +2529,7 @@ struct SearchPolicy {
     ordered_queue: bool,
     replay: bool,
     large_source_bands: bool,
+    integrated_proven: bool,
 }
 
 impl SearchPolicy {
@@ -2409,6 +2539,7 @@ impl SearchPolicy {
         ordered_queue: true,
         replay: true,
         large_source_bands: false,
+        integrated_proven: false,
     };
 }
 
@@ -2447,11 +2578,12 @@ where
     if expired() {
         return best;
     }
-    consider_proven_submatches(block, alignment, options, expired, &mut best);
-    if expired() {
-        return best;
+    if policy.integrated_proven {
+        consider_proven_submatches(block, alignment, options, expired, &mut best);
+        if expired() {
+            return best;
+        }
     }
-
     // Defluff normalizes the noncanonical 258 alias on input. Columbo also
     // offers a broader opt-in reverse candidate whenever symbol 284 plus five
     // extra bits may beat symbol 285; unlike Defluff, it does not require
@@ -2685,37 +2817,22 @@ where
     }
 
     if try_ordered_queue && !expired() {
-        if let Some(mut alternate) = pre_individual {
-            if alternate.tokens != best.tokens {
-                if let Some(mut post_individual) = try_clone_planned_block(&best) {
-                    // Explore the missing sibling first, then preserve the
-                    // original post-prune queue as a second bounded seed.
-                    ordered_state_queue(block, alignment, options, expired, &mut alternate);
-                    if alternate.bits < best.bits {
-                        best = alternate;
-                    }
-                    if !expired() {
-                        ordered_state_queue(
-                            block,
-                            alignment,
-                            options,
-                            expired,
-                            &mut post_individual,
-                        );
-                        if post_individual.bits < best.bits {
-                            best = post_individual;
-                        }
-                    }
-                } else {
-                    // Allocation failure keeps the established single-seed
-                    // route instead of making optional search an error.
-                    ordered_state_queue(block, alignment, options, expired, &mut best);
-                }
-            } else {
-                ordered_state_queue(block, alignment, options, expired, &mut best);
+        let alternate = pre_individual.filter(|alternate| alternate.tokens != best.tokens);
+        let mut seen = HashSet::new();
+        // Queue edges only expand matches to literals; they cannot reconstruct
+        // a match removed by the greedy individual-prune floor. Search the
+        // intact root first because its reachable graph is therefore a strict
+        // superset. If time remains, continue from the smaller pruned root.
+        // Both beams share exact visited state, so converged descendants are
+        // priced once rather than once per lineage.
+        if let Some(mut intact) = alternate {
+            ordered_state_queue(block, alignment, options, expired, &mut intact, &mut seen);
+            if intact.bits < best.bits {
+                best = intact;
             }
-        } else {
-            ordered_state_queue(block, alignment, options, expired, &mut best);
+        }
+        if !expired() {
+            ordered_state_queue(block, alignment, options, expired, &mut best, &mut seen);
         }
     }
 
@@ -2776,6 +2893,7 @@ fn ordered_state_queue<F>(
     options: &Options,
     expired: &mut F,
     best: &mut PlannedBlock,
+    seen: &mut HashSet<Vec<Token>>,
 ) where
     F: FnMut() -> bool,
 {
@@ -2792,10 +2910,20 @@ fn ordered_state_queue<F>(
         bits: best.bits,
         table: QueueTable::Unknown,
     }];
-    // Every edge expands at least one match of length three or more. Token
-    // counts therefore increase monotonically, so no child can return to the
-    // unexpanded initial state.
-    let mut seen = Vec::new();
+    // Every edge expands at least one match of length three or more. Seed the
+    // shared exact history with this root so a later alternate queue cannot
+    // reprice it or any child already visited here. A linear history made every
+    // new state rescan up to hundreds of earlier multi-thousand-token vectors,
+    // wasting most of a max route on duplicate detection. `HashSet` still
+    // confirms full token equality after hashing, so collisions cannot
+    // suppress a distinct candidate.
+    seen.reserve(BEAM * DEPTH * CHILDREN);
+    for state in &current {
+        let Some(tokens) = try_clone_token_candidate(&state.tokens, block.plain.len()) else {
+            return;
+        };
+        seen.insert(tokens);
+    }
 
     for _ in 0..DEPTH {
         let mut next = Vec::new();
@@ -2841,18 +2969,17 @@ fn ordered_state_queue<F>(
                 else {
                     continue;
                 };
-                if seen.iter().any(|known| known == &tokens) {
-                    continue;
-                }
                 let Some(seen_tokens) = try_clone_token_candidate(&tokens, block.plain.len())
                 else {
                     return;
                 };
+                if !seen.insert(seen_tokens) {
+                    continue;
+                }
                 let Some(planned_tokens) = try_clone_token_candidate(&tokens, block.plain.len())
                 else {
                     return;
                 };
-                seen.push(seen_tokens);
                 let Some(plan) = plan_tokens(block, planned_tokens, alignment, options, expired)
                 else {
                     return;
@@ -4015,6 +4142,24 @@ mod tests {
         );
         assert!(expired.is_none());
         assert!(checks > 2);
+    }
+
+    #[test]
+    fn compact_proven_feedback_uses_token_and_plain_work_bounds() {
+        let matching = [test_match(4, 1, 0, 0, 0)];
+        assert!(compact_proven_submatch_route_eligible(&matching, 4));
+        assert!(!compact_proven_submatch_route_eligible(
+            &[Token::Literal(0)],
+            1
+        ));
+        assert!(!compact_proven_submatch_route_eligible(
+            &vec![matching[0]; COMPACT_PROVEN_SUBMATCH_TOKENS + 1],
+            4
+        ));
+        assert!(!compact_proven_submatch_route_eligible(
+            &matching,
+            MAX_PROVEN_SUBMATCH_FULL_PLAIN + 1
+        ));
     }
 
     #[test]

@@ -242,6 +242,7 @@ impl Progress {
             current_tokens: Cell::new(None),
             deadline_reached: Cell::new(false),
             enabled: self.enabled,
+            finalizing_after_soft_deadline: Cell::new(false),
             heartbeat_emitted: Cell::new(false),
             heartbeat_interval,
             last_reported: Cell::new(route_started),
@@ -370,6 +371,7 @@ pub(crate) struct RouteProgress {
     current_tokens: Cell<Option<usize>>,
     deadline_reached: Cell<bool>,
     enabled: bool,
+    finalizing_after_soft_deadline: Cell<bool>,
     heartbeat_emitted: Cell<bool>,
     heartbeat_interval: Duration,
     last_reported: Cell<Option<Instant>>,
@@ -393,6 +395,7 @@ impl RouteProgress {
             current_tokens: Cell::new(None),
             deadline_reached: Cell::new(false),
             enabled: false,
+            finalizing_after_soft_deadline: Cell::new(false),
             heartbeat_emitted: Cell::new(false),
             heartbeat_interval: MAX_ROUTE_HEARTBEAT,
             last_reported: Cell::new(None),
@@ -415,6 +418,17 @@ impl RouteProgress {
         if self.enabled {
             self.deadline_reached.set(true);
         }
+    }
+
+    pub(crate) fn finalizing_after_soft_deadline(&self, grace: Duration) {
+        if !self.enabled || self.finalizing_after_soft_deadline.replace(true) {
+            return;
+        }
+        println!(
+            "  S{}       · Soft deadline reached · finalizing active candidate · up to {} grace",
+            self.stream_id,
+            format_duration(grace),
+        );
     }
 
     pub(crate) fn deadline_was_reached(&self) -> bool {

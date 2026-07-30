@@ -263,7 +263,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                     frame_written = true;
                 }
             }
-            b"zTXt" | b"iTXt" | b"iCCP" => {
+            b"zTXt" | b"iTXt" | b"iCCP"
+                if compressed_zlib_offset(chunk.kind, chunk.data).is_some() =>
+            {
                 let replacement = if let Some(replacement) = &quick_replacements[index] {
                     try_clone_compressed_body(replacement)
                         .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?
@@ -275,7 +277,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                         DefaultFloor::Shared,
                         &mut budget,
                     )?
-                    .expect("compressed PNG metadata has a recognized zlib offset")
+                    .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?
                 };
                 source_deflate_bits = source_deflate_bits
                     .checked_add(replacement.source_deflate_bits)
@@ -833,16 +835,12 @@ enum ImageJob {
 // Parsing, checksum validation, and PNG reconstruction also consume wall time,
 // but only the raw Deflate searches receive the proportional slices below.
 // Reserve ten percent outside the non-largest slices (twenty percent for a
-// container with more than 32 unique image streams), then permit the final
-// largest stream one bounded comparison-floor allowance. This mirrors the
-// original Columbo C optimizer's per-stream fallback recovery; the black-box
-// timeout tests cap the complete process, including this at-most-two-second
-// allowance.
+// container with more than 32 unique image streams). The final largest stream
+// receives the remaining search time; the raw optimizer's global ten-percent
+// plus one-second grace replaces the former PNG-specific recovery allowance.
 const NON_LARGEST_IMAGE_SEARCH_FRACTION: f64 = 0.90;
 const MANY_IMAGE_SEARCH_FRACTION: f64 = 0.80;
 const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
-const LARGEST_IMAGE_FLOOR_ALLOWANCE_FRACTION: f64 = 0.20;
-const LARGEST_IMAGE_FLOOR_ALLOWANCE_CAP: Duration = Duration::from_secs(2);
 
 /// Optimize the IDAT stream and each unique APNG frame under one file budget.
 ///
@@ -909,16 +907,6 @@ fn optimize_image_streams(
     } else {
         NON_LARGEST_IMAGE_SEARCH_FRACTION
     };
-    // Do not multiply fallback grace across very large animations: their many
-    // mandatory validation/floor passes already account for the wall-clock
-    // headroom. Smaller containers can use one bounded final-stream recovery.
-    let largest_floor_allowance = if jobs.len() > MANY_IMAGE_JOB_THRESHOLD {
-        Duration::ZERO
-    } else {
-        scale_duration(options.timeout, LARGEST_IMAGE_FLOOR_ALLOWANCE_FRACTION)
-            .min(LARGEST_IMAGE_FLOOR_ALLOWANCE_CAP)
-    };
-
     let mut optimized_idat = None;
     let mut optimized = Vec::<Option<FrameOptimization>>::new();
     optimized
@@ -947,10 +935,8 @@ fn optimize_image_streams(
             weight,
             total_weight,
             non_largest_fraction,
-            largest_floor_allowance,
             job == reserved_largest,
         );
-        let extends_file_deadline = call_options.timeout > file_remaining;
 
         // A spent search budget disables optional searches, not validation.
         // Every IDAT/fdAT stream must still be fully decoded, checksum-checked,
@@ -961,9 +947,6 @@ fn optimize_image_streams(
         };
         let result =
             optimize_scheduled_png_zlib(stream, &call_options, false, image_floor, budget)?;
-        if extends_file_deadline && budget.deadline.remaining().is_zero() {
-            budget.timed_out = true;
-        }
         match job {
             ImageJob::Idat => {
                 optimized_idat = Some(FrameOptimization {
@@ -1103,22 +1086,14 @@ fn image_stream_timeout(
     weight: usize,
     total_weight: usize,
     non_largest_fraction: f64,
-    largest_floor: Duration,
     is_largest: bool,
 ) -> Duration {
-    if weight == 0 || total_weight == 0 {
+    if weight == 0 || total_weight == 0 || remaining.is_zero() {
         return Duration::ZERO;
-    }
-    if remaining.is_zero() {
-        return if is_largest {
-            largest_floor
-        } else {
-            Duration::ZERO
-        };
     }
     let headroom = scale_duration(remaining, 0.98);
     if is_largest {
-        return headroom.max(largest_floor);
+        return headroom;
     }
     let proportional = scale_duration(
         configured,
@@ -1932,7 +1907,7 @@ mod tests {
     }
 
     #[test]
-    fn image_timeout_is_proportional_and_reserves_largest_leftover() {
+    fn image_timeout_is_proportional_and_gives_largest_the_remainder() {
         let configured = Duration::from_secs(10);
         let remaining = Duration::from_secs(8);
 
@@ -1943,7 +1918,6 @@ mod tests {
                 2,
                 10,
                 NON_LARGEST_IMAGE_SEARCH_FRACTION,
-                Duration::from_secs(2),
                 false,
             ),
             Duration::from_millis(1_800)
@@ -1955,7 +1929,6 @@ mod tests {
                 2,
                 10,
                 MANY_IMAGE_SEARCH_FRACTION,
-                Duration::ZERO,
                 false,
             ),
             Duration::from_millis(1_600)
@@ -1967,7 +1940,6 @@ mod tests {
                 2,
                 10,
                 NON_LARGEST_IMAGE_SEARCH_FRACTION,
-                Duration::from_secs(2),
                 true,
             ),
             Duration::from_millis(7_840)
@@ -1979,10 +1951,9 @@ mod tests {
                 2,
                 10,
                 NON_LARGEST_IMAGE_SEARCH_FRACTION,
-                Duration::from_secs(2),
                 true,
             ),
-            Duration::from_secs(2)
+            Duration::ZERO
         );
     }
 
@@ -2080,6 +2051,25 @@ mod tests {
         );
         assert!(!parsed.chunks.iter().any(|chunk| chunk.kind == *b"tEXt"));
         assert!(result.data.len() < input.len());
+    }
+
+    #[test]
+    fn uncompressed_itxt_is_preserved_without_entering_zlib_optimization() {
+        let metadata = b"Comment\0\0\0\0\0plain UTF-8 text";
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"iTXt", metadata));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let result = optimize(&input, &Options::default()).unwrap();
+        let parsed = parse(&result.data).unwrap();
+        let preserved = parsed
+            .chunks
+            .iter()
+            .find(|chunk| chunk.kind == *b"iTXt")
+            .expect("uncompressed iTXt should be preserved");
+        assert_eq!(preserved.data, metadata);
     }
 
     #[test]

@@ -21,7 +21,7 @@ const PROGRAM_VERSION: &str = concat!(
     ".",
     env!("CARGO_PKG_VERSION_MINOR")
 );
-const PROGRAM_STAGE: &str = "Beta";
+const PROGRAM_STAGE: &str = "Alpha";
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -703,9 +703,10 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         concat!(
-            "  -t, --timeout          stop byte-seeking searches after this many seconds",
+            "  -t, --timeout          stop starting search routes after this many seconds",
             "\n                         (default: 180; range: 10..4000;",
-            " fractions round up)"
+            " fractions round up;",
+            "\n                         active route grace: 10% + 1 second)"
         )
     )?;
     writeln!(
