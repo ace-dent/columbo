@@ -1372,9 +1372,13 @@ fn optimize_compressed_body(
     let body_len = zlib_offset
         .checked_add(optimized.data.len())
         .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
+    let source_header = data.get(zlib_offset..).and_then(|zlib| zlib.get(..2));
+    let header_improved = optimized.data.get(..2) != source_header;
     if !options.strict
         && (body_len > data.len()
-            || (body_len == data.len() && output_deflate_bits >= source_deflate_bits))
+            || (body_len == data.len()
+                && output_deflate_bits >= source_deflate_bits
+                && !header_improved))
     {
         return Ok(Some(CompressedBodyOptimization {
             replacement: None,
@@ -1540,6 +1544,11 @@ mod tests {
         stream
     }
 
+    fn assert_maximum_flevel(stream: &[u8]) {
+        assert!(zlib::has_rfc1950_header(stream));
+        assert_eq!(stream[1] >> 6, 3);
+    }
+
     #[test]
     fn validates_crc_before_decoding_idat() {
         let mut input = SIGNATURE.to_vec();
@@ -1584,7 +1593,8 @@ mod tests {
 
         let result = optimize(&input, &Options::default()).unwrap();
         assert!(result.data.len() <= input.len());
-        parse(&result.data).unwrap();
+        let parsed = parse(&result.data).unwrap();
+        assert_maximum_flevel(&parsed.idat);
     }
 
     #[test]
@@ -2122,6 +2132,37 @@ mod tests {
         assert!(result.data.len() <= input.len());
         let parsed = parse(&result.data).unwrap();
         assert_eq!(parsed.fdat_frames.len(), 1);
+        assert_maximum_flevel(&parsed.idat);
+        assert_maximum_flevel(&parsed.fdat_frames[0]);
+    }
+
+    #[test]
+    fn relaxed_compressed_metadata_retains_flevel_only_improvement() {
+        let empty_zlib = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut metadata = b"Comment\0\0".to_vec();
+        metadata.extend_from_slice(&empty_zlib);
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"zTXt", &metadata));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let result = optimize(
+            &input,
+            &Options {
+                strict: false,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse(&result.data).unwrap();
+        let metadata = parsed
+            .chunks
+            .iter()
+            .find(|chunk| chunk.kind == *b"zTXt")
+            .expect("compressed metadata should be retained");
+        let offset = compressed_zlib_offset(metadata.kind, metadata.data).unwrap();
+        assert_maximum_flevel(&metadata.data[offset..]);
     }
 
     #[test]

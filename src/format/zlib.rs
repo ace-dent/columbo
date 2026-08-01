@@ -80,7 +80,9 @@ pub(super) fn optimize_embedded(
     }
 
     // A zlib stream is exactly: two-byte header, raw Deflate data, Adler-32.
-    // Keep both wrapper fields byte-for-byte so Columbo only changes Deflate.
+    // The checksum and window/method byte remain unchanged. FLEVEL is only an
+    // encoder-effort hint, so rewritten streams advertise Columbo's maximum
+    // optimization effort while retaining a valid FCHECK value.
     let raw_input = &input[2..input.len() - 4];
     let mut raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
 
@@ -126,7 +128,7 @@ pub(super) fn optimize_embedded(
         .checked_add(6)
         .ok_or_else(|| Error::new("zlib output is too large"))?;
     let mut data = try_vec_with_capacity(output_size, OUTPUT_ALLOCATION_ERROR)?;
-    data.extend_from_slice(&input[..2]);
+    data.extend_from_slice(&maximum_compression_header(input[0]));
     data.extend_from_slice(&raw.data);
     data.extend_from_slice(&input[input.len() - 4..]);
 
@@ -135,6 +137,7 @@ pub(super) fn optimize_embedded(
     if data.len() > input.len() && !options.strict {
         data.clear();
         try_append_bytes(&mut data, input, OUTPUT_ALLOCATION_ERROR)?;
+        data[..2].copy_from_slice(&maximum_compression_header(input[0]));
         raw.info.deflate_bits = raw.info.source_deflate_bits;
     }
 
@@ -143,6 +146,19 @@ pub(super) fn optimize_embedded(
         info: Some(raw.info),
         timed_out: raw.timed_out,
     })
+}
+
+/// Preserve CM/CINFO while advertising RFC 1950's maximum compression level.
+///
+/// FCHECK occupies the low five bits of FLG and makes the two-byte header a
+/// multiple of 31. FDICT is clear because dictionary-backed streams are
+/// rejected before this helper is reached.
+fn maximum_compression_header(cmf: u8) -> [u8; 2] {
+    const MAXIMUM_FLEVEL: u8 = 0b11 << 6;
+
+    let unchecked = (u16::from(cmf) << 8) | u16::from(MAXIMUM_FLEVEL);
+    let fcheck = (31 - unchecked % 31) % 31;
+    [cmf, MAXIMUM_FLEVEL | fcheck as u8]
 }
 
 /// Recognize the complete two-byte RFC 1950 header.
@@ -205,11 +221,14 @@ mod tests {
     }
 
     #[test]
-    fn preserves_a_valid_empty_stream() {
+    fn valid_empty_stream_advertises_maximum_compression() {
         // Empty fixed-Huffman Deflate stream followed by Adler-32("").
         let input = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
         let result = optimize(&input, &Options::default()).unwrap();
-        assert_eq!(result.data, input);
+        assert_eq!(&result.data[..2], &[0x78, 0xda]);
+        assert_eq!(&result.data[2..], &input[2..]);
+        assert!(has_rfc1950_header(&result.data));
+        assert_eq!(result.data[1] >> 6, 3);
         assert!(!result.timed_out);
     }
 
