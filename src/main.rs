@@ -83,6 +83,12 @@ struct ExecutionTimings {
     total: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CautionDestination {
+    Stdout,
+    Stderr,
+}
+
 enum ParsedCommand {
     Help,
     Run(Command),
@@ -166,15 +172,14 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
         let _ = print_detailed_header(&mut io::stderr(), &command, input.len(), read_elapsed);
     }
 
-    if (command.options.verbose || command.options.visual) && !command.options.strict {
-        let note =
-            "note: strict mode disabled; enabling compact empty/singleton Huffman alphabets \
-                    and the non-standard length-258 alias";
-        if command.options.visual {
-            eprintln!("{note}");
-        } else {
-            println!("{note}");
+    match strict_mode_caution_destination(&command.options) {
+        Some(CautionDestination::Stdout) => {
+            let _ = print_strict_mode_caution(&mut io::stdout(), terminal::stdout_color_enabled());
         }
+        Some(CautionDestination::Stderr) => {
+            let _ = print_strict_mode_caution(&mut io::stderr(), terminal::stderr_color_enabled());
+        }
+        None => {}
     }
 
     let optimize_started = detailed.then(Instant::now);
@@ -371,6 +376,29 @@ fn print_detailed_header(
         )
     } else {
         writeln!(output, "Mode     normal · {strictness}{dry_run}")
+    }
+}
+
+fn print_strict_mode_caution(output: &mut dyn Write, color: bool) -> io::Result<()> {
+    let (yellow, reset) = if color {
+        ("\x1b[33m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    writeln!(
+        output,
+        "{yellow}Caution:{reset} strict mode disabled; enabling compact empty/singleton \
+         Huffman alphabets and the non-standard length-258 alias"
+    )
+}
+
+fn strict_mode_caution_destination(options: &Options) -> Option<CautionDestination> {
+    if options.strict {
+        None
+    } else if options.verbose {
+        Some(CautionDestination::Stdout)
+    } else {
+        Some(CautionDestination::Stderr)
     }
 }
 
@@ -1295,6 +1323,45 @@ mod tests {
         assert!(result.contains("Output  not written · dry run"));
         assert!(result.contains("Size    1024 → 1000 bytes · saved 24 bytes (2.34%)"));
         assert!(result.contains("Time    32.00 ms total"));
+    }
+
+    #[test]
+    fn relaxed_mode_caution_colors_only_its_label() {
+        let message = "Caution: strict mode disabled; enabling compact empty/singleton \
+                       Huffman alphabets and the non-standard length-258 alias\n";
+
+        let mut plain = Vec::new();
+        print_strict_mode_caution(&mut plain, false).unwrap();
+        assert_eq!(String::from_utf8(plain).unwrap(), message);
+
+        let mut colored = Vec::new();
+        print_strict_mode_caution(&mut colored, true).unwrap();
+        assert_eq!(
+            String::from_utf8(colored).unwrap(),
+            message.replacen("Caution:", "\x1b[33mCaution:\x1b[0m", 1)
+        );
+    }
+
+    #[test]
+    fn relaxed_mode_caution_is_routed_in_default_verbose_and_visual_modes() {
+        let strict = parsed_command(["in"]);
+        let default = parsed_command(["--strict", "0", "in"]);
+        let verbose = parsed_command(["--strict", "0", "--verbose", "in"]);
+        let visual = parsed_command(["--strict", "0", "--visual", "in"]);
+
+        assert_eq!(strict_mode_caution_destination(&strict.options), None);
+        assert_eq!(
+            strict_mode_caution_destination(&default.options),
+            Some(CautionDestination::Stderr)
+        );
+        assert_eq!(
+            strict_mode_caution_destination(&verbose.options),
+            Some(CautionDestination::Stdout)
+        );
+        assert_eq!(
+            strict_mode_caution_destination(&visual.options),
+            Some(CautionDestination::Stderr)
+        );
     }
 
     #[test]
