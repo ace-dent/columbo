@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: MIT
 
-//! Lightweight, line-oriented progress reporting for human test runs.
+//! Dependency-free human progress reporting.
 //!
-//! The renderer writes the verbose report to standard output and is
-//! intentionally dependency-free and append-only. Redirected output therefore
-//! remains readable, while terminals receive restrained colour without cursor
-//! movement or a competing spinner.
+//! Verbose mode is append-only on standard output, so redirected reports remain
+//! readable. Visual mode delegates to a bounded-width terminal stream card on
+//! standard error. Both consume the same low-frequency optimizer checkpoints.
 
 use std::cell::Cell;
-use std::env;
-use std::io::{self, IsTerminal};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::{Format, Options};
+
+mod visual;
 
 pub(crate) const MAX_REPORTED_BLOCKS: usize = 64;
 
@@ -56,12 +55,14 @@ pub(crate) struct BlockProgress {
 pub(crate) struct BlockReport {
     pub(crate) blocks: Vec<BlockProgress>,
     pub(crate) total_blocks: usize,
+    pub(crate) total_bits: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct CandidateProgress {
     pub(crate) bytes: usize,
     pub(crate) bits: u64,
+    pub(crate) report: Option<BlockReport>,
     pub(crate) reference_bits: u64,
     /// Whether this complete candidate is strictly smaller than its source.
     ///
@@ -95,6 +96,8 @@ pub(crate) struct Progress {
     enabled: bool,
     optimizer_started: Instant,
     stream_id: usize,
+    verbose: bool,
+    visual: bool,
 }
 
 impl Progress {
@@ -102,50 +105,61 @@ impl Progress {
         options: &Options,
         optimizer_started: Instant,
         stream: StreamProgress,
+        source_report: Option<BlockReport>,
     ) -> Self {
-        if !options.verbose {
+        let visual = visual::enabled(options);
+        let verbose = options.verbose && !visual;
+        if !verbose && !visual {
             return Self {
                 color: false,
                 enabled: false,
                 optimizer_started,
                 stream_id: 0,
+                verbose: false,
+                visual: false,
             };
         }
 
         let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
         let color = terminal_color_enabled();
-        println!();
-        println!("{}Deflate stream {stream_id}{}", cyan(color), reset(color));
-        println!(
-            "  Source  {} {} · {} meaningful {} · {} {}{}",
-            stream.compressed_bytes,
-            plural(stream.compressed_bytes, "byte", "bytes"),
-            stream.meaningful_bits,
-            plural_u64(stream.meaningful_bits, "bit", "bits"),
-            stream.blocks,
-            plural(stream.blocks, "block", "blocks"),
-            if stream.empty_blocks == 0 {
-                String::new()
-            } else {
-                format!(
-                    " · {} empty {}",
-                    stream.empty_blocks,
-                    plural(stream.empty_blocks, "block", "blocks")
-                )
-            }
-        );
-        println!(
-            "  Parsed  {} · {} decoded {}",
-            format_duration(stream.parse_elapsed),
-            stream.decoded_bytes,
-            plural_u64(stream.decoded_bytes, "byte", "bytes"),
-        );
+        if visual {
+            visual::begin(stream_id, &stream, source_report);
+        } else {
+            println!();
+            println!("{}Deflate stream {stream_id}{}", cyan(color), reset(color));
+            println!(
+                "  Source  {} {} · {} meaningful {} · {} {}{}",
+                stream.compressed_bytes,
+                plural(stream.compressed_bytes, "byte", "bytes"),
+                stream.meaningful_bits,
+                plural_u64(stream.meaningful_bits, "bit", "bits"),
+                stream.blocks,
+                plural(stream.blocks, "block", "blocks"),
+                if stream.empty_blocks == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " · {} empty {}",
+                        stream.empty_blocks,
+                        plural(stream.empty_blocks, "block", "blocks")
+                    )
+                }
+            );
+            println!(
+                "  Parsed  {} · {} decoded {}",
+                format_duration(stream.parse_elapsed),
+                stream.decoded_bytes,
+                plural_u64(stream.decoded_bytes, "byte", "bytes"),
+            );
+        }
 
         Self {
             color,
             enabled: true,
             optimizer_started,
             stream_id,
+            verbose,
+            visual,
         }
     }
 
@@ -155,6 +169,15 @@ impl Progress {
 
     pub(crate) fn normalization(self, blocks: usize, elapsed: Duration) {
         if !self.enabled || blocks == 0 {
+            return;
+        }
+        if self.visual {
+            visual::activity(
+                self.stream_id,
+                &format!("Strict normalization · {blocks} blocks"),
+            );
+        }
+        if !self.verbose {
             return;
         }
         println!(
@@ -169,6 +192,20 @@ impl Progress {
 
     pub(crate) fn same_distance_opportunities(self, report: SameDistanceProgress) {
         if !self.enabled {
+            return;
+        }
+        if self.visual {
+            let status = if report.runs == 0 {
+                "Source parsed · no adjacent match runs".to_owned()
+            } else {
+                format!(
+                    "Source parsed · {} match runs · up to {} removable tokens",
+                    report.runs, report.tokens_removable
+                )
+            };
+            visual::activity(self.stream_id, &status);
+        }
+        if !self.verbose {
             return;
         }
         if report.runs == 0 {
@@ -197,7 +234,9 @@ impl Progress {
     }
 
     pub(crate) fn routes(self) {
-        if self.enabled {
+        if self.visual {
+            visual::activity(self.stream_id, "Choosing optimization routes");
+        } else if self.enabled {
             println!();
             println!("  S{} Routes", self.stream_id);
         }
@@ -205,7 +244,11 @@ impl Progress {
 
     pub(crate) fn start(self, name: &'static str) -> RouteStep {
         if self.enabled {
-            println!("  S{} {} {name}…", self.stream_id, arrow(self.color));
+            if self.visual {
+                visual::route_started(self.stream_id, name);
+            } else {
+                println!("  S{} {} {name}…", self.stream_id, arrow(self.color));
+            }
             RouteStep {
                 name,
                 progress: self,
@@ -254,12 +297,20 @@ impl Progress {
             total: Cell::new(0),
             unit_plural: Cell::new("items"),
             unit_singular: Cell::new("item"),
+            verbose: self.verbose,
+            visual: self.visual,
         };
         (step, details)
     }
 
     pub(crate) fn candidate(self, name: &'static str, candidate: CandidateProgress) {
         if !self.enabled {
+            return;
+        }
+        if self.visual {
+            visual::candidate(self.stream_id, name, &candidate);
+        }
+        if !self.verbose {
             return;
         }
         let marker = if candidate.profitable {
@@ -280,7 +331,9 @@ impl Progress {
     }
 
     pub(crate) fn skipped(self, name: &'static str, reason: &'static str) {
-        if self.enabled {
+        if self.visual {
+            visual::activity(self.stream_id, &format!("{name} skipped · {reason}"));
+        } else if self.enabled {
             println!(
                 "  S{}   {} {name} skipped · {reason}",
                 self.stream_id,
@@ -291,6 +344,12 @@ impl Progress {
 
     pub(crate) fn blocks(self, report: Option<BlockReport>) {
         if !self.enabled {
+            return;
+        }
+        if self.visual {
+            visual::final_plan(self.stream_id, report.as_ref());
+        }
+        if !self.verbose {
             return;
         }
         println!();
@@ -339,6 +398,20 @@ impl Progress {
         if !self.enabled {
             return;
         }
+        if self.visual {
+            visual::finish(
+                self.stream_id,
+                selected_route,
+                output_bytes,
+                output_bits,
+                source_bits,
+                self.optimizer_started.elapsed(),
+                timed_out,
+            );
+        }
+        if !self.verbose {
+            return;
+        }
         println!(
             "  S{} {} Selected {selected_route} · {} {} / {} {} · {} · {}{}",
             self.stream_id,
@@ -360,7 +433,7 @@ impl Progress {
 
 /// Live context for one long-running route.
 ///
-/// Every method is a no-op when verbose reporting is disabled. Interior
+/// Every method is a no-op when progress reporting is disabled. Interior
 /// mutability lets the deadline callback and planner share this reporter
 /// without changing the optimizer's ownership or cancellation model.
 pub(crate) struct RouteProgress {
@@ -383,6 +456,8 @@ pub(crate) struct RouteProgress {
     total: Cell<usize>,
     unit_plural: Cell<&'static str>,
     unit_singular: Cell<&'static str>,
+    verbose: bool,
+    visual: bool,
 }
 
 impl RouteProgress {
@@ -407,6 +482,8 @@ impl RouteProgress {
             total: Cell::new(0),
             unit_plural: Cell::new("items"),
             unit_singular: Cell::new("item"),
+            verbose: false,
+            visual: false,
         }
     }
 
@@ -422,6 +499,18 @@ impl RouteProgress {
 
     pub(crate) fn finalizing_after_soft_deadline(&self, grace: Duration) {
         if !self.enabled || self.finalizing_after_soft_deadline.replace(true) {
+            return;
+        }
+        if self.visual {
+            visual::activity(
+                self.stream_id,
+                &format!(
+                    "Soft deadline · finalizing with {} grace",
+                    format_duration(grace)
+                ),
+            );
+        }
+        if !self.verbose {
             return;
         }
         println!(
@@ -454,6 +543,12 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
+        if self.visual {
+            visual::work(self.stream_id, name, 0, total);
+        }
+        if !self.verbose {
+            return;
+        }
         println!(
             "  S{}     {} {name} · {} {}",
             self.stream_id,
@@ -467,6 +562,14 @@ impl RouteProgress {
     pub(crate) fn advance(&self, completed: usize) {
         if self.enabled {
             self.completed.set(completed.min(self.total.get()));
+            if self.visual {
+                visual::work(
+                    self.stream_id,
+                    self.phase.get(),
+                    self.completed.get(),
+                    self.total.get(),
+                );
+            }
         }
     }
 
@@ -475,6 +578,14 @@ impl RouteProgress {
         if self.enabled {
             self.completed.set(current.min(self.total.get()));
             self.current_tokens.set(Some(tokens));
+            if self.visual {
+                visual::work(
+                    self.stream_id,
+                    self.phase.get(),
+                    self.completed.get(),
+                    self.total.get(),
+                );
+            }
         }
     }
 
@@ -485,12 +596,24 @@ impl RouteProgress {
     pub(crate) fn activity(&self, name: &'static str) {
         if self.enabled {
             self.phase.set(name);
+            if self.visual {
+                visual::work(self.stream_id, name, self.completed.get(), self.total.get());
+            }
         }
     }
 
     /// Print a periodic status line from an existing deadline probe.
     pub(crate) fn heartbeat(&self) {
         if !self.enabled {
+            return;
+        }
+        if self.visual {
+            visual::work(
+                self.stream_id,
+                self.phase.get(),
+                self.completed.get(),
+                self.total.get(),
+            );
             return;
         }
         let now = Instant::now();
@@ -563,6 +686,13 @@ impl RouteProgress {
         }
         self.last_reported.set(Some(Instant::now()));
 
+        if self.visual {
+            visual::checkpoint(self.stream_id, name, bits, blocks, improved);
+        }
+        if !self.verbose {
+            return;
+        }
+
         if improved {
             println!(
                 "  S{}       {} {name} · {} · {bits} {} in {blocks} {} · {}",
@@ -611,6 +741,17 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
+        if self.visual {
+            visual::work(
+                self.stream_id,
+                "Replanning emitted stream",
+                round.saturating_sub(1),
+                limit,
+            );
+        }
+        if !self.verbose {
+            return;
+        }
         println!(
             "  S{}     {} Replay {round}/{limit} · reparsing {blocks} {} at {bits} {}",
             self.stream_id,
@@ -637,6 +778,12 @@ impl RouteProgress {
         if accepted {
             self.best_bits.set(Some(after_bits));
             self.best_blocks.set(blocks);
+            if self.visual {
+                visual::checkpoint(self.stream_id, "Replay accepted", after_bits, blocks, true);
+            }
+            if !self.verbose {
+                return;
+            }
             println!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · saved {} · accepted as {blocks} {}",
                 self.stream_id,
@@ -646,6 +793,12 @@ impl RouteProgress {
                 plural(blocks, "block", "blocks")
             );
         } else {
+            if self.visual {
+                visual::activity(self.stream_id, "Replay stable · best retained");
+            }
+            if !self.verbose {
+                return;
+            }
             println!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · no strict improvement; route stabilized",
                 self.stream_id,
@@ -656,7 +809,12 @@ impl RouteProgress {
     }
 
     pub(crate) fn replay_stopped(&self, round: usize, elapsed: Duration, reason: &'static str) {
-        if self.enabled {
+        if self.visual {
+            visual::activity(
+                self.stream_id,
+                &format!("Replay {round} stopped · {reason}"),
+            );
+        } else if self.enabled {
             println!(
                 "  S{}       {} Replay {round} · {} · {reason}",
                 self.stream_id,
@@ -667,7 +825,9 @@ impl RouteProgress {
     }
 
     pub(crate) fn stopped(&self, reason: &'static str) {
-        if self.enabled {
+        if self.visual {
+            visual::activity(self.stream_id, reason);
+        } else if self.enabled {
             println!(
                 "  S{}       {} {reason} · {} route elapsed",
                 self.stream_id,
@@ -694,6 +854,18 @@ impl RouteStep {
             return;
         };
         let elapsed = started.elapsed();
+        if self.progress.visual {
+            match candidate.as_ref() {
+                Some(candidate) => visual::candidate(self.progress.stream_id, self.name, candidate),
+                None => visual::activity(
+                    self.progress.stream_id,
+                    &format!("{} · no candidate", self.name),
+                ),
+            }
+        }
+        if !self.progress.verbose {
+            return;
+        }
         match candidate {
             Some(candidate) => {
                 let marker = if candidate.profitable {
@@ -728,6 +900,12 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
+        if self.progress.visual {
+            visual::activity(self.progress.stream_id, &format!("{} complete", self.name));
+        }
+        if !self.progress.verbose {
+            return;
+        }
         println!(
             "  S{} {} {} · {}",
             self.progress.stream_id,
@@ -741,6 +919,12 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
+        if self.progress.visual {
+            visual::activity(self.progress.stream_id, &format!("{} failed", self.name));
+        }
+        if !self.progress.verbose {
+            return;
+        }
         println!(
             "  S{} {} {} · {} · failed",
             self.progress.stream_id,
@@ -756,9 +940,6 @@ fn route_heartbeat_interval(budget: Duration) -> Duration {
 }
 
 pub(crate) fn format_detected(options: &Options, format: Format) {
-    if !options.verbose {
-        return;
-    }
     let label = match format {
         Format::Auto => "raw Deflate",
         Format::Raw => "raw Deflate",
@@ -767,7 +948,16 @@ pub(crate) fn format_detected(options: &Options, format: Format) {
         Format::Gzip => "GZIP",
         Format::Zip => "ZIP",
     };
-    println!("Format   {label}");
+    if visual::enabled(options) {
+        visual::format_detected(label);
+    } else if options.verbose {
+        println!("Format   {label}");
+    }
+}
+
+/// Whether block-plan snapshots will be consumed by a progress renderer.
+pub(crate) fn reports_enabled(options: &Options) -> bool {
+    options.verbose || visual::enabled(options)
 }
 
 pub(crate) fn format_duration(duration: Duration) -> String {
@@ -824,9 +1014,7 @@ fn format_bit_count(bits: u64) -> String {
 }
 
 fn terminal_color_enabled() -> bool {
-    io::stdout().is_terminal()
-        && env::var_os("NO_COLOR").is_none()
-        && env::var_os("TERM").map_or(true, |term| term != "dumb")
+    crate::terminal::stdout_color_enabled()
 }
 
 fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {

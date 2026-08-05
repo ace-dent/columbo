@@ -45,6 +45,13 @@ pub struct Options {
     /// Reporting is deliberately kept out of hot token and Huffman loops.
     /// Quiet and verbose runs use the same optimization and memory policies.
     pub verbose: bool,
+    /// Show an interactive two-row map for every Deflate stream.
+    ///
+    /// The source row remains fixed while the output row follows the best
+    /// complete candidate found so far. Visual reporting is enabled only when
+    /// standard error is an interactive terminal; redirected runs remain free
+    /// of ANSI cursor-control sequences.
+    pub visual: bool,
     /// Remove supported wrapper metadata while rebuilding the file.
     pub strip_metadata: bool,
     /// Emit conservative Deflate that is accepted by strict and older decoders.
@@ -73,6 +80,7 @@ impl Default for Options {
         Self {
             exhaustive: false,
             verbose: false,
+            visual: false,
             strip_metadata: false,
             strict: true,
             timeout: DEFAULT_TIMEOUT,

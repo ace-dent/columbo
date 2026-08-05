@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod terminal;
+
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -117,7 +119,7 @@ fn main() -> ExitCode {
 fn run() -> std::result::Result<(), u8> {
     let command = match parse_args(env::args_os().skip(1)) {
         Ok(ParsedCommand::Help) => {
-            let _ = print_usage(&mut io::stdout());
+            let _ = print_usage(&mut io::stdout(), terminal::stdout_color_enabled());
             return Ok(());
         }
         Ok(ParsedCommand::Run(command)) => command,
@@ -126,7 +128,7 @@ fn run() -> std::result::Result<(), u8> {
                 eprintln!("{message}");
             }
             if error.show_usage {
-                let _ = print_usage(&mut io::stderr());
+                let _ = print_usage(&mut io::stderr(), terminal::stderr_color_enabled());
             }
             return Err(2);
         }
@@ -137,8 +139,9 @@ fn run() -> std::result::Result<(), u8> {
 
 fn execute(command: Command) -> std::result::Result<(), u8> {
     let overwrites_input = command.destination.overwrites_input(&command.input);
-    let total_started = command.options.verbose.then(Instant::now);
-    let read_started = command.options.verbose.then(Instant::now);
+    let detailed = command.options.verbose || command.options.visual;
+    let total_started = detailed.then(Instant::now);
+    let read_started = detailed.then(Instant::now);
     let input = match read_file(&command.input, command.options.max_input_bytes) {
         Ok(bytes) => bytes,
         Err(ReadError::TooLarge) => {
@@ -158,18 +161,29 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
     let read_elapsed = read_started.map_or(Duration::ZERO, |started| started.elapsed());
 
     if command.options.verbose {
-        print_verbose_header(&command, input.len(), read_elapsed);
+        let _ = print_detailed_header(&mut io::stdout(), &command, input.len(), read_elapsed);
+    } else if command.options.visual {
+        let _ = print_detailed_header(&mut io::stderr(), &command, input.len(), read_elapsed);
     }
 
-    if command.options.verbose && !command.options.strict {
-        println!(
+    if (command.options.verbose || command.options.visual) && !command.options.strict {
+        let note =
             "note: strict mode disabled; enabling compact empty/singleton Huffman alphabets \
-             and the non-standard length-258 alias"
-        );
+                    and the non-standard length-258 alias";
+        if command.options.visual {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
     }
 
-    let optimize_started = command.options.verbose.then(Instant::now);
-    let mut spinner = Spinner::start(command.options.exhaustive && !command.options.verbose);
+    let optimize_started = detailed.then(Instant::now);
+    if command.options.visual && !visual_terminal_available() {
+        eprintln!("visual mode needs an interactive terminal; continuing without the live display");
+    }
+    let mut spinner = Spinner::start(
+        command.options.exhaustive && !command.options.verbose && !command.options.visual,
+    );
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
     let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -181,7 +195,7 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
         }
     };
 
-    let write_started = command.options.verbose.then(Instant::now);
+    let write_started = detailed.then(Instant::now);
     let output_action = match command.destination.output_path(&command.input) {
         None => OutputAction::DryRun,
         Some(output) if optimized.bits_saved != 0 => {
@@ -248,18 +262,29 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
             ),
         }
     }
+    let timings = ExecutionTimings {
+        read: read_elapsed,
+        optimize: optimize_elapsed,
+        write: write_elapsed,
+        total: total_started.map_or(Duration::ZERO, |started| started.elapsed()),
+    };
     if command.options.verbose {
-        print_verbose_result(
+        let _ = print_detailed_result(
+            &mut io::stdout(),
             &output_action,
             input.len(),
             optimized.data.len(),
             optimized.bits_saved,
-            &ExecutionTimings {
-                read: read_elapsed,
-                optimize: optimize_elapsed,
-                write: write_elapsed,
-                total: total_started.map_or(Duration::ZERO, |started| started.elapsed()),
-            },
+            &timings,
+        );
+    } else if command.options.visual {
+        let _ = print_detailed_result(
+            &mut io::stderr(),
+            &output_action,
+            input.len(),
+            optimized.data.len(),
+            optimized.bits_saved,
+            &timings,
         );
     } else {
         print_quiet_result(
@@ -302,20 +327,32 @@ fn print_quiet_result(
     }
 }
 
-fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Duration) {
+fn print_detailed_header(
+    output: &mut dyn Write,
+    command: &Command,
+    input_bytes: usize,
+    read_elapsed: Duration,
+) -> io::Result<()> {
     let input_name = command
         .input
         .file_name()
         .unwrap_or(command.input.as_os_str());
-    println!();
-    println!("{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · verbose");
-    println!("────────────────────────");
-    println!(
+    let report_mode = if command.options.visual {
+        "visual"
+    } else {
+        "verbose"
+    };
+    writeln!(output)?;
+    let title = format!("{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · {report_mode}");
+    writeln!(output, "{title}")?;
+    writeln!(output, "{}", "─".repeat(title.chars().count()))?;
+    writeln!(
+        output,
         "Input    {:?} · {input_bytes} {} · read {}",
         input_name,
         plural_bytes(input_bytes),
         format_elapsed(read_elapsed)
-    );
+    )?;
     let strictness = if command.options.strict {
         "strict"
     } else {
@@ -327,59 +364,72 @@ fn print_verbose_header(command: &Command, input_bytes: usize, read_elapsed: Dur
         ""
     };
     if command.options.exhaustive {
-        println!(
+        writeln!(
+            output,
             "Mode     max · {strictness}{dry_run} · {} file-wide budget",
             format_elapsed(command.options.timeout),
-        );
+        )
     } else {
-        println!("Mode     normal · {strictness}{dry_run}");
+        writeln!(output, "Mode     normal · {strictness}{dry_run}")
     }
 }
 
-fn print_verbose_result(
+fn print_detailed_result(
+    output: &mut dyn Write,
     action: &OutputAction,
     input_bytes: usize,
     output_bytes: usize,
     bits_saved: u64,
     timings: &ExecutionTimings,
-) {
-    println!();
-    println!("Result");
+) -> io::Result<()> {
+    writeln!(output)?;
+    writeln!(output, "Result")?;
     match action {
-        OutputAction::WrittenOptimized(output) => {
-            let output_name = output.file_name().unwrap_or(output.as_os_str());
-            println!("  Output  {:?}", output_name);
+        OutputAction::WrittenOptimized(path) => {
+            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            writeln!(output, "  Output  {:?}", output_name)?;
         }
-        OutputAction::CopiedOriginal(output) => {
-            let output_name = output.file_name().unwrap_or(output.as_os_str());
-            println!("  Output  {:?} · original copied · no savings", output_name);
+        OutputAction::CopiedOriginal(path) => {
+            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            writeln!(
+                output,
+                "  Output  {:?} · original copied · no savings",
+                output_name
+            )?;
         }
-        OutputAction::Preserved(output) => {
-            let output_name = output.file_name().unwrap_or(output.as_os_str());
-            println!("  Output  {:?} · preserved · no savings", output_name);
+        OutputAction::Preserved(path) => {
+            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            writeln!(
+                output,
+                "  Output  {:?} · preserved · no savings",
+                output_name
+            )?;
         }
-        OutputAction::DryRun => println!("  Output  not written · dry run"),
+        OutputAction::DryRun => writeln!(output, "  Output  not written · dry run")?,
     }
-    println!(
+    writeln!(
+        output,
         "  Size    {input_bytes} → {output_bytes} {} · {}",
         plural_bytes(output_bytes),
         describe_optimization_change(input_bytes, output_bytes, bits_saved)
-    );
+    )?;
     if !action.wrote_file() {
-        println!(
+        writeln!(
+            output,
             "  Time    {} total · read {} · optimize {}",
             format_elapsed(timings.total),
             format_elapsed(timings.read),
             format_elapsed(timings.optimize),
-        );
+        )
     } else {
-        println!(
+        writeln!(
+            output,
             "  Time    {} total · read {} · optimize {} · write {}",
             format_elapsed(timings.total),
             format_elapsed(timings.read),
             format_elapsed(timings.optimize),
             format_elapsed(timings.write)
-        );
+        )
     }
 }
 
@@ -499,6 +549,7 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             "-h" | "--help" => return Ok(ParsedCommand::Help),
             "--raw" => format = Format::Raw,
             "-v" | "--verbose" => options.verbose = true,
+            "--visual" => options.visual = true,
             "-m" | "--max" => options.exhaustive = true,
             "-d" | "--dry-run" => dry_run = true,
             "--out" => {
@@ -541,6 +592,13 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
             }
         }
         index += 1;
+    }
+
+    if options.verbose && options.visual {
+        return Err(CliError::message(
+            "--visual cannot be combined with --verbose",
+            false,
+        ));
     }
 
     let (input, destination) = if dry_run {
@@ -666,10 +724,12 @@ fn output_error() -> CliError {
     CliError::message("--out requires an output filename", false)
 }
 
-fn print_usage(output: &mut dyn Write) -> io::Result<()> {
+fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(
         output,
-        "🕵🏻‍♂️  \x1b[1m{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE}\x1b[0m"
+        "🕵🏻‍♂️  {}{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE}{}",
+        if color { "\x1b[1m" } else { "" },
+        if color { "\x1b[0m" } else { "" },
     )?;
     writeln!(
         output,
@@ -687,6 +747,10 @@ fn print_usage(output: &mut dyn Write) -> io::Result<()> {
     writeln!(
         output,
         "  -v, --verbose          show live route timings, bit gains, and block choices"
+    )?;
+    writeln!(
+        output,
+        "      --visual           show a live Deflate block map with aligned in/out rows"
     )?;
     writeln!(
         output,
@@ -1046,6 +1110,10 @@ struct Spinner {
     worker: Option<JoinHandle<()>>,
 }
 
+fn visual_terminal_available() -> bool {
+    io::stderr().is_terminal() && env::var_os("TERM").map_or(true, |term| term != "dumb")
+}
+
 impl Spinner {
     fn start(enabled: bool) -> Self {
         if !enabled || !io::stderr().is_terminal() {
@@ -1057,16 +1125,21 @@ impl Spinner {
 
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = Arc::clone(&running);
+        let color = terminal::stderr_color_enabled();
         let worker = thread::spawn(move || {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut frame = 0;
             // Avoid flashing a spinner for work that completes quickly.
             thread::park_timeout(Duration::from_millis(300));
             while worker_running.load(Ordering::Relaxed) {
-                eprint!(
-                    "\r\x1b[36m{}\x1b[0m maximizing compression...",
-                    FRAMES[frame]
-                );
+                if color {
+                    eprint!(
+                        "\r\x1b[36m{}\x1b[0m maximizing compression...",
+                        FRAMES[frame]
+                    );
+                } else {
+                    eprint!("\r{} maximizing compression...", FRAMES[frame]);
+                }
                 let _ = io::stderr().flush();
                 frame = (frame + 1) % FRAMES.len();
                 thread::park_timeout(Duration::from_millis(200));
@@ -1148,6 +1221,80 @@ mod tests {
         assert!(!parsed_options(["in"]).verbose);
         assert!(parsed_options(["-v", "in"]).verbose);
         assert!(parsed_options(["--verbose", "in"]).verbose);
+    }
+
+    #[test]
+    fn visual_mode_is_distinct_from_verbose_reporting() {
+        assert!(!parsed_options(["in"]).visual);
+        assert!(parsed_options(["--visual", "in"]).visual);
+
+        let error = match parse_args(
+            ["--visual", "--verbose", "in"]
+                .into_iter()
+                .map(OsString::from),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("visual and verbose modes should not be combined"),
+        };
+        assert_eq!(
+            error.message.as_deref(),
+            Some("--visual cannot be combined with --verbose")
+        );
+    }
+
+    #[test]
+    fn visual_mode_reuses_the_detailed_start_and_end_summaries() {
+        let visual = parsed_command(["--visual", "--dry-run", "in"]);
+        let verbose = parsed_command(["--verbose", "--dry-run", "in"]);
+        let mut visual_header = Vec::new();
+        let mut verbose_header = Vec::new();
+        print_detailed_header(&mut visual_header, &visual, 1_024, Duration::from_millis(2))
+            .unwrap();
+        print_detailed_header(
+            &mut verbose_header,
+            &verbose,
+            1_024,
+            Duration::from_millis(2),
+        )
+        .unwrap();
+
+        let visual_header = String::from_utf8(visual_header).unwrap();
+        let verbose_header = String::from_utf8(verbose_header).unwrap();
+        assert!(visual_header.contains("· visual\n"));
+        assert!(verbose_header.contains("· verbose\n"));
+        assert_eq!(
+            visual_header.lines().skip(3).collect::<Vec<_>>(),
+            verbose_header.lines().skip(3).collect::<Vec<_>>()
+        );
+        let mut header_lines = visual_header.lines();
+        assert_eq!(header_lines.next(), Some(""));
+        let title = header_lines.next().unwrap();
+        let underline = header_lines.next().unwrap();
+        assert_eq!(title.chars().count(), underline.chars().count());
+        assert!(underline.chars().all(|character| character == '─'));
+        assert!(visual_header.contains("Input    \"in\" · 1024 bytes · read 2.00 ms"));
+        assert!(visual_header.contains("Mode     normal · strict · dry run"));
+
+        let mut result = Vec::new();
+        print_detailed_result(
+            &mut result,
+            &OutputAction::DryRun,
+            1_024,
+            1_000,
+            192,
+            &ExecutionTimings {
+                read: Duration::from_millis(2),
+                optimize: Duration::from_millis(30),
+                write: Duration::ZERO,
+                total: Duration::from_millis(32),
+            },
+        )
+        .unwrap();
+        let result = String::from_utf8(result).unwrap();
+        assert!(result.contains("Result\n"));
+        assert!(result.contains("Output  not written · dry run"));
+        assert!(result.contains("Size    1024 → 1000 bytes · saved 24 bytes (2.34%)"));
+        assert!(result.contains("Time    32.00 ms total"));
     }
 
     #[test]
@@ -1305,7 +1452,7 @@ mod tests {
     #[test]
     fn help_describes_only_the_merged_strict_policy() {
         let mut help = Vec::new();
-        print_usage(&mut help).unwrap();
+        print_usage(&mut help, false).unwrap();
         let help = String::from_utf8(help).unwrap();
 
         assert!(help.contains("--strict 0|1"));
@@ -1327,6 +1474,15 @@ mod tests {
         assert!(help.contains("Advanced:"));
         assert!(help.contains("--raw"));
         assert!(help.contains("live route timings, bit gains, and block choices"));
+        assert!(help.contains("--visual"));
+        assert!(help.contains("live Deflate block map with aligned in/out rows"));
+        assert!(!help.contains('\x1b'));
+
+        let mut colored_help = Vec::new();
+        print_usage(&mut colored_help, true).unwrap();
+        let colored_help = String::from_utf8(colored_help).unwrap();
+        assert!(colored_help.contains("\x1b[1mcolumbo"));
+        assert!(!colored_help.contains("38;5"));
     }
 
     #[test]

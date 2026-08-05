@@ -21,6 +21,7 @@ mod error;
 mod format;
 mod options;
 mod progress;
+mod terminal;
 
 pub use error::{Error, Result};
 pub use options::{

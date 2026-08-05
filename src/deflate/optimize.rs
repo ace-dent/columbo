@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::progress::{
-    BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress, RouteProgress,
-    SameDistanceProgress, StreamProgress, MAX_REPORTED_BLOCKS,
+    reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
+    RouteProgress, SameDistanceProgress, StreamProgress, MAX_REPORTED_BLOCKS,
 };
 use crate::{Error, Options, Result};
 
@@ -233,12 +233,14 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     let started = Instant::now();
     let parsed = parse_stream(input, decoded_limit.min(options.max_decoded_bytes))?;
     // Avoid even an extra clock read in ordinary speed-first runs.
-    let parse_elapsed = if options.verbose {
+    let reporting = reports_enabled(options);
+    let parse_elapsed = if reporting {
         started.elapsed()
     } else {
         std::time::Duration::ZERO
     };
     let mut blocks = parsed.blocks;
+    let source_report = capture_source_block_report(&blocks, parsed.source_block_count, reporting);
     let progress = Progress::begin(
         options,
         started,
@@ -250,6 +252,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed,
         },
+        source_report,
     );
     if options.strict {
         let normalization_started = progress.enabled().then(Instant::now);
@@ -1059,7 +1062,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         candidate.bits
     };
     let final_report = if keep_original {
-        capture_source_block_report(&blocks, parsed.source_block_count, options.verbose)
+        capture_source_block_report(&blocks, parsed.source_block_count, reporting)
     } else {
         candidate.block_report.take()
     };
@@ -1332,13 +1335,14 @@ fn candidate_progress(
     CandidateProgress {
         bytes: candidate.data.len(),
         bits: candidate.bits,
+        report: candidate.block_report.clone(),
         reference_bits,
         profitable,
     }
 }
 
-/// Run one original-source max search, with nested telemetry only in verbose
-/// mode and the historical hot path otherwise.
+/// Run one original-source max search, with nested telemetry only in a human
+/// reporting mode and the historical hot path otherwise.
 fn build_source_max_candidate<F>(
     source: CandidateInput<'_>,
     options: &Options,
@@ -1377,7 +1381,7 @@ where
 
 /// Keep the telemetry-heavy planner monomorphized only once. The generic
 /// wrapper above preserves inlined deadline checks for production quiet mode,
-/// while verbose mode can afford one indirect call at its existing probes.
+/// while human reporting can afford one indirect call at its existing probes.
 fn build_source_max_candidate_verbose(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3247,7 +3251,7 @@ where
         parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
     }
 
-    let block_report = capture_planned_block_report(&plans, options.verbose);
+    let block_report = capture_planned_block_report(&plans, reports_enabled(options));
     Ok(Candidate {
         data,
         bits,
@@ -3374,6 +3378,7 @@ fn capture_planned_block_report(plans: &[PlannedBlock], enabled: bool) -> Option
     Some(BlockReport {
         blocks,
         total_blocks: plans.len(),
+        total_bits: plans.iter().map(|plan| plan.bits).sum(),
     })
 }
 
@@ -3389,6 +3394,9 @@ fn capture_source_block_report(
     if !enabled || blocks.len() != source_block_count {
         return None;
     }
+    let total_bits = blocks.iter().try_fold(0_u64, |total, block| {
+        Some(total.saturating_add(block.original?.len))
+    })?;
     let shown = blocks.len().min(MAX_REPORTED_BLOCKS);
     let mut report = Vec::new();
     report.try_reserve_exact(shown).ok()?;
@@ -3407,6 +3415,7 @@ fn capture_source_block_report(
     Some(BlockReport {
         blocks: report,
         total_blocks: source_block_count,
+        total_bits,
     })
 }
 
@@ -4376,6 +4385,7 @@ mod tests {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
+            None,
         );
         let candidates =
             build_bounded_generic_max_candidates(source, &options, &deadline, progress, None)
@@ -4530,6 +4540,7 @@ mod tests {
                     meaningful_bits: parsed.meaningful_bits,
                     parse_elapsed: Duration::ZERO,
                 },
+                None,
             ),
         )
         .unwrap()
