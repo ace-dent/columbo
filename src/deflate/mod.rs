@@ -9,6 +9,7 @@ mod model;
 mod optimize;
 mod parse;
 mod search;
+mod stop;
 pub(crate) mod stream;
 
 pub(crate) use optimize::{optimize_raw, optimize_raw_prefix_with_floor, DefaultFloor, RawInfo};

@@ -34,6 +34,7 @@ use super::model::{
     PlannedBlock, Representation, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
+use super::stop::SearchStop;
 
 /// A transformed token vector is temporary, but it can be much larger than
 /// its source: one compact match may become 258 literal `Token` values. Give a
@@ -211,20 +212,24 @@ pub(crate) fn improve_plan_with_same_distance_floor(
 ) -> PlannedBlock {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    consider_same_distance_runs(block, alignment, &floor_options, &mut || false, &mut best);
+    consider_same_distance_runs(
+        block,
+        alignment,
+        &floor_options,
+        &mut SearchStop::never(),
+        &mut best,
+    );
     best
 }
 
-fn consider_same_distance_runs<F>(
+fn consider_same_distance_runs(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
-    if block.tokens.len() < 2 || expired() {
+) {
+    if block.tokens.len() < 2 || stop.reached() {
         return;
     }
     let literal_lengths: &[u8] = match &best.representation {
@@ -240,7 +245,7 @@ fn consider_same_distance_runs<F>(
         block.plain.len(),
         literal_lengths,
         options.exhaustive,
-        expired,
+        stop,
     ) else {
         return;
     };
@@ -248,7 +253,7 @@ fn consider_same_distance_runs<F>(
     // Price the canonical candidate first. Its planned token storage is
     // reference-counted, so relaxed mode can derive an alias sibling lazily
     // without retaining or eagerly allocating a second large token vector.
-    let Some(candidate) = plan_tokens(block, repacked, alignment, options, expired) else {
+    let Some(candidate) = plan_tokens(block, repacked, alignment, options, stop) else {
         return;
     };
     let canonical_tokens = Arc::clone(&candidate.tokens);
@@ -256,7 +261,7 @@ fn consider_same_distance_runs<F>(
         *best = candidate;
     }
     if !options.strict
-        && !expired()
+        && !stop.reached()
         && canonical_tokens.iter().any(|token| {
             matches!(
                 token,
@@ -269,7 +274,7 @@ fn consider_same_distance_runs<F>(
         })
     {
         if let Some(aliased) = rewrite_258_symbols(&canonical_tokens, block.plain.len(), true) {
-            consider_tokens(block, aliased, alignment, options, expired, best);
+            consider_tokens(block, aliased, alignment, options, stop, best);
         }
     }
 }
@@ -281,16 +286,13 @@ fn consider_same_distance_runs<F>(
 /// valid at the run start; every later byte follows the same backward relation,
 /// including overlapping copies. Moving only those internal boundaries is
 /// therefore lossless and never searches the history window.
-fn repack_same_distance_runs<F>(
+fn repack_same_distance_runs(
     tokens: &[Token],
     decoded_bytes: usize,
     literal_lengths: &[u8],
     exhaustive: bool,
-    expired: &mut F,
-) -> Option<Vec<Token>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<Token>> {
     let mut output_count = tokens.len();
     let mut decoded_total = 0_usize;
     let mut max_active = 0_usize;
@@ -336,7 +338,7 @@ where
             literal_lengths,
             max_active,
             max_deficit,
-            expired,
+            stop,
         )?)
     };
     let mut output = new_token_candidate(output_count, decoded_bytes)?;
@@ -425,15 +427,12 @@ impl SameDistancePartitioner {
     /// With the minimum number of output matches the total deficit is at most
     /// 257 bytes, regardless of run length. At most `deficit` matches can have
     /// a non-zero deficit, so long runs add no DP depth.
-    fn new<F>(
+    fn new(
         literal_lengths: &[u8],
         max_active: usize,
         max_deficit: usize,
-        expired: &mut F,
-    ) -> Option<Self>
-    where
-        F: FnMut() -> bool,
-    {
+        stop: &mut SearchStop<'_>,
+    ) -> Option<Self> {
         let width = max_deficit.checked_add(1)?;
         let choice_count = max_active.checked_add(1)?.checked_mul(width)?;
         let mut choices = Vec::new();
@@ -454,12 +453,12 @@ impl SameDistancePartitioner {
         let mut current = [u32::MAX; 258];
         previous[0] = 0;
         for slot in 1..=max_active {
-            if expired() {
+            if stop.reached() {
                 return None;
             }
             current[..width].fill(u32::MAX);
             for used_deficit in 0..=max_deficit {
-                if used_deficit & 31 == 0 && expired() {
+                if used_deficit & 31 == 0 && stop.reached() {
                     return None;
                 }
                 let mut best_cost = u32::MAX;
@@ -623,23 +622,21 @@ pub(crate) fn compact_proven_submatch_route_eligible(tokens: &[Token], plain_len
             .any(|token| matches!(token, Token::Match { .. }))
 }
 
-fn consider_proven_submatches<F>(
+fn consider_proven_submatches(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     if !proven_submatch_route_eligible(&best.tokens, block.plain.len(), options.exhaustive)
-        || expired()
+        || stop.reached()
     {
         return;
     }
 
     for pass in 0..MAX_PROVEN_SUBMATCH_PASSES {
-        if expired() {
+        if stop.reached() {
             return;
         }
         let pass_tokens = Arc::clone(&best.tokens);
@@ -665,7 +662,7 @@ fn consider_proven_submatches<F>(
             &literal_lengths,
             full_graph,
             options.exhaustive,
-            expired,
+            stop,
         ) else {
             return;
         };
@@ -675,7 +672,7 @@ fn consider_proven_submatches<F>(
             &literal_lengths,
             &distance_lengths,
             ProvenSubmatchRestriction::None,
-            expired,
+            stop,
         ) else {
             return;
         };
@@ -689,7 +686,7 @@ fn consider_proven_submatches<F>(
             &literal_lengths,
             &distance_lengths,
             ProvenSubmatchRestriction::SourceSymbol,
-            expired,
+            stop,
         ) else {
             return;
         };
@@ -724,7 +721,7 @@ fn consider_proven_submatches<F>(
             individual_limit,
             &mut payload_rewrites,
             &mut priced_candidates,
-            expired,
+            stop,
             best,
         )
         .is_none()
@@ -741,7 +738,7 @@ fn consider_proven_submatches<F>(
                 individual_limit,
                 &mut symbol_free_rewrites,
                 &mut priced_candidates,
-                expired,
+                stop,
                 best,
             )
             .is_none()
@@ -753,7 +750,7 @@ fn consider_proven_submatches<F>(
         // starving other opportunities. This separate candidate still removes
         // the highest symbol from every occurrence when that complete
         // header-oriented rewrite fits its explicit bound.
-        if !expired() {
+        if !stop.reached() {
             consider_highest_length_symbol_elimination(
                 block,
                 &pass_tokens,
@@ -762,7 +759,7 @@ fn consider_proven_submatches<F>(
                 &literal_lengths,
                 &distance_lengths,
                 &mut priced_candidates,
-                expired,
+                stop,
                 best,
             );
         }
@@ -781,22 +778,19 @@ fn consider_proven_submatches<F>(
 /// The stream optimizer runs this as an independent candidate lineage. Keeping
 /// it separate prevents an immediate local resegmentation win from replacing a
 /// different token spelling that reaches a better fixed point after replay.
-pub(crate) fn improve_plan_with_proven_submatches<F>(
+pub(crate) fn improve_plan_with_proven_submatches(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     mut best: PlannedBlock,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
-    consider_proven_submatches(block, alignment, options, expired, &mut best);
+) -> PlannedBlock {
+    consider_proven_submatches(block, alignment, options, stop, &mut best);
     best
 }
 
 #[allow(clippy::too_many_arguments)]
-fn consider_proven_submatch_rewrite_family<F>(
+fn consider_proven_submatch_rewrite_family(
     block: &ParsedBlock,
     source: &[Token],
     alignment: u8,
@@ -804,12 +798,9 @@ fn consider_proven_submatch_rewrite_family<F>(
     individual_limit: usize,
     rewrites: &mut [ProvenSubmatchRewrite],
     priced_candidates: &mut Vec<Arc<Vec<Token>>>,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) -> Option<()>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<()> {
     if individual_limit != 0 && !rewrites.is_empty() {
         let mut order = Vec::new();
         order.try_reserve_exact(rewrites.len()).ok()?;
@@ -821,7 +812,7 @@ where
             )
         });
         for index in order.into_iter().take(individual_limit) {
-            if expired() {
+            if stop.reached() {
                 return None;
             }
             let Some(tokens) = apply_proven_submatch_rewrites(
@@ -837,7 +828,7 @@ where
                 alignment,
                 options,
                 priced_candidates,
-                expired,
+                stop,
                 best,
             );
         }
@@ -847,7 +838,7 @@ where
     // candidate already priced above. Avoid rebuilding the same Huffman table
     // twice in the deadline-independent default floor.
     if should_price_combined_proven_submatch_candidate(rewrites.len(), individual_limit) {
-        if expired() {
+        if stop.reached() {
             return None;
         }
         rewrites.sort_by_key(|rewrite| rewrite.token_index);
@@ -858,7 +849,7 @@ where
                 alignment,
                 options,
                 priced_candidates,
-                expired,
+                stop,
                 best,
             );
         }
@@ -895,7 +886,7 @@ fn proven_submatch_seed_lengths(block: &ParsedBlock, best: &PlannedBlock) -> (Ve
 }
 
 #[allow(clippy::too_many_arguments)]
-fn select_proven_submatch_targets<F>(
+fn select_proven_submatch_targets(
     tokens: &[Token],
     decoded_bytes: usize,
     source_splits: &[usize],
@@ -903,11 +894,8 @@ fn select_proven_submatch_targets<F>(
     literal_lengths: &[u8],
     full_graph: bool,
     exhaustive: bool,
-    expired: &mut F,
-) -> Option<Vec<ProvenSubmatchTarget>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<ProvenSubmatchTarget>> {
     let highest_symbol = tokens
         .iter()
         .filter_map(|token| match *token {
@@ -935,7 +923,7 @@ where
     let mut plain_offset = 0_usize;
 
     for (token_index, &token) in tokens.iter().enumerate() {
-        if token_index & 1_023 == 0 && expired() {
+        if token_index & 1_023 == 0 && stop.reached() {
             return None;
         }
         let end = plain_offset.checked_add(token.decoded_len())?;
@@ -1074,21 +1062,18 @@ fn match_near_source_split(start: usize, end: usize, source_splits: &[usize]) ->
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_proven_submatch_rewrites<F>(
+fn build_proven_submatch_rewrites(
     targets: &[ProvenSubmatchTarget],
     plain: &[u8],
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     restriction: ProvenSubmatchRestriction,
-    expired: &mut F,
-) -> Option<Vec<ProvenSubmatchRewrite>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<ProvenSubmatchRewrite>> {
     let mut rewrites = Vec::new();
     rewrites.try_reserve_exact(targets.len()).ok()?;
     for target in targets {
-        if expired() {
+        if stop.reached() {
             return None;
         }
         let length = target.source.decoded_len();
@@ -1108,9 +1093,9 @@ where
             literal_lengths,
             distance_lengths,
             forbidden_length_symbol,
-            expired,
+            stop,
         );
-        if expired() {
+        if stop.reached() {
             return None;
         }
         let Some(replacement) = replacement else {
@@ -1132,17 +1117,14 @@ where
     Some(rewrites)
 }
 
-fn solve_proven_submatch<F>(
+fn solve_proven_submatch(
     source: Token,
     decoded: &[u8],
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     forbidden_length_symbol: Option<u16>,
-    expired: &mut F,
-) -> Option<Vec<Token>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<Token>> {
     let Token::Match {
         length,
         length_symbol,
@@ -1154,7 +1136,7 @@ where
     if usize::from(length) != decoded.len() || decoded.len() > 258 || decoded.len() < 3 {
         return None;
     }
-    if expired() {
+    if stop.reached() {
         return None;
     }
 
@@ -1183,7 +1165,7 @@ where
 
         for match_length in 3..=decoded.len() - start {
             visited_edges = visited_edges.checked_add(1)?;
-            if visited_edges & 31 == 0 && expired() {
+            if visited_edges & 31 == 0 && stop.reached() {
                 return None;
             }
             let match_length: u16 = match_length.try_into().ok()?;
@@ -1205,7 +1187,7 @@ where
         costs[start] = best_cost;
         choices[start] = best_choice;
     }
-    if expired() {
+    if stop.reached() {
         return None;
     }
 
@@ -1333,7 +1315,7 @@ fn apply_proven_submatch_rewrites(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn consider_highest_length_symbol_elimination<F>(
+fn consider_highest_length_symbol_elimination(
     block: &ParsedBlock,
     tokens: &[Token],
     alignment: u8,
@@ -1341,11 +1323,9 @@ fn consider_highest_length_symbol_elimination<F>(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     priced_candidates: &mut Vec<Arc<Vec<Token>>>,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     let Some(highest_symbol) = tokens
         .iter()
         .filter_map(|token| match *token {
@@ -1383,7 +1363,7 @@ fn consider_highest_length_symbol_elimination<F>(
     }
     let mut plain_offset = 0_usize;
     for (token_index, &token) in tokens.iter().enumerate() {
-        if token_index & 1_023 == 0 && expired() {
+        if token_index & 1_023 == 0 && stop.reached() {
             return;
         }
         let end = match plain_offset.checked_add(token.decoded_len()) {
@@ -1427,7 +1407,7 @@ fn consider_highest_length_symbol_elimination<F>(
         literal_lengths,
         distance_lengths,
         ProvenSubmatchRestriction::Symbol(highest_symbol),
-        expired,
+        stop,
     ) else {
         return;
     };
@@ -1442,24 +1422,22 @@ fn consider_highest_length_symbol_elimination<F>(
             alignment,
             options,
             priced_candidates,
-            expired,
+            stop,
             best,
         );
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn consider_unique_proven_submatch_tokens<F>(
+fn consider_unique_proven_submatch_tokens(
     block: &ParsedBlock,
     tokens: Vec<Token>,
     alignment: u8,
     options: &Options,
     priced_candidates: &mut Vec<Arc<Vec<Token>>>,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     if priced_candidates
         .iter()
         .any(|candidate| candidate.as_slice() == tokens.as_slice())
@@ -1467,7 +1445,7 @@ fn consider_unique_proven_submatch_tokens<F>(
         return;
     }
     if let Some(planned_tokens) =
-        consider_proven_submatch_tokens(block, tokens, alignment, options, expired, best)
+        consider_proven_submatch_tokens(block, tokens, alignment, options, stop, best)
     {
         // Capacity is preflighted once per pass. If an unusual allocator
         // failure still prevents retaining the exact identity witness, exact
@@ -1478,18 +1456,15 @@ fn consider_unique_proven_submatch_tokens<F>(
     }
 }
 
-fn consider_proven_submatch_tokens<F>(
+fn consider_proven_submatch_tokens(
     block: &ParsedBlock,
     tokens: Vec<Token>,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) -> Option<Arc<Vec<Token>>>
-where
-    F: FnMut() -> bool,
-{
-    let candidate = plan_tokens(block, tokens, alignment, options, expired)?;
+) -> Option<Arc<Vec<Token>>> {
+    let candidate = plan_tokens(block, tokens, alignment, options, stop)?;
     let canonical_tokens = Arc::clone(&candidate.tokens);
     if candidate.bits < best.bits {
         *best = candidate;
@@ -1498,7 +1473,7 @@ where
     // Generated length 258 is canonical. Relaxed mode retains the explicit
     // non-standard sibling only when complete exact pricing proves it smaller.
     if !options.strict
-        && !expired()
+        && !stop.reached()
         && canonical_tokens.iter().any(|token| {
             matches!(
                 token,
@@ -1511,7 +1486,7 @@ where
         })
     {
         if let Some(alias) = rewrite_258_symbols(&canonical_tokens, block.plain.len(), true) {
-            consider_tokens(block, alias, alignment, options, expired, best);
+            consider_tokens(block, alias, alignment, options, stop, best);
         }
     }
     Some(canonical_tokens)
@@ -1537,7 +1512,7 @@ pub(crate) fn plan_block_with_floor(
 ) -> PlannedBlock {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    let base = plan_block(block, alignment, &floor_options, || false);
+    let base = plan_block(block, alignment, &floor_options, &mut SearchStop::never());
     improve_plan_with_floor(block, alignment, &floor_options, extended, base)
 }
 
@@ -1599,7 +1574,7 @@ fn improve_plan_with_floor_policy(
         return best;
     }
 
-    let mut never_expired = || false;
+    let mut never_expired = SearchStop::never();
     consider_same_distance_runs(
         block,
         alignment,
@@ -1726,7 +1701,12 @@ fn improve_plan_with_floor_policy(
     if best.tokens != block.tokens {
         if let Some(replay_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len()) {
             if let Some(replay_block) = try_transformed_block(block, replay_tokens) {
-                let mut replay = plan_block(&replay_block, alignment, &floor_options, || false);
+                let mut replay = plan_block(
+                    &replay_block,
+                    alignment,
+                    &floor_options,
+                    &mut SearchStop::never(),
+                );
                 let feedback_seeds = feedback_tree_seeds(&replay_block, options.strict);
                 consider_feedback_seed_trees(
                     &replay_block,
@@ -1786,7 +1766,7 @@ pub(crate) fn improve_plan_with_deft4j_tree_floor(
         block,
         alignment,
         &floor_options,
-        &mut || false,
+        &mut SearchStop::never(),
         &mut best,
         0,
     );
@@ -1798,15 +1778,13 @@ pub(crate) fn improve_plan_with_deft4j_tree_floor(
 /// The original Columbo C implementation introduced this bounded family after
 /// studying deft4j's least-family pruning. It is a Columbo extension rather
 /// than a reconstruction of deft4j's ordered state graph.
-fn consider_compact_short_bands<F>(
+fn consider_compact_short_bands(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     if block.tokens.len() > COMPACT_SHORT_BAND_MAX_TOKENS
         || block.plain.len() > COMPACT_SHORT_BAND_MAX_PLAIN
     {
@@ -1814,7 +1792,7 @@ fn consider_compact_short_bands<F>(
     }
 
     for last_symbol in COMPACT_SHORT_BAND_ENDS {
-        if expired() {
+        if stop.reached() {
             return;
         }
         let Some(tokens) = expand_selected_matches(&block.tokens, &block.plain, |_, token, _| {
@@ -1826,7 +1804,7 @@ fn consider_compact_short_bands<F>(
         }) else {
             continue;
         };
-        consider_tokens(block, tokens, alignment, options, expired, best);
+        consider_tokens(block, tokens, alignment, options, stop, best);
     }
 }
 
@@ -1884,7 +1862,7 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     // Huffman representations do not depend on the incoming bit alignment.
     // Ignore a stored result here because its padding was priced at the dummy
     // alignment; the stream planner has already retained the valid stored form.
-    let mut candidate = plan_block(&transformed, 0, &floor_options, || false);
+    let mut candidate = plan_block(&transformed, 0, &floor_options, &mut SearchStop::never());
     let seeds = feedback_tree_seeds(&transformed, options.strict);
     consider_feedback_seed_trees(&transformed, &floor_options, &seeds, &mut candidate);
     if !matches!(candidate.representation, Representation::Stored) && candidate.bits < plan.bits {
@@ -1956,8 +1934,13 @@ pub(crate) fn replay_table_ladder(
         ) else {
             break;
         };
-        let Some(candidate) = plan_tokens(&block, tokens, alignment, &floor_options, &mut || false)
-        else {
+        let Some(candidate) = plan_tokens(
+            &block,
+            tokens,
+            alignment,
+            &floor_options,
+            &mut SearchStop::never(),
+        ) else {
             break;
         };
         let Some((next_literal, next_distance)) = plan_lengths(&candidate) else {
@@ -2022,7 +2005,7 @@ pub(crate) fn plan_block_with_short_family_floor(
 ) -> PlannedBlock {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    let base = plan_block(block, alignment, &floor_options, || false);
+    let base = plan_block(block, alignment, &floor_options, &mut SearchStop::never());
     let base = improve_plan_with_same_distance_floor(block, alignment, &floor_options, base);
     improve_plan_with_short_family_floor(block, &floor_options, base)
 }
@@ -2245,16 +2228,14 @@ fn ensure_floor_distance_symbols(frequencies: &mut [u32; 30], min_distance_codes
     }
 }
 
-fn consider_deft4j_trees<F>(
+fn consider_deft4j_trees(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
     individual_trial_limit: usize,
-) where
-    F: FnMut() -> bool,
-{
+) {
     let mut distance_frequencies = block.distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     // Emulate the reference OpenJDK `PriorityQueue` heap operations. deft4j's
@@ -2287,21 +2268,21 @@ fn consider_deft4j_trees<F>(
     let non_larger = expand_matches(&block.tokens, &block.plain, &literal, &distance, true);
     if let Some(tokens) = strict {
         let duplicate = non_larger.as_ref().is_some_and(|other| other == &tokens);
-        consider_deft4j_rebuild(block, tokens, alignment, options, expired, best);
+        consider_deft4j_rebuild(block, tokens, alignment, options, stop, best);
         if !duplicate {
             if let Some(tokens) = non_larger {
-                consider_deft4j_rebuild(block, tokens, alignment, options, expired, best);
+                consider_deft4j_rebuild(block, tokens, alignment, options, stop, best);
             }
         }
     } else if let Some(tokens) = non_larger {
-        consider_deft4j_rebuild(block, tokens, alignment, options, expired, best);
+        consider_deft4j_rebuild(block, tokens, alignment, options, stop, best);
     }
     if individual_trial_limit != 0 {
         individual_prune_from_lengths(
             block,
             alignment,
             options,
-            expired,
+            stop,
             best,
             &literal,
             &distance,
@@ -2317,16 +2298,14 @@ fn consider_deft4j_trees<F>(
 /// existing matches to spell literally, and the changed frequencies feed a
 /// second deft4j tree. Moving the transformed block into Columbo's planner
 /// after pricing that second tree avoids another large token-vector clone.
-fn consider_deft4j_rebuild<F>(
+fn consider_deft4j_rebuild(
     source: &ParsedBlock,
     tokens: Vec<Token>,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     let Some(candidate) = try_transformed_block(source, tokens) else {
         return;
     };
@@ -2337,7 +2316,7 @@ fn consider_deft4j_rebuild<F>(
     let deft4j =
         plan_for_explicit_lengths(&candidate.tokens, &literal, &distance, options.exhaustive);
 
-    let mut planned = plan_owned_block(candidate, alignment, options, expired);
+    let mut planned = plan_owned_block(candidate, alignment, options, stop);
     if let Some(deft4j) = deft4j {
         if deft4j.bits < planned.bits {
             planned.bits = deft4j.bits;
@@ -2349,22 +2328,19 @@ fn consider_deft4j_rebuild<F>(
     }
 }
 
-pub(crate) fn plan_block_with_search<F>(
+pub(crate) fn plan_block_with_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
         options,
         SearchPolicy::FULL,
         SearchBase::Price,
-        expired,
+        stop,
     )
 }
 
@@ -2373,23 +2349,20 @@ where
 /// Stream split discovery prices the unsplit block before it ranks any
 /// boundaries. Passing that exact plan back here avoids rebuilding the same
 /// exhaustive Huffman representation when the token search begins.
-pub(crate) fn plan_block_with_complete_base_search<F>(
+pub(crate) fn plan_block_with_complete_base_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     base: PlannedBlock,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
         options,
         SearchPolicy::FULL,
         SearchBase::Complete(base),
-        expired,
+        stop,
     )
 }
 
@@ -2398,15 +2371,12 @@ where
 /// This preserves a distinct fixed point from the ordinary endpoint ordering.
 /// Max mode runs it as an independent comparison candidate, so the locally
 /// smaller seed cannot displace the completed normal route.
-pub(crate) fn plan_block_with_integrated_proven_search<F>(
+pub(crate) fn plan_block_with_integrated_proven_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
@@ -2416,7 +2386,7 @@ where
             ..SearchPolicy::FULL
         },
         SearchBase::Price,
-        expired,
+        stop,
     )
 }
 
@@ -2425,16 +2395,13 @@ where
 /// This preserves the historical ordering as an additive comparison route:
 /// the bounded floor establishes feedback-tree seeds, then the full search may
 /// extend them without replacing the ordinary stream lineage.
-pub(crate) fn plan_block_with_complete_integrated_proven_search<F>(
+pub(crate) fn plan_block_with_complete_integrated_proven_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     base: PlannedBlock,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
@@ -2444,7 +2411,7 @@ where
             ..SearchPolicy::FULL
         },
         SearchBase::Complete(base),
-        expired,
+        stop,
     )
 }
 
@@ -2455,16 +2422,13 @@ where
 /// queue, and post-search replay to their independent candidates. This keeps a
 /// long source-block chain moving forward instead of spending its entire wall
 /// budget on the first locally interesting block.
-pub(crate) fn plan_block_with_narrow_search<F>(
+pub(crate) fn plan_block_with_narrow_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     allow_individual_prune: bool,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
@@ -2478,24 +2442,21 @@ where
             integrated_proven: false,
         },
         SearchBase::Price,
-        expired,
+        stop,
     )
 }
 
 /// Continue the narrow whole-block route from an independently completed
 /// exact candidate while retaining the original source tokens as another
 /// transformation parent.
-pub(crate) fn plan_block_with_seeded_narrow_search<F>(
+pub(crate) fn plan_block_with_seeded_narrow_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     allow_individual_prune: bool,
     seed: PlannedBlock,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     plan_block_with_search_policy(
         block,
         alignment,
@@ -2509,7 +2470,7 @@ where
             integrated_proven: false,
         },
         SearchBase::Additional(seed),
-        expired,
+        stop,
     )
 }
 
@@ -2543,21 +2504,18 @@ impl SearchPolicy {
     };
 }
 
-fn plan_block_with_search_policy<F>(
+fn plan_block_with_search_policy(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     policy: SearchPolicy,
     base: SearchBase,
-    expired: &mut F,
-) -> PlannedBlock
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> PlannedBlock {
     let mut best = match base {
-        SearchBase::Price => plan_block(block, alignment, options, &mut *expired),
+        SearchBase::Price => plan_block(block, alignment, options, &mut *stop),
         SearchBase::Additional(seed) => {
-            let ordinary = plan_block(block, alignment, options, &mut *expired);
+            let ordinary = plan_block(block, alignment, options, &mut *stop);
             if seed.bits < ordinary.bits {
                 seed
             } else {
@@ -2571,16 +2529,16 @@ where
     // with Defluff's limiter. Price both before optional byte-seeking work.
     let feedback_seeds = feedback_tree_seeds(block, options.strict);
     consider_feedback_seed_trees(block, options, &feedback_seeds, &mut best);
-    if expired() {
+    if stop.reached() {
         return best;
     }
-    consider_same_distance_runs(block, alignment, options, expired, &mut best);
-    if expired() {
+    consider_same_distance_runs(block, alignment, options, stop, &mut best);
+    if stop.reached() {
         return best;
     }
     if policy.integrated_proven {
-        consider_proven_submatches(block, alignment, options, expired, &mut best);
-        if expired() {
+        consider_proven_submatches(block, alignment, options, stop, &mut best);
+        if stop.reached() {
             return best;
         }
     }
@@ -2602,14 +2560,14 @@ where
     if has_258_alias {
         if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
             if normalized.as_slice() != block.tokens.as_slice() {
-                consider_tokens(block, normalized, alignment, options, expired, &mut best);
+                consider_tokens(block, normalized, alignment, options, stop, &mut best);
             }
         }
     }
     if !options.strict && block.literal_frequencies[285] != 0 {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
             if aliased.as_slice() != block.tokens.as_slice() {
-                consider_tokens(block, aliased, alignment, options, expired, &mut best);
+                consider_tokens(block, aliased, alignment, options, stop, &mut best);
             }
         }
     }
@@ -2633,10 +2591,10 @@ where
     let sparse_literal_endpoint = block.tokens.len() <= 20_000 && match_count <= 32;
     if block.plain.len() <= 12_000
         && (block.tokens.len() <= 4_000 || sparse_literal_endpoint)
-        && !expired()
+        && !stop.reached()
     {
         if let Some(literals) = literal_token_candidate(&block.plain) {
-            consider_tokens(block, literals, alignment, options, expired, &mut best);
+            consider_tokens(block, literals, alignment, options, stop, &mut best);
         }
     }
 
@@ -2656,13 +2614,13 @@ where
     seeds.push(fixed_lengths());
     deduplicate_seeds(&mut seeds);
 
-    if !expired() {
+    if !stop.reached() {
         consider_columbo_defluff_derived_rescan(
             block,
             alignment,
             options,
             &feedback_seeds,
-            expired,
+            stop,
             &mut best,
         );
     }
@@ -2675,7 +2633,7 @@ where
     let pass_limit = 12;
     let fixed_seed = fixed_lengths();
     for (mut literal_lengths, mut distance_lengths) in seeds {
-        if expired() {
+        if stop.reached() {
             break;
         }
 
@@ -2698,7 +2656,7 @@ where
                     strictly_expanded,
                     alignment,
                     options,
-                    expired,
+                    stop,
                     &mut best,
                 );
             }
@@ -2718,7 +2676,7 @@ where
             ) else {
                 break;
             };
-            let Some(candidate) = plan_tokens(block, expanded, alignment, options, expired) else {
+            let Some(candidate) = plan_tokens(block, expanded, alignment, options, stop) else {
                 break;
             };
             let next_lengths = plan_lengths(&candidate);
@@ -2757,7 +2715,7 @@ where
             };
             literal_lengths = next_literal;
             distance_lengths = next_distance;
-            if expired() {
+            if stop.reached() {
                 break;
             }
         }
@@ -2773,20 +2731,20 @@ where
         &fixed_distance,
         false,
     ) {
-        consider_tokens(block, tokens, alignment, options, expired, &mut best);
+        consider_tokens(block, tokens, alignment, options, stop, &mut best);
     }
 
-    if policy.large_source_bands && !expired() {
-        consider_large_source_bands(block, alignment, options, expired, &mut best);
+    if policy.large_source_bands && !stop.reached() {
+        consider_large_source_bands(block, alignment, options, stop, &mut best);
     }
 
     if policy.match_groups
         && options.exhaustive
         && block.tokens.len() <= 250_000
         && block.plain.len() <= 10_000_000
-        && !expired()
+        && !stop.reached()
     {
-        match_group_search(block, alignment, options, expired, &mut best);
+        match_group_search(block, alignment, options, stop, &mut best);
     }
 
     // Literal-heavy encoder blocks often contain only one or two marginal
@@ -2812,11 +2770,11 @@ where
     let pre_individual = (try_ordered_queue && try_individual_prune && match_count != 0)
         .then(|| try_clone_planned_block(&best))
         .flatten();
-    if try_individual_prune && match_count != 0 && !expired() {
-        individual_prune_search(block, alignment, options, expired, &mut best);
+    if try_individual_prune && match_count != 0 && !stop.reached() {
+        individual_prune_search(block, alignment, options, stop, &mut best);
     }
 
-    if try_ordered_queue && !expired() {
+    if try_ordered_queue && !stop.reached() {
         let alternate = pre_individual.filter(|alternate| alternate.tokens != best.tokens);
         let mut seen = HashSet::new();
         // Queue edges only expand matches to literals; they cannot reconstruct
@@ -2826,17 +2784,17 @@ where
         // Both beams share exact visited state, so converged descendants are
         // priced once rather than once per lineage.
         if let Some(mut intact) = alternate {
-            ordered_state_queue(block, alignment, options, expired, &mut intact, &mut seen);
+            ordered_state_queue(block, alignment, options, stop, &mut intact, &mut seen);
             if intact.bits < best.bits {
                 best = intact;
             }
         }
-        if !expired() {
-            ordered_state_queue(block, alignment, options, expired, &mut best, &mut seen);
+        if !stop.reached() {
+            ordered_state_queue(block, alignment, options, stop, &mut best, &mut seen);
         }
     }
 
-    if policy.replay && options.exhaustive && best.tokens != block.tokens && !expired() {
+    if policy.replay && options.exhaustive && best.tokens != block.tokens && !stop.reached() {
         // Columbo's original C --max scheduler replays completed winning token
         // states through the default ladder. Use a non-exhaustive child round
         // to avoid recursive route multiplication while retaining that
@@ -2851,7 +2809,7 @@ where
             let Some(replay_block) = try_transformed_block(block, replay_tokens) else {
                 break;
             };
-            let replay = plan_block_with_search(&replay_block, alignment, &replay_options, expired);
+            let replay = plan_block_with_search(&replay_block, alignment, &replay_options, stop);
             if replay.bits < best.bits {
                 let next_tokens = try_clone_token_candidate(&replay.tokens, block.plain.len());
                 best = replay;
@@ -2862,7 +2820,7 @@ where
             } else {
                 break;
             }
-            if expired() {
+            if stop.reached() {
                 break;
             }
         }
@@ -2887,16 +2845,14 @@ enum QueueTable {
     NoCodes,
 }
 
-fn ordered_state_queue<F>(
+fn ordered_state_queue(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
     seen: &mut HashSet<Vec<Token>>,
-) where
-    F: FnMut() -> bool,
-{
+) {
     const BEAM: usize = 8;
     const DEPTH: usize = 5;
     const CHILDREN: usize = 6;
@@ -2928,7 +2884,7 @@ fn ordered_state_queue<F>(
     for _ in 0..DEPTH {
         let mut next = Vec::new();
         for state in &current {
-            if expired() {
+            if stop.reached() {
                 return;
             }
             let repriced_lengths;
@@ -2942,7 +2898,7 @@ fn ordered_state_queue<F>(
                     let Some(state_block) = try_transformed_block(block, state_tokens) else {
                         return;
                     };
-                    let state_plan = plan_block(&state_block, alignment, options, &mut *expired);
+                    let state_plan = plan_block(&state_block, alignment, options, &mut *stop);
                     let Some(lengths) = plan_lengths(&state_plan) else {
                         continue;
                     };
@@ -2961,7 +2917,7 @@ fn ordered_state_queue<F>(
                 distance_lengths,
             );
             for group in groups.iter().take(CHILDREN) {
-                if expired() {
+                if stop.reached() {
                     return;
                 }
                 let Some(tokens) =
@@ -2980,7 +2936,7 @@ fn ordered_state_queue<F>(
                 else {
                     return;
                 };
-                let Some(plan) = plan_tokens(block, planned_tokens, alignment, options, expired)
+                let Some(plan) = plan_tokens(block, planned_tokens, alignment, options, stop)
                 else {
                     return;
                 };
@@ -3075,18 +3031,16 @@ fn consider_feedback_seed_trees(
 /// Columbo/Defluff hybrid. Defluff supplies the strict fresh/adjusted rescan
 /// shape, but Columbo sends each token set through its broader planner instead
 /// of scoring Defluff's supplied tables and exact four-pass header directly.
-fn consider_columbo_defluff_derived_rescan<F>(
+fn consider_columbo_defluff_derived_rescan(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     seeds: &[FeedbackTreeSeed; 2],
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     for seed in seeds {
-        if expired() {
+        if stop.reached() {
             return;
         }
         let Some(fresh_tokens) =
@@ -3096,7 +3050,7 @@ fn consider_columbo_defluff_derived_rescan<F>(
         };
         let (fresh_literal_frequencies, fresh_distance_frequencies) =
             count_frequencies(&fresh_tokens);
-        consider_tokens(block, fresh_tokens, alignment, options, expired, best);
+        consider_tokens(block, fresh_tokens, alignment, options, stop, best);
 
         let adjusted_literal = (seed.builder)(&fresh_literal_frequencies, 15, 0);
         let adjusted_distance = (seed.builder)(&fresh_distance_frequencies, 15, 0);
@@ -3109,7 +3063,7 @@ fn consider_columbo_defluff_derived_rescan<F>(
             &adjusted_literal,
             &adjusted_distance,
         ) {
-            consider_tokens(block, adjusted_tokens, alignment, options, expired, best);
+            consider_tokens(block, adjusted_tokens, alignment, options, stop, best);
         }
     }
 }
@@ -3171,22 +3125,20 @@ fn expand_defluff_matches(
 /// they cover progressively longer short-match alphabets plus one sparse
 /// longer-match set. Each candidate is rebuilt and must strictly beat the
 /// complete incumbent before it can affect output.
-fn consider_large_source_bands<F>(
+fn consider_large_source_bands(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     if !large_source_bands_eligible(block.plain.len(), block.tokens.len()) {
         return;
     }
 
     const CUMULATIVE_ENDS: [u16; 5] = [262, 265, 267, 269, 270];
     for end in CUMULATIVE_ENDS {
-        if expired() {
+        if stop.reached() {
             return;
         }
         let Some(tokens) = expand_selected_matches(
@@ -3196,10 +3148,10 @@ fn consider_large_source_bands<F>(
         ) else {
             continue;
         };
-        consider_tokens(block, tokens, alignment, options, expired, best);
+        consider_tokens(block, tokens, alignment, options, stop, best);
     }
 
-    if expired() {
+    if stop.reached() {
         return;
     }
     const LONG_FAMILIES: [u16; 12] = [260, 261, 262, 263, 264, 265, 266, 267, 268, 269, 270, 280];
@@ -3208,7 +3160,7 @@ fn consider_large_source_bands<F>(
         &block.plain,
         |_, token, _| matches!(token, Token::Match { length_symbol, .. } if LONG_FAMILIES.contains(&length_symbol)),
     ) {
-        consider_tokens(block, tokens, alignment, options, expired, best);
+        consider_tokens(block, tokens, alignment, options, stop, best);
     }
 }
 
@@ -3230,15 +3182,13 @@ struct MatchGroup {
     delta: i64,
 }
 
-fn match_group_search<F>(
+fn match_group_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     let mut seeds = Vec::new();
     if let Some(lengths) = plan_lengths(best) {
         seeds.push(lengths);
@@ -3260,13 +3210,13 @@ fn match_group_search<F>(
         );
         let cap = if options.exhaustive { 20 } else { 8 };
         for group in groups.iter().take(cap) {
-            if expired() {
+            if stop.reached() {
                 return;
             }
             if let Some(tokens) =
                 expand_groups(&block.tokens, &block.plain, std::slice::from_ref(group))
             {
-                consider_tokens(block, tokens, alignment, options, expired, best);
+                consider_tokens(block, tokens, alignment, options, stop, best);
             }
         }
 
@@ -3274,11 +3224,11 @@ fn match_group_search<F>(
         // length/distance families. Test the first few prefixes directly.
         let combined_cap = if options.exhaustive { 5 } else { 3 };
         for count in 2..=combined_cap.min(groups.len()) {
-            if expired() {
+            if stop.reached() {
                 return;
             }
             if let Some(tokens) = expand_groups(&block.tokens, &block.plain, &groups[..count]) {
-                consider_tokens(block, tokens, alignment, options, expired, best);
+                consider_tokens(block, tokens, alignment, options, stop, best);
             }
         }
     }
@@ -3381,35 +3331,30 @@ fn expand_groups(tokens: &[Token], plain: &[u8], groups: &[MatchGroup]) -> Optio
     })
 }
 
-fn consider_tokens<F>(
+fn consider_tokens(
     source: &ParsedBlock,
     tokens: Vec<Token>,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
-    if let Some(candidate) = plan_tokens(source, tokens, alignment, options, expired) {
+) {
+    if let Some(candidate) = plan_tokens(source, tokens, alignment, options, stop) {
         if candidate.bits < best.bits {
             *best = candidate;
         }
     }
 }
 
-fn plan_tokens<F>(
+fn plan_tokens(
     source: &ParsedBlock,
     tokens: Vec<Token>,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<PlannedBlock>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<PlannedBlock> {
     let candidate = try_transformed_block(source, tokens)?;
-    Some(plan_owned_block(candidate, alignment, options, expired))
+    Some(plan_owned_block(candidate, alignment, options, stop))
 }
 
 /// Build the owned block needed to price one optional token transformation.
@@ -3684,15 +3629,13 @@ pub(crate) fn rewrite_258_symbols(
     Some(rewritten)
 }
 
-fn individual_prune_search<F>(
+fn individual_prune_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-) where
-    F: FnMut() -> bool,
-{
+) {
     // Exact source bits can remain the block winner even though deleting one
     // costly match and rebuilding the table would improve it. In that case
     // there is no tree on `best`, so use the decoded source tree as the cost
@@ -3705,7 +3648,7 @@ fn individual_prune_search<F>(
         block,
         alignment,
         options,
-        expired,
+        stop,
         best,
         &literal_lengths,
         &distance_lengths,
@@ -3714,18 +3657,16 @@ fn individual_prune_search<F>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn individual_prune_from_lengths<F>(
+fn individual_prune_from_lengths(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     trial_limit: usize,
-) where
-    F: FnMut() -> bool,
-{
+) {
     if trial_limit == 0 {
         return;
     }
@@ -3768,13 +3709,13 @@ fn individual_prune_from_lengths<F>(
     }
 
     for (_, token_index) in trials {
-        if expired() {
+        if stop.reached() {
             break;
         }
         if let Some(tokens) = expand_selected_matches(&block.tokens, &block.plain, |index, _, _| {
             index == token_index
         }) {
-            consider_tokens(block, tokens, alignment, options, expired, best);
+            consider_tokens(block, tokens, alignment, options, stop, best);
         }
     }
 }
@@ -3830,7 +3771,7 @@ mod tests {
             decoded_bytes,
             literal_lengths,
             exhaustive,
-            &mut || false,
+            &mut SearchStop::never(),
         )
     }
 
@@ -3839,7 +3780,12 @@ mod tests {
         max_active: usize,
         max_deficit: usize,
     ) -> Option<SameDistancePartitioner> {
-        SameDistancePartitioner::new(literal_lengths, max_active, max_deficit, &mut || false)
+        SameDistancePartitioner::new(
+            literal_lengths,
+            max_active,
+            max_deficit,
+            &mut SearchStop::never(),
+        )
     }
 
     fn decode_test_tokens(tokens: &[Token]) -> Option<Vec<u8>> {
@@ -3992,7 +3938,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             None,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_proven_submatch_rewrite(
@@ -4022,7 +3968,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             None,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_proven_submatch_rewrite(
@@ -4050,7 +3996,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             None,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_proven_submatch_rewrite(
@@ -4080,7 +4026,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             None,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .is_none());
 
@@ -4090,7 +4036,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             Some(268),
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_proven_submatch_rewrite(
@@ -4115,7 +4061,7 @@ mod tests {
             &literal_lengths,
             &distance_lengths,
             Some(285),
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         let seed = [Token::Literal(b'A')];
@@ -4129,18 +4075,19 @@ mod tests {
         );
 
         let mut checks = 0_usize;
-        let expired = solve_proven_submatch(
+        let mut expires = || {
+            checks += 1;
+            checks > 2
+        };
+        let result = solve_proven_submatch(
             source,
             &decoded,
             &literal_lengths,
             &distance_lengths,
             None,
-            &mut || {
-                checks += 1;
-                checks > 2
-            },
+            &mut SearchStop::callback(&mut expires),
         );
-        assert!(expired.is_none());
+        assert!(result.is_none());
         assert!(checks > 2);
     }
 
@@ -4179,7 +4126,7 @@ mod tests {
             &FIXED_LITERAL_CODE_LENGTHS,
             false,
             false,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert!(default.len() <= DEFAULT_PROVEN_SUBMATCH_TARGETS);
@@ -4194,7 +4141,7 @@ mod tests {
             &FIXED_LITERAL_CODE_LENGTHS,
             true,
             true,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_eq!(exhaustive.len(), tokens.len());
@@ -4236,7 +4183,7 @@ mod tests {
             &FIXED_LITERAL_CODE_LENGTHS,
             false,
             false,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert!(targets.len() <= DEFAULT_PROVEN_SUBMATCH_TARGETS);
@@ -4321,8 +4268,14 @@ mod tests {
         );
 
         let options = Options::default();
-        let candidate =
-            plan_tokens(&block, candidate_tokens.clone(), 0, &options, &mut || false).unwrap();
+        let candidate = plan_tokens(
+            &block,
+            candidate_tokens.clone(),
+            0,
+            &options,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
         let incumbent = |bits| PlannedBlock {
             tokens: block.tokens.clone(),
             plain: block.plain.clone(),
@@ -4337,7 +4290,7 @@ mod tests {
             candidate_tokens.clone(),
             0,
             &options,
-            &mut || false,
+            &mut SearchStop::never(),
             &mut tie,
         );
         assert_eq!(tie.tokens.as_slice(), source_tokens);
@@ -4348,7 +4301,7 @@ mod tests {
             candidate_tokens.clone(),
             0,
             &options,
-            &mut || false,
+            &mut SearchStop::never(),
             &mut strict_win,
         );
         assert_eq!(strict_win.bits, candidate.bits);
@@ -4362,7 +4315,7 @@ mod tests {
             0,
             &options,
             &mut priced_candidates,
-            &mut || false,
+            &mut SearchStop::never(),
             &mut deduplicated,
         );
         assert_eq!(priced_candidates.len(), 1);
@@ -4372,7 +4325,7 @@ mod tests {
             0,
             &options,
             &mut priced_candidates,
-            &mut || false,
+            &mut SearchStop::never(),
             &mut deduplicated,
         );
         assert_eq!(priced_candidates.len(), 1);
@@ -4473,14 +4426,10 @@ mod tests {
     fn direct_same_distance_coalescing_does_not_enter_the_dp() {
         let source = [test_match(100, 1, 0, 0, 0), test_match(158, 1, 0, 0, 0)];
         let mut dp_must_not_poll = || -> bool { panic!("direct coalescing entered the DP") };
-        let repacked = repack_same_distance_runs(
-            &source,
-            258,
-            &FIXED_LITERAL_CODE_LENGTHS,
-            false,
-            &mut dp_must_not_poll,
-        )
-        .unwrap();
+        let mut stop = SearchStop::callback(&mut dp_must_not_poll);
+        let repacked =
+            repack_same_distance_runs(&source, 258, &FIXED_LITERAL_CODE_LENGTHS, false, &mut stop)
+                .unwrap();
         assert_eq!(repacked.len(), 1);
     }
 
@@ -4489,12 +4438,13 @@ mod tests {
         let source = vec![test_match(257, 1, 0, 0, 0); 257];
         let decoded_bytes = 257 * 257;
         let mut default_must_not_poll = || -> bool { panic!("default fallback entered the DP") };
+        let mut default_stop = SearchStop::callback(&mut default_must_not_poll);
         let repacked = repack_same_distance_runs(
             &source,
             decoded_bytes,
             &FIXED_LITERAL_CODE_LENGTHS,
             false,
-            &mut default_must_not_poll,
+            &mut default_stop,
         )
         .unwrap();
         assert_eq!(repacked.len(), 257);
@@ -4511,12 +4461,13 @@ mod tests {
             polls += 1;
             polls > 3
         };
+        let mut expiring_stop = SearchStop::callback(&mut expires_during_dp);
         assert!(repack_same_distance_runs(
             &source,
             decoded_bytes,
             &FIXED_LITERAL_CODE_LENGTHS,
             true,
-            &mut expires_during_dp,
+            &mut expiring_stop,
         )
         .is_none());
         assert!(polls > 3);
@@ -4726,15 +4677,15 @@ mod tests {
             legacy_floor
         };
 
-        let base = plan_block(&block, 3, &floor_options, || false);
+        let base = plan_block(&block, 3, &floor_options, &mut SearchStop::never());
         let reused = improve_plan_with_floor(&block, 3, &options, true, base);
         let reused = improve_plan_with_short_family_floor(&block, &options, reused);
         assert_same_plan(&reused, &legacy);
 
-        let fresh_deft4j_base = plan_block(&block, 3, &floor_options, || false);
+        let fresh_deft4j_base = plan_block(&block, 3, &floor_options, &mut SearchStop::never());
         let fresh_deft4j =
             improve_plan_with_deft4j_tree_floor(&block, 3, &options, fresh_deft4j_base);
-        let cloned_deft4j_base = plan_block(&block, 3, &floor_options, || false);
+        let cloned_deft4j_base = plan_block(&block, 3, &floor_options, &mut SearchStop::never());
         let cloned_deft4j_base =
             try_clone_planned_block(&cloned_deft4j_base).expect("small plan metadata is cloneable");
         let cloned_deft4j =
@@ -4785,7 +4736,7 @@ mod tests {
             distance_extra_bits: 0,
         });
         let block = short_family_test_block(tokens, vec![b'a'; 1_003]);
-        let mut selected = plan_block(&block, 0, &Options::default(), || false);
+        let mut selected = plan_block(&block, 0, &Options::default(), &mut SearchStop::never());
         assert!(matches!(
             selected.representation,
             Representation::Dynamic(_)
@@ -4976,7 +4927,13 @@ mod tests {
             source_type: SourceBlockType::Dynamic,
         };
 
-        individual_prune_search(&block, 0, &Options::default(), &mut || false, &mut best);
+        individual_prune_search(
+            &block,
+            0,
+            &Options::default(),
+            &mut SearchStop::never(),
+            &mut best,
+        );
 
         assert!(best.bits < u64::MAX);
         assert_eq!(best.tokens.as_slice(), vec![Token::Literal(b'a'); 4]);

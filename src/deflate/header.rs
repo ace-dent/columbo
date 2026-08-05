@@ -13,6 +13,7 @@ use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
     MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
 };
+use super::stop::SearchStop;
 
 const INF: u64 = u64::MAX / 4;
 
@@ -178,7 +179,7 @@ pub(crate) fn best_dynamic_plan(
     original: Option<&DynamicPlan>,
     strict: bool,
     exhaustive: bool,
-    mut expired: impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
 ) -> Option<DynamicPlan> {
     let extra_bits = token_extra_bits(tokens);
     let source_exact = original.and_then(|plan| score_existing_dynamic(tokens, plan, strict));
@@ -235,7 +236,7 @@ pub(crate) fn best_dynamic_plan(
 
     'outer: for literal in &literal_candidates {
         for distance in &distance_candidates {
-            if expired() {
+            if stop.reached() {
                 break 'outer;
             }
             let data_bits = token_bits_from_frequencies(
@@ -258,7 +259,7 @@ pub(crate) fn best_dynamic_plan(
     // Keep the RLE-smoothed pair in --max: the ordinary tree-family grid
     // already covers the fast path, and `keep_better` requires a strict win
     // from the completely priced alternate plan.
-    if exhaustive && !expired() {
+    if exhaustive && !stop.reached() {
         if let Some(candidate) = columbo_rle_tree_candidate(
             literal_frequencies,
             distance_frequencies,
@@ -276,7 +277,7 @@ pub(crate) fn best_dynamic_plan(
     // Columbo's --max route tries these stable assignments before its more
     // expensive finished-tree searches. DeflOpt 2.07 does not permute a
     // finished tree, so this remains explicitly a Columbo extension.
-    if exhaustive && !expired() {
+    if exhaustive && !stop.reached() {
         if let Some(seed) = best.clone() {
             let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
             let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
@@ -287,7 +288,7 @@ pub(crate) fn best_dynamic_plan(
                 // header win even though neither change affects payload cost.
                 let mut literal = seed_literal;
                 arrange_equal_frequency_lengths(literal_frequencies, &mut literal, descending);
-                if literal != seed_literal && !expired() {
+                if literal != seed_literal && !stop.reached() {
                     if let Some(candidate) =
                         plan_for_explicit_lengths(tokens, &literal, &seed_distance, exhaustive)
                     {
@@ -298,7 +299,7 @@ pub(crate) fn best_dynamic_plan(
                 // The lightweight max route also arranges both alphabets.
                 let mut distance = seed_distance;
                 arrange_equal_frequency_lengths(distance_frequencies, &mut distance, descending);
-                if (literal != seed_literal || distance != seed_distance) && !expired() {
+                if (literal != seed_literal || distance != seed_distance) && !stop.reached() {
                     if let Some(candidate) =
                         plan_for_explicit_lengths(tokens, &literal, &distance, exhaustive)
                     {
@@ -313,7 +314,7 @@ pub(crate) fn best_dynamic_plan(
     // freedom more locally. It is particularly useful for small, literal-heavy
     // blocks, where rearranging the tree can save a whole byte without changing
     // a single decoded token. This route is not part of DeflOpt 2.07.
-    if exhaustive && tokens.len() <= 700 && !expired() {
+    if exhaustive && tokens.len() <= 700 && !stop.reached() {
         if let Some(seed) = best.clone() {
             improve_by_length_swaps(
                 tokens,
@@ -321,7 +322,7 @@ pub(crate) fn best_dynamic_plan(
                 distance_frequencies,
                 &seed,
                 exhaustive,
-                &mut expired,
+                stop,
                 &mut best,
             );
         }
@@ -1212,7 +1213,7 @@ fn improve_by_length_swaps(
     distance_frequencies: &[u32; 30],
     seed: &DynamicPlan,
     exhaustive: bool,
-    expired: &mut impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
     best: &mut Option<DynamicPlan>,
 ) {
     let mut literal_lengths = vec![0_u8; 286];
@@ -1246,7 +1247,7 @@ fn improve_by_length_swaps(
         &mut distance_lengths,
         true,
         exhaustive,
-        expired,
+        stop,
         &mut current,
         best,
     );
@@ -1257,7 +1258,7 @@ fn improve_by_length_swaps(
         &mut distance_lengths,
         false,
         exhaustive,
-        expired,
+        stop,
         &mut current,
         best,
     );
@@ -1271,21 +1272,21 @@ fn improve_one_tree_by_swaps(
     distance_lengths: &mut [u8],
     literal_tree: bool,
     exhaustive: bool,
-    expired: &mut impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
     current: &mut DynamicPlan,
     best: &mut Option<DynamicPlan>,
 ) {
     const MAX_PASSES: usize = 12;
 
     for _ in 0..MAX_PASSES {
-        if expired() {
+        if stop.reached() {
             break;
         }
 
         let mut selected_pair = None;
         let mut selected_plan = current.clone();
         for a in 0..frequencies.len() {
-            if expired() {
+            if stop.reached() {
                 return;
             }
             let length_a = if literal_tree {
@@ -2476,7 +2477,7 @@ mod tests {
             None,
             true,
             false,
-            || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert!(strict.has_strictly_compatible_huffman_codes());
@@ -2505,7 +2506,7 @@ mod tests {
             None,
             false,
             false,
-            || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert!(!relaxed.has_strictly_compatible_huffman_codes());

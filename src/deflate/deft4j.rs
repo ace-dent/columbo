@@ -33,6 +33,7 @@ use super::model::{
     SourceBlockType, Token,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
+use super::stop::SearchStop;
 
 type StateId = usize;
 
@@ -888,17 +889,18 @@ impl Deft4jPipeline {
         best.improved = true;
     }
 
-    fn pruned_fixed_point<F>(&mut self, source: StateId, expired: &mut F) -> Option<TransformMemo>
-    where
-        F: FnMut() -> bool,
-    {
+    fn pruned_fixed_point(
+        &mut self,
+        source: StateId,
+        stop: &mut SearchStop<'_>,
+    ) -> Option<TransformMemo> {
         let mut current = source;
         let mut current_bits = self
             .queue
             .score(current, ScoreKind::DefaultHeaderFixedPoint, self.strict)?
             .bits;
         let mut changed = false;
-        while !expired() && !self.queue.saturated {
+        while !stop.reached() && !self.queue.saturated {
             let next = self.queue.transform_pruned(current, &self.plain)?;
             if next.state == current {
                 break;
@@ -922,20 +924,17 @@ impl Deft4jPipeline {
         })
     }
 
-    fn add_optimized_recoded<F>(
+    fn add_optimized_recoded(
         &mut self,
         source: StateId,
         best: &mut Deft4jBest,
-        expired: &mut F,
-    ) -> bool
-    where
-        F: FnMut() -> bool,
-    {
+        stop: &mut SearchStop<'_>,
+    ) -> bool {
         let Some(strict) = self.queue.transform_strict(source, &self.plain) else {
             return false;
         };
         self.submit(strict.state, best);
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
@@ -946,7 +945,7 @@ impl Deft4jPipeline {
             return false;
         };
         self.submit(strict_recoded.state, best);
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
@@ -957,11 +956,11 @@ impl Deft4jPipeline {
             return false;
         };
         self.submit(strict_pruned.state, best);
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
-        let Some(full) = self.pruned_fixed_point(pruned.state, expired) else {
+        let Some(full) = self.pruned_fixed_point(pruned.state, stop) else {
             return false;
         };
         if full.changed {
@@ -973,45 +972,44 @@ impl Deft4jPipeline {
         true
     }
 
-    fn run_optimizations<F>(
+    fn run_optimizations(
         &mut self,
         source: StateId,
         best: &mut Deft4jBest,
-        expired: &mut F,
-    ) -> bool
-    where
-        F: FnMut() -> bool,
-    {
-        if !self.add_optimized_recoded(source, best, expired) {
+        stop: &mut SearchStop<'_>,
+    ) -> bool {
+        if !self.add_optimized_recoded(source, best, stop) {
             return false;
         }
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
         let Some(least) = self.queue.transform_least(source, &self.plain, false) else {
             return false;
         };
-        if !self.add_optimized_recoded(least.state, best, expired) {
+        if !self.add_optimized_recoded(least.state, best, stop) {
             return false;
         }
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
         let Some(least_seen) = self.queue.transform_least(source, &self.plain, true) else {
             return false;
         };
-        self.add_optimized_recoded(least_seen.state, best, expired)
+        self.add_optimized_recoded(least_seen.state, best, stop)
     }
 
-    fn run_multi<F>(&mut self, source: StateId, best: &mut Deft4jBest, expired: &mut F) -> bool
-    where
-        F: FnMut() -> bool,
-    {
+    fn run_multi(
+        &mut self,
+        source: StateId,
+        best: &mut Deft4jBest,
+        stop: &mut SearchStop<'_>,
+    ) -> bool {
         self.submit(source, best);
-        if !self.run_optimizations(source, best, expired) {
+        if !self.run_optimizations(source, best, stop) {
             return false;
         }
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
@@ -1019,10 +1017,10 @@ impl Deft4jPipeline {
             return false;
         };
         self.submit(recoded.state, best);
-        if !self.run_optimizations(recoded.state, best, expired) {
+        if !self.run_optimizations(recoded.state, best, stop) {
             return false;
         }
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
@@ -1030,50 +1028,47 @@ impl Deft4jPipeline {
             return false;
         };
         self.submit(pruned.state, best);
-        if !self.run_optimizations(pruned.state, best, expired) {
+        if !self.run_optimizations(pruned.state, best, stop) {
             return false;
         }
-        if expired() || self.queue.saturated {
+        if stop.reached() || self.queue.saturated {
             return false;
         }
 
-        let Some(full) = self.pruned_fixed_point(pruned.state, expired) else {
+        let Some(full) = self.pruned_fixed_point(pruned.state, stop) else {
             return false;
         };
         if full.changed {
             self.submit(full.state, best);
-            if !self.run_optimizations(full.state, best, expired) {
+            if !self.run_optimizations(full.state, best, stop) {
                 return false;
             }
         }
         true
     }
 
-    fn run_ordered<F>(&mut self, base: StateId, best: &mut Deft4jBest, expired: &mut F)
-    where
-        F: FnMut() -> bool,
-    {
-        if !self.run_multi(base, best, expired) || expired() || self.queue.saturated {
+    fn run_ordered(&mut self, base: StateId, best: &mut Deft4jBest, stop: &mut SearchStop<'_>) {
+        if !self.run_multi(base, best, stop) || stop.reached() || self.queue.saturated {
             return;
         }
         let Some(strict) = self.queue.transform_strict(base, &self.plain) else {
             return;
         };
         if strict.changed
-            && (!self.run_multi(strict.state, best, expired) || expired() || self.queue.saturated)
+            && (!self.run_multi(strict.state, best, stop) || stop.reached() || self.queue.saturated)
         {
             return;
         }
         let Some(least) = self.queue.transform_least(base, &self.plain, false) else {
             return;
         };
-        if !self.run_multi(least.state, best, expired) || expired() || self.queue.saturated {
+        if !self.run_multi(least.state, best, stop) || stop.reached() || self.queue.saturated {
             return;
         }
         let Some(least_seen) = self.queue.transform_least(base, &self.plain, true) else {
             return;
         };
-        let _ = self.run_multi(least_seen.state, best, expired);
+        let _ = self.run_multi(least_seen.state, best, stop);
     }
 }
 
@@ -1082,16 +1077,13 @@ struct BlockOutcome {
     improved: bool,
 }
 
-fn plan_source_block_once<F>(
+fn plan_source_block_once(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     available_bytes: usize,
-    expired: &mut F,
-) -> BlockOutcome
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> BlockOutcome {
     let mut best = Deft4jBest {
         plan: initial_plan(block, alignment, options),
         improved: false,
@@ -1162,7 +1154,7 @@ where
     if matches!(
         block.source_type,
         SourceBlockType::Fixed | SourceBlockType::Dynamic
-    ) && !expired()
+    ) && !stop.reached()
     {
         // A fixed-strict winner above remains alive while the deft4j state queue
         // runs. Reserve its payload from the queue's arena so both cannot each
@@ -1206,7 +1198,7 @@ where
                 depth: 0,
                 token_payload_charge: TokenPayloadCharge::Shared,
             }) {
-                pipeline.run_ordered(base, &mut best, expired);
+                pipeline.run_ordered(base, &mut best, stop);
 
                 // The source table and deft4j recodes form the source-derived
                 // path. Columbo's no-split sibling also keeps the original
@@ -1216,7 +1208,7 @@ where
                 // repeat the fixed-point adoption performed by `WorkingBlock`.
                 // Reuse this queue so shared states are deduplicated rather
                 // than rescanning them in a second complete route.
-                if !expired() && !pipeline.queue.saturated {
+                if !stop.reached() && !pipeline.queue.saturated {
                     if let Some((alternate_literal, alternate_distance)) =
                         alternate_seed_lengths(&best.plan, &literal_lengths, &distance_lengths)
                     {
@@ -1231,7 +1223,7 @@ where
                             depth: 0,
                             token_payload_charge: TokenPayloadCharge::Shared,
                         }) {
-                            pipeline.run_ordered(alternate_base, &mut best, expired);
+                            pipeline.run_ordered(alternate_base, &mut best, stop);
                         }
                     }
                 }
@@ -1411,29 +1403,21 @@ impl WorkingBlock {
         self.token_payload_bytes.checked_add(self.other_model_bytes)
     }
 
-    fn plan<F>(
+    fn plan(
         &mut self,
         alignment: u8,
         options: &Options,
         budget: &mut Deft4jRouteBudget,
-        expired: &mut F,
-    ) -> Option<u64>
-    where
-        F: FnMut() -> bool,
-    {
+        stop: &mut SearchStop<'_>,
+    ) -> Option<u64> {
         let slot = usize::from(alignment & 7);
         if let Some(plan) = &self.plans[slot] {
             return Some(plan.bits);
         }
 
         loop {
-            let outcome = plan_source_block_once(
-                &self.block,
-                alignment,
-                options,
-                budget.remaining(),
-                expired,
-            );
+            let outcome =
+                plan_source_block_once(&self.block, alignment, options, budget.remaining(), stop);
             let bits = outcome.plan.bits;
             if !outcome.improved {
                 self.plans[slot] = Some(outcome.plan);
@@ -1463,7 +1447,7 @@ impl WorkingBlock {
                 budget.release(self.token_payload_bytes)?;
                 self.token_payload_bytes = new_token_bytes;
             }
-            if expired() {
+            if stop.reached() {
                 // The adopted plan is complete and remains a valid emission
                 // candidate even though another fixed-point pass cannot start.
                 self.plans[slot] = Some(outcome.plan);
@@ -1472,24 +1456,21 @@ impl WorkingBlock {
         }
     }
 
-    fn take_plan<F>(
+    fn take_plan(
         &mut self,
         alignment: u8,
         options: &Options,
         budget: &mut Deft4jRouteBudget,
-        expired: &mut F,
-    ) -> Option<PlannedBlock>
-    where
-        F: FnMut() -> bool,
-    {
+        stop: &mut SearchStop<'_>,
+    ) -> Option<PlannedBlock> {
         let slot = usize::from(alignment & 7);
-        if self.plans[slot].is_none() && expired() {
+        if self.plans[slot].is_none() && stop.reached() {
             // An untouched tail must not run fixed-strict expansion after the
             // deadline. Emit the current block object faithfully instead; this
             // keeps all earlier source-route wins without another full model scan.
             return cheap_current_plan(&self.block, alignment, options);
         }
-        self.plan(alignment, options, budget, expired)?;
+        self.plan(alignment, options, budget, stop)?;
         self.plans[slot].take()
     }
 }
@@ -1529,21 +1510,18 @@ fn adopt_plan(block: &mut ParsedBlock, plan: &PlannedBlock) -> Option<()> {
 /// The returned blocks are ready for emission in order. A deadline may leave a
 /// valid partially explored list, while allocation failure abandons this
 /// optional route and leaves the caller's complete fallback untouched.
-pub(crate) fn plan_source_blocks<F>(
+pub(crate) fn plan_source_blocks(
     source: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     plan_source_blocks_with_budget(
         source,
         start_alignment,
         options,
         MAX_DEFT4J_ROUTE_BYTES,
-        expired,
+        stop,
     )
 }
 
@@ -1555,28 +1533,22 @@ where
 /// queue's state cache without invoking the source-list route's separate
 /// fixed-point adoption or reimplementing the deft4j graph in the stream
 /// planner.
-pub(crate) fn plan_source_block<F>(
+pub(crate) fn plan_source_block(
     source: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<PlannedBlock>
-where
-    F: FnMut() -> bool,
-{
-    Some(plan_source_block_once(source, alignment, options, MAX_DEFT4J_ROUTE_BYTES, expired).plan)
+    stop: &mut SearchStop<'_>,
+) -> Option<PlannedBlock> {
+    Some(plan_source_block_once(source, alignment, options, MAX_DEFT4J_ROUTE_BYTES, stop).plan)
 }
 
-fn plan_source_blocks_with_budget<F>(
+fn plan_source_blocks_with_budget(
     source: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     budget_bytes: usize,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut blocks = prepare_source_blocks(source)?;
     if blocks.is_empty() {
         return None;
@@ -1588,10 +1560,10 @@ where
     // correcting beta-17's repeated-pass position-accounting quirk.
     let mut alignment = start_alignment & 7;
     for block in &mut blocks {
-        if expired() {
+        if stop.reached() {
             break;
         }
-        let bits = block.plan(alignment, options, &mut budget, expired)?;
+        let bits = block.plan(alignment, options, &mut budget, stop)?;
         alignment = ((u64::from(alignment) + bits) & 7) as u8;
     }
 
@@ -1599,10 +1571,10 @@ where
     // at the same list index and is immediately retried against its neighbour.
     alignment = start_alignment & 7;
     let mut index = 0;
-    while index + 1 < blocks.len() && !expired() {
-        let current_bits = blocks[index].plan(alignment, options, &mut budget, expired)?;
+    while index + 1 < blocks.len() && !stop.reached() {
+        let current_bits = blocks[index].plan(alignment, options, &mut budget, stop)?;
         let next_alignment = ((u64::from(alignment) + current_bits) & 7) as u8;
-        let next_bits = blocks[index + 1].plan(next_alignment, options, &mut budget, expired)?;
+        let next_bits = blocks[index + 1].plan(next_alignment, options, &mut budget, stop)?;
 
         let left_type = blocks[index].block.source_type;
         let right_type = blocks[index + 1].block.source_type;
@@ -1632,7 +1604,7 @@ where
                     merged.token_payload_bytes,
                     merged.other_model_bytes,
                 );
-                let merged_bits = merged.plan(alignment, options, &mut budget, expired)?;
+                let merged_bits = merged.plan(alignment, options, &mut budget, stop)?;
                 if merged_bits < current_bits.checked_add(next_bits)? {
                     let replaced_bytes = blocks[index]
                         .accounted_bytes()?
@@ -1656,7 +1628,7 @@ where
     output.try_reserve_exact(blocks.len()).ok()?;
     alignment = start_alignment & 7;
     for block in &mut blocks {
-        let plan = block.take_plan(alignment, options, &mut budget, expired)?;
+        let plan = block.take_plan(alignment, options, &mut budget, stop)?;
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
         output.push(plan);
     }
@@ -1876,7 +1848,7 @@ mod tests {
             literal_block(b"aaaaaaaa", SourceBlockType::Fixed),
             literal_block(b"aaaaaaaa", SourceBlockType::Fixed),
         ];
-        let mut never = || false;
+        let mut never = SearchStop::never();
         let plans = plan_source_blocks(&blocks, 0, &Options::default(), &mut never).unwrap();
         assert_eq!(
             plans.len(),
@@ -1890,7 +1862,7 @@ mod tests {
     fn stored_merge_limit_is_asymmetric_and_hard() {
         let left = literal_block(&vec![1; 40_000], SourceBlockType::Stored);
         let right = literal_block(&vec![2; 30_000], SourceBlockType::Fixed);
-        let mut never = || false;
+        let mut never = SearchStop::never();
         let plans = plan_source_blocks(&[left, right], 0, &Options::default(), &mut never).unwrap();
         assert_eq!(plans.len(), 2);
     }
@@ -1904,13 +1876,14 @@ mod tests {
             calls.set(calls.get() + 1);
             false
         };
+        let mut stop = SearchStop::callback(&mut deadline);
         let mut budget = Deft4jRouteBudget::new(MAX_DEFT4J_ROUTE_BYTES);
         let first = block
-            .plan(3, &Options::default(), &mut budget, &mut deadline)
+            .plan(3, &Options::default(), &mut budget, &mut stop)
             .unwrap();
         let after_first = calls.get();
         let second = block
-            .plan(3, &Options::default(), &mut budget, &mut deadline)
+            .plan(3, &Options::default(), &mut budget, &mut stop)
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(calls.get(), after_first);
@@ -1920,8 +1893,8 @@ mod tests {
     fn expired_tail_uses_current_tokens_without_fixed_strict_expansion() {
         let blocks = [costly_match_block(), costly_match_block()];
         let source_tokens = [Arc::clone(&blocks[0].tokens), Arc::clone(&blocks[1].tokens)];
-        let mut expired = || true;
-        let plans = plan_source_blocks(&blocks, 0, &Options::default(), &mut expired).unwrap();
+        let mut stop = SearchStop::always();
+        let plans = plan_source_blocks(&blocks, 0, &Options::default(), &mut stop).unwrap();
 
         assert_eq!(plans.len(), 2);
         for (plan, source) in plans.iter().zip(source_tokens) {
@@ -1938,7 +1911,7 @@ mod tests {
         // retained, only that mark byte remains and the second block cannot
         // allocate another expanded token vector.
         let budget_bytes = token_payload_bytes(3).unwrap() + 1;
-        let mut never = || false;
+        let mut never = SearchStop::never();
         let plans = plan_source_blocks_with_budget(
             &blocks,
             0,

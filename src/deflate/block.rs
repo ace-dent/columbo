@@ -17,6 +17,7 @@ use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
     CODE_LENGTH_ORDER,
 };
+use super::stop::SearchStop;
 
 /// Route-local ceiling for completed canonical Huffman kernels.
 ///
@@ -54,9 +55,9 @@ pub(crate) fn plan_block(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
 ) -> PlannedBlock {
-    let (representation, bits) = plan_representation(block, alignment, options, expired);
+    let (representation, bits) = plan_representation(block, alignment, options, stop);
 
     PlannedBlock {
         tokens: block.tokens.clone(),
@@ -77,9 +78,9 @@ pub(crate) fn plan_owned_block(
     block: ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
 ) -> PlannedBlock {
-    let (representation, bits) = plan_representation(&block, alignment, options, expired);
+    let (representation, bits) = plan_representation(&block, alignment, options, stop);
     PlannedBlock {
         tokens: block.tokens,
         plain: block.plain,
@@ -175,7 +176,7 @@ impl ReusableBlockPlan {
 pub(crate) fn plan_reusable_block(
     block: &ParsedBlock,
     options: &Options,
-    expired: impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
 ) -> ReusableBlockPlan {
     let fixed_bits = fixed_block_bits(&block.tokens).unwrap_or(u64::MAX);
     let dynamic = best_dynamic_plan(
@@ -185,7 +186,7 @@ pub(crate) fn plan_reusable_block(
         block.original_dynamic.as_ref(),
         options.strict,
         options.exhaustive,
-        expired,
+        stop,
     );
 
     let (representation, bits) = if dynamic
@@ -331,7 +332,7 @@ impl CanonicalPlanCache {
         if let Some(plan) = self.lookup_reusable_with_fingerprint(block, options, fingerprint) {
             return plan;
         }
-        let plan = plan_reusable_block(block, options, || false);
+        let plan = plan_reusable_block(block, options, &mut SearchStop::never());
         self.insert(block, options, fingerprint, &plan);
         plan
     }
@@ -468,9 +469,9 @@ fn plan_representation(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
-    expired: impl FnMut() -> bool,
+    stop: &mut SearchStop<'_>,
 ) -> (Representation, u64) {
-    plan_reusable_block(block, options, expired).into_alignment(block, alignment, options.strict)
+    plan_reusable_block(block, options, stop).into_alignment(block, alignment, options.strict)
 }
 
 fn select_aligned_representation(
@@ -815,7 +816,7 @@ mod tests {
 
         let options = Options::default();
         let mut cache = CanonicalPlanCache::new();
-        let expected = plan_block(&first, 3, &options, || false);
+        let expected = plan_block(&first, 3, &options, &mut SearchStop::never());
         let first_cached = plan_block_cached(&first, 3, &options, &mut cache);
         let second_cached = plan_block_cached(&second, 3, &options, &mut cache);
 
@@ -851,7 +852,7 @@ mod tests {
         cache.first_by_hash.clear();
         cache.first_by_hash.insert(collision, 0);
 
-        let expected = plan_block(&second, 5, &options, || false);
+        let expected = plan_block(&second, 5, &options, &mut SearchStop::never());
         let actual = plan_block_cached(&second, 5, &options, &mut cache);
         assert_same_plan(&actual, &expected);
         assert_eq!(cache.entries.len(), 2);
@@ -954,7 +955,7 @@ mod tests {
         let options = Options::default();
         let mut cache = CanonicalPlanCache::with_limits(1, 0);
 
-        let expected = plan_block(&block, 4, &options, || false);
+        let expected = plan_block(&block, 4, &options, &mut SearchStop::never());
         let first = plan_block_cached(&block, 4, &options, &mut cache);
         let second = plan_block_cached(&block, 4, &options, &mut cache);
         assert_same_plan(&first, &expected);

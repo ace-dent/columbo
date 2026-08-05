@@ -45,6 +45,7 @@ use super::search::{
     same_distance_opportunities, score_short_family_frequencies, tighten_terminal_plan,
     try_clone_planned_block, ShortFamilyStats,
 };
+use super::stop::SearchStop;
 
 // The original Columbo C implementation tries its default long-merge route in
 // this encoded-size range. The gate avoids quadratic work on very large streams
@@ -188,17 +189,14 @@ fn cheapest_grouped_layout(
 ///
 /// Splits and merges are flattened into ordinary [`PlannedBlock`] values. This
 /// keeps stream search out of the emitter and makes every returned block useful
-/// on its own. `expired` is deliberately borrowed from the caller so all block,
+/// on its own. `stop` is deliberately borrowed from the caller so all block,
 /// header, and stream searches share one deadline.
-pub(crate) fn plan_stream<F>(
+pub(crate) fn plan_stream(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let progress = RouteProgress::disabled();
     plan_stream_with_progress(
         blocks,
@@ -206,7 +204,7 @@ where
         options,
         false,
         false,
-        expired,
+        stop,
         &progress,
     )
 }
@@ -217,16 +215,13 @@ where
 /// The source route still establishes a structural fallback and fills its
 /// canonical plan cache, but it need not repeat the full token-preserving floor
 /// that the incumbent already completed.
-pub(crate) fn plan_stream_from_established_floor<F>(
+pub(crate) fn plan_stream_from_established_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     integrated_compact_proven: bool,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let progress = RouteProgress::disabled();
     plan_stream_with_progress(
         blocks,
@@ -234,7 +229,7 @@ where
         options,
         true,
         integrated_compact_proven,
-        expired,
+        stop,
         &progress,
     )
 }
@@ -243,18 +238,15 @@ where
 ///
 /// The ordinary entry point above supplies a disabled reporter, keeping all
 /// standard and non-verbose callers on the same search path.
-pub(crate) fn plan_stream_with_progress<F>(
+pub(crate) fn plan_stream_with_progress(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     comparison_floor_secured: bool,
     integrated_compact_proven: bool,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: &RouteProgress,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     let detailed_progress = progress.enabled().then_some(progress);
     let mut plan_cache = CanonicalPlanCache::new();
     progress.phase(
@@ -275,7 +267,7 @@ where
     // available; starting token recodes for dozens of later APNG frames would
     // turn a bounded timeout into unbounded work. Strict mode must still
     // rewrite incompatible dynamic alphabets.
-    let floor_time_available = !expired();
+    let floor_time_available = !stop.reached();
     if !floor_time_available && !options.strict {
         return stored_floor.map(|floor| finish_plan(floor, options));
     }
@@ -375,7 +367,7 @@ where
     // Secure a complete deadline-independent path before token-spelling or
     // split searches. On a shared container deadline this also guarantees
     // that every stream receives useful structural optimization.
-    let mut fallback = if floor_time_available && !reuse_established_floor && !expired() {
+    let mut fallback = if floor_time_available && !reuse_established_floor && !stop.reached() {
         mandatory_token_floor_plan(blocks, start_alignment, options, &mut plan_cache)?
     } else {
         direct_structural_plan(blocks, start_alignment, options, &mut plan_cache)?
@@ -412,7 +404,7 @@ where
             "grouped block",
             "grouped blocks",
         );
-        if !expired() {
+        if !stop.reached() {
             if let Some(candidate) = sequential_plan_with_compact_policy(
                 grouped,
                 start_alignment,
@@ -420,7 +412,7 @@ where
                 AdjacentMergeSearch::Disabled,
                 integrated_compact_proven,
                 &mut plan_cache,
-                expired,
+                stop,
                 detailed_progress,
             ) {
                 progress.advance(grouped.len());
@@ -449,7 +441,7 @@ where
                 && block.plain.len() >= WHOLE_STREAM_RECODE_MIN_PLAIN)
         && same_distance_opportunities(blocks).repartition_runs >= 2;
     let mut boundary_search_completed = false;
-    if prioritize_boundary_graph && !expired() {
+    if prioritize_boundary_graph && !stop.reached() {
         boundary_search_completed = true;
         if let Some(candidate) = plan_global_boundary_graph(
             blocks,
@@ -457,7 +449,7 @@ where
             options,
             allow_regroup,
             &mut plan_cache,
-            expired,
+            stop,
             progress,
             detailed_progress,
         ) {
@@ -489,7 +481,7 @@ where
         "source blocks",
     );
     let mut source_search_selected = false;
-    if !expired() {
+    if !stop.reached() {
         if let Some(candidate) = sequential_plan_with_compact_policy(
             blocks,
             start_alignment,
@@ -497,7 +489,7 @@ where
             fallback_merge_search,
             integrated_compact_proven,
             &mut plan_cache,
-            expired,
+            stop,
             detailed_progress,
         ) {
             progress.advance(blocks.len());
@@ -534,7 +526,7 @@ where
     if blocks.len() <= 1 && blocks.first().map_or(true, |block| block.plain.len() < 128) {
         return Some(finish_plan(fallback, options));
     }
-    if expired() {
+    if stop.reached() {
         return Some(finish_plan(fallback, options));
     }
 
@@ -559,7 +551,7 @@ where
                     AdjacentMergeSearch::Disabled,
                     integrated_compact_proven,
                     &mut plan_cache,
-                    expired,
+                    stop,
                     detailed_progress,
                 );
                 if let Some(collected) = collected {
@@ -573,7 +565,7 @@ where
                 }
             }
         }
-        if expired() {
+        if stop.reached() {
             return Some(finish_plan(fallback, options));
         }
 
@@ -603,7 +595,7 @@ where
         options,
         allow_regroup,
         &mut plan_cache,
-        expired,
+        stop,
         progress,
         detailed_progress,
     ) else {
@@ -623,19 +615,16 @@ where
 /// this helper. Keeping graph construction, progress reporting, and DP pricing
 /// together prevents route reordering from duplicating the expensive work.
 #[allow(clippy::too_many_arguments)]
-fn plan_global_boundary_graph<F>(
+fn plan_global_boundary_graph(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     allow_regroup: bool,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: &RouteProgress,
     detailed_progress: Option<&RouteProgress>,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     progress.phase(
         "Building global boundary graph",
         blocks.len(),
@@ -662,7 +651,7 @@ where
         options,
         allow_regroup,
         plan_cache,
-        expired,
+        stop,
         detailed_progress,
     )?;
     progress.advance(cuts.len().saturating_sub(1));
@@ -678,21 +667,18 @@ where
 /// [`plan_stream`]: it deliberately omits grouping, split probes, boundary DP,
 /// and iterative state queues so a long regular chain can finish within its
 /// own wall-clock slice.
-pub(crate) fn plan_source_no_split_route<F>(
+pub(crate) fn plan_source_no_split_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     allow_individual_prune: bool,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let prepared = prepare_blocks(blocks);
     let blocks = prepared.as_deref().unwrap_or(blocks);
     let mut plan_cache = CanonicalPlanCache::new();
     let fallback = direct_structural_plan(blocks, start_alignment, options, &mut plan_cache)?;
-    if expired() {
+    if stop.reached() {
         return Some(finish_plan(fallback, options));
     }
 
@@ -705,7 +691,7 @@ where
             allow_individual_prune,
         },
         &mut plan_cache,
-        expired,
+        stop,
         None,
     );
     match searched {
@@ -723,15 +709,12 @@ where
 /// stabilizes this seed through the established planner separately, so a
 /// locally smaller resegmentation cannot displace a different route whose
 /// later replay reaches the better fixed point.
-pub(crate) fn plan_proven_submatch_route<F>(
+pub(crate) fn plan_proven_submatch_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     if !blocks.iter().any(|block| {
         proven_submatch_route_eligible(&block.tokens, block.plain.len(), options.exhaustive)
     }) {
@@ -751,13 +734,13 @@ where
         // representation is therefore the selected Huffman table, and this
         // cheap structural price can branch from it without repeating the
         // ordinary floor or retaining stale source-bit references.
-        let base = plan_block(block, alignment, &floor_options, &mut *expired);
+        let base = plan_block(block, alignment, &floor_options, &mut *stop);
         if !proven_submatch_route_eligible(&base.tokens, block.plain.len(), options.exhaustive) {
             append_output_plan(&mut plans, &mut output_bits, base, true)?;
             continue;
         }
         let base_bits = base.bits;
-        let plan = improve_plan_with_proven_submatches(block, alignment, options, expired, base);
+        let plan = improve_plan_with_proven_submatches(block, alignment, options, stop, base);
         let block_changed = plan.bits < base_bits;
         changed |= block_changed;
         let plan = if block_changed {
@@ -776,15 +759,12 @@ where
 /// Keeping this complete source-generation candidate separate prevents its
 /// locally smaller token spelling from hiding the ordinary replay fixed point.
 /// The optimizer admits it only for a compact, explicitly bounded block list.
-pub(crate) fn plan_integrated_proven_source_route<F>(
+pub(crate) fn plan_integrated_proven_source_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut plans = Vec::new();
     plans.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
@@ -793,7 +773,7 @@ where
     let mut plan_cache = CanonicalPlanCache::new();
 
     for block in blocks {
-        if expired() {
+        if stop.reached() {
             return None;
         }
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
@@ -806,7 +786,7 @@ where
             alignment,
             &floor_options,
             base,
-            &mut *expired,
+            &mut *stop,
         );
         append_output_plan(&mut plans, &mut output_bits, plan, true)?;
     }
@@ -820,16 +800,13 @@ where
 /// search and has no recursive replay. It is safe to finish after the main
 /// deadline because its work is linear in the selected block list and every
 /// accepted merge strictly reduces the complete candidate's bit count.
-pub(crate) fn plan_terminal_merge_route<F>(
+pub(crate) fn plan_terminal_merge_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
-    if blocks.len() < 2 || blocks.len() > MAX_GREEDY_SOURCE_BLOCKS || expired() {
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    if blocks.len() < 2 || blocks.len() > MAX_GREEDY_SOURCE_BLOCKS || stop.reached() {
         return None;
     }
     let mut plan_cache = CanonicalPlanCache::new();
@@ -841,7 +818,7 @@ where
         AdjacentMergeSearch::LongRun,
         SourceBlockSearch::Floor,
         &mut plan_cache,
-        expired,
+        stop,
         None,
     )?;
     (total_bits(&candidate) < total_bits(&fallback)).then(|| finish_plan(candidate, options))
@@ -1458,7 +1435,7 @@ pub(crate) fn plan_fragmented_replay(
         options,
         &mut plan_cache,
         false,
-        &mut || false,
+        &mut SearchStop::never(),
     ) {
         if split.len() <= MAX_FRAGMENTED_REPLAY_BLOCKS && total_bits(&split) < total_bits(&best) {
             best = split;
@@ -1485,7 +1462,7 @@ pub(crate) fn plan_compact_source_split_floor(
         options,
         &mut plan_cache,
         false,
-        &mut || false,
+        &mut SearchStop::never(),
     )
 }
 
@@ -1495,15 +1472,12 @@ pub(crate) fn plan_compact_source_split_floor(
 /// again. Once it expires, untouched blocks retain their ordinary base plan,
 /// so the caller receives a complete candidate containing every split already
 /// proved useful rather than losing the whole route at the timer edge.
-pub(crate) fn plan_compact_source_split_floor_until<F>(
+pub(crate) fn plan_compact_source_split_floor_until(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut plan_cache = CanonicalPlanCache::new();
     plan_compact_source_split_floor_cached(
         blocks,
@@ -1511,21 +1485,18 @@ where
         options,
         &mut plan_cache,
         true,
-        expired,
+        stop,
     )
 }
 
-fn plan_compact_source_split_floor_cached<F>(
+fn plan_compact_source_split_floor_cached(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     plan_cache: &mut CanonicalPlanCache,
     prioritize_inside_match_cuts: bool,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut output = Vec::new();
     output.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
@@ -1574,10 +1545,10 @@ where
         let mut winner_bits = total_bits(&winner);
 
         let rescue_after_deadline =
-            priority_block == Some(block_index) && prioritize_inside_match_cuts && expired();
+            priority_block == Some(block_index) && prioritize_inside_match_cuts && stop.reached();
         if block.tokens.len() >= 16
             && block.plain.len() >= 128
-            && (!expired() || rescue_after_deadline)
+            && (!stop.reached() || rescue_after_deadline)
         {
             let composite = Composite::new(std::slice::from_ref(block))?;
             let source = composite.sources[0];
@@ -1605,7 +1576,7 @@ where
             cuts.dedup_by_key(|cut| cut.plain);
             let mut completed_rescue_trials = 0_usize;
             for split in cuts {
-                if expired() && (!rescue_after_deadline || completed_rescue_trials >= 6) {
+                if stop.reached() && (!rescue_after_deadline || completed_rescue_trials >= 6) {
                     break;
                 }
                 let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
@@ -2333,18 +2304,15 @@ impl PendingBlock<'_> {
 /// as DeflOpt does. Removing the first block's seven-bit end code and the next
 /// block's three-bit header saves exactly ten bits.
 #[cfg(test)]
-fn sequential_plan<F>(
+fn sequential_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     merge_search: AdjacentMergeSearch,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     sequential_plan_with_compact_policy(
         blocks,
         start_alignment,
@@ -2352,7 +2320,7 @@ where
         merge_search,
         false,
         plan_cache,
-        expired,
+        stop,
         progress,
     )
 }
@@ -2362,19 +2330,16 @@ where
 /// The routing bit comes from an already-completed whole-stream comparison;
 /// it changes search order only and never rejects either complete floor.
 #[allow(clippy::too_many_arguments)]
-fn sequential_plan_with_compact_policy<F>(
+fn sequential_plan_with_compact_policy(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     merge_search: AdjacentMergeSearch,
     integrated_compact_proven: bool,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     sequential_plan_with_source_search(
         blocks,
         start_alignment,
@@ -2384,25 +2349,22 @@ where
             integrated_compact_proven,
         },
         plan_cache,
-        expired,
+        stop,
         progress,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sequential_plan_with_source_search<F>(
+fn sequential_plan_with_source_search(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     merge_search: AdjacentMergeSearch,
     source_search: SourceBlockSearch,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     let Some((first, rest)) = blocks.split_first() else {
         return Some(Vec::new());
     };
@@ -2427,7 +2389,7 @@ where
                 options,
                 source_search,
                 plan_cache,
-                expired,
+                stop,
             ),
         };
         let pending_bits = total_bits(&pending_plans);
@@ -2442,7 +2404,7 @@ where
             options,
             source_search,
             plan_cache,
-            expired,
+            stop,
         );
         let separate_bits = pending_bits + total_bits(&current_plans);
 
@@ -2456,7 +2418,7 @@ where
             && (small_merge || options.exhaustive || long_huffman_merge)
             && pending_block.tokens.len() + current.tokens.len() <= MAX_MERGED_TOKENS
             && pending_block.plain.len() + current.plain.len() <= MAX_MERGED_PLAIN
-            && !expired();
+            && !stop.reached();
 
         // A fixed/fixed join is exact and needs no Huffman search. Keep it as a
         // candidate even on streams outside the long-merge range.
@@ -2496,7 +2458,7 @@ where
                 options,
                 source_search,
                 plan_cache,
-                expired,
+                stop,
             );
             if total_bits(&candidate) < separate_bits
                 && merged_winner
@@ -2565,24 +2527,21 @@ where
             options,
             source_search,
             plan_cache,
-            expired,
+            stop,
         ),
     };
     append_output_plans(&mut output, &mut output_bits, pending_plans)?;
     Some(output)
 }
 
-fn plan_source_with_search<F>(
+fn plan_source_with_search(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     search: SourceBlockSearch,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
-) -> Vec<PlannedBlock>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Vec<PlannedBlock> {
     match search {
         SourceBlockSearch::Full {
             integrated_compact_proven,
@@ -2592,19 +2551,19 @@ where
             options,
             integrated_compact_proven,
             plan_cache,
-            expired,
+            stop,
         ),
         SourceBlockSearch::Narrow {
             allow_individual_prune,
         } => {
-            let plan = match plan_source_block(block, alignment, options, expired) {
-                Some(seed) if !expired() => plan_block_with_seeded_narrow_search(
+            let plan = match plan_source_block(block, alignment, options, stop) {
+                Some(seed) if !stop.reached() => plan_block_with_seeded_narrow_search(
                     block,
                     alignment,
                     options,
                     allow_individual_prune,
                     seed,
-                    expired,
+                    stop,
                 ),
                 Some(seed) => seed,
                 None => plan_block_with_narrow_search(
@@ -2612,7 +2571,7 @@ where
                     alignment,
                     options,
                     allow_individual_prune,
-                    expired,
+                    stop,
                 ),
             };
             vec![plan]
@@ -2621,9 +2580,10 @@ where
             // Once the terminal route spends its allowance, finish the
             // complete candidate with the ordinary table selector instead of
             // starting another extended floor on every remaining block.
-            let plan = if expired() {
-                lookup_block_cached(block, alignment, options, plan_cache)
-                    .unwrap_or_else(|| plan_block(block, alignment, options, || true))
+            let plan = if stop.reached() {
+                lookup_block_cached(block, alignment, options, plan_cache).unwrap_or_else(|| {
+                    plan_block(block, alignment, options, &mut SearchStop::always())
+                })
             } else {
                 let mut floor_options = options.clone();
                 floor_options.exhaustive = false;
@@ -2713,41 +2673,38 @@ fn blocks_share_dynamic_tree(left: &ParsedBlock, right: &ParsedBlock) -> bool {
 /// Columbo's compact 32-token probes and tries one Turtledeflate-inspired
 /// adaptive probe before exact Columbo replanning. Children use the direct
 /// block planner in default mode because they are not pending merge candidates.
-fn plan_source_with_splits<F>(
+fn plan_source_with_splits(
     block: &ParsedBlock,
     alignment: u8,
     options: &Options,
     integrated_compact_proven: bool,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
-) -> Vec<PlannedBlock>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Vec<PlannedBlock> {
     if block.tokens.len() < 16
         || block.plain.len() < 128
         || (!options.exhaustive && block.plain.len() < 32_768)
     {
         let plan = match lookup_block_cached(block, alignment, options, plan_cache) {
             Some(base) => {
-                plan_block_with_complete_base_search(block, alignment, options, base, expired)
+                plan_block_with_complete_base_search(block, alignment, options, base, stop)
             }
-            None => plan_block_with_search(block, alignment, options, expired),
+            None => plan_block_with_search(block, alignment, options, stop),
         };
         return vec![plan];
     }
 
     let base = if options.exhaustive {
         lookup_block_cached(block, alignment, options, plan_cache)
-            .unwrap_or_else(|| plan_block(block, alignment, options, &mut *expired))
+            .unwrap_or_else(|| plan_block(block, alignment, options, &mut *stop))
     } else {
         // Default mode retains its established whole-block token search before
         // the seven inexpensive eighth probes.
         match lookup_block_cached(block, alignment, options, plan_cache) {
             Some(base) => {
-                plan_block_with_complete_base_search(block, alignment, options, base, expired)
+                plan_block_with_complete_base_search(block, alignment, options, base, stop)
             }
-            None => plan_block_with_search(block, alignment, options, expired),
+            None => plan_block_with_search(block, alignment, options, stop),
         }
     };
     let complete_base = options
@@ -2757,7 +2714,7 @@ where
     let mut best = vec![base];
     let mut best_bits = total_bits(&best);
     let unsplit_floor_bits = best_bits;
-    if expired() {
+    if stop.reached() {
         return best;
     }
 
@@ -2809,7 +2766,7 @@ where
         return best;
     }
     for &split in &cuts {
-        if expired() {
+        if stop.reached() {
             break;
         }
         let boundaries = [start, split, end];
@@ -2819,7 +2776,7 @@ where
             alignment,
             options,
             plan_cache,
-            expired,
+            stop,
         ) else {
             continue;
         };
@@ -2838,9 +2795,9 @@ where
     // either child token search or the unsplit state beam: both expensive
     // routes repeatedly rebuild Huffman candidates, while this route can
     // cheaply expose a boundary absent from the seven fixed eighths.
-    if options.exhaustive && !expired() {
+    if options.exhaustive && !stop.reached() {
         if let Some(candidate) = plan_adaptive_split(
-            &composite, start, end, &cuts, alignment, options, plan_cache, expired,
+            &composite, start, end, &cuts, alignment, options, plan_cache, stop,
         ) {
             let candidate_bits = total_bits(&candidate);
             if adaptive_split_is_worth_replay(candidate_bits, best_bits) {
@@ -2859,11 +2816,11 @@ where
         options.exhaustive,
         ranked_splits.first().map(|&(bits, _)| bits),
         unsplit_floor_bits,
-    ) && !expired()
+    ) && !stop.reached()
     {
         if let Some(&(_, split)) = ranked_splits.first() {
             if let Some(candidate) =
-                plan_searched_split(&composite, start, split, end, alignment, options, expired)
+                plan_searched_split(&composite, start, split, end, alignment, options, stop)
             {
                 let candidate_bits = total_bits(&candidate);
                 if candidate_bits < best_bits {
@@ -2886,23 +2843,23 @@ where
     // here because their completed normal comparison route already supplies
     // the ordinary lineage. This covers both state families without running
     // two full beams.
-    if options.exhaustive && !expired() {
+    if options.exhaustive && !stop.reached() {
         let searched_base = match complete_base {
             Some(base)
                 if block.tokens.len() <= COMPACT_SOURCE_SPLIT_MAX_TOKENS
                     && !integrated_compact_proven =>
             {
                 let base =
-                    plan_block_with_complete_base_search(block, alignment, options, base, expired);
+                    plan_block_with_complete_base_search(block, alignment, options, base, stop);
                 let base = improve_plan_with_integrated_proven_floor(
                     block, alignment, options, true, base,
                 );
                 improve_plan_with_short_family_floor(block, options, base)
             }
             Some(base) => plan_block_with_complete_integrated_proven_search(
-                block, alignment, options, base, expired,
+                block, alignment, options, base, stop,
             ),
-            None => plan_block_with_search(block, alignment, options, expired),
+            None => plan_block_with_search(block, alignment, options, stop),
         };
         if searched_base.bits < best_bits {
             best_bits = searched_base.bits;
@@ -2929,7 +2886,7 @@ where
             } else {
                 (outer, end)
             };
-            if expired() {
+            if stop.reached() {
                 return best;
             }
             // Compact sources retain the exact sibling in default mode. On
@@ -2945,7 +2902,7 @@ where
                 })
                 .flatten()
             {
-                if expired() {
+                if stop.reached() {
                     return best;
                 }
                 let boundaries = if inner.plain < outer.plain {
@@ -2959,7 +2916,7 @@ where
                     alignment,
                     options,
                     plan_cache,
-                    expired,
+                    stop,
                 ) else {
                     return best;
                 };
@@ -2972,7 +2929,7 @@ where
         }
         return best;
     }
-    if expired() {
+    if stop.reached() {
         return best;
     }
 
@@ -2981,11 +2938,11 @@ where
     // makes max mode deterministic and gives plausible boundaries the first
     // search slots.
     for (_, split) in ranked_splits.into_iter().skip(refined_splits) {
-        if expired() {
+        if stop.reached() {
             break;
         }
         let Some(candidate) =
-            plan_searched_split(&composite, start, split, end, alignment, options, expired)
+            plan_searched_split(&composite, start, split, end, alignment, options, stop)
         else {
             continue;
         };
@@ -2998,31 +2955,28 @@ where
     best
 }
 
-fn plan_searched_split<F>(
+fn plan_searched_split(
     composite: &Composite<'_>,
     start: Cut,
     split: Cut,
     end: Cut,
     alignment: u8,
     options: &Options,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let left = make_range(composite, start, split)?;
-    let left_plan = plan_block_with_search(&left, alignment, options, expired);
-    if expired() {
+    let left_plan = plan_block_with_search(&left, alignment, options, stop);
+    if stop.reached() {
         return None;
     }
     let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
     let right = make_range(composite, split, end)?;
-    let right_plan = plan_block_with_search(&right, right_alignment, options, expired);
+    let right_plan = plan_block_with_search(&right, right_alignment, options, stop);
     Some(vec![left_plan, right_plan])
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_adaptive_split<F>(
+fn plan_adaptive_split(
     composite: &Composite<'_>,
     start: Cut,
     end: Cut,
@@ -3030,11 +2984,8 @@ fn plan_adaptive_split<F>(
     alignment: u8,
     options: &Options,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut adaptive_cut = Vec::new();
     add_adaptive_split_cut(
         &mut adaptive_cut,
@@ -3042,7 +2993,7 @@ where
         start,
         end,
         options.strict,
-        expired,
+        stop,
     )?;
     let &split = adaptive_cut.first()?;
     if established_cuts.contains(&split) {
@@ -3053,14 +3004,7 @@ where
     // The histogram route already discovered this cut and exact structural
     // planning validates it. Feeding it into the older child token-search
     // ladder repeats expensive work for negligible observed gain.
-    plan_structural_ranges(
-        composite,
-        &boundaries,
-        alignment,
-        options,
-        plan_cache,
-        expired,
-    )
+    plan_structural_ranges(composite, &boundaries, alignment, options, plan_cache, stop)
 }
 
 fn adaptive_split_is_worth_replay(candidate_bits: u64, established_bits: u64) -> bool {
@@ -3094,28 +3038,25 @@ fn midpoint_cuts(composite: &Composite, start: Cut, end: Cut) -> [Option<Cut>; 2
 }
 
 /// Directly plan consecutive ranges while carrying their exact bit alignment.
-fn plan_structural_ranges<F>(
+fn plan_structural_ranges(
     composite: &Composite,
     boundaries: &[Cut],
     mut alignment: u8,
     options: &Options,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut plans = Vec::new();
     plans
         .try_reserve_exact(boundaries.len().saturating_sub(1))
         .ok()?;
     for pair in boundaries.windows(2) {
-        if expired() {
+        if stop.reached() {
             return None;
         }
         let range = make_range(composite, pair[0], pair[1])?;
         let plan = lookup_block_cached(&range, alignment, options, plan_cache)
-            .unwrap_or_else(|| plan_block(&range, alignment, options, &mut *expired));
+            .unwrap_or_else(|| plan_block(&range, alignment, options, &mut *stop));
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
         plans.push(plan);
     }
@@ -3819,17 +3760,14 @@ struct AdaptiveSplit {
 /// probe/deadline caps. It omits Turtledeflate's alternate edge-basin stack;
 /// the caller accepts the cut only after exact token-preserving replanning and
 /// a material complete-plan win.
-fn add_adaptive_split_cut<F>(
+fn add_adaptive_split_cut(
     cuts: &mut Vec<Cut>,
     composite: &Composite,
     start: Cut,
     end: Cut,
     min_distance_codes: bool,
-    expired: &mut F,
-) -> Option<()>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<()> {
     if !composite.cut_is_token_boundary(start) || !composite.cut_is_token_boundary(end) {
         return Some(());
     }
@@ -3869,7 +3807,7 @@ where
         left_bits.checked_add(right_bits)
     };
 
-    let Some(candidate) = coarse_to_fine_split(start.token, end.token, &mut score_split, expired)
+    let Some(candidate) = coarse_to_fine_split(start.token, end.token, &mut score_split, stop)
     else {
         return Some(());
     };
@@ -3899,15 +3837,14 @@ fn estimate_histogram_range_bits(
 /// This independent Columbo implementation is substantially different from
 /// Turtledeflate's `turtledeflate_best_block_split`; it is not a translation
 /// or exact recreation.
-fn coarse_to_fine_split<S, F>(
+fn coarse_to_fine_split<S>(
     start: usize,
     end: usize,
     score: &mut S,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
 ) -> Option<AdaptiveSplit>
 where
     S: FnMut(usize) -> Option<u64>,
-    F: FnMut() -> bool,
 {
     if end <= start.checked_add(2)? {
         return None;
@@ -3920,10 +3857,10 @@ where
     cache.try_reserve_exact(ADAPTIVE_SPLIT_MAX_PROBES).ok()?;
     // Always retain the original midpoint. Besides being a useful probe, it
     // makes a completely flat score choose two balanced children.
-    cached_adaptive_split_score(original_midpoint, &mut probes, &mut cache, score, expired)?;
+    cached_adaptive_split_score(original_midpoint, &mut probes, &mut cache, score, stop)?;
 
     while range_end - range_start > ADAPTIVE_SPLIT_FINAL_WIDTH {
-        if expired() {
+        if stop.reached() {
             return None;
         }
         let span = range_end - range_start;
@@ -3939,7 +3876,7 @@ where
             {
                 continue;
             }
-            let bits = cached_adaptive_split_score(token, &mut probes, &mut cache, score, expired)?;
+            let bits = cached_adaptive_split_score(token, &mut probes, &mut cache, score, stop)?;
             samples.push(AdaptiveSplit { token, bits });
         }
         if samples.len() < 2 {
@@ -3977,11 +3914,11 @@ where
         range_end = next_end;
     }
 
-    if expired() {
+    if stop.reached() {
         return None;
     }
     for token in range_start..=range_end {
-        cached_adaptive_split_score(token, &mut probes, &mut cache, score, expired)?;
+        cached_adaptive_split_score(token, &mut probes, &mut cache, score, stop)?;
     }
 
     cache.into_iter().min_by_key(|candidate| {
@@ -3993,21 +3930,20 @@ where
     })
 }
 
-fn cached_adaptive_split_score<S, F>(
+fn cached_adaptive_split_score<S>(
     token: usize,
     probes: &mut usize,
     cache: &mut Vec<AdaptiveSplit>,
     score: &mut S,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
 ) -> Option<u64>
 where
     S: FnMut(usize) -> Option<u64>,
-    F: FnMut() -> bool,
 {
     if let Some(candidate) = cache.iter().find(|candidate| candidate.token == token) {
         return Some(candidate.bits);
     }
-    if *probes >= ADAPTIVE_SPLIT_MAX_PROBES || expired() {
+    if *probes >= ADAPTIVE_SPLIT_MAX_PROBES || stop.reached() {
         return None;
     }
     let bits = score(token)?;
@@ -4080,7 +4016,7 @@ struct DpNode {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn boundary_dp<F>(
+fn boundary_dp(
     blocks: &[ParsedBlock],
     composite: &Composite,
     cuts: &[Cut],
@@ -4088,12 +4024,9 @@ fn boundary_dp<F>(
     options: &Options,
     allow_regroup: bool,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
+    stop: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
-) -> Option<Vec<PlannedBlock>>
-where
-    F: FnMut() -> bool,
-{
+) -> Option<Vec<PlannedBlock>> {
     if cuts.len() > MAX_BOUNDARY_DP_CUTS {
         return None;
     }
@@ -4111,7 +4044,7 @@ where
         if let Some(progress) = progress {
             progress.advance(start_index);
         }
-        if expired() {
+        if stop.reached() {
             return None;
         }
         // There are exactly eight possible starting bit alignments, so a
@@ -4134,17 +4067,11 @@ where
             if !edge_allowed(composite, start, end, options.exhaustive, allow_regroup) {
                 continue;
             }
-            if expired() {
+            if stop.reached() {
                 return None;
             }
             let Some(edge) = prepare_edge(
-                blocks,
-                composite,
-                start,
-                end,
-                options,
-                plan_cache,
-                &mut *expired,
+                blocks, composite, start, end, options, plan_cache, &mut *stop,
             ) else {
                 continue;
             };
@@ -4154,7 +4081,7 @@ where
             {
                 // Match the former per-alignment loop: a plan that reaches the
                 // deadline is still allowed to update its first DP state.
-                if reachable_index != 0 && expired() {
+                if reachable_index != 0 && stop.reached() {
                     return None;
                 }
                 let template = edge.plan(alignment);
@@ -4350,18 +4277,15 @@ impl PreparedEdge {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_edge<F>(
+fn prepare_edge(
     blocks: &[ParsedBlock],
     composite: &Composite,
     start: Cut,
     end: Cut,
     options: &Options,
     plan_cache: &mut CanonicalPlanCache,
-    expired: &mut F,
-) -> Option<PreparedEdge>
-where
-    F: FnMut() -> bool,
-{
+    stop: &mut SearchStop<'_>,
+) -> Option<PreparedEdge> {
     // Boundary planning preserves complete tokens. An edge ending or beginning
     // inside one proven match deterministically materializes only that endpoint
     // fragment at the original distance (or as one or two known literals).
@@ -4371,7 +4295,7 @@ where
         let block = &blocks[source_index];
         let reusable = plan_cache
             .lookup_reusable(block, options)
-            .unwrap_or_else(|| plan_reusable_block(block, options, expired));
+            .unwrap_or_else(|| plan_reusable_block(block, options, stop));
         return Some(PreparedEdge {
             plain_len: block.plain.len(),
             source_type: block.source_type,
@@ -4386,7 +4310,7 @@ where
     // probe, preserving the established deadline priority.
     let reusable = plan_cache
         .lookup_reusable(&range, options)
-        .unwrap_or_else(|| plan_reusable_block(&range, options, &mut *expired));
+        .unwrap_or_else(|| plan_reusable_block(&range, options, &mut *stop));
     let source_range = overlapping_source_range(composite, start, end);
     let source_spans = &composite.sources[source_range.clone()];
     let whole_sources = source_spans.first().is_some_and(|first| {
@@ -5028,7 +4952,7 @@ mod tests {
             0,
             &options,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_eq!(plans.len(), 2);
@@ -5070,7 +4994,7 @@ mod tests {
             0,
             &Options::default(),
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert_eq!(plans.len(), 3);
@@ -5114,7 +5038,7 @@ mod tests {
                     end,
                     &options,
                     &mut plan_cache,
-                    &mut || false,
+                    &mut SearchStop::never(),
                 )
                 .unwrap();
                 let template = edge.plan(alignment);
@@ -5296,8 +5220,8 @@ mod tests {
             let distance = token.abs_diff(733) as u64;
             Some(distance * distance)
         };
-        let candidate =
-            coarse_to_fine_split(0, 2_048, &mut score, &mut || false).expect("a legal cut");
+        let candidate = coarse_to_fine_split(0, 2_048, &mut score, &mut SearchStop::never())
+            .expect("a legal cut");
 
         assert_eq!(candidate.token, 733);
         assert_eq!(candidate.bits, 0);
@@ -5306,8 +5230,8 @@ mod tests {
 
     #[test]
     fn coarse_to_fine_split_centres_flat_ties() {
-        let candidate =
-            coarse_to_fine_split(0, 2_048, &mut |_| Some(1), &mut || false).expect("a legal cut");
+        let candidate = coarse_to_fine_split(0, 2_048, &mut |_| Some(1), &mut SearchStop::never())
+            .expect("a legal cut");
 
         assert_eq!(candidate.token, 1_024);
     }
@@ -5326,7 +5250,15 @@ mod tests {
             plain: bytes.len(),
         };
 
-        add_adaptive_split_cut(&mut cuts, &composite, start, end, false, &mut || false).unwrap();
+        add_adaptive_split_cut(
+            &mut cuts,
+            &composite,
+            start,
+            end,
+            false,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
 
         assert_eq!(
             cuts,
@@ -5352,7 +5284,7 @@ mod tests {
                 plain: 512,
             },
             false,
-            &mut || false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         assert!(cuts.is_empty());
@@ -5365,7 +5297,7 @@ mod tests {
                 scorer_called = true;
                 Some(0)
             },
-            &mut || true,
+            &mut SearchStop::always(),
         );
         assert!(candidate.is_none());
         assert!(!scorer_called);
@@ -5428,7 +5360,7 @@ mod tests {
         let source = literal_block(b"immutable payload", SourceBlockType::Dynamic);
         assert!(prepare_blocks(std::slice::from_ref(&source)).is_none());
 
-        let plan = plan_block(&source, 0, &Options::default(), || false);
+        let plan = plan_block(&source, 0, &Options::default(), &mut SearchStop::never());
         assert!(Arc::ptr_eq(&plan.tokens, &source.tokens));
         assert!(Arc::ptr_eq(&plan.plain, &source.plain));
     }
@@ -5503,7 +5435,7 @@ mod tests {
             strict: false,
             ..Options::default()
         };
-        let after_deadline = plan_stream(&blocks, 0, &relaxed, &mut || true).unwrap();
+        let after_deadline = plan_stream(&blocks, 0, &relaxed, &mut SearchStop::always()).unwrap();
         assert_eq!(total_bits(&after_deadline), total_bits(&plans));
         assert_eq!(after_deadline.len(), plans.len());
     }
@@ -5523,7 +5455,7 @@ mod tests {
         assert_eq!(plans[0].plain.len(), 2_400);
         let separate_bits: u64 = blocks
             .iter()
-            .map(|block| plan_block(block, 0, &options, || false).bits)
+            .map(|block| plan_block(block, 0, &options, &mut SearchStop::never()).bits)
             .sum();
         assert!(total_bits(&plans) < separate_bits);
 
@@ -5535,10 +5467,16 @@ mod tests {
             ..Options::default()
         };
         let mut deadline_checks = 0;
-        let deadline_safe = plan_stream(&blocks, 0, &exhaustive, &mut || {
+        let mut expires = || {
             deadline_checks += 1;
             deadline_checks > 1
-        })
+        };
+        let deadline_safe = plan_stream(
+            &blocks,
+            0,
+            &exhaustive,
+            &mut SearchStop::callback(&mut expires),
+        )
         .unwrap();
         assert_eq!(deadline_safe.len(), 1);
         assert_eq!(deadline_safe[0].plain.len(), 2_400);
@@ -5591,7 +5529,7 @@ mod tests {
             &exhaustive,
             SourceBlockSearch::Floor,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
         );
         assert_eq!(plans.len(), 1);
 
@@ -5818,8 +5756,8 @@ mod tests {
             literal_block(b"a", SourceBlockType::Fixed),
             literal_block(b"b", SourceBlockType::Fixed),
         ];
-        let separate_left = plan_block(&blocks[0], 0, &options, || false);
-        let separate_right = plan_block(&blocks[1], 0, &options, || false);
+        let separate_left = plan_block(&blocks[0], 0, &options, &mut SearchStop::never());
+        let separate_right = plan_block(&blocks[1], 0, &options, &mut SearchStop::never());
         assert!(is_fixed_plan(&separate_left));
         assert!(is_fixed_plan(&separate_right));
 
@@ -5830,7 +5768,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Local,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
@@ -5845,8 +5783,13 @@ mod tests {
         let options = Options::default();
         let left_block = literal_block(b"a", SourceBlockType::Fixed);
         let right_block = literal_block(b"b", SourceBlockType::Fixed);
-        let left = plan_block(&left_block, 0, &options, || false);
-        let right = plan_block(&right_block, (left.bits & 7) as u8, &options, || false);
+        let left = plan_block(&left_block, 0, &options, &mut SearchStop::never());
+        let right = plan_block(
+            &right_block,
+            (left.bits & 7) as u8,
+            &options,
+            &mut SearchStop::never(),
+        );
         assert!(is_fixed_plan(&left));
         assert!(is_fixed_plan(&right));
 
@@ -5908,7 +5851,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
@@ -5922,13 +5865,13 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
         assert!(total_bits(&collected) < total_bits(&adjacent));
 
-        let planned = plan_stream(&blocks, 0, &options, &mut || false).unwrap();
+        let planned = plan_stream(&blocks, 0, &options, &mut SearchStop::never()).unwrap();
         assert_eq!(total_bits(&planned), total_bits(&collected));
     }
 
@@ -5946,7 +5889,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
@@ -5956,7 +5899,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
@@ -5979,8 +5922,9 @@ mod tests {
         ];
         let mut plan_cache = CanonicalPlanCache::new();
         let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
-        let route = plan_source_no_split_route(&blocks, 0, &options, true, &mut || false)
-            .expect("the direct route retains a complete fallback");
+        let route =
+            plan_source_no_split_route(&blocks, 0, &options, true, &mut SearchStop::never())
+                .expect("the direct route retains a complete fallback");
 
         assert!(total_bits(&route) <= total_bits(&fallback));
         let decoded: Vec<_> = route
@@ -5999,14 +5943,16 @@ mod tests {
         ];
         let mut plan_cache = CanonicalPlanCache::new();
         let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
-        let merged = plan_terminal_merge_route(&blocks, 0, &options, &mut || false)
+        let merged = plan_terminal_merge_route(&blocks, 0, &options, &mut SearchStop::never())
             .expect("equal neighbours have a profitable deterministic merge");
 
         assert!(total_bits(&merged) < total_bits(&fallback));
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].plain.as_slice(), &[b'a'; 1_600]);
 
-        assert!(plan_terminal_merge_route(&blocks, 0, &options, &mut || true).is_none());
+        assert!(
+            plan_terminal_merge_route(&blocks, 0, &options, &mut SearchStop::always()).is_none()
+        );
     }
 
     #[test]
@@ -6040,7 +5986,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::Disabled,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();
@@ -6050,7 +5996,7 @@ mod tests {
             &options,
             AdjacentMergeSearch::LongRun,
             &mut plan_cache,
-            &mut || false,
+            &mut SearchStop::never(),
             None,
         )
         .unwrap();

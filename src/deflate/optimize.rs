@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: MIT
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::progress::{
     reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
@@ -23,6 +22,7 @@ use super::search::{
     improve_plan_with_short_family_floor, plan_block_with_integrated_proven_search,
     rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
+use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,
     plan_compact_source_split_floor, plan_compact_source_split_floor_until, plan_fragmented_replay,
@@ -92,21 +92,6 @@ const PARALLEL_ROUTE_MAX_MODEL: usize = 64 * 1_024 * 1_024;
 // whose source graph cannot reliably finish inside the initial four-fifths.
 const PREBUILD_BOUNDED_FLOOR_MAX_DECODED: u64 = 768 * 1_024;
 const CONCURRENT_BOUNDED_FLOOR_MAX_DECODED: u64 = 2 * 1_024 * 1_024;
-// The configured timeout is a soft scheduling boundary. An active route may
-// finish its current candidate within ten percent plus one second. This avoids
-// discarding a completed saving at the timer edge while keeping the caller's
-// total wall-clock overrun predictable.
-const TIMEOUT_GRACE_DIVISOR: u32 = 10;
-const TIMEOUT_GRACE_BASE: Duration = Duration::from_secs(1);
-// Independent bounded routes run concurrently, while their best result can
-// feed a later sequential refinement. Give the primary independent routes
-// four fifths of the soft time remaining when they start. The reserved fifth
-// plus global route grace keeps follow-up reachable, while allowing a
-// nearly complete floor-seeded candidate to finish instead of discarding its
-// late strict improvements. This is a route-class allocation, independent of
-// file size and the user's absolute timeout.
-const INITIAL_BOUNDED_PHASE_NUMERATOR: u32 = 4;
-const INITIAL_BOUNDED_PHASE_DENOMINATOR: u32 = 5;
 
 /// Facts collected while decoding the source stream. Container handlers use
 /// these values to validate their checksums without inflating a second time.
@@ -273,11 +258,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         });
     }
     progress.routes();
-    let deadline = Deadline {
-        started,
-        duration: options.timeout,
-        state: AtomicU8::new(0),
-    };
+    let deadline = Deadline::new(started, options.timeout);
 
     // Prefix callers need the exact bytes occupied by the first stream. Any
     // unused high bits in its final byte belong to that stream's byte-level
@@ -326,7 +307,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             complete_default_candidate = Some(floors.complete);
             floors.max_seed
         } else {
-            build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
+            build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?
         })
     } else {
         None
@@ -463,7 +444,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         run_proven_feedback.then(|| progress.start("Columbo proven-feedback floor"));
     if run_proven_feedback {
         proven_feedback_candidate =
-            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
+            build_compact_proven_feedback_candidate(source, options, &mut deadline.hard_stop())?;
     }
     if let Some(step) = proven_feedback_step {
         step.finish(proven_feedback_candidate.as_ref().map(|candidate| {
@@ -521,7 +502,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 options,
                 decoded_limit,
                 identity,
-                &mut || deadline.expired(),
+                &mut deadline.hard_stop(),
             )? {
                 seeded.replace_if_smaller(split);
             }
@@ -623,7 +604,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                                                 progress,
                                                 &deadline,
                                                 integrated_compact_source_max,
-                                                &mut || deadline.route_should_stop(),
+                                                &mut deadline.hard_stop(),
                                             )
                                         })
                                     })
@@ -844,16 +825,19 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 source,
                 &floor_options,
                 DEFAULT_RAW_REPLAY_LIMIT,
-                &mut || deadline.expired(),
+                &mut deadline.hard_stop(),
             )?,
             DefaultFloor::CompleteThenBounded | DefaultFloor::Shared => {
-                build_bounded_floor_candidate(source, options, &mut || deadline.expired())?
+                build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?
             }
         }
     } else {
-        build_candidate(source, options, DEFAULT_RAW_REPLAY_LIMIT, &mut || {
-            deadline.expired()
-        })?
+        build_candidate(
+            source,
+            options,
+            DEFAULT_RAW_REPLAY_LIMIT,
+            &mut deadline.hard_stop(),
+        )?
     };
     if let Some(step) = initial_step {
         step.finish(Some(candidate_progress(
@@ -872,7 +856,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     if deft4j_eligible && default_floor == DefaultFloor::Complete && deadline.can_start_route() {
         let deft4j_step = progress.start("deft4j-derived source route");
         deft4j_candidate =
-            build_deft4j_source_candidate(source, options, &mut || deadline.expired())?;
+            build_deft4j_source_candidate(source, options, &mut deadline.hard_stop())?;
         deft4j_step.finish(deft4j_candidate.as_ref().map(|deft4j| {
             candidate_progress(
                 deft4j,
@@ -911,7 +895,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     &replay_options,
                     MAX_RAW_REPLAY_LIMIT,
                     ReplayPlanner::Fragmented,
-                    &mut || deadline.expired(),
+                    &mut deadline.hard_stop(),
                 )
                 .map(|candidate| candidate.named("Columbo fragmented collection"))
             })
@@ -956,7 +940,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     progress,
                     &deadline,
                     integrated_compact_source_max,
-                    &mut || deadline.expired(),
+                    &mut deadline.hard_stop(),
                 )?)
             } else {
                 None
@@ -1025,10 +1009,13 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             // transformations, so retain one additive seeded pass after both
             // source-shaped routes. Its incumbent remains available if this
             // final route times out or fails to improve it.
-            let seeded_candidate =
-                refine_with_max_planner(&candidate, options, decoded_limit, identity, &mut || {
-                    deadline.expired()
-                })?;
+            let seeded_candidate = refine_with_max_planner(
+                &candidate,
+                options,
+                decoded_limit,
+                identity,
+                &mut deadline.hard_stop(),
+            )?;
             if let Some(step) = seeded_step {
                 step.finish(Some(candidate_progress(
                     &seeded_candidate,
@@ -1343,17 +1330,14 @@ fn candidate_progress(
 
 /// Run one original-source max search, with nested telemetry only in a human
 /// reporting mode and the historical hot path otherwise.
-fn build_source_max_candidate<F>(
+fn build_source_max_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
     deadline: &Deadline,
     integrated_compact_proven: bool,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     if !progress.enabled() {
         let candidate = build_candidate_from_established_floor(
             source,
@@ -1379,16 +1363,14 @@ where
     )
 }
 
-/// Keep the telemetry-heavy planner monomorphized only once. The generic
-/// wrapper above preserves inlined deadline checks for production quiet mode,
-/// while human reporting can afford one indirect call at its existing probes.
+/// Add progress heartbeats to the shared concrete stop policy.
 fn build_source_max_candidate_verbose(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
     deadline: &Deadline,
     integrated_compact_proven: bool,
-    expired: &mut dyn FnMut() -> bool,
+    expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
     let (step, details) = progress.start_detailed(
         "Columbo source max route",
@@ -1400,18 +1382,19 @@ fn build_source_max_candidate_verbose(
         if deadline.soft_expired() {
             details.finalizing_after_soft_deadline(timeout_grace(deadline.duration));
         }
-        let should_stop = expired();
+        let should_stop = expired.reached();
         if should_stop && deadline.was_triggered() {
             details.deadline_reached();
         }
         should_stop
     };
+    let mut monitored_stop = SearchStop::callback(&mut monitored_expired);
     match build_candidate_with_progress(
         source,
         options,
         MAX_RAW_REPLAY_LIMIT,
         integrated_compact_proven,
-        &mut monitored_expired,
+        &mut monitored_stop,
         &details,
     ) {
         Ok(candidate) if candidate.route == "Original source" => {
@@ -1558,14 +1541,6 @@ fn compact_dependent_deft4j_work_class(source: CandidateInput<'_>) -> bool {
         && has_multiple_nonempty_blocks(source.blocks)
 }
 
-fn bounded_refinement_should_stop(deadline: &Deadline, stop_at_soft_deadline: bool) -> bool {
-    if stop_at_soft_deadline {
-        deadline.soft_expired()
-    } else {
-        deadline.expired()
-    }
-}
-
 /// Refine the bounded route family's best deft4j lineage in place.
 ///
 /// Keeping this stage in one helper lets the caller evaluate the independent
@@ -1598,7 +1573,7 @@ fn refine_bounded_deft4j_lineage(
                 decoded_limit,
                 identity,
                 default_floor.allows_single_block_deft4j(),
-                &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+                &mut deadline.bounded_stop(stop_at_soft_deadline),
             )? {
                 if deadline.can_start_route() {
                     let refined = refine_with_default_planner(
@@ -1606,7 +1581,7 @@ fn refine_bounded_deft4j_lineage(
                         options,
                         decoded_limit,
                         identity,
-                        &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+                        &mut deadline.bounded_stop(stop_at_soft_deadline),
                     )?;
                     seeded.replace_if_smaller(refined);
                 }
@@ -1621,7 +1596,7 @@ fn refine_bounded_deft4j_lineage(
                         options,
                         decoded_limit,
                         identity,
-                        &mut || bounded_refinement_should_stop(deadline, stop_at_soft_deadline),
+                        &mut deadline.bounded_stop(stop_at_soft_deadline),
                     )? {
                         seeded.replace_if_smaller(terminal);
                     }
@@ -1630,10 +1605,13 @@ fn refine_bounded_deft4j_lineage(
             }
         }
     } else if let Some(deft4j) = deft4j_candidate.as_ref() {
-        let refined =
-            refine_with_default_planner(deft4j, options, decoded_limit, identity, &mut || {
-                bounded_refinement_should_stop(deadline, stop_at_soft_deadline)
-            })?;
+        let refined = refine_with_default_planner(
+            deft4j,
+            options,
+            decoded_limit,
+            identity,
+            &mut deadline.bounded_stop(stop_at_soft_deadline),
+        )?;
         replace_optional_if_smaller(deft4j_candidate, refined);
     }
     Ok(())
@@ -1750,7 +1728,7 @@ fn build_bounded_phase_candidates(
         && run_deft4j
         && deadline.can_start_route();
     let mut prebuilt_deft4j = if prebuild_deft4j {
-        build_deft4j_source_candidate(source, options, &mut || deadline.route_should_stop())?
+        build_deft4j_source_candidate(source, options, &mut deadline.hard_stop())?
     } else {
         None
     };
@@ -1761,7 +1739,7 @@ fn build_bounded_phase_candidates(
                 options,
                 source.decoded_limit,
                 source.identity,
-                &mut || deadline.route_should_stop(),
+                &mut deadline.hard_stop(),
             )?;
             deft4j.replace_if_smaller(refined);
         }
@@ -1846,9 +1824,7 @@ fn build_bounded_phase_candidates(
                 .name("columbo-deft4j-derived".into())
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
-                        build_deft4j_source_candidate(source, options, &mut || {
-                            route_window.should_stop()
-                        })
+                        build_deft4j_source_candidate(source, options, &mut route_window.stop())
                     })
                 })
                 .ok()
@@ -1858,9 +1834,7 @@ fn build_bounded_phase_candidates(
                 .name("columbo-no-split".into())
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
-                        build_narrow_source_candidate(source, options, &mut || {
-                            route_window.should_stop()
-                        })
+                        build_narrow_source_candidate(source, options, &mut route_window.stop())
                     })
                 })
                 .ok()
@@ -1876,7 +1850,7 @@ fn build_bounded_phase_candidates(
                             progress,
                             deadline,
                             false,
-                            &mut || route_window.should_stop(),
+                            &mut route_window.stop(),
                         )
                     })
                 })
@@ -1887,9 +1861,11 @@ fn build_bounded_phase_candidates(
                 .name("columbo-proven-feedback-initial".into())
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
-                        build_compact_proven_feedback_candidate(source, options, &mut || {
-                            route_window.should_stop()
-                        })
+                        build_compact_proven_feedback_candidate(
+                            source,
+                            options,
+                            &mut route_window.stop(),
+                        )
                     })
                 })
                 .ok()
@@ -1910,14 +1886,14 @@ fn build_bounded_phase_candidates(
         let deft4j = match deft4j_worker.flatten() {
             Some(worker) => worker.join(),
             None if run_deft4j => Ok(run_route_with_cancellation(deadline, || {
-                build_deft4j_source_candidate(source, options, &mut || route_window.should_stop())
+                build_deft4j_source_candidate(source, options, &mut route_window.stop())
             })),
             None => Ok(Ok(None)),
         };
         let narrow = match narrow_worker.flatten() {
             Some(worker) => worker.join(),
             None if run_narrow => Ok(run_route_with_cancellation(deadline, || {
-                build_narrow_source_candidate(source, options, &mut || route_window.should_stop())
+                build_narrow_source_candidate(source, options, &mut route_window.stop())
             })),
             None => Ok(Ok(None)),
         };
@@ -1927,9 +1903,14 @@ fn build_bounded_phase_candidates(
                 Err(payload) => std::panic::resume_unwind(payload),
             },
             None if run_source_max => run_route_with_cancellation(deadline, || {
-                build_source_max_candidate(source, options, progress, deadline, false, &mut || {
-                    route_window.should_stop()
-                })
+                build_source_max_candidate(
+                    source,
+                    options,
+                    progress,
+                    deadline,
+                    false,
+                    &mut route_window.stop(),
+                )
             })
             .map(Some),
             None => Ok(None),
@@ -1940,9 +1921,7 @@ fn build_bounded_phase_candidates(
                 Err(payload) => std::panic::resume_unwind(payload),
             },
             None if run_proven_feedback => run_route_with_cancellation(deadline, || {
-                build_compact_proven_feedback_candidate(source, options, &mut || {
-                    route_window.should_stop()
-                })
+                build_compact_proven_feedback_candidate(source, options, &mut route_window.stop())
             }),
             None => Ok(None),
         };
@@ -1987,12 +1966,12 @@ fn build_bounded_phase_candidates_sequential(
     completed_floor: Option<Candidate>,
 ) -> Result<BoundedPhaseCandidates> {
     let deft4j = if run_deft4j && route_window.can_start_route() {
-        build_deft4j_source_candidate(source, options, &mut || route_window.should_stop())?
+        build_deft4j_source_candidate(source, options, &mut route_window.stop())?
     } else {
         None
     };
     let narrow = if run_narrow && route_window.can_start_route() {
-        build_narrow_source_candidate(source, options, &mut || route_window.should_stop())?
+        build_narrow_source_candidate(source, options, &mut route_window.stop())?
     } else {
         None
     };
@@ -2070,14 +2049,11 @@ fn run_route_with_cancellation<T>(
     result
 }
 
-fn build_bounded_floor_candidate<F>(
+fn build_bounded_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     build_candidate(source, &floor_options, DEFAULT_RAW_REPLAY_LIMIT, expired)
@@ -2106,7 +2082,7 @@ fn improve_default_floor_with_feedback(
     if compact_source_has_bounded_match_preserving_feedback(source) && deadline.can_start_route() {
         let step = progress.start("Columbo match-preserving feedback");
         let contender =
-            build_compact_proven_feedback_candidate(source, options, &mut || deadline.expired())?;
+            build_compact_proven_feedback_candidate(source, options, &mut deadline.hard_stop())?;
         step.finish(contender.as_ref().map(|candidate| {
             candidate_progress(
                 candidate,
@@ -2124,7 +2100,7 @@ fn improve_default_floor_with_feedback(
             source,
             options,
             &candidate,
-            &mut || deadline.expired(),
+            &mut deadline.hard_stop(),
         )?;
         step.finish(contender.as_ref().map(|candidate| {
             candidate_progress(
@@ -2165,7 +2141,7 @@ fn build_complete_default_floor_candidate(
         source,
         &floor_options,
         DEFAULT_RAW_REPLAY_LIMIT,
-        &mut || deadline.expired(),
+        &mut deadline.hard_stop(),
     )?;
     let max_seed = candidate.clone().named("Normal floor");
     let complete =
@@ -2177,15 +2153,12 @@ fn build_complete_default_floor_candidate(
 ///
 /// Its retained plans have the same shape needed by each bounded continuation,
 /// so rebuilding the candidate would only consume deadline and memory.
-fn completed_or_bounded_floor<F>(
+fn completed_or_bounded_floor(
     source: CandidateInput<'_>,
     options: &Options,
     completed_floor: Option<Candidate>,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     match completed_floor {
         Some(floor) => Ok(floor.named("Normal floor")),
         None => build_bounded_floor_candidate(source, options, expired),
@@ -2204,9 +2177,8 @@ fn build_bounded_floor_lineage(
     route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
-        route_window.should_stop()
-    })?;
+    let floor =
+        completed_or_bounded_floor(source, options, completed_floor, &mut route_window.stop())?;
     continue_bounded_floor_lineage(source, floor, options, route_window, true)
 }
 
@@ -2222,9 +2194,8 @@ fn build_bounded_floor_descendants(
     route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
 ) -> Result<(Candidate, Option<Candidate>)> {
-    let floor = completed_or_bounded_floor(source, options, completed_floor, &mut || {
-        route_window.should_stop()
-    })?;
+    let floor =
+        completed_or_bounded_floor(source, options, completed_floor, &mut route_window.stop())?;
     if !run_seeded_max {
         return continue_bounded_floor_lineage(source, floor, options, route_window, false);
     }
@@ -2260,7 +2231,7 @@ fn continue_bounded_floor_lineage(
             options,
             MAX_RAW_REPLAY_LIMIT,
             false,
-            &mut || route_window.should_stop(),
+            &mut route_window.stop(),
         )?
         .named("Columbo max refinement");
         descendant = Some(seeded);
@@ -2277,7 +2248,7 @@ fn continue_bounded_floor_lineage(
                 options,
                 0,
                 ReplayPlanner::Full,
-                &mut || route_window.should_stop(),
+                &mut route_window.stop(),
             )?
             .named("Columbo floor-seeded grouping");
             descendant = Some(grouped);
@@ -2313,7 +2284,7 @@ fn build_bounded_generic_max_candidates(
                                 progress,
                                 deadline,
                                 false,
-                                &mut || deadline.route_should_stop(),
+                                &mut deadline.hard_stop(),
                             )
                         })
                     })
@@ -2337,7 +2308,7 @@ fn build_bounded_generic_max_candidates(
                         progress,
                         deadline,
                         false,
-                        &mut || deadline.route_should_stop(),
+                        &mut deadline.hard_stop(),
                     )
                 })
                 .map(Some)
@@ -2365,14 +2336,11 @@ fn build_bounded_generic_max_candidates(
 /// Its fixed-point work remains subject to the caller's Columbo deadline and
 /// memory policies. Any later cross-route replay is scheduled explicitly by
 /// the caller.
-fn build_deft4j_source_candidate<F>(
+fn build_deft4j_source_candidate(
     source: CandidateInput<'_>,
     options: &Options,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let Some(plans) = plan_source_blocks(source.blocks, 0, options, &mut *expired) else {
         return Ok(None);
     };
@@ -2386,14 +2354,11 @@ where
 /// parsed payloads and deadline. It is intentionally not replayed through
 /// `plan_stream`; doing so would immediately repeat the grouping and split
 /// work this sibling exists to bypass.
-fn build_narrow_source_candidate<F>(
+fn build_narrow_source_candidate(
     source: CandidateInput<'_>,
     options: &Options,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let Some(plans) = plan_source_no_split_route(source.blocks, 0, options, true, &mut *expired)
     else {
         return Ok(None);
@@ -2409,17 +2374,14 @@ where
 /// Reparse that encoded incumbent once, validate its identity, and keep the
 /// seeded deft4j walk additive to the original deft4j candidate rather than
 /// replaying duplicate work on the original blocks.
-fn build_deft4j_seed_candidate<F>(
+fn build_deft4j_seed_candidate(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
     allow_single_block: bool,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     if !deft4j_source_route_eligible(&stream.blocks, allow_single_block) {
         return Ok(None);
@@ -2434,16 +2396,13 @@ where
 /// This is not duplicate source work: the reparsed deft4j candidate contains
 /// merged blocks and expanded token states that the original normal floor
 /// cannot see. The original floor remains an independent comparison below.
-fn refine_with_default_planner<F>(
+fn refine_with_default_planner(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     let mut floor_options = options.clone();
@@ -2508,16 +2467,13 @@ fn build_prepared_compact_source_split_floor(
     )
 }
 
-fn build_prepared_compact_source_split_floor_until<F>(
+fn build_prepared_compact_source_split_floor_until(
     seed: &CompactSplitSeed,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let Some(plans) =
         plan_compact_source_split_floor_until(&seed.stream.blocks, 0, options, expired)
     else {
@@ -2546,7 +2502,7 @@ fn build_prepared_compact_source_split_floor_from_plans(
         decoded_limit,
         identity,
     };
-    let mut never_expires = || false;
+    let mut never_expires = SearchStop::never();
     build_candidate_from_plans(
         source,
         plans,
@@ -2596,16 +2552,13 @@ fn refine_with_compact_source_split_floor(
     build_prepared_compact_source_split_floor(&seed, options, decoded_limit, identity)
 }
 
-fn refine_with_compact_source_split_floor_until<F>(
+fn refine_with_compact_source_split_floor_until(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let Some(seed) = prepare_compact_source_split_seed(candidate, decoded_limit, identity)? else {
         return Ok(None);
     };
@@ -2685,7 +2638,7 @@ fn refine_with_compact_quad_floor(
     }
     plans.push(plan);
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
-    let mut never_expires = || false;
+    let mut never_expires = SearchStop::never();
     build_candidate_from_plans(
         source,
         plans,
@@ -2711,21 +2664,18 @@ fn refine_with_compact_proven_feedback(
 ) -> Result<Option<Candidate>> {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
-    let mut never_expires = || false;
+    let mut never_expires = SearchStop::never();
     build_compact_proven_feedback_candidate(source, options, &mut never_expires)
 }
 
 /// Apply the full Columbo max planner to a complete rewritten candidate.
-fn refine_with_max_planner<F>(
+fn refine_with_max_planner(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)
@@ -2739,17 +2689,14 @@ where
 /// with bounded table floors. If time remains, at most two ordinary replays
 /// may stabilize the smaller list. Optional probes observe the caller's
 /// deadline; complete candidate emission and validation still finish.
-fn refine_with_terminal_merge<F>(
+fn refine_with_terminal_merge(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
-    if expired() {
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    if expired.reached() {
         return Ok(None);
     }
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
@@ -2772,15 +2719,12 @@ where
 
 /// Build one complete-stream candidate and follow strict improvements through
 /// a small number of reparse/replan rounds.
-fn build_candidate<F>(
+fn build_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     replay_limit: usize,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     build_candidate_with_proven_policy(source, options, replay_limit, true, expired)
 }
 
@@ -2793,18 +2737,17 @@ where
 /// reserved for that broader route. The 4,000-token/80-KiB eligibility band is
 /// enforced by
 /// `compact_proven_submatch_route_eligible` before this helper is called.
-fn build_compact_proven_feedback_candidate<F>(
+fn build_compact_proven_feedback_candidate(
     source: CandidateInput<'_>,
     options: &Options,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
     let [block] = source.blocks else {
         return Ok(None);
     };
-    if !compact_proven_submatch_route_eligible(&block.tokens, block.plain.len()) || expired() {
+    if !compact_proven_submatch_route_eligible(&block.tokens, block.plain.len())
+        || expired.reached()
+    {
         return Ok(None);
     }
     let mut route_options = options.clone();
@@ -2819,7 +2762,7 @@ where
     // by the floor's distinct replay fixed point.
     let mut candidate =
         build_compact_proven_seed_candidate(source, floor_plan, &route_options, options, expired)?;
-    if options.exhaustive || expired() {
+    if options.exhaustive || expired.reached() {
         return Ok(Some(candidate));
     }
     // Start the default-only sibling from its own ordinary price. This retains
@@ -2843,16 +2786,13 @@ where
 /// Ordinary replay and repeated proven-before-feedback replay can each win.
 /// Keeping this small helper shared by both seed lineages makes that necessary
 /// comparison explicit without rebuilding the seed plan itself.
-fn build_compact_proven_seed_candidate<F>(
+fn build_compact_proven_seed_candidate(
     source: CandidateInput<'_>,
     plan: PlannedBlock,
     route_options: &Options,
     options: &Options,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     // The first proven-before-feedback pass exposes two distinct replay fixed
     // points. Ordinary replays can stabilize a better table for some streams,
     // while preserving the integrated ordering through every replay wins on
@@ -2892,16 +2832,13 @@ where
 /// This recreates the integrated floor used before proven resegmentation was
 /// separated into an endpoint lineage, but retains it as an additive complete
 /// stream. The caller enforces the four-block/16-KiB-token work bound.
-fn build_compact_integrated_proven_feedback_candidate<F>(
+fn build_compact_integrated_proven_feedback_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     incumbent: &Candidate,
-    expired: &mut F,
-) -> Result<Option<Candidate>>
-where
-    F: FnMut() -> bool,
-{
-    if !compact_source_has_bounded_integrated_proven_feedback(source) || expired() {
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    if !compact_source_has_bounded_integrated_proven_feedback(source) || expired.reached() {
         return Ok(None);
     }
     let mut route_options = options.clone();
@@ -2925,7 +2862,7 @@ where
     // many compact multi-block wins. Only follow the second integrated replay
     // fixed point when that completed candidate did not improve the incumbent;
     // this keeps the route adaptive without using corpus- or time-based gates.
-    if !candidate.is_strictly_smaller_than(incumbent) && !expired() {
+    if !candidate.is_strictly_smaller_than(incumbent) && !expired.reached() {
         let integrated = build_candidate_from_plans(
             source,
             integrated_replay_plans,
@@ -2940,16 +2877,13 @@ where
     Ok(Some(candidate))
 }
 
-fn build_candidate_with_proven_policy<F>(
+fn build_candidate_with_proven_policy(
     source: CandidateInput<'_>,
     options: &Options,
     replay_limit: usize,
     run_proven_lineage: bool,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     let Some(plans) = plan_stream(source.blocks, 0, options, &mut *expired) else {
         return source_candidate(source, options);
     };
@@ -2961,7 +2895,7 @@ where
         ReplayPlanner::Full,
         expired,
     )?;
-    if !run_proven_lineage || expired() {
+    if !run_proven_lineage || expired.reached() {
         return Ok(candidate);
     }
 
@@ -3003,16 +2937,13 @@ where
 ///
 /// This avoids rebuilding the same token-preserving floor inside source max;
 /// the planner still carries a complete structural fallback of its own.
-fn build_candidate_from_established_floor<F>(
+fn build_candidate_from_established_floor(
     source: CandidateInput<'_>,
     options: &Options,
     replay_limit: usize,
     integrated_compact_proven: bool,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     let Some(plans) = plan_stream_from_established_floor(
         source.blocks,
         0,
@@ -3036,17 +2967,14 @@ where
 ///
 /// Keeping this separate from `build_candidate` means ordinary and quiet
 /// routes do not take clocks or maintain progress state in their hot loops.
-fn build_candidate_with_progress<F>(
+fn build_candidate_with_progress(
     source: CandidateInput<'_>,
     options: &Options,
     replay_limit: usize,
     integrated_compact_proven: bool,
-    expired: &mut F,
+    expired: &mut SearchStop<'_>,
     progress: &RouteProgress,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+) -> Result<Candidate> {
     let Some(plans) = plan_stream_with_progress(
         source.blocks,
         0,
@@ -3082,17 +3010,14 @@ enum ReplayPlanner {
 /// collection strategies intentionally need to preserve a locally dearer seed,
 /// so accepting the initial plan list here prevents the ordinary planner from
 /// replacing it before its new block boundaries have been reparsed.
-fn build_candidate_from_plans<F>(
+fn build_candidate_from_plans(
     source: CandidateInput<'_>,
     plans: Vec<PlannedBlock>,
     options: &Options,
     replay_limit: usize,
     replay_planner: ReplayPlanner,
-    expired: &mut F,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+    expired: &mut SearchStop<'_>,
+) -> Result<Candidate> {
     build_candidate_from_plans_with_progress(
         source,
         plans,
@@ -3105,18 +3030,15 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_candidate_from_plans_with_progress<F>(
+fn build_candidate_from_plans_with_progress(
     source: CandidateInput<'_>,
     mut plans: Vec<PlannedBlock>,
     options: &Options,
     replay_limit: usize,
     replay_planner: ReplayPlanner,
-    expired: &mut F,
+    expired: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
-) -> Result<Candidate>
-where
-    F: FnMut() -> bool,
-{
+) -> Result<Candidate> {
     let (mut data, mut bits) = emit_plans(source.compressed, &plans, options.strict)?;
     let initial_loses = !is_strictly_better(
         data.len(),
@@ -3138,7 +3060,7 @@ where
             }
             break;
         }
-        if expired() {
+        if expired.reached() {
             if let Some(progress) = progress {
                 progress.deadline_reached();
                 progress.stopped("File-wide deadline reached before the next replay");
@@ -3203,7 +3125,7 @@ where
                 && options.exhaustive
                 && replay_bits == bits
                 && replay_data == data
-                && !expired();
+                && !expired.reached();
             if let (Some(progress), Some(started)) = (progress, replay_started) {
                 if progress.deadline_was_reached() {
                     progress.replay_stopped(
@@ -3450,133 +3372,14 @@ fn block_progress(
     }
 }
 
-const DEADLINE_TIMED_OUT: u8 = 1;
-const DEADLINE_ROUTES_CANCELLED: u8 = 2;
-
-fn timeout_grace(duration: Duration) -> Duration {
-    if duration.is_zero() {
-        return Duration::ZERO;
-    }
-    TIMEOUT_GRACE_BASE.saturating_add(duration / TIMEOUT_GRACE_DIVISOR)
-}
-
-fn initial_bounded_phase_share(remaining: Duration) -> Duration {
-    remaining.saturating_mul(INITIAL_BOUNDED_PHASE_NUMERATOR) / INITIAL_BOUNDED_PHASE_DENOMINATOR
-}
-
-struct Deadline {
-    started: Instant,
-    duration: Duration,
-    // Timeout and route-cancellation flags share one atomic so a hot search
-    // probe performs only one synchronization load. The flags carry no data,
-    // so relaxed ordering is sufficient.
-    state: AtomicU8,
-}
-
-impl Deadline {
-    fn remaining(&self) -> Duration {
-        self.duration.saturating_sub(self.started.elapsed())
-    }
-
-    /// Whether another independent route may begin.
-    fn can_start_route(&self) -> bool {
-        if self.soft_expired() {
-            return false;
-        }
-        self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED == 0
-    }
-
-    fn soft_expired(&self) -> bool {
-        if self.started.elapsed() < self.duration {
-            return false;
-        }
-        self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
-        true
-    }
-
-    /// Hard stop polled by an active route while it finalizes a candidate.
-    fn expired(&self) -> bool {
-        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
-            return true;
-        }
-        let hard_duration = self.duration.saturating_add(timeout_grace(self.duration));
-        if self.started.elapsed() < hard_duration {
-            return false;
-        }
-        self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
-        true
-    }
-
-    fn route_should_stop(&self) -> bool {
-        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
-            return true;
-        }
-        let hard_duration = self.duration.saturating_add(timeout_grace(self.duration));
-        if self.started.elapsed() >= hard_duration {
-            self.state.fetch_or(DEADLINE_TIMED_OUT, Ordering::Relaxed);
-            return true;
-        }
-        false
-    }
-
-    fn cancel_routes(&self) {
-        // `fetch_or` cannot erase a timeout racing with this route failure.
-        self.state
-            .fetch_or(DEADLINE_ROUTES_CANCELLED, Ordering::Relaxed);
-    }
-
-    fn was_triggered(&self) -> bool {
-        self.soft_expired();
-        self.state.load(Ordering::Relaxed) & DEADLINE_TIMED_OUT != 0
-    }
-}
-
-/// Cooperative stop boundary for one route phase.
-///
-/// A phase yield does not mark the file as timed out: it merely forwards each
-/// route's complete incumbent to the next stage while the global soft budget
-/// still permits that stage to start.
-struct RouteWindow<'a> {
-    deadline: &'a Deadline,
-    stop_after: Option<Duration>,
-}
-
-impl<'a> RouteWindow<'a> {
-    fn full(deadline: &'a Deadline) -> Self {
-        Self {
-            deadline,
-            stop_after: None,
-        }
-    }
-
-    fn reserving_follow_up(deadline: &'a Deadline) -> Self {
-        let elapsed = deadline.started.elapsed();
-        let initial_share = initial_bounded_phase_share(deadline.remaining());
-        Self {
-            deadline,
-            stop_after: Some(elapsed.saturating_add(initial_share)),
-        }
-    }
-
-    fn can_start_route(&self) -> bool {
-        self.deadline.can_start_route()
-            && self.stop_after.map_or(true, |stop_after| {
-                self.deadline.started.elapsed() < stop_after
-            })
-    }
-
-    fn should_stop(&self) -> bool {
-        self.stop_after
-            .is_some_and(|stop_after| self.deadline.started.elapsed() >= stop_after)
-            || self.deadline.route_should_stop()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::super::stop::{
+        initial_bounded_phase_share, TIMEOUT_GRACE_BASE, TIMEOUT_GRACE_DIVISOR,
+    };
     use super::*;
     use crate::deflate::bitstream::BitWriter;
     use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
@@ -4213,14 +4016,24 @@ mod tests {
             },
         };
         let options = Options::default();
-        let completed =
-            build_candidate(source, &options, DEFAULT_RAW_REPLAY_LIMIT, &mut || false).unwrap();
+        let completed = build_candidate(
+            source,
+            &options,
+            DEFAULT_RAW_REPLAY_LIMIT,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
         let expected_data = completed.data.clone();
         let expected_bits = completed.bits;
 
-        let reused = completed_or_bounded_floor(source, &options, Some(completed), &mut || {
-            panic!("reusing a completed floor must not start another build")
-        })
+        let mut must_not_build =
+            || panic!("reusing a completed floor must not start another build");
+        let reused = completed_or_bounded_floor(
+            source,
+            &options,
+            Some(completed),
+            &mut SearchStop::callback(&mut must_not_build),
+        )
         .unwrap();
 
         assert_eq!(reused.data, expected_data);
@@ -4369,11 +4182,7 @@ mod tests {
             decoded_limit: 2,
             identity,
         };
-        let deadline = Deadline {
-            started: Instant::now(),
-            duration: Duration::MAX,
-            state: AtomicU8::new(0),
-        };
+        let deadline = Deadline::new(Instant::now(), Duration::MAX);
         let progress = Progress::begin(
             &options,
             deadline.started,
@@ -4519,12 +4328,9 @@ mod tests {
             timeout: Duration::MAX,
             ..Options::default()
         };
-        let deadline = Deadline {
-            started: Instant::now(),
-            duration: Duration::MAX,
-            state: AtomicU8::new(0),
-        };
-        let base = build_bounded_floor_candidate(source, &options, &mut || false).unwrap();
+        let deadline = Deadline::new(Instant::now(), Duration::MAX);
+        let base =
+            build_bounded_floor_candidate(source, &options, &mut SearchStop::never()).unwrap();
         let complete = build_complete_default_floor_candidate(
             source,
             &options,
@@ -4557,11 +4363,7 @@ mod tests {
 
     #[test]
     fn route_errors_cancel_siblings_without_marking_a_timeout() {
-        let deadline = Deadline {
-            started: Instant::now(),
-            duration: Duration::MAX,
-            state: AtomicU8::new(0),
-        };
+        let deadline = Deadline::new(Instant::now(), Duration::MAX);
         let failed: Result<()> =
             run_route_with_cancellation(&deadline, || Err(Error::new("synthetic route failure")));
 
@@ -4569,11 +4371,7 @@ mod tests {
         assert!(deadline.route_should_stop());
         assert!(!deadline.was_triggered());
 
-        let successful = Deadline {
-            started: Instant::now(),
-            duration: Duration::MAX,
-            state: AtomicU8::new(0),
-        };
+        let successful = Deadline::new(Instant::now(), Duration::MAX);
         let completed: Result<()> = run_route_with_cancellation(&successful, || Ok(()));
         assert!(completed.is_ok());
         assert!(!successful.route_should_stop());
@@ -4608,24 +4406,22 @@ mod tests {
     fn soft_deadline_stops_new_routes_before_active_work() {
         let duration = Duration::from_secs(10);
         let grace = timeout_grace(duration);
-        let inside_grace = Deadline {
-            started: Instant::now()
+        let inside_grace = Deadline::new(
+            Instant::now()
                 .checked_sub(duration + grace / 2)
                 .expect("test duration fits in Instant"),
             duration,
-            state: AtomicU8::new(0),
-        };
+        );
         assert!(!inside_grace.can_start_route());
         assert!(!inside_grace.expired());
         assert!(inside_grace.was_triggered());
 
-        let past_hard_deadline = Deadline {
-            started: Instant::now()
+        let past_hard_deadline = Deadline::new(
+            Instant::now()
                 .checked_sub(duration + grace + Duration::from_millis(1))
                 .expect("test duration fits in Instant"),
             duration,
-            state: AtomicU8::new(0),
-        };
+        );
         assert!(past_hard_deadline.expired());
         assert!(past_hard_deadline.was_triggered());
     }
