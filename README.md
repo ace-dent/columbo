@@ -19,6 +19,39 @@ Combines methods from the following work:
 
 This project focuses on reverse-engineering the techniques used to save the last few bytes from deflate streams.
 
+## Usage
+
+```text
+columbo [options] [--out file] input
+columbo --dry-run [options] input
+```
+
+`input` may be a PNG/APNG, GZIP, ZIP, or zlib file; its format is detected automatically. Columbo optimizes the input in place unless `--out` or `--dry-run` is used. An existing file is replaced only when the output is smaller or saves at least one meaningful Deflate bit. Input and decoded Deflate data are limited to 1 GiB.
+
+### Options
+
+- `-h`, `--help`: Show command-line help and exit.
+- `-v`, `--verbose`: Show route timings, bit gains, and final block choices.
+- `--visual`: Show a live Deflate block map. Requires an interactive terminal and cannot be combined with `--verbose`.
+- `-m`, `--max`: Enable slower block-boundary and token-spelling searches for potentially smaller output.
+- `-d`, `--dry-run`: Run the complete optimization and report savings without writing a file. This mode accepts one positional input and ignores `--out`.
+- `--out <file>`: Write the result to `file` instead of modifying the input. For compatibility, an output path may also be supplied as a second positional argument.
+- `-t <seconds>`, `--timeout <seconds>`: Stop starting new search routes after the specified time. The default is 180 seconds; values are clamped to 10–4000 seconds and fractions round up. An active route receives a grace period of 10% plus one second.
+- `--strict <0|1>`: Select conservative Deflate output. The default, `1`, supports strict and older decoders; `0` permits compact empty or singleton Huffman alphabets and the non-standard length-258 alias.
+- `--strip`: Remove supported PNG, GZIP, and ZIP metadata or comment fields. Metadata is preserved by default.
+- `--raw`: Treat the input as a headerless RFC 1951 Deflate stream instead of detecting a wrapper.
+
+Options that take a value also accept `--out=<file>`, `--timeout=<seconds>`, and `--strict=<0|1>`.
+
+### Examples
+
+```sh
+columbo image.png
+columbo --out optimized.png image.png
+columbo --dry-run --max archive.zip
+columbo --raw --timeout 60 stream.deflate
+```
+
 ## Acknowledgements
 
 Thanks to all contributors.
