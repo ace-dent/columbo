@@ -102,6 +102,7 @@ under [Inner stream-planner gates](#inner-stream-planner-gates).
 | `Complete` | Standalone raw/zlib and ZIP-default policy: finish the ordinary comparison route before max-only work for that stream. |
 | `CompleteThenBounded` | Single unique PNG image-job policy: preserve the complete default result, then give max routes a bounded shared schedule. |
 | `Shared` | GZIP-member, PNG-metadata, multi-image PNG, and ZIP-max refinement policy: use a bounded per-stream floor so surrounding work retains time and decoded-size budget. |
+| `Established` | A caller already retains this complete, validated stream as its floor. Copy it into a new Max lineage without rebuilding Default; every selectable descendant is still reparsed and identity-checked. |
 
 ### Wrapper and floor-policy routing
 
@@ -131,11 +132,18 @@ flowchart TD
     PPNGROUTES --> PMETA["Supported compressed metadata streams"]
     PMETA --> SHAREDMETA["Shared floor per serial metadata stream"]
     PPNGROUTES --> PJOBS{"Exactly one unique image job"}
-    PJOBS -- "Yes" --> CTB["CompleteThenBounded"]
-    PJOBS -- "No" --> SHAREDPNG["Shared floor per serial image job"]
+    PJOBS -- "Yes" --> PMAX{"Bounded single-image Max"}
+    PMAX -- "No" --> CTB["CompleteThenBounded"]
+    PMAX -- "Yes" --> PRACE["Main CompleteThenBounded lineage<br/>+ eligible early transformed lineage"]
+    PJOBS -- "No" --> PAPNGB{"Bounded multi-image Max"}
+    PAPNGB -- "Yes" --> PPAR["Up to 8 fixed worker lanes<br/>Shared floor per image stream"]
+    PAPNGB -- "No" --> SHAREDPNG["Shared floor per serial image job"]
     PZIP --> ZMAX{"--max"}
     ZMAX -- "No" --> ZDEFAULT["Complete default archive pass"]
-    ZMAX -- "Yes" --> ZPHASE1["🟡 Phase 1 · complete default archive"]
+    ZMAX -- "Yes" --> ZBOUND{"Bounded archive work"}
+    ZBOUND -- "Yes" --> ZRACE["Complete default archive + direct-Max<br/>original archive in parallel"]
+    ZRACE --> ZREFINE["Refine completed Default archive<br/>and select byte/bit winner"]
+    ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · complete default archive"]
     ZPHASE1 --> ZTIME{"Time remains"}
     ZTIME -- "No" --> ZWIN["Return phase-1 floor"]
     ZTIME -- "Yes" --> ZPHASE2["🔴 Phase 2 · refine finished archive<br/>Shared floors and actual remainder"]
@@ -151,11 +159,12 @@ mean that separate members share a Huffman tree, candidate, or worker.
 | Raw / top-level zlib | Uses `Complete`; default and max route families run serially. | 🔴 |
 | GZIP | Up to 16,384 concatenated members run serially in source order with one file deadline and cumulative decoded budget; every raw member uses `Shared`. | 🟡 |
 | PNG metadata | Compressed `zTXt`, compressed `iTXt`, and `iCCP` zlib streams use `Shared`. A stream not selected for stripping and no larger than 4,096 bytes may receive a 100 ms probe, under a 64 MiB compressed-plus-decoded probe-work budget. A non-winning probe is retried during normal definitive reconstruction; the unknown-unsafe-ancillary early return is the exception. | 🟡 |
-| PNG / APNG image data | IDAT is always its own job. Exact-compressed duplicate fdAT frames share one optimization job; IDAT and representative fdAT jobs run **serially**, smallest first with source-order tie-breaking. Exactly one job uses `CompleteThenBounded`; two or more use `Shared`. The final largest job receives 98% of the actual remainder. Non-largest jobs use 90% of proportional configured allowance, or 80% when there are more than 32 jobs, capped at the same 98% headroom. | 🔴 |
+| PNG / APNG image data | IDAT is always its own job. Exact-compressed duplicate fdAT frames share one optimization job only when both compressed bytes and exact decoded size match. Every IDAT/fdAT stream must decode to the exact IHDR/fcTL scanline size, including Adam7 passes. Exactly one job uses `CompleteThenBounded`; two or more use `Shared`. Bounded multi-image Max work (≤8 MiB compressed and ≤64 MiB decoded in aggregate) uses up to eight fixed worker lanes with a 4% container margin; each lane runs its small-to-large slice serially. Other work retains the serial small-first schedule. | 🔴 |
+| PNG single-image Max | For ≤8 MiB compressed and ≤64 MiB decoded, the main `CompleteThenBounded` lineage races an early transformed lineage only when the source has a same-distance graph above the complete 512-match bound, or when a 2+-block stream of ≤768 KiB would otherwise serialize exact Default. The early lineage spends one fifth on an ordinary parent, then refines it through `Established`; the exact Default lineage remains the quality floor. | 🔴 |
 | PNG decoded-equivalent frame reuse | After serial job optimization, checksum/size groups are decoded and byte-compared before the best compressed spelling is reused. Retained comparison data is capped at 32 MiB and comparison work at 64 MiB. | 🟡 |
 | PNG unsafe ancillary fallback | If an unknown ancillary chunk is unsafe to copy and `--strip` does not remove it, Columbo validates every image stream and then preserves the complete source PNG. Metadata syntax was parsed and any completed metadata probe was validated, but an unprobed metadata payload is not definitively decoded on this early return. | 🟢 |
 | ZIP default | Unencrypted, nonempty method-8 entries are optimization jobs and run serially, largest first, using `Complete` and one archive deadline; unencrypted stored entries are validated but not Deflate-optimized. Encrypted entries are preserved without payload decoding. | 🟡 |
-| ZIP max | Phase 1 builds the complete default archive. If time remains, phase 2 re-optimizes that finished archive with max plus `Shared` floors, small entries first and the physically latest largest entry receiving 98% of the actual remainder. Other slices are proportional and capped at the same headroom. Weight is normally decoded size; if a largest entry is at least 98% of its decoded size, compression slack plus 5% of compressed size is used instead. Phase 2 is retained on a byte win or a same-byte meaningful-bit win. | 🔴 |
+| ZIP max | For archives ≤8 MiB with ≤64 MiB total optimizable decoded data, the complete Default archive and a direct-Max original-source archive run concurrently; the caller also refines the finished Default archive with the actual remainder. Larger archives retain the sequential two-phase path. Entry scheduling remains small-first in Max refinement, and all complete archives are selected by bytes then meaningful bits. | 🔴 |
 
 ### Raw-stream route tree
 
@@ -174,8 +183,11 @@ flowchart TD
     D1 -- "No" --> D2
     D1RUN --> D2{"D2 eligible + G0"}
     D2 -- "Yes" --> D2RUN["🟡 Integrated multi-block feedback sibling"]
-    D2 -- "No" --> PICK
-    D2RUN --> PICK["Select byte/meaningful-bit winner"]
+    D2 -- "No" --> D3
+    D2RUN --> D3{"D3 · strict literal-only tree"}
+    D3 -- "Yes" --> D3RUN["🟡 Up to 4 improving balanced-tree rounds"]
+    D3 -- "No" --> PICK
+    D3RUN --> PICK["Select byte/meaningful-bit winner"]
 
     MODE -- "Yes" --> POLICY{"Floor policy"}
     POLICY -- "Complete" --> CFLOOR["🟡 Mandatory ordinary comparison floor"]
@@ -183,21 +195,24 @@ flowchart TD
     CM1 -- "Yes" --> CDEFT["🔴 Direct deft4j source candidate"]
     CM1 -- "No" --> LATE["Continue at late-max tree"]
     CDEFT --> LATE
-    POLICY -- "CompleteThenBounded or Shared" --> BOUNDED["Continue at bounded-max tree"]
+    POLICY -- "CompleteThenBounded, Shared, or Established" --> BOUNDED["Continue at bounded-max tree"]
 ```
 
 #### Bounded max
 
 ```mermaid
 flowchart TD
-    START["Max + CompleteThenBounded or Shared"] --> M0{"M0 · prebuild floor"}
+    START["Max + bounded floor policy"] --> EST{"Established"}
+    EST -- "Yes" --> EFLOOR["Retain caller-validated complete floor"]
+    EST -- "No" --> M0{"M0 · prebuild floor"}
     M0 -- "Yes" --> PREFLOOR["Shared: bounded floor<br/>CompleteThenBounded: complete default + retained max seed<br/>eligible D1/D2 still check G0"]
     M0 -- "No" --> DEFER["Build floor inside bounded phase"]
+    EFLOOR --> M1F
     PREFLOOR --> M1F["M1 · record deft eligibility"]
     DEFER --> M1F
     M1F --> M2F["M2 · record no-split eligibility"]
     M2F --> M3F["M3 · record compact proven-feedback eligibility"]
-    M3F --> M4F["M4 · record compact-quad source eligibility"]
+    M3F --> M4F["M4 · record compact balanced-tree eligibility"]
     M4F --> M5{"M5 · parallel work cap"}
 
     M5 -- "Fails" --> SERIAL["🟡 Standard serial phase<br/>floor + eligible M1/M2 under G0<br/>source max and M3 remain later"]
@@ -242,7 +257,7 @@ flowchart TD
     M10CSEED -- "Yes" --> SEEDSPLIT["🟡 Deterministic compact split cleanup"]
     M10CSEED -- "No" --> M4SEED
     SEEDSPLIT --> M4SEED{"M4 · resulting floor-seeded parent eligible"}
-    M4SEED -- "Yes" --> M4SEEDRUN["🟡 Deterministic quad / feedback cleanup"]
+    M4SEED -- "Yes" --> M4SEEDRUN["🟡 Deterministic balanced-tree / feedback cleanup"]
     M4SEED -- "No" --> M10B
     M4SEEDRUN --> M10B{"M10b · bounded deft / weak-split lineage"}
     M10B -- "Applicable" --> M10RUN["🔴 Timed refinements start under G0<br/>admitted compact cleanup may finish deterministically"]
@@ -267,13 +282,13 @@ flowchart TD
     M12G -- "Yes" --> SMAX["🔴 Broad source-max route"]
     M12G -- "No" --> M13
     SMAX --> M4SRC{"M4 · rewritten source-max parent eligible"}
-    M4SRC -- "Yes" --> M4SRUN["🟡 Deterministic quad / feedback cleanup"]
+    M4SRC -- "Yes" --> M4SRUN["🟡 Deterministic balanced-tree / feedback cleanup"]
     M4SRC -- "No" --> M13
     M4SRUN --> M13{"M13 · seed selectable, not stable,<br/>optional routes allowed, + G0"}
     M13 -- "Yes" --> SEEDRUN["🔴 Max planner on selected rewrite"]
     M13 -- "No" --> M4FINAL
     SEEDRUN --> M4FINAL{"M4 · final selected parent eligible + G0"}
-    M4FINAL -- "Yes" --> QFINAL["🟡 Final quad cleanup"]
+    M4FINAL -- "Yes" --> QFINAL["🟡 Final balanced-tree cleanup"]
     M4FINAL -- "No" --> PICKMAX
     QFINAL --> PICKMAX["Select byte/meaningful-bit winner<br/>or relaxed raw source"]
 ```
@@ -291,12 +306,13 @@ comparison order.
 | G0 · timed-route start | A new independent timed route starts only before its soft deadline and while no sibling cancellation flag is set. Active work that polls the hard deadline may finish until configured timeout + 10% + 1 second; a zero timeout has no grace. Multi-route bounded phases normally receive 4/5 of the then-remaining soft time, reserving 1/5 for follow-up. | Stops new timed starts; never skips parsing, validation, or a complete fallback. An already admitted deterministic cleanup may use a no-expiry callback and finish after G0 closes. |
 | D1 · match-preserving default feedback | A complete non-exhaustive/default-floor pass; exactly one parsed block; at least one match; at most 4,000 tokens and 80,000 decoded bytes. | Runs proven-before-feedback and ordinary endpoint orders as independent complete candidates. Default mode and a prebuilt `CompleteThenBounded` floor can use it; standalone `Complete` max omits this extra sibling. |
 | D2 · integrated default feedback | A complete non-exhaustive/default-floor pass; 2–4 parsed blocks; compressed stream at most 16 KiB; decoded stream at most 128 KiB; at most 16 Ki tokens total; at least one block satisfies D1's match/token/plain eligibility. | Runs a compact multi-block integrated-proven candidate in default mode or a prebuilt `CompleteThenBounded` floor; standalone `Complete` max omits it. Its second endpoint replay runs only if the first candidate did not beat the incumbent and hard time remains. |
-| M0 · bounded-floor prebuild | Max plus `Shared` always prebuilds a bounded floor. Max plus `CompleteThenBounded` prebuilds when nonempty blocks ≤1, decoded bytes ≤768 KiB, decoded bytes >2 MiB, or more than 512 matches belong to source same-distance runs. `Complete` never prebuilds here. | Otherwise the multi-block single-image PNG floor is built inside the bounded phase. |
+| D3 · strict literal-only balanced tree | Strict complete Default/default-floor pass; source compressed bytes ≤8 KiB; exactly one nonempty dynamic source block; ≤4,096 tokens; no distance symbols. | Runs up to four strictly improving one-block balanced-tree rounds. Each round ranks bounded pair and quad moves with the ordinary header grid, exhaustively finalizes only the winning tree, reparses the complete candidate, and stops at a fixed point. This structurally targets the complete-distance-alphabet overhead that strict mode cannot omit. |
+| M0 · bounded-floor prebuild | Max plus `Shared` always prebuilds a bounded floor. Max plus `CompleteThenBounded` prebuilds when nonempty blocks ≤1, decoded bytes ≤768 KiB, decoded bytes >2 MiB, or more than 512 matches belong to source same-distance runs. `Established` directly retains the complete caller-provided floor; `Complete` never prebuilds here. | Otherwise the multi-block single-image PNG floor is built inside the bounded phase. |
 | M1 · deft4j source | Max. With exactly one nonempty block: floor policy must allow a single-block route (`Complete` or `CompleteThenBounded`) and the block must be fixed/dynamic. With 2–128 nonempty blocks: at least two must be fixed/dynamic. Other counts are rejected. | Adds the direct deft4j-derived source candidate. |
 | M2 · no-split source | Max + `CompleteThenBounded`; compressed bytes ≤512 KiB; 2–128 nonempty blocks; every nonempty block fixed/dynamic. | Adds the bounded narrow source route. |
 | M3 · compact proven feedback | Max + `CompleteThenBounded`; exactly one parsed block; at least one match; ≤4,000 tokens; ≤80,000 decoded bytes. | Schedules the proven-first sibling in the initial phase under M8/M9, or tries it after that phase if it has not completed and G0 remains open. |
-| M4 · compact quad | The top-level flag requires max + `CompleteThenBounded`, compressed bytes ≤8 KiB, decoded bytes ≤128 KiB, exactly one nonempty dynamic source block, and ≤4,096 tokens in that block. Each rewritten parent must parse as exactly one dynamic block with ≤4,096 tokens and a retained source dynamic-tree seed. | On floor-seeded and source-max parents, admitted quad/feedback cleanup is deterministic and needs no new G0 start; the final selected-parent trial does require G0. The equal-Kraft tree move may add at most 18 payload bits and is retained only when exact header-plus-payload pricing wins. Compact proven-feedback also has its own route-local quad trial. |
-| M5 · route-level parallel cap | Max + bounded floor policy (`CompleteThenBounded` or `Shared`); compressed bytes ≤8 MiB; decoded bytes ≤64 MiB; estimated parsed model ≤64 MiB. | Allows broad independent candidate arenas to overlap. Failure selects Standard scheduling: floor, eligible M1/M2 routes, and dependent work remain serial, M8 is disabled, and source max remains eligible later; it does not promise an equivalent deferred floor-max descendant. |
+| M4 · compact balanced tree | The top-level flag requires max + `CompleteThenBounded`, compressed bytes ≤8 KiB, decoded bytes ≤128 KiB, exactly one nonempty dynamic source block, and ≤4,096 tokens in that block. Each rewritten parent must parse as exactly one dynamic block with ≤4,096 tokens and a retained source dynamic-tree seed. | On floor-seeded and source-max parents, admitted pair/quad tree and feedback cleanup is deterministic and needs no new G0 start; the final selected-parent trial does require G0. Max exactly prices every prospective quad tree and, for an empty distance alphabet, every pair tree. Matched Max streams omit the pair family because their independent token/boundary lineages cover the useful work and the duplicate search can delay larger wins. Each move permits at most 18 extra payload bits and survives only when complete header-plus-payload pricing wins. |
+| M5 · route-level parallel cap | Max + bounded floor policy (`CompleteThenBounded`, `Shared`, or `Established`); compressed bytes ≤8 MiB; decoded bytes ≤64 MiB; estimated parsed model ≤64 MiB. | Allows broad independent candidate arenas to overlap. Failure selects Standard scheduling: floor, eligible M1/M2 routes, and dependent work remain serial, M8 is disabled, and source max remains eligible later; it does not promise an equivalent deferred floor-max descendant. |
 | M6 · bounded PNG policy | Evaluated only for `CompleteThenBounded` after M5. `GenericParallel` when neither M1 nor M2 is eligible. Otherwise `FloorExpansion` when source has ≥2 nonempty blocks or the completed floor changes nonempty boundaries/token arrays. Otherwise `Standard`. | Chooses which independent source and floor lineages own the initial wall-clock window. |
 | M7 · floor descendant | The floor must be selected (`strict` or strictly smaller than source) and its bounded route window must remain open. `GenericParallel` and `FloorExpansion` run an established-floor max descendant. Standard scheduling may instead run standalone bounded grouping when the reparsed floor has multiple nonempty blocks. | The established-floor max and standalone grouping descendants are mutually exclusive. |
 | M8 · initial compact source max | `FloorExpansion` + M5; compressed bytes ≤16 KiB. One nonempty block additionally needs decoded bytes ≤128 KiB, or ≤16 Ki tokens plus at least two repartition runs. For 2–4 nonempty blocks: decoded bytes ≤128 KiB × block count, ≤16 Ki tokens, and at least two repartition runs. | Makes source max eligible for the initial bounded worker phase. |
@@ -484,9 +500,15 @@ no shared cache lock between them.
 Other duplicate-work controls include:
 
 - Reusing a completed default/floor candidate before max descendants.
+- Using `Established` when a PNG worker already owns the complete transformed
+  parent, so the descendant does not rebuild the same ordinary floor.
+- Parsing a completed bounded floor once for its grouping and Max descendants.
 - Skipping rewritten-seed replay after an exact unexpired max fixed point.
-- Deduplicating exact compressed APNG frames before optimization.
+- Deduplicating exact compressed APNG frames with matching decoded geometry
+  before optimization.
 - Exact decoded comparison before cross-frame compressed-stream reuse.
+- Scheduling one direct-Max ZIP archive beside the exact Default archive,
+  instead of making every original-source route wait behind Default feedback.
 - Selecting one compact source-token owner when proven and source-max beams
   would substantially overlap.
 - Pricing bounded grouping ranges once before selecting the least-cost ordered
@@ -494,22 +516,26 @@ Other duplicate-work controls include:
 
 ## Multithreading
 
-Columbo does not parallelize files or container members. PNG/APNG image jobs,
-compressed PNG metadata, GZIP members, and ZIP entries are scheduled serially
-so decoded-byte and wall-clock budgets are shared and bounded in a
-deterministic, format-specific order. In `--max`, selected independent routes
-**inside one raw Deflate stream** may overlap. Default mode and standalone
-raw/top-level-zlib max planning remain algorithmically serial.
+Columbo does not parallelize files supplied to the CLI. Default mode, PNG
+metadata, GZIP members, and standalone raw/top-level-zlib planning remain
+algorithmically serial. In bounded `--max` work, it may overlap independent
+raw routes, APNG image streams, the two useful single-image PNG lineages, or
+complete ZIP archive lineages. Every site has explicit compressed, decoded,
+or model bounds and rejoins before wrapper reconstruction.
 
 Broad candidate-route overlap requires **all** of M5: max mode, a bounded floor
 policy, compressed bytes ≤8 MiB, decoded bytes ≤64 MiB, and parsed-model
 estimate ≤64 MiB. The estimate charges token storage, decoded bytes, and
 per-block model overhead. Two narrower sites use their own tighter work caps:
-compact-split follow-up and floor-seeded grouping range pricing. There is no
-thread pool or CLI thread-count option.
+compact-split follow-up and floor-seeded grouping range pricing. The wrapper
+sites below have their own 8 MiB compressed and 64 MiB decoded bounds. There
+is no persistent thread pool or CLI thread-count option.
 
 | Internal thread site | When it runs | Work split | Indicator |
 | --- | --- | --- | --- |
+| ZIP archive lineages | Max; input ≤8 MiB; total decoded bytes of optimizable entries ≤64 MiB. | One worker runs direct Max from the original archive while the caller completes Default and refines that finished archive. The byte/bit best complete archive wins. | 🔴 |
+| Single-image PNG lineages | Max; compressed ≤8 MiB; exact decoded image bytes ≤64 MiB; source either exceeds the 512-match complete graph or is a 2+-block ≤768 KiB serial-floor class. | One worker builds a quick ordinary parent and continues it through `Established`; the caller preserves exact Default and the direct bounded routes. | 🔴 |
+| Multi-image PNG jobs | Max; at least two unique jobs; aggregate compressed ≤8 MiB; aggregate exact decoded bytes ≤64 MiB. | Up to eight fixed lanes receive balanced contiguous slices of the small-to-large job order. Each lane runs its jobs serially with child-grace-aware proportional time; 4% remains for parse, join, and rebuild work. | 🔴 |
 | Initial bounded max phase | M5 plus the individual M1/M2/M8/M9 route gates and G0. | Up to four named workers for deft4j, no-split, initial source max, and initial proven feedback; caller builds/reuses the floor lineage. `Shared` generally overlaps only eligible multi-block deft work with its floor. | 🔴 |
 | Generic single-image PNG phase | `CompleteThenBounded`, M5, G0, and M6=`GenericParallel`. | One source-max worker while the caller builds the floor→seeded-max lineage. | 🔴 |
 | Bounded PNG follow-up | `CompleteThenBounded`, G0, and bounded refinement remains. A source-max worker additionally requires M5 and no completed or suppressing source-max route. A compact-split worker instead requires at least one prepared weak-deft parent: multiple nonempty blocks, <2% direct deft gain, ≤16 KiB compressed, ≤128 KiB decoded, 2–4 nonempty non-stored blocks, ≤16 Ki tokens, and at least one block with ≥16 tokens and ≥128 decoded bytes. | Optional source-max and compact-split workers run while the caller refines the deft lineage. | 🔴 |
@@ -521,9 +547,9 @@ parallel range-pricing step is used only by the floor-seeded grouping
 continuation. If only one hardware worker is available it falls back to serial
 pricing.
 
-Worker creation is optional. A failed route spawn runs equivalent work on the
-caller when appropriate or leaves the normal later serial route eligible. A
-failed grouping spawn prices that chunk on the caller. Route siblings share
+Worker creation is optional. A failed archive, image-lane, route, or grouping
+spawn runs equivalent work on the caller when appropriate or leaves the normal
+later serial route eligible. Route siblings share
 immutable parsed input but own their candidate arenas and caches. An error or
 panic in a candidate-route sibling requests cooperative cancellation; all
 successfully started scoped workers are joined before the error is returned or
@@ -550,10 +576,12 @@ the internal scheduler described here.
 | --- | --- | --- | --- |
 | Original raw-candidate preservation | Keeps compatible raw Deflate source bytes as the relaxed fallback; strict repairs are the documented exception. Wrapper-level reconstruction or normalization can still change container bytes. | 🟢 | **Columbo** |
 | One-bit output selection | At equal byte length, any positive meaningful-Deflate-bit saving—including one bit—sets `bits_saved` and permits a CLI write. Padding-only changes do not. | 🟢 | **Columbo** |
-| Complete / CompleteThenBounded / Shared floors | Selects standalone, single-image PNG, or multi-stream deadline behavior without exposing wrapper policy as a public option. | 🟡 | **Columbo** |
-| Two-phase ZIP max | Builds the complete default archive, then refines that output with max and the actual remaining budget. | 🔴 | **Columbo** |
+| Complete / CompleteThenBounded / Shared / Established floors | Selects standalone, single-image PNG, multi-stream, or already-retained-parent deadline behavior without exposing wrapper policy as a public option. | 🟡 | **Columbo** |
+| Parallel ZIP max lineages | On bounded archives, races exact Default and direct original-source Max, then also refines the completed Default archive. Larger archives use the sequential two-phase equivalent. | 🔴 | **Columbo** |
 | PNG compressed-metadata probe | Gives small supported ancillary zlib streams a bounded early probe, retrying non-winners during normal reconstruction; the unknown-unsafe-ancillary early return preserves the source first. | 🟡 | Original **Columbo C** behavior, bounded Rust implementation |
-| PNG duplicate and equivalent-frame reuse | Shares optimization for exact-compressed duplicate fdAT frames, then uses bounded exact decoded comparison before reusing a better spelling across equivalent fdAT frames. IDAT remains a separate job. | 🟡 | **Columbo** |
+| Exact PNG image geometry | Computes filtered IDAT/fdAT byte counts from IHDR/fcTL, including Adam7, and requires each zlib stream to decode to that exact size. | 🟢 | **PNG/APNG / Columbo** |
+| Parallel PNG Max scheduling | Races distinct bounded single-image lineages and assigns independent APNG streams to at most eight fixed lanes, with explicit memory and wall-clock headroom. | 🔴 | **Columbo** |
+| PNG duplicate and equivalent-frame reuse | Shares optimization for exact-compressed fdAT frames only when decoded geometry also matches, then uses bounded exact decoded comparison before reusing a better spelling across equivalent frames. IDAT remains a separate job. | 🟡 | **Columbo** |
 | PNG packet coalescing and APNG renumbering | Coalesces IDAT/fdAT packetization, saving one 12-byte chunk envelope per removed packet, and rebuilds APNG sequence numbers. | 🟢 | **PNG/APNG / Columbo** |
 | zlib effort-header normalization | Rebuilds RFC 1950 FLG with FLEVEL=3 and valid FCHECK while retaining CM/CINFO and rejecting preset dictionaries. This changes the API-selected wrapper even when the raw body is retained; the CLI still requires nonzero `bits_saved` before writing solely for compression. | 🟢 | **RFC 1950 / Columbo** |
 | GZIP member scheduling | Validates and optimizes concatenated members serially with shared timeout/decoded budgets and optional metadata stripping. | 🟡 | **RFC 1952 / Columbo** |
@@ -581,7 +609,9 @@ the internal scheduler described here.
 | Match-preserving and integrated proven feedback | Adds the compact D1/D2/M3 state orders as independent complete candidates. | 🟡 | **Columbo** |
 | Terminal tree tightening | Applies bounded feedback trees and one strictly improving existing-match-to-literal replay to eligible final Huffman blocks. | 🟡 | DeflOpt-inspired primitive; **Columbo** scheduling |
 | Table replay ladder | Follows the selected table through up to four token-expansion/rebuild states, retaining the best intermediate. | 🟡 | **Columbo** |
-| Compact quad lengthening | On one dynamic block, tries a bounded one-shorter/four-longer equal-Kraft tree family, permits at most 18 extra payload bits, and exactly prices complete header plus payload. | 🟡 | Original **Columbo C** method |
+| Compact pair lengthening | On one dynamic block, shortens one length-L code to L-1 and lengthens two other length-L codes to L+1. This preserves the Kraft sum; bounded frequency-ranked candidates may spend at most 18 payload bits and are accepted only when the complete header-plus-payload result wins. | 🟡 | **Columbo Rust** |
+| Compact quad lengthening | On one dynamic block, tries the original bounded one-shorter/four-longer equal-Kraft tree family, permits at most 18 extra payload bits, and prices complete header plus payload. | 🟡 | Original **Columbo C** method |
+| Compact balanced-tree cleanup | Selects the better pair/quad tree, exhaustively finalizes only Default's winning tree, and may compose Max's tree result with compact proven feedback. The structural strict literal-only Default route runs at most four improving rounds; matched Max streams avoid the duplicate pair family. | 🟡 | **Columbo** scheduling |
 
 ### Structural and max routes
 

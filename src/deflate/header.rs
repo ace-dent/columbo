@@ -349,6 +349,7 @@ pub(crate) fn plan_columbo_quad_lengthen_candidate(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
     seed: &DynamicPlan,
+    exhaustive_header: bool,
 ) -> Option<DynamicPlan> {
     const CANDIDATE_CAP: usize = 5;
     const PAYLOAD_MARGIN_BITS: i64 = 18;
@@ -444,11 +445,125 @@ pub(crate) fn plan_columbo_quad_lengthen_candidate(
                                 &literal,
                                 &seed_distance,
                                 data_bits,
-                                true,
+                                exhaustive_header,
                             ) {
                                 keep_better(&mut best, candidate);
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Try Columbo's one-shorter/two-longer equal-Kraft tree move.
+///
+/// Shortening one length-L code to L-1 adds the same code-space weight that
+/// lengthening two other length-L codes to L+1 removes. The bounded candidate
+/// lists favor a frequently used short code and rarely used long codes, while
+/// exact header-plus-payload pricing remains the acceptance test.
+pub(crate) fn plan_columbo_pair_lengthen_candidate(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    seed: &DynamicPlan,
+    exhaustive_header: bool,
+) -> Option<DynamicPlan> {
+    const CANDIDATE_CAP: usize = 5;
+    const PAYLOAD_MARGIN_BITS: i64 = 18;
+
+    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
+        return None;
+    }
+    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
+    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
+    let extra_bits = token_extra_bits(tokens);
+    let mut best: Option<DynamicPlan> = None;
+    let mut shorten = Vec::<(usize, u32)>::new();
+    let mut lengthen = Vec::<(usize, u32)>::new();
+    if shorten.try_reserve_exact(CANDIDATE_CAP).is_err()
+        || lengthen.try_reserve_exact(CANDIDATE_CAP).is_err()
+    {
+        return None;
+    }
+
+    for length in 2_u8..=14 {
+        shorten.clear();
+        lengthen.clear();
+        for (symbol, &candidate) in seed_literal.iter().enumerate() {
+            if candidate != length {
+                continue;
+            }
+            let entry = (symbol, literal_frequencies[symbol]);
+
+            let short_insertion = shorten
+                .iter()
+                .position(|&(_, frequency)| frequency < entry.1)
+                .unwrap_or(shorten.len());
+            if short_insertion < CANDIDATE_CAP {
+                if shorten.len() == CANDIDATE_CAP {
+                    shorten.pop();
+                }
+                shorten.insert(short_insertion, entry);
+            }
+
+            let long_insertion = lengthen
+                .iter()
+                .position(|&(_, frequency)| frequency > entry.1)
+                .unwrap_or(lengthen.len());
+            if long_insertion < CANDIDATE_CAP {
+                if lengthen.len() == CANDIDATE_CAP {
+                    lengthen.pop();
+                }
+                lengthen.insert(long_insertion, entry);
+            }
+        }
+        if shorten.is_empty() || lengthen.len() < 2 {
+            continue;
+        }
+
+        for &(short_symbol, short_frequency) in &shorten {
+            for first in 0..lengthen.len() - 1 {
+                for second in first + 1..lengthen.len() {
+                    let long_symbols = [lengthen[first], lengthen[second]];
+                    if long_symbols
+                        .iter()
+                        .any(|&(symbol, _)| symbol == short_symbol)
+                    {
+                        continue;
+                    }
+                    let payload_delta = long_symbols
+                        .iter()
+                        .fold(-i64::from(short_frequency), |delta, (_, frequency)| {
+                            delta + i64::from(*frequency)
+                        });
+                    if payload_delta > PAYLOAD_MARGIN_BITS {
+                        continue;
+                    }
+
+                    let mut literal = seed_literal;
+                    literal[short_symbol] -= 1;
+                    for &(symbol, _) in &long_symbols {
+                        literal[symbol] += 1;
+                    }
+                    let Some(data_bits) = token_bits_from_frequencies(
+                        literal_frequencies,
+                        distance_frequencies,
+                        &literal,
+                        &seed_distance,
+                        extra_bits,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(candidate) = plan_for_explicit_lengths_with_cost(
+                        &literal,
+                        &seed_distance,
+                        data_bits,
+                        exhaustive_header,
+                    ) {
+                        keep_better(&mut best, candidate);
                     }
                 }
             }
@@ -2253,6 +2368,7 @@ mod tests {
             &literal_frequencies,
             &distance_frequencies,
             &seed,
+            true,
         )
         .expect("the Kraft-preserving quad move is legal");
 
@@ -2260,6 +2376,51 @@ mod tests {
         for symbol in b"bcde" {
             assert_eq!(candidate.literal_lengths[usize::from(*symbol)], 4);
         }
+        assert!(Huffman::build(&candidate.literal_lengths).is_some());
+    }
+
+    #[test]
+    fn columbo_pair_move_preserves_a_complete_tree() {
+        let mut tokens = vec![Token::Literal(b'A'); 100];
+        tokens.extend(b"bc".iter().copied().map(Token::Literal));
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[usize::from(b'A')] = 100;
+        for symbol in b"bc" {
+            literal_frequencies[usize::from(*symbol)] = 1;
+        }
+        literal_frequencies[256] = 1;
+        let distance_frequencies = [0_u32; 30];
+
+        // Four length-two leaves form a complete tree. Shortening the frequent
+        // leaf and lengthening two rare leaves preserves the Kraft sum.
+        let mut literal_lengths = vec![0_u8; 257];
+        for symbol in b"Abc" {
+            literal_lengths[usize::from(*symbol)] = 2;
+        }
+        literal_lengths[256] = 2;
+        let seed = DynamicPlan {
+            literal_lengths,
+            distance_lengths: vec![1],
+            code_length_lengths: [0; 19],
+            rle: Vec::new(),
+            hlit: 257,
+            hdist: 1,
+            hclen: 4,
+            bits: 0,
+        };
+
+        let candidate = plan_columbo_pair_lengthen_candidate(
+            &tokens,
+            &literal_frequencies,
+            &distance_frequencies,
+            &seed,
+            true,
+        )
+        .expect("the Kraft-preserving pair move is legal");
+
+        assert_eq!(candidate.literal_lengths[usize::from(b'A')], 1);
+        assert_eq!(candidate.literal_lengths[usize::from(b'b')], 3);
+        assert_eq!(candidate.literal_lengths[usize::from(b'c')], 3);
         assert!(Huffman::build(&candidate.literal_lengths).is_some());
     }
 

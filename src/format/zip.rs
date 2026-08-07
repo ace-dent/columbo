@@ -4,6 +4,7 @@ use crate::checksum::crc32_update;
 use crate::deflate::{optimize_raw_prefix_with_floor, DefaultFloor};
 use crate::{Error, Optimization, Options, Result};
 
+use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
@@ -21,6 +22,14 @@ const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate ZIP output";
 const MODEL_ALLOCATION_ERROR: &str = "could not allocate ZIP entry model";
 const LOCAL_ALLOCATION_ERROR: &str = "could not allocate ZIP local entry";
+
+// Max keeps an exact Default archive as a quality floor while exploring a
+// separate direct-Max archive. Running those independent branches together
+// prevents slow Default feedback on one member from delaying useful Max work
+// on another. Bound both retained input and decoded models because the two
+// complete branches temporarily require separate archive and Deflate arenas.
+const PARALLEL_MAX_ARCHIVE_INPUT: usize = 8 * 1_024 * 1_024;
+const PARALLEL_MAX_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 
 #[derive(Debug)]
 struct Entry {
@@ -97,16 +106,73 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         return optimize_once(input, options, DefaultFloor::Complete);
     }
 
+    if !options.visual && parallel_max_archive_is_bounded(input) {
+        return optimize_max_parallel(input, options);
+    }
+
+    optimize_max_sequential(input, options)
+}
+
+/// Build Default-seeded and direct-Max archives inside the same wall-clock
+/// window, then retain the byte-first winner.
+///
+/// The raw optimizer already avoids rebuilding a complete Default route when
+/// given a shared container floor. This archive-level pairing therefore makes
+/// original-source Max routes available immediately without rebuilding the
+/// expensive Default route inside that branch. Refining the completed Default
+/// archive remains useful rather than duplicate work: its rewritten block and
+/// token choices expose a distinct search basin that the source branch cannot
+/// necessarily reach.
+fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization> {
+    thread::scope(|scope| {
+        let started = Instant::now();
+        let max_worker = thread::Builder::new()
+            .name("columbo-zip-direct-max".into())
+            .spawn_scoped(scope, || {
+                optimize_once(input, options, DefaultFloor::Shared)
+            });
+
+        let mut floor_options = options.clone();
+        floor_options.exhaustive = false;
+        let floor = optimize_once(input, &floor_options, DefaultFloor::Complete);
+
+        let max_worker = match max_worker {
+            Ok(worker) => worker,
+            // Thread creation failure is not an optimization failure. Finish
+            // the established sequential route using the Default result and
+            // whatever part of the original allowance remains.
+            Err(_) => return refine_complete_floor(input, options, started, floor?),
+        };
+        let refined_floor =
+            floor.and_then(|floor| refine_complete_floor(input, options, started, floor));
+        let direct = match max_worker.join() {
+            Ok(result) => result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        Ok(best_complete_optimization(refined_floor?, direct))
+    })
+}
+
+fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimization> {
+    let started = Instant::now();
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    let floor = optimize_once(input, &floor_options, DefaultFloor::Complete)?;
+    refine_complete_floor(input, options, started, floor)
+}
+
+fn refine_complete_floor(
+    input: &[u8],
+    options: &Options,
+    started: Instant,
+    mut floor: Optimization,
+) -> Result<Optimization> {
     // Max benchmarks and interactive runs allocate one file-wide allowance,
     // normally measured default time plus an extra search budget. Preserve
     // that contract explicitly: establish the complete default archive once,
     // then use only the actual remainder to refine its already-smaller Deflate
     // members. The second phase starts from the finished floor and therefore
     // uses `Shared` raw floors instead of rebuilding default work per member.
-    let started = Instant::now();
-    let mut floor_options = options.clone();
-    floor_options.exhaustive = false;
-    let mut floor = optimize_once(input, &floor_options, DefaultFloor::Complete)?;
     let remaining = options.timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         floor.timed_out = true;
@@ -126,6 +192,52 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     refined.bits_saved = combined_savings(input.len(), &floor, &refined);
     refined.timed_out |= floor.timed_out;
     Ok(refined)
+}
+
+fn best_complete_optimization(mut floor: Optimization, mut direct: Optimization) -> Optimization {
+    let timed_out = floor.timed_out || direct.timed_out;
+    let direct_wins = direct.data.len() < floor.data.len()
+        || (direct.data.len() == floor.data.len() && direct.bits_saved > floor.bits_saved);
+    if direct_wins {
+        direct.timed_out = timed_out;
+        direct
+    } else {
+        floor.timed_out = timed_out;
+        floor
+    }
+}
+
+fn parallel_max_archive_is_bounded(input: &[u8]) -> bool {
+    if input.len() > PARALLEL_MAX_ARCHIVE_INPUT {
+        return false;
+    }
+    let Some(eocd_offset) = find_end_of_central_directory(input) else {
+        return false;
+    };
+    let Some(eocd) = input.get(eocd_offset..eocd_offset.saturating_add(22)) else {
+        return false;
+    };
+    let central_offset = le32(eocd, 16) as usize;
+    let central_size = le32(eocd, 12) as usize;
+    if central_offset
+        .checked_add(central_size)
+        .filter(|&end| end == eocd_offset)
+        .is_none()
+    {
+        return false;
+    }
+    let Ok(entries) =
+        parse_central_entries(input, central_offset, eocd_offset, le16(eocd, 10), false)
+    else {
+        return false;
+    };
+    entries
+        .iter()
+        .filter(|entry| entry_is_optimizable(entry))
+        .try_fold(0_u64, |total, entry| {
+            total.checked_add(u64::from(entry.uncompressed_size))
+        })
+        .is_some_and(|decoded| decoded <= PARALLEL_MAX_ARCHIVE_DECODED)
 }
 
 fn combined_savings(original_bytes: usize, floor: &Optimization, refined: &Optimization) -> u64 {
@@ -1203,6 +1315,48 @@ mod tests {
         if max.data.len() == default.data.len() {
             assert!(max.bits_saved >= default.bits_saved);
         }
+    }
+
+    #[test]
+    fn parallel_max_selection_is_byte_first_then_bit_first() {
+        let floor = Optimization {
+            data: vec![0; 10],
+            bits_saved: 3,
+            timed_out: false,
+        };
+        let bit_winner = Optimization {
+            data: vec![1; 10],
+            bits_saved: 4,
+            timed_out: true,
+        };
+        let selected = best_complete_optimization(floor.clone(), bit_winner);
+        assert_eq!(selected.data, vec![1; 10]);
+        assert!(selected.timed_out);
+
+        let byte_winner = Optimization {
+            data: vec![2; 9],
+            bits_saved: 8,
+            timed_out: false,
+        };
+        let selected = best_complete_optimization(floor, byte_winner);
+        assert_eq!(selected.data, vec![2; 9]);
+    }
+
+    #[test]
+    fn parallel_max_archive_requires_bounded_work() {
+        let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, false, false);
+        assert!(parallel_max_archive_is_bounded(&input));
+
+        let oversized = single_entry_archive(
+            8,
+            &deflate,
+            crc32_update(0, b"x"),
+            u32::try_from(PARALLEL_MAX_ARCHIVE_DECODED + 1).unwrap(),
+            false,
+            false,
+        );
+        assert!(!parallel_max_archive_is_bounded(&oversized));
     }
 
     #[test]

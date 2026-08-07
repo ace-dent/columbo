@@ -12,7 +12,10 @@ use crate::{Error, Options, Result};
 use super::bitstream::BitWriter;
 use super::block::{emit_block, plan_block};
 use super::deft4j::plan_source_blocks;
-use super::header::plan_columbo_quad_lengthen_candidate;
+use super::header::{
+    plan_columbo_pair_lengthen_candidate, plan_columbo_quad_lengthen_candidate,
+    plan_for_explicit_lengths,
+};
 use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
 };
@@ -56,9 +59,10 @@ const COMPACT_SPLIT_FLOOR_MAX_TOKENS: usize = 16 * 1024;
 // The original Columbo C quad-lengthening move is a bounded one-block header
 // floor. Its upper model limits avoid turning it into another general search;
 // no corpus-derived lower size or token threshold is needed.
-const COMPACT_QUAD_MAX_COMPRESSED: usize = 8 * 1_024;
-const COMPACT_QUAD_MAX_DECODED: u64 = 128 * 1_024;
-const COMPACT_QUAD_MAX_TOKENS: usize = 4_096;
+const COMPACT_TREE_MAX_COMPRESSED: usize = 8 * 1_024;
+const COMPACT_TREE_MAX_DECODED: u64 = 128 * 1_024;
+const COMPACT_TREE_MAX_TOKENS: usize = 4_096;
+const DEFAULT_STRICT_TREE_ROUNDS: usize = 4;
 // A complementary source-root beam remains cheap on very small token graphs,
 // even when proven feedback has already improved the ordinary floor. Retain
 // both basins through a 2,048-token graph; above it, the extra beam competes
@@ -123,12 +127,15 @@ pub(crate) struct RawOptimization {
 /// time they retain the ordinary result, while a short run may fall back to
 /// any earlier complete candidate. Multi-stream containers use
 /// [`DefaultFloor::Shared`] so one member cannot consume time needed by later
-/// members.
+/// members. [`DefaultFloor::Established`] means the caller already retains the
+/// complete input stream as its comparison floor, so descendants can begin
+/// without rebuilding an ordinary candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
     Complete,
     CompleteThenBounded,
     Shared,
+    Established,
 }
 
 impl DefaultFloor {
@@ -141,7 +148,7 @@ impl DefaultFloor {
     }
 
     fn allows_single_block_deft4j(self) -> bool {
-        !matches!(self, Self::Shared)
+        !matches!(self, Self::Shared | Self::Established)
     }
 }
 
@@ -173,6 +180,49 @@ pub(crate) fn inspect_raw_prefix(input: &[u8], decoded_limit: u64) -> Result<(us
             source_empty_block_count: parsed.source_empty_block_count,
         },
     ))
+}
+
+/// Report whether a PNG Max scheduler benefits from an early transformed
+/// lineage beside its exact Default lineage.
+///
+/// A dense same-distance graph needs the reduced parent because the direct
+/// bounded graph cannot enumerate every combination. A small multi-block
+/// stream needs it for a different reason: exact Default is deliberately
+/// established serially for this work class, so it can otherwise consume a
+/// short Max allowance before any independent source route starts. Larger
+/// multi-block floors already overlap those routes internally and must not
+/// receive a redundant outer worker. The probe performs only the normal
+/// bounded parse; optimization reparses and independently validates every
+/// selectable output.
+pub(crate) fn raw_source_benefits_from_early_max_lineage(
+    input: &[u8],
+    decoded_limit: u64,
+) -> Result<bool> {
+    let parsed = parse_stream(input, decoded_limit)?;
+    if parsed.consumed != input.len() {
+        return Err(Error::new("trailing data after Deflate stream"));
+    }
+    let dense_match_graph =
+        source_run_match_count_exceeds(&parsed.blocks, PROVEN_SUBMATCH_FULL_MATCH_LIMIT);
+    let nonempty_blocks = parsed
+        .blocks
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    Ok(early_transformed_lineage_is_useful(
+        nonempty_blocks,
+        parsed.decoded_size,
+        dense_match_graph,
+    ))
+}
+
+fn early_transformed_lineage_is_useful(
+    nonempty_blocks: usize,
+    decoded_size: u64,
+    dense_match_graph: bool,
+) -> bool {
+    dense_match_graph
+        || (nonempty_blocks >= 2 && decoded_size <= PREBUILD_BOUNDED_FLOOR_MAX_DECODED)
 }
 
 /// Canonicalize Defluff's non-standard length-258 spelling before planning.
@@ -317,12 +367,15 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                     || source_run_match_count_exceeds(&blocks, PROVEN_SUBMATCH_FULL_MATCH_LIMIT)
             }
             DefaultFloor::Shared => true,
+            DefaultFloor::Established => false,
             DefaultFloor::Complete => false,
         };
     let guaranteed_floor_step =
         prebuild_floor_first.then(|| progress.start("Normal comparison floor"));
     let mut complete_default_candidate = None;
-    let mut guaranteed_floor_candidate = if prebuild_floor_first {
+    let mut guaranteed_floor_candidate = if default_floor == DefaultFloor::Established {
+        Some(established_floor_candidate(source)?)
+    } else if prebuild_floor_first {
         Some(if default_floor == DefaultFloor::CompleteThenBounded {
             let floors =
                 build_complete_default_floor_candidate(source, options, &deadline, progress)?;
@@ -346,9 +399,9 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             )
         }));
     }
-    let compact_quad_eligible = options.exhaustive
+    let compact_tree_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
-        && compact_quad_source_eligible(original.len(), parsed.decoded_size, &blocks);
+        && compact_balanced_tree_source_eligible(original.len(), parsed.decoded_size, &blocks);
     let compact_proven_feedback_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && source.blocks.len() == 1
@@ -509,11 +562,12 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         floor.plans.clear();
     }
     // A completed floor-seeded max route may end at a different header/token
-    // fixed point from source max. Finish the same bounded quad cleanup on
+    // fixed point from source max. Finish the same bounded tree cleanup on
     // that exact parent before releasing it. This is deterministic finalization
     // of an already completed candidate, so it remains valid after the soft
-    // deadline and cannot discard the parent when no quad improvement exists.
-    if compact_quad_eligible {
+    // deadline and cannot discard the parent when no balanced-tree improvement
+    // exists.
+    if compact_tree_eligible {
         if let Some(seeded) = &mut floor_seeded_candidate {
             // A one-block source may become a multi-block floor after the max
             // descendant. Those new boundaries admit the same deterministic
@@ -528,15 +582,15 @@ pub(crate) fn optimize_raw_prefix_with_floor(
             )? {
                 seeded.replace_if_smaller(split);
             }
-            if let Some(mut quad) =
-                refine_with_compact_quad_floor(seeded, options, decoded_limit, identity)?
+            if let Some(mut tree) =
+                refine_with_compact_balanced_tree_floor(seeded, options, decoded_limit, identity)?
             {
                 if let Some(feedback) =
-                    refine_with_compact_proven_feedback(&quad, options, decoded_limit, identity)?
+                    refine_with_compact_proven_feedback(&tree, options, decoded_limit, identity)?
                 {
-                    quad.replace_if_smaller(feedback);
+                    tree.replace_if_smaller(feedback);
                 }
-                seeded.replace_if_smaller(quad);
+                seeded.replace_if_smaller(tree);
             }
         }
     }
@@ -849,7 +903,9 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                 DEFAULT_RAW_REPLAY_LIMIT,
                 &mut deadline.hard_stop(),
             )?,
-            DefaultFloor::CompleteThenBounded | DefaultFloor::Shared => {
+            DefaultFloor::CompleteThenBounded
+            | DefaultFloor::Shared
+            | DefaultFloor::Established => {
                 build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?
             }
         }
@@ -970,17 +1026,18 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         };
         if let Some(mut max_candidate) = source_max {
             // A locally smaller proven-feedback endpoint can hide the bounded
-            // quad-header win reachable from source max. Finish that cheap
+            // balanced-tree header win reachable from source max. Finish that
+            // cheap
             // lineage-specific cleanup before comparing complete streams.
-            if compact_quad_eligible {
-                let quad_step = progress.start("Columbo source-max quad floor");
-                let mut quad = refine_with_compact_quad_floor(
+            if compact_tree_eligible {
+                let tree_step = progress.start("Columbo source-max balanced-tree floor");
+                let mut tree = refine_with_compact_balanced_tree_floor(
                     &max_candidate,
                     options,
                     decoded_limit,
                     identity,
                 )?;
-                if let Some(candidate) = quad.as_mut() {
+                if let Some(candidate) = tree.as_mut() {
                     if let Some(feedback) = refine_with_compact_proven_feedback(
                         candidate,
                         options,
@@ -990,15 +1047,15 @@ pub(crate) fn optimize_raw_prefix_with_floor(
                         candidate.replace_if_smaller(feedback);
                     }
                 }
-                quad_step.finish(quad.as_ref().map(|quad| {
+                tree_step.finish(tree.as_ref().map(|tree| {
                     candidate_progress(
-                        quad,
+                        tree,
                         source.meaningful_bits,
-                        quad.is_strictly_smaller_than_source(source),
+                        tree.is_strictly_smaller_than_source(source),
                     )
                 }));
-                if let Some(quad) = quad {
-                    max_candidate.replace_if_smaller(quad);
+                if let Some(tree) = tree {
+                    max_candidate.replace_if_smaller(tree);
                 }
             }
             source_max_stabilized_incumbent = candidate.is_encoding_stabilized_by(&max_candidate);
@@ -1049,18 +1106,19 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         }
     }
 
-    if compact_quad_eligible && deadline.can_start_route() {
-        let quad_step = progress.start("Columbo compact quad floor");
-        let quad = refine_with_compact_quad_floor(&candidate, options, decoded_limit, identity)?;
-        quad_step.finish(quad.as_ref().map(|quad| {
+    if compact_tree_eligible && deadline.can_start_route() {
+        let tree_step = progress.start("Columbo compact balanced-tree floor");
+        let tree =
+            refine_with_compact_balanced_tree_floor(&candidate, options, decoded_limit, identity)?;
+        tree_step.finish(tree.as_ref().map(|tree| {
             candidate_progress(
-                quad,
+                tree,
                 source.meaningful_bits,
-                quad.is_strictly_smaller_than_source(source),
+                tree.is_strictly_smaller_than_source(source),
             )
         }));
-        if let Some(quad) = quad {
-            candidate.replace_if_smaller(quad);
+        if let Some(tree) = tree {
+            candidate.replace_if_smaller(tree);
         }
     }
 
@@ -1164,12 +1222,12 @@ fn narrow_source_route_eligible(blocks: &[ParsedBlock], compressed_len: usize) -
         })
 }
 
-fn compact_quad_source_eligible(
+fn compact_balanced_tree_source_eligible(
     compressed_len: usize,
     decoded_size: u64,
     blocks: &[ParsedBlock],
 ) -> bool {
-    if compressed_len > COMPACT_QUAD_MAX_COMPRESSED || decoded_size > COMPACT_QUAD_MAX_DECODED {
+    if compressed_len > COMPACT_TREE_MAX_COMPRESSED || decoded_size > COMPACT_TREE_MAX_DECODED {
         return false;
     }
     let mut nonempty = blocks.iter().filter(|block| !block.plain.is_empty());
@@ -1178,7 +1236,24 @@ fn compact_quad_source_eligible(
     };
     nonempty.next().is_none()
         && block.source_type == SourceBlockType::Dynamic
-        && block.tokens.len() <= COMPACT_QUAD_MAX_TOKENS
+        && block.tokens.len() <= COMPACT_TREE_MAX_TOKENS
+}
+
+fn compact_strict_literal_tree_eligible(compressed_len: usize, blocks: &[ParsedBlock]) -> bool {
+    if compressed_len > COMPACT_TREE_MAX_COMPRESSED {
+        return false;
+    }
+    let mut nonempty = blocks.iter().filter(|block| !block.plain.is_empty());
+    let Some(block) = nonempty.next() else {
+        return false;
+    };
+    nonempty.next().is_none()
+        && block.source_type == SourceBlockType::Dynamic
+        && block.tokens.len() <= COMPACT_TREE_MAX_TOKENS
+        && block
+            .distance_frequencies
+            .iter()
+            .all(|&frequency| frequency == 0)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2082,6 +2157,27 @@ fn build_bounded_floor_candidate(
         .map(|candidate| candidate.named("Normal floor"))
 }
 
+/// Copy a complete caller-retained stream into the local candidate set.
+///
+/// `Established` is used only for a stream just emitted and validated by an
+/// independent Columbo lineage. Re-running Default here would rediscover a
+/// floor the caller already owns; later descendants reparse these bytes before
+/// using them, preserving the normal identity checks.
+fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(source.compressed.len())
+        .map_err(|_| Error::new("could not allocate Deflate output"))?;
+    data.extend_from_slice(source.compressed);
+    Ok(Candidate {
+        data,
+        bits: source.meaningful_bits,
+        plans: Vec::new(),
+        block_report: None,
+        route: "Normal floor",
+        max_planner_is_stable: false,
+    })
+}
+
 /// Add the bounded siblings that form the complete ordinary-mode floor.
 ///
 /// These routes are deliberately shared by a normal invocation and the floor
@@ -2134,6 +2230,31 @@ fn improve_default_floor_with_feedback(
         if let Some(contender) = contender {
             candidate.replace_if_smaller(contender);
         }
+    }
+    if options.strict
+        && compact_strict_literal_tree_eligible(source.compressed.len(), source.blocks)
+    {
+        let tree_step = progress.start("Columbo strict literal-tree cleanup");
+        for _ in 0..DEFAULT_STRICT_TREE_ROUNDS {
+            let Some(next) = refine_with_compact_balanced_tree_floor(
+                &candidate,
+                options,
+                source.decoded_limit,
+                source.identity,
+            )?
+            else {
+                break;
+            };
+            if !next.is_strictly_smaller_than(&candidate) {
+                break;
+            }
+            candidate = next;
+        }
+        tree_step.finish(Some(candidate_progress(
+            &candidate,
+            source.meaningful_bits,
+            candidate.is_strictly_smaller_than_source(source),
+        )));
     }
     Ok(candidate)
 }
@@ -2613,12 +2734,12 @@ fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]
         .is_some_and(|tokens| tokens <= COMPACT_SPLIT_FLOOR_MAX_TOKENS)
 }
 
-/// Apply Columbo's bounded quad-lengthening move to one finished dynamic block.
+/// Apply Columbo's bounded pair/quad balanced-tree moves to one dynamic block.
 ///
 /// The source-level gate is an upper work bound. This post-route helper neither
 /// changes tokens nor replays the result; the encoded incumbent remains an
 /// independent fallback if every legal tree move loses.
-fn refine_with_compact_quad_floor(
+fn refine_with_compact_balanced_tree_floor(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
@@ -2628,21 +2749,64 @@ fn refine_with_compact_quad_floor(
     let [block] = stream.blocks.as_slice() else {
         return Ok(None);
     };
-    if block.source_type != SourceBlockType::Dynamic || block.tokens.len() > COMPACT_QUAD_MAX_TOKENS
+    if block.source_type != SourceBlockType::Dynamic || block.tokens.len() > COMPACT_TREE_MAX_TOKENS
     {
         return Ok(None);
     }
     let Some(seed) = block.original_dynamic.as_ref() else {
         return Ok(None);
     };
-    let Some(dynamic) = plan_columbo_quad_lengthen_candidate(
-        &block.tokens,
-        &block.literal_frequencies,
-        &block.distance_frequencies,
-        seed,
-    ) else {
+    // Default's bounded feedback floors gain broadly from the cheap pair move.
+    // In Max, matched streams already have several independent token and
+    // boundary lineages; repeating this tree search there can delay larger
+    // wins. Keep Max's pair move for the empty-distance case that motivated it.
+    let pair = (!options.exhaustive
+        || block
+            .distance_frequencies
+            .iter()
+            .all(|&frequency| frequency == 0))
+    .then(|| {
+        plan_columbo_pair_lengthen_candidate(
+            &block.tokens,
+            &block.literal_frequencies,
+            &block.distance_frequencies,
+            seed,
+            options.exhaustive,
+        )
+    })
+    .flatten();
+    let dynamic = [
+        pair,
+        plan_columbo_quad_lengthen_candidate(
+            &block.tokens,
+            &block.literal_frequencies,
+            &block.distance_frequencies,
+            seed,
+            options.exhaustive,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .min_by_key(|candidate| candidate.bits);
+    let Some(mut dynamic) = dynamic else {
         return Ok(None);
     };
+    // Default ranks the bounded move family with its ordinary header grid,
+    // then gives only the winning tree one exhaustive header finalization.
+    // Max already prices every prospective tree exhaustively. This retains
+    // the useful header tail without repeating that work for losing moves.
+    if !options.exhaustive {
+        if let Some(finalized) = plan_for_explicit_lengths(
+            &block.tokens,
+            &dynamic.literal_lengths,
+            &dynamic.distance_lengths,
+            true,
+        ) {
+            if finalized.bits < dynamic.bits {
+                dynamic = finalized;
+            }
+        }
+    }
     if dynamic.bits >= candidate.bits {
         return Ok(None);
     }
@@ -2669,15 +2833,16 @@ fn refine_with_compact_quad_floor(
         ReplayPlanner::Full,
         &mut never_expires,
     )
-    .map(|candidate| Some(candidate.named("Columbo compact quad floor")))
+    .map(|candidate| Some(candidate.named("Columbo compact balanced-tree floor")))
 }
 
-/// Stabilize one quad rewrite through the bounded proven-feedback fixed point.
+/// Stabilize one balanced-tree rewrite through proven-feedback's fixed point.
 ///
 /// A new Huffman header changes match-to-literal prices; the resulting token
 /// feedback can in turn expose a second header win. The compact route enforces
-/// its own 4,000-token/80-KiB work bounds and applies quad cleanup to its final
-/// seed, so one composition closes this dependency without rerunning max.
+/// its own 4,000-token/80-KiB work bounds and applies balanced-tree cleanup to
+/// its own final seed, so one composition closes this dependency without
+/// rerunning max.
 fn refine_with_compact_proven_feedback(
     candidate: &Candidate,
     options: &Options,
@@ -2838,13 +3003,16 @@ fn build_compact_proven_seed_candidate(
     )?
     .named("Columbo proven-feedback floor");
     candidate.replace_if_smaller(integrated);
-    // Quad cleanup follows each seed lineage independently. Comparing the
-    // pre-quad candidates first can hide a locally dearer seed whose table
-    // exposes the smaller completed quad endpoint.
-    if let Some(quad) =
-        refine_with_compact_quad_floor(&candidate, options, source.decoded_limit, source.identity)?
-    {
-        candidate.replace_if_smaller(quad);
+    // Balanced-tree cleanup follows each seed lineage independently. Comparing
+    // the pre-cleanup candidates first can hide a locally dearer seed whose
+    // table exposes the smaller completed tree endpoint.
+    if let Some(tree) = refine_with_compact_balanced_tree_floor(
+        &candidate,
+        options,
+        source.decoded_limit,
+        source.identity,
+    )? {
+        candidate.replace_if_smaller(tree);
     }
     Ok(candidate)
 }
@@ -4064,6 +4232,29 @@ mod tests {
     }
 
     #[test]
+    fn established_floor_is_a_complete_strict_max_candidate() {
+        let source = [0x03, 0x00];
+        let established = optimize_raw(&source, &Options::default()).unwrap();
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::ZERO,
+            ..Options::default()
+        };
+
+        let maximum = optimize_raw_prefix_with_floor(
+            &established.data,
+            &options,
+            options.max_decoded_bytes,
+            DefaultFloor::Established,
+        )
+        .unwrap();
+
+        assert!(maximum.timed_out);
+        assert_eq!(maximum.data, established.data);
+        assert_eq!(maximum.info.deflate_bits, established.info.deflate_bits);
+    }
+
+    #[test]
     fn bounded_parallel_floors_preserve_a_complete_stream() {
         // Two nonempty Huffman blocks activate both independent phase-one
         // routes. They share the parsed token/plain buffers and wall clock,
@@ -4153,23 +4344,34 @@ mod tests {
             &too_many_tokens
         ));
 
-        let mut quad_block = parsed.blocks[0].clone();
-        quad_block.source_type = SourceBlockType::Dynamic;
-        quad_block.tokens = vec![Token::Literal(b'a')].into();
-        assert!(compact_quad_source_eligible(
+        let mut tree_block = parsed.blocks[0].clone();
+        tree_block.source_type = SourceBlockType::Dynamic;
+        tree_block.tokens = vec![Token::Literal(b'a')].into();
+        assert!(compact_balanced_tree_source_eligible(
             1,
-            quad_block.plain.len() as u64,
-            std::slice::from_ref(&quad_block),
+            tree_block.plain.len() as u64,
+            std::slice::from_ref(&tree_block),
         ));
-        assert!(!compact_quad_source_eligible(
-            COMPACT_QUAD_MAX_COMPRESSED + 1,
-            quad_block.plain.len() as u64,
-            std::slice::from_ref(&quad_block),
+        assert!(!compact_balanced_tree_source_eligible(
+            COMPACT_TREE_MAX_COMPRESSED + 1,
+            tree_block.plain.len() as u64,
+            std::slice::from_ref(&tree_block),
         ));
-        assert!(!compact_quad_source_eligible(
+        assert!(!compact_balanced_tree_source_eligible(
             1,
-            quad_block.plain.len() as u64,
-            &[quad_block.clone(), quad_block],
+            tree_block.plain.len() as u64,
+            &[tree_block.clone(), tree_block.clone()],
+        ));
+
+        tree_block.distance_frequencies = [0; 30];
+        assert!(compact_strict_literal_tree_eligible(
+            1,
+            std::slice::from_ref(&tree_block),
+        ));
+        tree_block.distance_frequencies[0] = 1;
+        assert!(!compact_strict_literal_tree_eligible(
+            1,
+            std::slice::from_ref(&tree_block),
         ));
     }
 
@@ -4325,6 +4527,29 @@ mod tests {
             std::slice::from_ref(&block),
             PROVEN_SUBMATCH_FULL_MATCH_LIMIT
         ));
+    }
+
+    #[test]
+    fn early_max_lineage_probe_rejects_trailing_data() {
+        assert!(!raw_source_benefits_from_early_max_lineage(&[0x03, 0x00], 0).unwrap());
+        let error = raw_source_benefits_from_early_max_lineage(&[0x03, 0x00, 0xff], 0).unwrap_err();
+        assert_eq!(error.message(), "trailing data after Deflate stream");
+    }
+
+    #[test]
+    fn early_max_lineage_covers_only_distinct_or_serial_work() {
+        assert!(early_transformed_lineage_is_useful(1, 1, true));
+        assert!(early_transformed_lineage_is_useful(
+            2,
+            PREBUILD_BOUNDED_FLOOR_MAX_DECODED,
+            false,
+        ));
+        assert!(!early_transformed_lineage_is_useful(
+            2,
+            PREBUILD_BOUNDED_FLOOR_MAX_DECODED + 1,
+            false,
+        ));
+        assert!(!early_transformed_lineage_is_useful(1, 1, false));
     }
 
     #[test]

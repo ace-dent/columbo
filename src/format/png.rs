@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::checksum::crc32_update;
-use crate::deflate::{decoded_bytes_for_comparison, raw_stream_decodes_to, DefaultFloor, RawInfo};
+use crate::deflate::{
+    decoded_bytes_for_comparison, raw_source_benefits_from_early_max_lineage,
+    raw_stream_decodes_to, DefaultFloor, RawInfo,
+};
 use crate::{Error, Optimization, Options, Result};
 
 use super::{scale_duration, zlib, SearchDeadline};
@@ -14,6 +18,16 @@ const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const MAX_EXACT_REUSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXACT_REUSE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_PROBE_WORK_BYTES: u64 = 64 * 1024 * 1024;
+// A single-image Max run can retain exact Default and direct-Max raw models
+// together. Keep that combined working set within the same broad bounds used
+// for independent raw-route arenas.
+const PARALLEL_MAX_IMAGE_COMPRESSED: usize = 8 * 1024 * 1024;
+const PARALLEL_MAX_IMAGE_DECODED: u64 = 64 * 1024 * 1024;
+const PARALLEL_MAX_IMAGE_WORKERS: usize = 8;
+// A fifth is enough to finish the inexpensive parent on representative image
+// streams while reserving most of Max for the descendants that need it. This
+// is the same follow-up reservation used by Deflate's bounded route schedule.
+const QUICK_FLOOR_SEARCH_FRACTION: f64 = 0.20;
 /// Every APNG frame owns and validates an independent zlib stream. Bound that
 /// invocation count separately from the generic chunk count because an empty
 /// frame consumes almost no decoded-byte budget.
@@ -37,7 +51,9 @@ struct Chunk<'a> {
 struct ParsedPng<'a> {
     chunks: Vec<Chunk<'a>>,
     idat: Vec<u8>,
+    idat_decoded_size: u64,
     fdat_frames: Vec<Vec<u8>>,
+    fdat_decoded_sizes: Vec<u64>,
     has_unknown_unsafe_ancillary: bool,
 }
 
@@ -48,6 +64,7 @@ struct ParseState {
     height: u32,
     bit_depth: u8,
     color_type: u8,
+    interlace_method: u8,
     saw_plte: bool,
     palette_entries: u32,
     saw_idat: bool,
@@ -60,6 +77,7 @@ struct ParseState {
     sequence_expected: u32,
     frame_open: bool,
     frame_has_data: bool,
+    current_fdat_decoded_size: Option<u64>,
 
     saw_chrm: bool,
     saw_gama: bool,
@@ -200,8 +218,14 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         budget.timed_out = timed_out_before_probe;
     }
 
-    let (optimized_idat, optimized_frames) =
-        optimize_image_streams(&parsed.idat, &parsed.fdat_frames, options, &mut budget)?;
+    let (optimized_idat, optimized_frames) = optimize_image_streams(
+        &parsed.idat,
+        parsed.idat_decoded_size,
+        &parsed.fdat_frames,
+        &parsed.fdat_decoded_sizes,
+        options,
+        &mut budget,
+    )?;
     let mut source_deflate_bits = frame_source_bits(&optimized_idat)?;
     let mut output_deflate_bits = frame_output_bits(&optimized_idat)?;
     for frame in &optimized_frames {
@@ -380,6 +404,7 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
     let mut idat = Vec::new();
     let mut fdat = Vec::new();
     let mut fdat_frames = Vec::new();
+    let mut fdat_decoded_sizes = Vec::new();
     let mut state = ParseState::default();
     let mut has_unknown_unsafe_ancillary = false;
     let mut compressed_metadata_streams = 0_usize;
@@ -429,6 +454,23 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
 
         validate_palette(kind, data, &mut state)?;
         validate_ancillary(kind, data, &mut state)?;
+        // fcTL begins the next fdAT zlib stream; IEND closes the final one.
+        if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
+            fdat_frames
+                .try_reserve(1)
+                .map_err(|_| Error::new("could not allocate PNG frame model"))?;
+            fdat_decoded_sizes
+                .try_reserve(1)
+                .map_err(|_| Error::new("could not allocate PNG frame model"))?;
+            fdat_frames.push(std::mem::take(&mut fdat));
+            fdat_decoded_sizes.push(
+                state
+                    .current_fdat_decoded_size
+                    .take()
+                    .ok_or_else(|| Error::new("invalid APNG frame data"))?,
+            );
+        }
+
         validate_animation_control(kind, data, &mut state)?;
         if compressed_zlib_offset(kind, data).is_some() {
             compressed_metadata_streams += 1;
@@ -437,14 +479,6 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
                     "PNG contains too many compressed metadata streams",
                 ));
             }
-        }
-
-        // fcTL begins the next fdAT zlib stream; IEND closes the final one.
-        if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
-            fdat_frames
-                .try_reserve(1)
-                .map_err(|_| Error::new("could not allocate PNG frame model"))?;
-            fdat_frames.push(std::mem::take(&mut fdat));
         }
 
         if kind == *b"IDAT" {
@@ -468,7 +502,10 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
                 return Err(Error::new("bad APNG fdAT chunk"));
             }
             state.sequence_expected += 1;
-            state.frame_has_data = true;
+            // A sequence-number-only chunk may occur between real fdAT
+            // packets, but it cannot by itself satisfy the frame-data
+            // requirement.
+            state.frame_has_data |= data.len() > 4;
             fdat.try_reserve(data.len() - 4)
                 .map_err(|_| Error::new("could not allocate PNG frame stream"))?;
             fdat.extend_from_slice(&data[4..]);
@@ -513,10 +550,13 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
         return Err(Error::new("invalid PNG zlib header check"));
     }
 
+    let idat_decoded_size = png_image_decoded_size(&state)?;
     Ok(ParsedPng {
         chunks,
         idat,
+        idat_decoded_size,
         fdat_frames,
+        fdat_decoded_sizes,
         has_unknown_unsafe_ancillary,
     })
 }
@@ -529,6 +569,7 @@ fn validate_ihdr(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<(
     state.height = u32::from_be_bytes(data[4..8].try_into().unwrap());
     state.bit_depth = data[8];
     state.color_type = data[9];
+    state.interlace_method = data[12];
     if state.width == 0
         || state.height == 0
         || !valid_bit_depth(state.color_type, state.bit_depth)
@@ -540,6 +581,76 @@ fn validate_ihdr(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<(
     }
     state.saw_ihdr = true;
     Ok(())
+}
+
+/// Return the exact number of filtered scanline bytes carried by IDAT.
+///
+/// This is also a security boundary for parallel Max: each branch receives
+/// this value as its decode ceiling, so a small malicious zlib stream cannot
+/// make two workers retain unexpectedly large payload models.
+fn png_image_decoded_size(state: &ParseState) -> Result<u64> {
+    png_decoded_size(
+        state.width,
+        state.height,
+        state.bit_depth,
+        state.color_type,
+        state.interlace_method,
+    )
+}
+
+fn png_decoded_size(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    interlace_method: u8,
+) -> Result<u64> {
+    let samples_per_pixel = match color_type {
+        0 | 3 => 1_u64,
+        2 => 3,
+        4 => 2,
+        6 => 4,
+        _ => return Err(Error::new("invalid PNG IHDR")),
+    };
+    let bits_per_pixel = samples_per_pixel * u64::from(bit_depth);
+    let pass_size = |width: u64, height: u64| -> Option<u64> {
+        if width == 0 || height == 0 {
+            return Some(0);
+        }
+        let row_bits = width.checked_mul(bits_per_pixel)?;
+        let row_bytes = row_bits.checked_add(7)? / 8;
+        height.checked_mul(row_bytes.checked_add(1)?)
+    };
+
+    let width = u64::from(width);
+    let height = u64::from(height);
+    if interlace_method == 0 {
+        return pass_size(width, height)
+            .ok_or_else(|| Error::new("PNG image dimensions are too large"));
+    }
+
+    // Adam7 pass geometry: (starting x, starting y, x step, y step).
+    const ADAM7: [(u64, u64, u64, u64); 7] = [
+        (0, 0, 8, 8),
+        (4, 0, 8, 8),
+        (0, 4, 4, 8),
+        (2, 0, 4, 4),
+        (0, 2, 2, 4),
+        (1, 0, 2, 2),
+        (0, 1, 1, 2),
+    ];
+    ADAM7
+        .iter()
+        .try_fold(0_u64, |total, &(start_x, start_y, step_x, step_y)| {
+            let pass_width = width
+                .checked_sub(start_x)
+                .map_or(0, |remaining| remaining.div_ceil(step_x));
+            let pass_height = height
+                .checked_sub(start_y)
+                .map_or(0, |remaining| remaining.div_ceil(step_y));
+            total.checked_add(pass_size(pass_width, pass_height)?)
+        })
+        .ok_or_else(|| Error::new("PNG image dimensions are too large"))
 }
 
 fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<()> {
@@ -871,11 +982,19 @@ fn validate_animation_control(kind: [u8; 4], data: &[u8], state: &mut ParseState
             }
             // The default image uses IDAT, validated separately below.
             state.frame_has_data = true;
+            state.current_fdat_decoded_size = None;
         } else {
             if state.frame_open && !state.frame_has_data {
                 return Err(Error::new("missing APNG frame data"));
             }
             state.frame_has_data = false;
+            state.current_fdat_decoded_size = Some(png_decoded_size(
+                frame_width,
+                frame_height,
+                state.bit_depth,
+                state.color_type,
+                state.interlace_method,
+            )?);
         }
         state.frame_open = true;
     }
@@ -921,11 +1040,25 @@ const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
 /// because improving that one stream saves the same bytes at every occurrence.
 fn optimize_image_streams(
     idat: &[u8],
+    idat_decoded_size: u64,
     frames: &[Vec<u8>],
+    frame_decoded_sizes: &[u64],
     options: &Options,
     budget: &mut DecodeBudget,
 ) -> Result<(FrameOptimization, Vec<FrameOptimization>)> {
-    let representatives = frame_representatives(frames)?;
+    if frames.len() != frame_decoded_sizes.len() {
+        return Err(Error::new("invalid APNG frame model"));
+    }
+    let total_decoded_size = frame_decoded_sizes
+        .iter()
+        .try_fold(idat_decoded_size, |total, &size| total.checked_add(size))
+        .ok_or_else(|| Error::new("decoded PNG data exceeds configured safety limit"))?;
+    if total_decoded_size > budget.remaining {
+        return Err(Error::new(
+            "decoded PNG data exceeds configured safety limit",
+        ));
+    }
+    let representatives = frame_representatives(frames, frame_decoded_sizes)?;
     let mut representative_weights = Vec::new();
     representative_weights
         .try_reserve_exact(frames.len())
@@ -974,6 +1107,7 @@ fn optimize_image_streams(
     // have the same largest byte length; treating every tie as the reserve sink
     // would let an earlier tie consume the time intended for the final job.
     let reserved_largest = *jobs.last().expect("the IDAT job is always present");
+    let single_image = jobs.len() == 1;
     let non_largest_fraction = if jobs.len() > MANY_IMAGE_JOB_THRESHOLD {
         MANY_IMAGE_SEARCH_FRACTION
     } else {
@@ -985,7 +1119,7 @@ fn optimize_image_streams(
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::new("could not allocate PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
-    let image_floor = if jobs.len() == 1 {
+    let image_floor = if single_image {
         // Establish the genuine normal result before spending the remaining
         // file budget on PNG's bounded max routes. This keeps max output no
         // larger than default without allowing a slow normal floor to starve
@@ -994,50 +1128,82 @@ fn optimize_image_streams(
     } else {
         DefaultFloor::Shared
     };
-    for job in jobs {
-        let weight = match job {
-            ImageJob::Idat => idat.len(),
-            ImageJob::Frame(representative) => representative_weights[representative],
-        };
-        let mut call_options = options.clone();
-        let file_remaining = budget.deadline.remaining();
-        call_options.timeout = image_stream_timeout(
-            options.timeout,
-            file_remaining,
-            weight,
-            total_weight,
-            non_largest_fraction,
-            job == reserved_largest,
-        );
+    let parallel_multi_image = options.exhaustive
+        && !single_image
+        && !options.visual
+        && !budget.deadline.remaining().is_zero()
+        && parallel_multi_image_is_bounded(total_weight, total_decoded_size);
+    if parallel_multi_image {
+        let (results, timed_out) = optimize_image_jobs_parallel(
+            &jobs,
+            idat,
+            idat_decoded_size,
+            frames,
+            frame_decoded_sizes,
+            &representative_weights,
+            options,
+            // Reserve a small container margin outside child raw-route grace
+            // for per-stream parsing, worker joins, and PNG reconstruction.
+            scale_duration(budget.deadline.remaining(), 0.96),
+        )?;
+        for (job, result) in results {
+            store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
+        }
+        // Every unique stream was validated against its exact IHDR/fcTL size.
+        // Charge duplicate frames as well, but only once after all workers have
+        // rejoined so no thread mutates the shared file budget.
+        budget.remaining -= total_decoded_size;
+        budget.timed_out |= timed_out;
+    } else {
+        for job in jobs {
+            let weight = match job {
+                ImageJob::Idat => idat.len(),
+                ImageJob::Frame(representative) => representative_weights[representative],
+            };
+            let mut call_options = options.clone();
+            let file_remaining = budget.deadline.remaining();
+            call_options.timeout = image_stream_timeout(
+                options.timeout,
+                file_remaining,
+                weight,
+                total_weight,
+                non_largest_fraction,
+                job == reserved_largest,
+            );
 
-        // A spent search budget disables optional searches, not validation.
-        // Every IDAT/fdAT stream must still be fully decoded, checksum-checked,
-        // and charged to the file-wide expansion limit.
-        let stream = match job {
-            ImageJob::Idat => idat,
-            ImageJob::Frame(index) => frames[index].as_slice(),
-        };
-        let mut optimize_job =
-            || optimize_scheduled_png_zlib(stream, &call_options, false, image_floor, budget);
-        let result = if options.visual || options.verbose {
-            let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
-            crate::progress::with_stream_group(stream_id, &duplicates, optimize_job)?
-        } else {
-            optimize_job()?
-        };
-        match job {
-            ImageJob::Idat => {
-                optimized_idat = Some(FrameOptimization {
-                    data: result.data,
-                    info: result.info,
-                });
-            }
-            ImageJob::Frame(index) => {
-                optimized[index] = Some(FrameOptimization {
-                    data: result.data,
-                    info: result.info,
-                });
-            }
+            // A spent search budget disables optional searches, not validation.
+            // Every IDAT/fdAT stream must still be fully decoded, checksum-
+            // checked, and charged to the file-wide expansion limit.
+            let (stream, expected_decoded_size) =
+                image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
+            let mut optimize_job = || {
+                if single_image
+                    && options.exhaustive
+                    && parallel_max_image_is_bounded(idat.len(), idat_decoded_size)
+                {
+                    optimize_single_image_max_parallel(
+                        stream,
+                        expected_decoded_size,
+                        &call_options,
+                        budget,
+                    )
+                } else {
+                    optimize_scheduled_png_image_zlib(
+                        stream,
+                        expected_decoded_size,
+                        &call_options,
+                        image_floor,
+                        budget,
+                    )
+                }
+            };
+            let result = if options.visual || options.verbose {
+                let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
+                crate::progress::with_stream_group(stream_id, &duplicates, optimize_job)?
+            } else {
+                optimize_job()?
+            };
+            store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
         }
     }
 
@@ -1049,17 +1215,14 @@ fn optimize_image_streams(
             // Exact compressed duplicates share optimization work, not decode
             // budget. Each fdAT stream is an independent decoded payload in
             // the container and must count toward the file-wide safety limit.
-            let decoded_size = frame
-                .info
-                .as_ref()
-                .ok_or_else(|| Error::new("invalid PNG frame zlib stream"))?
-                .size;
-            if decoded_size > budget.remaining {
-                return Err(Error::new(
-                    "decoded PNG data exceeds configured safety limit",
-                ));
+            if !parallel_multi_image {
+                let decoded_size = frame
+                    .info
+                    .as_ref()
+                    .ok_or_else(|| Error::new("invalid PNG frame zlib stream"))?
+                    .size;
+                budget.remaining -= decoded_size;
             }
-            budget.remaining -= decoded_size;
             optimized[index] = Some(
                 try_clone_frame(frame)
                     .ok_or_else(|| Error::new("could not allocate duplicate PNG frame result"))?,
@@ -1082,18 +1245,199 @@ fn optimize_image_streams(
     ))
 }
 
+fn store_image_job_result(
+    job: ImageJob,
+    result: zlib::StreamOptimization,
+    optimized_idat: &mut Option<FrameOptimization>,
+    optimized_frames: &mut [Option<FrameOptimization>],
+) {
+    let result = FrameOptimization {
+        data: result.data,
+        info: result.info,
+    };
+    match job {
+        ImageJob::Idat => *optimized_idat = Some(result),
+        ImageJob::Frame(index) => optimized_frames[index] = Some(result),
+    }
+}
+
+fn image_job_source<'a>(
+    job: ImageJob,
+    idat: &'a [u8],
+    idat_decoded_size: u64,
+    frames: &'a [Vec<u8>],
+    frame_decoded_sizes: &[u64],
+) -> (&'a [u8], u64) {
+    match job {
+        ImageJob::Idat => (idat, idat_decoded_size),
+        ImageJob::Frame(index) => (frames[index].as_slice(), frame_decoded_sizes[index]),
+    }
+}
+
+fn image_job_weight(job: ImageJob, idat: &[u8], representative_weights: &[usize]) -> usize {
+    match job {
+        ImageJob::Idat => idat.len(),
+        ImageJob::Frame(index) => representative_weights[index],
+    }
+}
+
+fn parallel_multi_image_is_bounded(total_compressed: usize, total_decoded: u64) -> bool {
+    total_compressed <= PARALLEL_MAX_IMAGE_COMPRESSED && total_decoded <= PARALLEL_MAX_IMAGE_DECODED
+}
+
+/// Optimize independent APNG streams on a fixed number of CPU lanes.
+///
+/// Jobs are already sorted small-to-large. Contiguous balanced slices leave
+/// the largest stream in the shortest final slice when the division is uneven,
+/// preserving the serial scheduler's preference without a work-stealing queue
+/// or shared mutable state.
+#[allow(clippy::too_many_arguments)]
+fn optimize_image_jobs_parallel(
+    jobs: &[ImageJob],
+    idat: &[u8],
+    idat_decoded_size: u64,
+    frames: &[Vec<u8>],
+    frame_decoded_sizes: &[u64],
+    representative_weights: &[usize],
+    options: &Options,
+    phase_timeout: Duration,
+) -> Result<(Vec<(ImageJob, zlib::StreamOptimization)>, bool)> {
+    let worker_count = jobs.len().min(PARALLEL_MAX_IMAGE_WORKERS);
+    let jobs_per_worker = jobs.len() / worker_count;
+    let workers_with_extra_job = jobs.len() % worker_count;
+
+    thread::scope(|scope| {
+        let mut workers = Vec::new();
+        workers
+            .try_reserve_exact(worker_count)
+            .map_err(|_| Error::new("could not allocate PNG image workers"))?;
+        let mut fallback_results = Vec::new();
+        let mut fallback_timed_out = false;
+        let mut start = 0_usize;
+        for worker_index in 0..worker_count {
+            let count = jobs_per_worker + usize::from(worker_index < workers_with_extra_job);
+            let worker_jobs = &jobs[start..start + count];
+            start += count;
+            let worker = thread::Builder::new()
+                .name(format!("columbo-png-images-{worker_index}"))
+                .spawn_scoped(scope, move || {
+                    optimize_image_job_slice(
+                        worker_jobs,
+                        idat,
+                        idat_decoded_size,
+                        frames,
+                        frame_decoded_sizes,
+                        representative_weights,
+                        options,
+                        phase_timeout,
+                    )
+                });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                // Thread exhaustion is not a format error. Run this disjoint
+                // slice on the caller while successfully spawned workers
+                // continue their own slices.
+                Err(_) => {
+                    let (mut results, timed_out) = optimize_image_job_slice(
+                        worker_jobs,
+                        idat,
+                        idat_decoded_size,
+                        frames,
+                        frame_decoded_sizes,
+                        representative_weights,
+                        options,
+                        phase_timeout,
+                    )?;
+                    fallback_results.append(&mut results);
+                    fallback_timed_out |= timed_out;
+                }
+            }
+        }
+
+        for worker in workers {
+            let (mut results, timed_out) = match worker.join() {
+                Ok(result) => result?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            fallback_results.append(&mut results);
+            fallback_timed_out |= timed_out;
+        }
+        Ok((fallback_results, fallback_timed_out))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn optimize_image_job_slice(
+    jobs: &[ImageJob],
+    idat: &[u8],
+    idat_decoded_size: u64,
+    frames: &[Vec<u8>],
+    frame_decoded_sizes: &[u64],
+    representative_weights: &[usize],
+    options: &Options,
+    phase_timeout: Duration,
+) -> Result<(Vec<(ImageJob, zlib::StreamOptimization)>, bool)> {
+    let total_weight = jobs.iter().try_fold(0_usize, |total, &job| {
+        total.checked_add(image_job_weight(job, idat, representative_weights))
+    });
+    let total_weight = total_weight.ok_or_else(|| Error::new("PNG frame data too large"))?;
+    let mut results = Vec::new();
+    results
+        .try_reserve_exact(jobs.len())
+        .map_err(|_| Error::new("could not allocate PNG frame results"))?;
+    let mut timed_out = false;
+    for &job in jobs {
+        let weight = image_job_weight(job, idat, representative_weights);
+        let mut call_options = options.clone();
+        call_options.timeout =
+            parallel_image_job_timeout(phase_timeout, jobs.len(), weight, total_weight);
+        let (stream, expected_decoded_size) =
+            image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
+        let optimized = run_png_image_zlib(
+            stream,
+            &call_options,
+            expected_decoded_size,
+            DefaultFloor::Shared,
+        )?;
+        timed_out |= optimized.timed_out;
+        results.push((job, optimized));
+    }
+    Ok((results, timed_out))
+}
+
+/// Divide one worker's wall allowance while accounting for every child raw
+/// route's ten-percent-plus-one-second active-work grace.
+fn parallel_image_job_timeout(
+    phase_timeout: Duration,
+    job_count: usize,
+    weight: usize,
+    total_weight: usize,
+) -> Duration {
+    if phase_timeout.is_zero() || job_count == 0 || weight == 0 || total_weight == 0 {
+        return Duration::ZERO;
+    }
+    let hard_budget = phase_timeout
+        .saturating_add(scale_duration(phase_timeout, 0.10))
+        .saturating_add(Duration::from_secs(1));
+    let fixed_graces = Duration::from_secs(job_count as u64);
+    let soft_budget = scale_duration(hard_budget.saturating_sub(fixed_graces), 1.0 / 1.10);
+    scale_duration(soft_budget, weight as f64 / total_weight as f64)
+}
+
 /// Find the earliest exact-compressed representative in O(n log n) compares.
 /// Sorting slices directly avoids adversarial hash-collision buckets.
-fn frame_representatives(frames: &[Vec<u8>]) -> Result<Vec<usize>> {
+fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Vec<usize>> {
+    if frames.len() != decoded_sizes.len() {
+        return Err(Error::new("invalid APNG frame model"));
+    }
     let mut order = Vec::new();
     order
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::new("could not allocate PNG frame model"))?;
     order.extend(0..frames.len());
     order.sort_unstable_by(|&left, &right| {
-        frames[left]
-            .as_slice()
-            .cmp(frames[right].as_slice())
+        (frames[left].as_slice(), decoded_sizes[left])
+            .cmp(&(frames[right].as_slice(), decoded_sizes[right]))
             .then_with(|| left.cmp(&right))
     });
 
@@ -1105,8 +1449,9 @@ fn frame_representatives(frames: &[Vec<u8>]) -> Result<Vec<usize>> {
     let mut group_start = 0;
     while group_start < order.len() {
         let first = order[group_start];
-        let group_len =
-            order[group_start..].partition_point(|&index| frames[index] == frames[first]);
+        let group_len = order[group_start..].partition_point(|&index| {
+            frames[index] == frames[first] && decoded_sizes[index] == decoded_sizes[first]
+        });
         for &index in &order[group_start..group_start + group_len] {
             representatives[index] = first;
         }
@@ -1372,6 +1717,197 @@ fn zlib_raw_payload(input: &[u8]) -> Option<&[u8]> {
     (input.len() >= 6).then(|| &input[2..input.len() - 4])
 }
 
+fn parallel_max_image_is_bounded(compressed_size: usize, decoded_size: u64) -> bool {
+    compressed_size <= PARALLEL_MAX_IMAGE_COMPRESSED && decoded_size <= PARALLEL_MAX_IMAGE_DECODED
+}
+
+/// Race the independent lineages useful to a single-image Max run.
+///
+/// The main lineage retains the established CompleteThenBounded schedule: it
+/// finishes exact Default as the non-regression floor, then explores original-
+/// source Max states that an ordinary rewrite can remove. The worker finishes
+/// a cheaper transformed parent early, then spends the remainder in that
+/// distinct basin. We deliberately do not run Max again from the late exact-
+/// Default result: that lost broadly to the early parent while duplicating
+/// descendant work. Both lineages use the exact PNG scanline size as their
+/// decode ceiling; the file-wide safety budget is charged once after rejoin.
+fn optimize_single_image_max_parallel(
+    input: &[u8],
+    expected_decoded_size: u64,
+    options: &Options,
+    budget: &mut DecodeBudget,
+) -> Result<zlib::StreamOptimization> {
+    if expected_decoded_size > budget.remaining {
+        return Err(Error::new(
+            "decoded PNG data exceeds configured safety limit",
+        ));
+    }
+    let decoded_limit = expected_decoded_size;
+    let raw = zlib_raw_payload(input).ok_or_else(|| Error::new("invalid PNG image zlib stream"))?;
+    // Start the transformed lineage only when its search basin is distinct or
+    // exact Default would otherwise serialize all work in a short allowance.
+    // Other sources keep the CPU for the already-concurrent direct routes.
+    let run_early_lineage = raw_source_benefits_from_early_max_lineage(raw, decoded_limit)
+        .map_err(map_png_zlib_error)
+        .map_err(map_png_image_zlib_error)?;
+    let selected = thread::scope(|scope| {
+        let early_worker = run_early_lineage
+            .then(|| {
+                let mut quiet_options = options.clone();
+                quiet_options.verbose = false;
+                quiet_options.visual = false;
+                thread::Builder::new()
+                    .name("columbo-png-early-max".into())
+                    .spawn_scoped(scope, move || {
+                        optimize_quick_image_floor_lineage(input, &quiet_options, decoded_limit)
+                    })
+                    .ok()
+            })
+            .flatten();
+
+        let mut selected = run_png_image_zlib(
+            input,
+            options,
+            decoded_limit,
+            DefaultFloor::CompleteThenBounded,
+        )?;
+        if let Some(early_worker) = early_worker {
+            let early = match early_worker.join() {
+                Ok(result) => result?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            selected = best_zlib_optimization(selected, early);
+        };
+        Ok(selected)
+    })?;
+
+    let info = selected
+        .info
+        .as_ref()
+        .ok_or_else(|| Error::new("invalid PNG image zlib stream"))?;
+    if info.size != expected_decoded_size {
+        return Err(Error::new("PNG image data size does not match IHDR"));
+    }
+    if info.size > budget.remaining {
+        return Err(Error::new(
+            "decoded PNG data exceeds configured safety limit",
+        ));
+    }
+    budget.remaining -= info.size;
+    budget.timed_out |= selected.timed_out;
+    Ok(selected)
+}
+
+/// Establish an early complete transformed parent, then reserve most of this
+/// branch's allowance for Max descendants. The exact Default worker remains
+/// independent, so an interrupted quick floor cannot weaken the final result.
+fn optimize_quick_image_floor_lineage(
+    input: &[u8],
+    options: &Options,
+    decoded_limit: u64,
+) -> Result<zlib::StreamOptimization> {
+    let started = Instant::now();
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    floor_options.timeout = scale_duration(options.timeout, QUICK_FLOOR_SEARCH_FRACTION);
+    let floor = run_png_image_zlib(input, &floor_options, decoded_limit, DefaultFloor::Complete)?;
+    refine_single_image_floor(floor, options, started, decoded_limit)
+}
+
+fn refine_single_image_floor(
+    mut floor: zlib::StreamOptimization,
+    options: &Options,
+    started: Instant,
+    decoded_limit: u64,
+) -> Result<zlib::StreamOptimization> {
+    let remaining = options.timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        floor.timed_out = true;
+        return Ok(floor);
+    }
+
+    let mut refine_options = options.clone();
+    refine_options.timeout = remaining;
+    let mut refined = run_png_image_zlib(
+        &floor.data,
+        &refine_options,
+        decoded_limit,
+        DefaultFloor::Established,
+    )?;
+    if !zlib_optimization_is_better(&refined, &floor) {
+        floor.timed_out |= refined.timed_out;
+        return Ok(floor);
+    }
+    if let (Some(source), Some(output)) = (floor.info.as_ref(), refined.info.as_mut()) {
+        output.source_deflate_bits = source.source_deflate_bits;
+    }
+    refined.timed_out |= floor.timed_out;
+    Ok(refined)
+}
+
+fn best_zlib_optimization(
+    mut floor: zlib::StreamOptimization,
+    mut direct: zlib::StreamOptimization,
+) -> zlib::StreamOptimization {
+    let timed_out = floor.timed_out || direct.timed_out;
+    if zlib_optimization_is_better(&direct, &floor) {
+        direct.timed_out = timed_out;
+        direct
+    } else {
+        floor.timed_out = timed_out;
+        floor
+    }
+}
+
+fn zlib_optimization_is_better(
+    candidate: &zlib::StreamOptimization,
+    incumbent: &zlib::StreamOptimization,
+) -> bool {
+    candidate.data.len() < incumbent.data.len()
+        || (candidate.data.len() == incumbent.data.len()
+            && candidate.info.as_ref().map(|info| info.deflate_bits)
+                < incumbent.info.as_ref().map(|info| info.deflate_bits))
+}
+
+fn run_png_zlib(
+    input: &[u8],
+    options: &Options,
+    decoded_limit: u64,
+    lenient_header: bool,
+    default_floor: DefaultFloor,
+) -> Result<zlib::StreamOptimization> {
+    zlib::optimize_embedded(input, options, decoded_limit, lenient_header, default_floor)
+        .map_err(map_png_zlib_error)
+}
+
+fn run_png_image_zlib(
+    input: &[u8],
+    options: &Options,
+    expected_decoded_size: u64,
+    default_floor: DefaultFloor,
+) -> Result<zlib::StreamOptimization> {
+    run_png_zlib(input, options, expected_decoded_size, false, default_floor)
+        .map_err(map_png_image_zlib_error)
+}
+
+fn map_png_image_zlib_error(error: Error) -> Error {
+    if error.message() == "decoded PNG data exceeds configured safety limit" {
+        Error::new("PNG image data size does not match IHDR")
+    } else {
+        error
+    }
+}
+
+fn map_png_zlib_error(error: Error) -> Error {
+    if error.message().contains("internal memory safety") {
+        error
+    } else if error.message().contains("limit") || error.message().contains("safety") {
+        Error::new("decoded PNG data exceeds configured safety limit")
+    } else {
+        error
+    }
+}
+
 fn optimize_png_zlib(
     input: &[u8],
     options: &Options,
@@ -1383,17 +1919,29 @@ fn optimize_png_zlib(
     optimize_png_zlib_with_options(input, &call_options, lenient_header, default_floor, budget)
 }
 
-/// Optimize an image stream whose local slice was already computed from the
-/// file schedule. Unlike metadata calls, this deliberately does not clamp the
-/// final comparison-floor allowance a second time to the outer deadline.
-fn optimize_scheduled_png_zlib(
+fn optimize_scheduled_png_image_zlib(
     input: &[u8],
+    expected_decoded_size: u64,
     options: &Options,
-    lenient_header: bool,
     default_floor: DefaultFloor,
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
-    optimize_png_zlib_with_options(input, options, lenient_header, default_floor, budget)
+    if expected_decoded_size > budget.remaining {
+        return Err(Error::new(
+            "decoded PNG data exceeds configured safety limit",
+        ));
+    }
+    let result = run_png_image_zlib(input, options, expected_decoded_size, default_floor)?;
+    let info = result
+        .info
+        .as_ref()
+        .ok_or_else(|| Error::new("invalid PNG image zlib stream"))?;
+    if info.size != expected_decoded_size {
+        return Err(Error::new("PNG image data size does not match IHDR"));
+    }
+    budget.remaining -= info.size;
+    budget.timed_out |= result.timed_out;
+    Ok(result)
 }
 
 fn optimize_png_zlib_with_options(
@@ -1403,22 +1951,13 @@ fn optimize_png_zlib_with_options(
     default_floor: DefaultFloor,
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
-    let result = zlib::optimize_embedded(
+    let result = run_png_zlib(
         input,
         call_options,
         budget.remaining,
         lenient_header,
         default_floor,
-    )
-    .map_err(|error| {
-        if error.message().contains("internal memory safety") {
-            error
-        } else if error.message().contains("limit") || error.message().contains("safety") {
-            Error::new("decoded PNG data exceeds configured safety limit")
-        } else {
-            error
-        }
-    })?;
+    )?;
     if let Some(info) = &result.info {
         if info.size > budget.remaining {
             return Err(Error::new(
@@ -1604,6 +2143,19 @@ mod tests {
         data
     }
 
+    fn frame_control(sequence: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&sequence.to_be_bytes());
+        body.extend_from_slice(&1_u32.to_be_bytes()); // width
+        body.extend_from_slice(&1_u32.to_be_bytes()); // height
+        body.extend_from_slice(&0_u32.to_be_bytes()); // x offset
+        body.extend_from_slice(&0_u32.to_be_bytes()); // y offset
+        body.extend_from_slice(&1_u16.to_be_bytes()); // delay numerator
+        body.extend_from_slice(&10_u16.to_be_bytes()); // delay denominator
+        body.extend_from_slice(&[0, 0]); // dispose and blend operations
+        body
+    }
+
     fn black_scanline_zlib() -> Vec<u8> {
         vec![
             0x78, 0x01, // zlib header
@@ -1725,8 +2277,12 @@ mod tests {
 
     #[test]
     fn idat_reports_same_byte_bit_savings() {
+        let mut header = ihdr();
+        // The synthetic raw stream expands to 168 bytes. Model that as one
+        // filter byte followed by 167 grayscale samples.
+        header[..4].copy_from_slice(&167_u32.to_be_bytes());
         let mut input = SIGNATURE.to_vec();
-        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IHDR", &header));
         input.extend(chunk(*b"IDAT", &super::super::same_byte_bit_win_zlib()));
         input.extend(chunk(*b"IEND", &[]));
 
@@ -1752,6 +2308,105 @@ mod tests {
         assert!(result.timed_out);
         assert!(result.data.len() <= input.len());
         parse(&result.data).unwrap();
+    }
+
+    #[test]
+    fn image_decoded_size_matches_scanline_and_adam7_geometry() {
+        let indexed = ParseState {
+            width: 13,
+            height: 7,
+            bit_depth: 1,
+            color_type: 3,
+            ..ParseState::default()
+        };
+        // Each row contains one filter byte and ceil(13 / 8) data bytes.
+        assert_eq!(png_image_decoded_size(&indexed).unwrap(), 21);
+
+        let interlaced = ParseState {
+            width: 8,
+            height: 8,
+            bit_depth: 8,
+            color_type: 0,
+            interlace_method: 1,
+            ..ParseState::default()
+        };
+        // The seven filtered Adam7 passes contain 2+2+3+6+10+20+36 bytes.
+        assert_eq!(png_image_decoded_size(&interlaced).unwrap(), 79);
+    }
+
+    #[test]
+    fn rejects_idat_size_mismatch_in_default_and_max() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        // A 1x1 eight-bit grayscale image requires exactly two bytes: one
+        // filter byte and one sample. The checksum is valid for three bytes.
+        input.extend(chunk(*b"IDAT", &stored_zlib(&[0, 0, 0])));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for exhaustive in [false, true] {
+            let options = Options {
+                exhaustive,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            };
+            let error = optimize(&input, &options).unwrap_err();
+            assert_eq!(error.message(), "PNG image data size does not match IHDR");
+        }
+    }
+
+    #[test]
+    fn parallel_max_image_requires_bounded_input_and_decoded_work() {
+        assert!(parallel_max_image_is_bounded(
+            PARALLEL_MAX_IMAGE_COMPRESSED,
+            PARALLEL_MAX_IMAGE_DECODED,
+        ));
+        assert!(!parallel_max_image_is_bounded(
+            PARALLEL_MAX_IMAGE_COMPRESSED + 1,
+            PARALLEL_MAX_IMAGE_DECODED,
+        ));
+        assert!(!parallel_max_image_is_bounded(
+            PARALLEL_MAX_IMAGE_COMPRESSED,
+            PARALLEL_MAX_IMAGE_DECODED + 1,
+        ));
+        assert!(parallel_multi_image_is_bounded(
+            PARALLEL_MAX_IMAGE_COMPRESSED,
+            PARALLEL_MAX_IMAGE_DECODED,
+        ));
+        assert!(!parallel_multi_image_is_bounded(
+            PARALLEL_MAX_IMAGE_COMPRESSED + 1,
+            PARALLEL_MAX_IMAGE_DECODED,
+        ));
+    }
+
+    #[test]
+    fn parallel_image_timeout_accounts_for_each_child_grace() {
+        let timeout = parallel_image_job_timeout(Duration::from_secs(10), 2, 1, 2);
+        assert!(timeout >= Duration::from_millis(4_540));
+        assert!(timeout <= Duration::from_millis(4_550));
+        assert_eq!(
+            parallel_image_job_timeout(Duration::from_secs(10), 1, 1, 1),
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn parallel_max_selection_is_byte_first_then_bit_first() {
+        let stream = |length, bits, timed_out| zlib::StreamOptimization {
+            data: vec![0; length],
+            info: Some(RawInfo {
+                deflate_bits: bits,
+                ..RawInfo::default()
+            }),
+            timed_out,
+        };
+
+        let selected = best_zlib_optimization(stream(10, 100, false), stream(10, 99, true));
+        assert_eq!(selected.info.unwrap().deflate_bits, 99);
+        assert!(selected.timed_out);
+
+        let selected = best_zlib_optimization(stream(10, 90, true), stream(9, 100, false));
+        assert_eq!(selected.data.len(), 9);
+        assert!(selected.timed_out);
     }
 
     #[test]
@@ -1873,7 +2528,9 @@ mod tests {
 
         let error = optimize_image_streams(
             &black_scanline_zlib(),
+            2,
             &[invalid_frame],
+            &[0],
             &options,
             &mut budget,
         )
@@ -1997,7 +2654,14 @@ mod tests {
             b"alpha".to_vec(),
             b"gamma".to_vec(),
         ];
-        assert_eq!(frame_representatives(&frames).unwrap(), [0, 1, 0, 1, 4]);
+        assert_eq!(
+            frame_representatives(&frames, &[1; 5]).unwrap(),
+            [0, 1, 0, 1, 4]
+        );
+        assert_eq!(
+            frame_representatives(&frames, &[1, 1, 2, 1, 1]).unwrap(),
+            [0, 1, 2, 1, 4]
+        );
     }
 
     #[test]
@@ -2114,7 +2778,8 @@ mod tests {
 
             let started = std::time::Instant::now();
             let (optimized_idat, optimized_frames) =
-                optimize_image_streams(&source_idat, &frames, &options, &mut budget).unwrap();
+                optimize_image_streams(&source_idat, 2, &frames, &[2; 12], &options, &mut budget)
+                    .unwrap();
 
             assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(optimized_frames.len(), frames.len());
@@ -2142,7 +2807,8 @@ mod tests {
             timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
-        let error = optimize_image_streams(&idat, &frames, &options, &mut budget).unwrap_err();
+        let error =
+            optimize_image_streams(&idat, 0, &frames, &[2, 2], &options, &mut budget).unwrap_err();
         assert_eq!(
             error.message(),
             "decoded PNG data exceeds configured safety limit"
@@ -2157,7 +2823,7 @@ mod tests {
             timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
-        optimize_image_streams(&idat, &frames, &options, &mut budget).unwrap();
+        optimize_image_streams(&idat, 0, &frames, &[2, 2], &options, &mut budget).unwrap();
         assert_eq!(budget.remaining, 0);
     }
 
@@ -2234,18 +2900,6 @@ mod tests {
         actl.extend_from_slice(&0_u32.to_be_bytes());
         input.extend(chunk(*b"acTL", &actl));
 
-        let frame_control = |sequence: u32| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&sequence.to_be_bytes());
-            body.extend_from_slice(&1_u32.to_be_bytes()); // width
-            body.extend_from_slice(&1_u32.to_be_bytes()); // height
-            body.extend_from_slice(&0_u32.to_be_bytes()); // x offset
-            body.extend_from_slice(&0_u32.to_be_bytes()); // y offset
-            body.extend_from_slice(&1_u16.to_be_bytes()); // delay numerator
-            body.extend_from_slice(&10_u16.to_be_bytes()); // delay denominator
-            body.extend_from_slice(&[0, 0]); // dispose and blend operations
-            body
-        };
         input.extend(chunk(*b"fcTL", &frame_control(0)));
         input.extend(chunk(*b"IDAT", &zlib));
         input.extend(chunk(*b"fcTL", &frame_control(1)));
@@ -2258,8 +2912,30 @@ mod tests {
         assert!(result.data.len() <= input.len());
         let parsed = parse(&result.data).unwrap();
         assert_eq!(parsed.fdat_frames.len(), 1);
+        assert_eq!(parsed.fdat_decoded_sizes, [2]);
         assert_maximum_flevel(&parsed.idat);
         assert_maximum_flevel(&parsed.fdat_frames[0]);
+    }
+
+    #[test]
+    fn sequence_number_only_fdat_does_not_satisfy_frame_data() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        let mut actl = Vec::new();
+        actl.extend_from_slice(&2_u32.to_be_bytes());
+        actl.extend_from_slice(&0_u32.to_be_bytes());
+        input.extend(chunk(*b"acTL", &actl));
+        input.extend(chunk(*b"fcTL", &frame_control(0)));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"fcTL", &frame_control(1)));
+        input.extend(chunk(*b"fdAT", &2_u32.to_be_bytes()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let error = match parse(&input) {
+            Err(error) => error,
+            Ok(_) => panic!("sequence-number-only fdAT should be rejected"),
+        };
+        assert_eq!(error.message(), "invalid APNG frame count");
     }
 
     #[test]
@@ -2320,13 +2996,19 @@ mod tests {
         // This source is one bit behind strict output and three bits behind
         // relaxed output, without changing the byte length.
         metadata.extend_from_slice(&super::super::same_byte_bit_win_zlib());
+        let image = zlib::optimize_embedded(
+            &black_scanline_zlib(),
+            &Options::default(),
+            2,
+            false,
+            DefaultFloor::Complete,
+        )
+        .unwrap()
+        .data;
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &ihdr()));
         input.extend(chunk(*b"zTXt", &metadata));
-        input.extend(chunk(
-            *b"IDAT",
-            &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01],
-        ));
+        input.extend(chunk(*b"IDAT", &image));
         input.extend(chunk(*b"IEND", &[]));
 
         for strict in [true, false] {
