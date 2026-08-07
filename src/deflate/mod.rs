@@ -12,5 +12,7 @@ mod search;
 mod stop;
 pub(crate) mod stream;
 
-pub(crate) use optimize::{optimize_raw, optimize_raw_prefix_with_floor, DefaultFloor, RawInfo};
+pub(crate) use optimize::{
+    inspect_raw_prefix, optimize_raw, optimize_raw_prefix_with_floor, DefaultFloor, RawInfo,
+};
 pub(crate) use parse::{decoded_bytes_for_comparison, raw_stream_decodes_to};

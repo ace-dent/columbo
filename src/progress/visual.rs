@@ -46,14 +46,20 @@ pub(super) fn enabled(options: &Options) -> bool {
         && env::var_os("TERM").map_or(true, |term| term != "dumb")
 }
 
-pub(super) fn format_detected(format: &'static str) {
+pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usize>) {
     with_renderer(|renderer| {
         renderer.format = Some(format);
+        renderer.deflate_streams = deflate_streams;
         renderer.print_header();
     });
 }
 
-pub(super) fn begin(stream_id: usize, stream: &StreamProgress, source_report: Option<BlockReport>) {
+pub(super) fn begin(
+    stream_id: usize,
+    duplicates: &[usize],
+    stream: &StreamProgress,
+    source_report: Option<BlockReport>,
+) {
     with_renderer(|renderer| {
         renderer.print_header();
         // Container implementations finish streams serially. If an error path
@@ -61,6 +67,7 @@ pub(super) fn begin(stream_id: usize, stream: &StreamProgress, source_report: Op
         renderer.rendered_line_widths = None;
         renderer.active = Some(StreamView {
             id: stream_id,
+            duplicates: duplicates.to_vec(),
             source_bits: stream.meaningful_bits,
             source_blocks: stream.blocks,
             source_bytes: stream.compressed_bytes,
@@ -269,6 +276,7 @@ fn ensure_animator() {
 struct Renderer {
     active: Option<StreamView>,
     columns: usize,
+    deflate_streams: Option<usize>,
     format: Option<&'static str>,
     header_printed: bool,
     last_draw: Option<Instant>,
@@ -351,6 +359,9 @@ impl Renderer {
         let margin = " ".repeat(margin_width);
         let mut output = io::stderr().lock();
         let _ = writeln!(output, "Format   {format}");
+        if let Some(deflate_streams) = self.deflate_streams {
+            let _ = writeln!(output, "Deflate streams  {deflate_streams}");
+        }
         let _ = writeln!(output);
         let full_legend = format!(
             "{} stored  {} fixed  {} dynamic  {} boundary  {} working  {} changed  {} saved",
@@ -472,6 +483,7 @@ impl Renderer {
 
 struct StreamView {
     id: usize,
+    duplicates: Vec<usize>,
     source_bits: u64,
     source_blocks: usize,
     source_bytes: usize,
@@ -499,10 +511,10 @@ fn render_card(
 ) -> [String; 4] {
     let (margin_width, card_width) = card_dimensions(terminal_width);
     let margin = " ".repeat(margin_width);
+    let heading_text = fit_text(&stream_title(view), card_width, glyphs);
     let heading = format!(
-        "{margin}{}Stream {:02}{}",
+        "{margin}{}{heading_text}{}",
         style(color, "\x1b[1;36m"),
-        view.id,
         reset(color)
     );
     let source_prefix = "  in  ";
@@ -558,6 +570,19 @@ fn render_card(
     );
 
     [heading, source, output, information]
+}
+
+fn stream_title(view: &StreamView) -> String {
+    if view.duplicates.is_empty() {
+        return format!("Stream {:02}", view.id);
+    }
+    let duplicates = view
+        .duplicates
+        .iter()
+        .map(|stream| format!("{stream:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Stream {:02} · duplicates {duplicates}", view.id)
 }
 
 struct CellLayout {
@@ -1534,6 +1559,7 @@ mod tests {
         output.blocks[1].output_bits = 300;
         let view = StreamView {
             id: 1,
+            duplicates: Vec::new(),
             source_bits: 1_000,
             source_blocks: 2,
             source_bytes: 125,
@@ -1573,6 +1599,29 @@ mod tests {
         assert!(!input.contains('\x1b'));
         assert!(!output.contains('\x1b'));
         assert!(!information.contains('\x1b'));
+    }
+
+    #[test]
+    fn stream_title_identifies_physical_duplicates_sharing_work() {
+        let view = StreamView {
+            id: 2,
+            duplicates: vec![5, 8],
+            source_bits: 8,
+            source_blocks: 1,
+            source_bytes: 1,
+            source_report: None,
+            output_bits: 8,
+            output_bytes: 1,
+            output_report: None,
+            change_highlight_draws: 0,
+            pulse: 0,
+            status: String::new(),
+            work: None,
+        };
+
+        assert_eq!(stream_title(&view), "Stream 02 · duplicates 05, 08");
+        let [heading, ..] = render_card(&view, 80, false, Glyphs::for_unicode(true));
+        assert_eq!(heading, "Stream 02 · duplicates 05, 08");
     }
 
     #[test]

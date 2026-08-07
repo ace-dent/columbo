@@ -373,10 +373,11 @@ fn print_detailed_header(
             output,
             "Mode     max · {strictness}{dry_run} · {} file-wide budget",
             format_elapsed(command.options.timeout),
-        )
+        )?;
     } else {
-        writeln!(output, "Mode     normal · {strictness}{dry_run}")
+        writeln!(output, "Mode     normal · {strictness}{dry_run}")?;
     }
+    Ok(())
 }
 
 fn print_strict_mode_caution(output: &mut dyn Write, color: bool) -> io::Result<()> {
@@ -1302,6 +1303,7 @@ mod tests {
         assert!(underline.chars().all(|character| character == '─'));
         assert!(visual_header.contains("Input    \"in\" · 1024 bytes · read 2.00 ms"));
         assert!(visual_header.contains("Mode     normal · strict · dry run"));
+        assert!(visual_header.ends_with("Mode     normal · strict · dry run\n"));
 
         let mut result = Vec::new();
         print_detailed_result(

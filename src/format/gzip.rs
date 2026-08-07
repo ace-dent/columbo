@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::checksum::crc32_update;
-use crate::deflate::{optimize_raw_prefix_with_floor, DefaultFloor};
+use crate::deflate::{inspect_raw_prefix, optimize_raw_prefix_with_floor, DefaultFloor};
 use crate::{Error, Optimization, Options, Result};
 
 use super::{try_append_bytes, try_vec_with_capacity, SearchDeadline};
@@ -16,6 +16,80 @@ const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate GZIP output";
 /// dedicated cap prevents a small file from multiplying parser setup and
 /// checksum work without consuming the decoded-byte budget.
 const MAX_GZIP_MEMBERS: usize = 16_384;
+
+pub(super) fn deflate_stream_count(input: &[u8], max_decoded_bytes: u64) -> Result<usize> {
+    if input.is_empty() {
+        return Err(Error::new("invalid GZIP signature"));
+    }
+
+    let mut member_start = 0_usize;
+    let mut member_count = 0_usize;
+    let mut decoded_remaining = max_decoded_bytes;
+    while member_start < input.len() {
+        if member_count >= MAX_GZIP_MEMBERS {
+            return Err(Error::new("GZIP contains too many members"));
+        }
+        if input.len() - member_start < 18
+            || input[member_start] != 0x1f
+            || input[member_start + 1] != 0x8b
+        {
+            return Err(Error::new("invalid GZIP signature"));
+        }
+        if input[member_start + 2] != 8 {
+            return Err(Error::new("invalid GZIP compression method"));
+        }
+        let flags = input[member_start + 3];
+        if flags & RESERVED_FLAGS != 0 {
+            return Err(Error::new("reserved GZIP flags are set"));
+        }
+
+        let mut position = member_start + 10;
+        if flags & FEXTRA != 0 {
+            let length = read_u16(input, position, "truncated GZIP extra field")? as usize;
+            position += 2;
+            position = position
+                .checked_add(length)
+                .filter(|&end| end <= input.len())
+                .ok_or_else(|| Error::new("truncated GZIP extra field"))?;
+        }
+        if flags & FNAME != 0 {
+            position = skip_zero_terminated(input, position, "truncated GZIP filename")?;
+        }
+        if flags & FCOMMENT != 0 {
+            position = skip_zero_terminated(input, position, "truncated GZIP comment")?;
+        }
+        if flags & FHCRC != 0 {
+            let stored = read_u16(input, position, "truncated GZIP header CRC")?;
+            let calculated = crc32_update(0, &input[member_start..position]) as u16;
+            if stored != calculated {
+                return Err(Error::new("GZIP header CRC mismatch"));
+            }
+            position += 2;
+        }
+
+        let (consumed, info) = inspect_raw_prefix(&input[position..], decoded_remaining)?;
+        decoded_remaining = decoded_remaining
+            .checked_sub(info.size)
+            .ok_or_else(|| Error::new("decoded GZIP data exceeds configured safety limit"))?;
+        let trailer_start = position
+            .checked_add(consumed)
+            .filter(|&start| consumed != 0 && input.len().saturating_sub(start) >= 8)
+            .ok_or_else(|| Error::new("missing GZIP trailer"))?;
+        let stored_crc =
+            u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
+        let stored_size = u32::from_le_bytes(
+            input[trailer_start + 4..trailer_start + 8]
+                .try_into()
+                .unwrap(),
+        );
+        if stored_crc != info.crc32 || stored_size != info.size as u32 {
+            return Err(Error::new("GZIP trailer CRC or size mismatch"));
+        }
+        member_count += 1;
+        member_start = trailer_start + 8;
+    }
+    Ok(member_count)
+}
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     if input.is_empty() {
@@ -86,12 +160,14 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 
         let payload_start = position;
         let call_options = deadline.options_for_call(options);
-        let raw = optimize_raw_prefix_with_floor(
-            &input[payload_start..],
-            &call_options,
-            decoded_remaining,
-            DefaultFloor::Shared,
-        )?;
+        let raw = crate::progress::with_stream_group(member_count, &[], || {
+            optimize_raw_prefix_with_floor(
+                &input[payload_start..],
+                &call_options,
+                decoded_remaining,
+                DefaultFloor::Shared,
+            )
+        })?;
         if raw.info.size > decoded_remaining {
             return Err(Error::new(
                 "decoded GZIP data exceeds configured safety limit",
@@ -237,6 +313,7 @@ mod tests {
     fn optimizes_concatenated_members() {
         let mut input = empty_member(0);
         input.extend(empty_member(0));
+        assert_eq!(deflate_stream_count(&input, 1).unwrap(), 2);
         let result = optimize(&input, &Options::default()).unwrap();
         assert_eq!(result.data, input);
     }

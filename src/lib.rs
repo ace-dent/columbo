@@ -79,6 +79,16 @@ pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optim
     format::optimize(input, format, options)
 }
 
+/// Count the independent Deflate streams Columbo can inspect in one input.
+///
+/// Container declarations alone are not trusted: PNG/APNG and GZIP inputs are
+/// parsed far enough to distinguish physical streams, and encrypted or empty
+/// ZIP members that cannot expose a Deflate bitstream are not counted. The CLI
+/// uses this preflight only for verbose and visual headers.
+pub fn deflate_stream_count(input: &[u8], format: Format, options: &Options) -> Result<usize> {
+    format::deflate_stream_count(input, format, options)
+}
+
 #[cfg(test)]
 mod robustness_tests {
     use std::time::Duration;

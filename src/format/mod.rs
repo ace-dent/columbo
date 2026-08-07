@@ -115,7 +115,12 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         Format::Auto => detect(input),
         explicit => explicit,
     };
-    crate::progress::format_detected(options, detected);
+    let deflate_streams = if options.verbose || options.visual {
+        Some(deflate_stream_count(input, detected, options)?)
+    } else {
+        None
+    };
+    crate::progress::format_detected(options, detected, deflate_streams);
 
     match detected {
         Format::Auto | Format::Raw => super::deflate::optimize_raw(input, options)
@@ -139,6 +144,26 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         Format::Zlib => zlib::optimize(input, options),
         Format::Gzip => gzip::optimize(input, options),
         Format::Zip => zip::optimize(input, options),
+    }
+}
+
+pub(crate) fn deflate_stream_count(
+    input: &[u8],
+    requested: Format,
+    options: &Options,
+) -> Result<usize> {
+    if input.len() as u64 > options.max_input_bytes {
+        return Err(Error::new("input exceeds configured safety limit"));
+    }
+    let detected = match requested {
+        Format::Auto => detect(input),
+        explicit => explicit,
+    };
+    match detected {
+        Format::Auto | Format::Raw | Format::Zlib => Ok(1),
+        Format::Png => png::deflate_stream_count(input),
+        Format::Gzip => gzip::deflate_stream_count(input, options.max_decoded_bytes),
+        Format::Zip => zip::deflate_stream_count(input),
     }
 }
 

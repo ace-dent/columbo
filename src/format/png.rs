@@ -97,6 +97,19 @@ struct CompressedBodyOptimization {
     output_deflate_bits: u64,
 }
 
+pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
+    let parsed = parse(input)?;
+    let compressed_metadata = parsed
+        .chunks
+        .iter()
+        .filter(|chunk| supported_compressed_metadata(chunk))
+        .count();
+    1_usize
+        .checked_add(parsed.fdat_frames.len())
+        .and_then(|count| count.checked_add(compressed_metadata))
+        .ok_or_else(|| Error::new("too many PNG Deflate streams"))
+}
+
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
@@ -104,6 +117,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         deadline: SearchDeadline::new(options),
     };
     let parsed = parse(input)?;
+    let metadata_stream_ids = metadata_stream_ids(&parsed)?;
 
     // Small compressed metadata gets a short first pass in the original
     // Columbo C implementation so a profile or text comment cannot consume the
@@ -116,6 +130,11 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     quick_replacements.resize_with(parsed.chunks.len(), || None);
     let mut probe_work_remaining = MAX_METADATA_PROBE_WORK_BYTES;
     for (index, chunk) in parsed.chunks.iter().enumerate() {
+        // Detailed modes give each physical metadata stream one definitive
+        // card. Quiet runs retain the cheap speculative probe schedule.
+        if options.verbose || options.visual {
+            continue;
+        }
         if should_strip(chunk.kind, options) {
             continue;
         }
@@ -270,13 +289,20 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                     try_clone_compressed_body(replacement)
                         .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?
                 } else {
-                    optimize_compressed_body(
-                        chunk.kind,
-                        chunk.data,
-                        options,
-                        DefaultFloor::Shared,
-                        &mut budget,
-                    )?
+                    let mut optimize_metadata = || {
+                        optimize_compressed_body(
+                            chunk.kind,
+                            chunk.data,
+                            options,
+                            DefaultFloor::Shared,
+                            &mut budget,
+                        )
+                    };
+                    if let Some(stream_id) = metadata_stream_ids[index] {
+                        crate::progress::with_stream_group(stream_id, &[], optimize_metadata)?
+                    } else {
+                        optimize_metadata()?
+                    }
                     .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?
                 };
                 source_deflate_bits = source_deflate_bits
@@ -313,6 +339,36 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         output_deflate_bits,
         budget.timed_out,
     ))
+}
+
+fn supported_compressed_metadata(chunk: &Chunk<'_>) -> bool {
+    compressed_zlib_offset(chunk.kind, chunk.data)
+        .and_then(|offset| chunk.data.get(offset..))
+        .is_some_and(|zlib| {
+            zlib.len() >= 6 && zlib::has_rfc1950_header(zlib) && zlib[1] & 0x20 == 0
+        })
+}
+
+fn metadata_stream_ids(parsed: &ParsedPng<'_>) -> Result<Vec<Option<usize>>> {
+    let mut next_id = parsed
+        .fdat_frames
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| Error::new("too many PNG Deflate streams"))?;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(parsed.chunks.len())
+        .map_err(|_| Error::new("could not allocate PNG stream identifiers"))?;
+    for chunk in &parsed.chunks {
+        if supported_compressed_metadata(chunk) {
+            ids.push(Some(next_id));
+            next_id = next_id
+                .checked_add(1)
+                .ok_or_else(|| Error::new("too many PNG Deflate streams"))?;
+        } else {
+            ids.push(None);
+        }
+    }
+    Ok(ids)
 }
 
 fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
@@ -832,6 +888,22 @@ enum ImageJob {
     Frame(usize),
 }
 
+fn image_job_stream_group(job: ImageJob, representatives: &[usize]) -> (usize, Vec<usize>) {
+    match job {
+        ImageJob::Idat => (1, Vec::new()),
+        ImageJob::Frame(representative) => {
+            let duplicates = representatives
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &owner)| {
+                    (owner == representative && index != representative).then_some(index + 2)
+                })
+                .collect();
+            (representative + 2, duplicates)
+        }
+    }
+}
+
 // Parsing, checksum validation, and PNG reconstruction also consume wall time,
 // but only the raw Deflate searches receive the proportional slices below.
 // Reserve ten percent outside the non-largest slices (twenty percent for a
@@ -945,8 +1017,14 @@ fn optimize_image_streams(
             ImageJob::Idat => idat,
             ImageJob::Frame(index) => frames[index].as_slice(),
         };
-        let result =
-            optimize_scheduled_png_zlib(stream, &call_options, false, image_floor, budget)?;
+        let mut optimize_job =
+            || optimize_scheduled_png_zlib(stream, &call_options, false, image_floor, budget);
+        let result = if options.visual || options.verbose {
+            let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
+            crate::progress::with_stream_group(stream_id, &duplicates, optimize_job)?
+        } else {
+            optimize_job()?
+        };
         match job {
             ImageJob::Idat => {
                 optimized_idat = Some(FrameOptimization {
@@ -1595,6 +1673,54 @@ mod tests {
         assert!(result.data.len() <= input.len());
         let parsed = parse(&result.data).unwrap();
         assert_maximum_flevel(&parsed.idat);
+    }
+
+    #[test]
+    fn static_png_has_one_physical_deflate_stream() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        assert_eq!(deflate_stream_count(&input).unwrap(), 1);
+    }
+
+    #[test]
+    fn compressed_metadata_counts_after_image_streams() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        let mut text = b"Comment\0\0".to_vec();
+        text.extend(black_scanline_zlib());
+        input.extend(chunk(*b"zTXt", &text));
+        input.extend(chunk(*b"IEND", &[]));
+
+        assert_eq!(deflate_stream_count(&input).unwrap(), 2);
+        let parsed = parse(&input).unwrap();
+        assert_eq!(
+            metadata_stream_ids(&parsed)
+                .unwrap()
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn duplicate_apng_frames_share_a_named_visual_group() {
+        assert_eq!(
+            image_job_stream_group(ImageJob::Idat, &[0, 0, 2]),
+            (1, vec![])
+        );
+        assert_eq!(
+            image_job_stream_group(ImageJob::Frame(0), &[0, 0, 2]),
+            (2, vec![3])
+        );
+        assert_eq!(
+            image_job_stream_group(ImageJob::Frame(2), &[0, 0, 2]),
+            (4, vec![])
+        );
     }
 
     #[test]

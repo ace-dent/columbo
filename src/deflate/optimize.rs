@@ -153,6 +153,28 @@ pub(crate) fn optimize_raw(input: &[u8], options: &Options) -> Result<RawOptimiz
     Ok(optimized)
 }
 
+/// Parse one complete raw stream without running any optimization routes.
+///
+/// Detailed container inspection uses this to locate concatenated GZIP member
+/// trailers before the live header is printed. The normal optimization pass
+/// still performs its own validation and retains the decoded model it plans.
+pub(crate) fn inspect_raw_prefix(input: &[u8], decoded_limit: u64) -> Result<(usize, RawInfo)> {
+    let parsed = parse_stream(input, decoded_limit)?;
+    Ok((
+        parsed.consumed,
+        RawInfo {
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+            size: parsed.decoded_size,
+            max_distance: parsed.max_distance,
+            source_deflate_bits: parsed.meaningful_bits,
+            deflate_bits: parsed.meaningful_bits,
+            source_block_count: parsed.source_block_count,
+            source_empty_block_count: parsed.source_empty_block_count,
+        },
+    ))
+}
+
 /// Canonicalize Defluff's non-standard length-258 spelling before planning.
 ///
 /// Merely disabling the relaxed rewrite candidate is insufficient: an alias

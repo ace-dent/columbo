@@ -6,7 +6,7 @@
 //! readable. Visual mode delegates to a bounded-width terminal stream card on
 //! standard error. Both consume the same low-frequency optimizer checkpoints.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,50 @@ static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
 const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
+
+thread_local! {
+    static STREAM_GROUP: RefCell<Option<StreamGroup>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct StreamGroup {
+    id: usize,
+    duplicates: Vec<usize>,
+}
+
+struct StreamGroupGuard(Option<StreamGroup>);
+
+impl Drop for StreamGroupGuard {
+    fn drop(&mut self) {
+        STREAM_GROUP.with(|group| {
+            group.replace(self.0.take());
+        });
+    }
+}
+
+/// Associate one optimizer invocation with its physical container stream.
+///
+/// Exact APNG duplicates retain their own file-order identifiers while sharing
+/// one optimizer invocation. The visual title names those duplicate streams
+/// instead of presenting shared work as missing cards.
+pub(crate) fn with_stream_group<T>(
+    id: usize,
+    duplicates: &[usize],
+    operation: impl FnOnce() -> T,
+) -> T {
+    let previous = STREAM_GROUP.with(|group| {
+        group.replace(Some(StreamGroup {
+            id,
+            duplicates: duplicates.to_vec(),
+        }))
+    });
+    let _guard = StreamGroupGuard(previous);
+    operation()
+}
+
+fn current_stream_group() -> Option<StreamGroup> {
+    STREAM_GROUP.with(|group| group.borrow().clone())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BlockEncoding {
@@ -120,13 +164,31 @@ impl Progress {
             };
         }
 
-        let stream_id = NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+        let group = current_stream_group();
+        let stream_id = group.as_ref().map_or_else(
+            || NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
+            |group| group.id,
+        );
         let color = terminal_color_enabled();
         if visual {
-            visual::begin(stream_id, &stream, source_report);
+            visual::begin(
+                stream_id,
+                group
+                    .as_ref()
+                    .map_or(&[][..], |group| group.duplicates.as_slice()),
+                &stream,
+                source_report,
+            );
         } else {
             println!();
-            println!("{}Deflate stream {stream_id}{}", cyan(color), reset(color));
+            let duplicates = group.as_ref().map_or_else(String::new, |group| {
+                duplicate_stream_suffix(&group.duplicates)
+            });
+            println!(
+                "{}Deflate stream {stream_id}{duplicates}{}",
+                cyan(color),
+                reset(color)
+            );
             println!(
                 "  Source  {} {} · {} meaningful {} · {} {}{}",
                 stream.compressed_bytes,
@@ -939,7 +1001,7 @@ fn route_heartbeat_interval(budget: Duration) -> Duration {
     (budget / 30).clamp(MIN_ROUTE_HEARTBEAT, MAX_ROUTE_HEARTBEAT)
 }
 
-pub(crate) fn format_detected(options: &Options, format: Format) {
+pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams: Option<usize>) {
     let label = match format {
         Format::Auto => "raw Deflate",
         Format::Raw => "raw Deflate",
@@ -949,15 +1011,30 @@ pub(crate) fn format_detected(options: &Options, format: Format) {
         Format::Zip => "ZIP",
     };
     if visual::enabled(options) {
-        visual::format_detected(label);
+        visual::format_detected(label, deflate_streams);
     } else if options.verbose {
         println!("Format   {label}");
+        if let Some(deflate_streams) = deflate_streams {
+            println!("Deflate streams  {deflate_streams}");
+        }
     }
 }
 
 /// Whether block-plan snapshots will be consumed by a progress renderer.
 pub(crate) fn reports_enabled(options: &Options) -> bool {
     options.verbose || visual::enabled(options)
+}
+
+fn duplicate_stream_suffix(duplicates: &[usize]) -> String {
+    if duplicates.is_empty() {
+        return String::new();
+    }
+    let identifiers = duplicates
+        .iter()
+        .map(|stream| format!("{stream:02}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" · duplicates {identifiers}")
 }
 
 pub(crate) fn format_duration(duration: Duration) -> String {

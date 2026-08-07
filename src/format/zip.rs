@@ -59,6 +59,39 @@ pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
     ) || find_end_of_central_directory(input).is_some()
 }
 
+pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
+    let eocd_offset = find_end_of_central_directory(input)
+        .ok_or_else(|| Error::new("ZIP end of central directory not found"))?;
+    let eocd = input
+        .get(eocd_offset..eocd_offset + 22)
+        .ok_or_else(|| Error::new("truncated ZIP end of central directory"))?;
+    let disk_number = le16(eocd, 4);
+    let central_disk = le16(eocd, 6);
+    let entries_on_disk = le16(eocd, 8);
+    let entry_count = le16(eocd, 10);
+    let central_size = le32(eocd, 12);
+    let central_offset_u32 = le32(eocd, 16);
+    if disk_number != 0 || central_disk != 0 || entries_on_disk != entry_count {
+        return Err(Error::new("spanned ZIP archives are not supported"));
+    }
+    if entry_count == u16::MAX || central_size == u32::MAX || central_offset_u32 == u32::MAX {
+        return Err(Error::new("ZIP64 archives are not supported"));
+    }
+    let central_offset = central_offset_u32 as usize;
+    if central_offset
+        .checked_add(central_size as usize)
+        .filter(|&end| end == eocd_offset)
+        .is_none()
+    {
+        return Err(Error::new("unsupported ZIP layout"));
+    }
+    let entries = parse_central_entries(input, central_offset, eocd_offset, entry_count, false)?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry_is_optimizable(entry))
+        .count())
+}
+
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     if !options.exhaustive {
         return optimize_once(input, options, DefaultFloor::Complete);
@@ -150,6 +183,19 @@ fn optimize_once(
         entry_count,
         options.strip_metadata,
     )?;
+    let mut next_stream_id = 1_usize;
+    let stream_ids: Vec<Option<usize>> = entries
+        .iter()
+        .map(|entry| {
+            if entry_is_optimizable(entry) {
+                let id = next_stream_id;
+                next_stream_id = next_stream_id.saturating_add(1);
+                Some(id)
+            } else {
+                None
+            }
+        })
+        .collect();
     // Limit the sum before decoding any member. This avoids doing expensive
     // work on an archive whose declared expansion is already unsafe.
     let mut expanded_size = 0_u64;
@@ -182,13 +228,20 @@ fn optimize_once(
             call_options.timeout =
                 schedule.timeout_for(options.timeout, deadline.remaining(), &entries[index]);
         }
-        timed_out |= build_local_entry(
-            input,
-            central_offset,
-            &mut entries[index],
-            &call_options,
-            raw_default_floor,
-        )?;
+        let mut build_entry = || {
+            build_local_entry(
+                input,
+                central_offset,
+                &mut entries[index],
+                &call_options,
+                raw_default_floor,
+            )
+        };
+        timed_out |= if let Some(stream_id) = stream_ids[index] {
+            crate::progress::with_stream_group(stream_id, &[], build_entry)?
+        } else {
+            build_entry()?
+        };
     }
     let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
         total.checked_add(entry.source_deflate_bits)
@@ -1079,6 +1132,7 @@ mod tests {
 
         let result = optimize(&input, &Options::default()).unwrap();
         assert_eq!(result.data, input);
+        assert_eq!(deflate_stream_count(&input).unwrap(), 0);
     }
 
     #[test]
@@ -1086,6 +1140,7 @@ mod tests {
         // One-byte stored Deflate block containing "x".
         let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
         let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, false, false);
+        assert_eq!(deflate_stream_count(&input).unwrap(), 1);
         let result = optimize(&input, &Options::default()).unwrap();
 
         assert!(result.data.len() <= input.len());
