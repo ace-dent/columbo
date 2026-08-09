@@ -52,7 +52,8 @@ pub struct Options {
     /// standard error is an interactive terminal; redirected runs remain free
     /// of ANSI cursor-control sequences.
     pub visual: bool,
-    /// Remove supported wrapper metadata while rebuilding the file.
+    /// Remove supported wrapper metadata, including embedded credentials and
+    /// signatures, while rebuilding the file.
     pub strip_metadata: bool,
     /// Emit conservative Deflate that is accepted by strict and older decoders.
     ///

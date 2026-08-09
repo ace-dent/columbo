@@ -813,7 +813,7 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "      --strip            strip supported metadata/comment wrapper fields"
+        "      --strip            strip metadata, comments, and embedded credentials"
     )?;
     writeln!(output)?;
     writeln!(output, "Advanced:")?;

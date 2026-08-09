@@ -161,7 +161,7 @@ pub(crate) fn deflate_stream_count(
     };
     match detected {
         Format::Auto | Format::Raw | Format::Zlib => Ok(1),
-        Format::Png => png::deflate_stream_count(input),
+        Format::Png => png::deflate_stream_count(input, options.strip_metadata),
         Format::Gzip => gzip::deflate_stream_count(input, options.max_decoded_bytes),
         Format::Zip => zip::deflate_stream_count(input),
     }

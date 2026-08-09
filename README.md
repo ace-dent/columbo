@@ -38,7 +38,7 @@ columbo --dry-run [options] input
 - `--out <file>`: Write the result to `file` instead of modifying the input. For compatibility, an output path may also be supplied as a second positional argument.
 - `-t <seconds>`, `--timeout <seconds>`: Stop starting new search routes after the specified time. The default is 180 seconds; values are clamped to 10–4000 seconds and fractions round up. An active route receives a grace period of 10% plus one second.
 - `--strict <0|1>`: Select conservative Deflate output. The default, `1`, supports strict and older decoders; `0` permits compact empty or singleton Huffman alphabets and the non-standard length-258 alias.
-- `--strip`: Remove supported PNG, GZIP, and ZIP metadata or comment fields. Metadata is preserved by default.
+- `--strip`: Remove supported PNG, GZIP, and ZIP metadata or comment fields, including PNG Content Credentials and signatures. Metadata is preserved by default.
 - `--raw`: Treat the input as a headerless RFC 1951 Deflate stream instead of detecting a wrapper.
 
 Options that take a value also accept `--out=<file>`, `--timeout=<seconds>`, and `--strict=<0|1>`.

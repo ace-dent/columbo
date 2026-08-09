@@ -54,7 +54,7 @@ struct ParsedPng<'a> {
     idat_decoded_size: u64,
     fdat_frames: Vec<Vec<u8>>,
     fdat_decoded_sizes: Vec<u64>,
-    has_unknown_unsafe_ancillary: bool,
+    has_rewrite_sensitive_ancillary: bool,
 }
 
 #[derive(Default)]
@@ -94,6 +94,7 @@ struct ParseState {
     saw_scal: bool,
     saw_exif: bool,
     saw_time: bool,
+    saw_cabx: bool,
 }
 
 struct DecodeBudget {
@@ -115,8 +116,8 @@ struct CompressedBodyOptimization {
     output_deflate_bits: u64,
 }
 
-pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
-    let parsed = parse(input)?;
+pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result<usize> {
+    let parsed = parse(input, strip_metadata)?;
     let compressed_metadata = parsed
         .chunks
         .iter()
@@ -134,7 +135,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         timed_out: false,
         deadline: SearchDeadline::new(options),
     };
-    let parsed = parse(input)?;
+    let parsed = parse(input, options.strip_metadata)?;
     let metadata_stream_ids = metadata_stream_ids(&parsed)?;
 
     // Small compressed metadata gets a short first pass in the original
@@ -237,11 +238,11 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
     }
 
-    // An unknown unsafe-to-copy ancillary chunk may depend on the exact
-    // critical image representation. Its contract is unknowable, so after
-    // validating every image stream preserve the complete source unless
-    // --strip explicitly removes that chunk.
-    if !options.strip_metadata && parsed.has_unknown_unsafe_ancillary {
+    // A signature, iDOT, or unknown unsafe-to-copy ancillary chunk may depend
+    // on the exact critical image representation. Columbo cannot update its
+    // contract, so after validating every image stream preserve the complete
+    // source unless --strip explicitly removes that chunk.
+    if !options.strip_metadata && parsed.has_rewrite_sensitive_ancillary {
         let data =
             try_clone_bytes(input).ok_or_else(|| Error::new("could not allocate PNG output"))?;
         return Ok(Optimization::from_metrics(
@@ -395,7 +396,7 @@ fn metadata_stream_ids(parsed: &ParsedPng<'_>) -> Result<Vec<Option<usize>>> {
     Ok(ids)
 }
 
-fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
+fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
     if !input.starts_with(SIGNATURE) {
         return Err(Error::new("invalid PNG signature"));
     }
@@ -406,7 +407,7 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
     let mut fdat_frames = Vec::new();
     let mut fdat_decoded_sizes = Vec::new();
     let mut state = ParseState::default();
-    let mut has_unknown_unsafe_ancillary = false;
+    let mut has_rewrite_sensitive_ancillary = false;
     let mut compressed_metadata_streams = 0_usize;
     let mut position = SIGNATURE.len();
 
@@ -448,12 +449,18 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
         if kind[0] & 0x20 == 0 && !is_known_critical(kind) {
             return Err(Error::new("unknown PNG critical chunk"));
         }
-        if is_unknown_unsafe_ancillary(kind) {
-            has_unknown_unsafe_ancillary = true;
+        let strip_chunk = should_strip_kind(kind, strip_metadata);
+        if is_rewrite_sensitive_ancillary(kind) {
+            has_rewrite_sensitive_ancillary = true;
         }
 
         validate_palette(kind, data, &mut state)?;
-        validate_ancillary(kind, data, &mut state)?;
+        // Metadata whose semantics or placement are invalid is useful to no
+        // output that explicitly strips it. Still validate chunk boundaries,
+        // type bytes, and CRC above: --strip is not a general PNG repair mode.
+        if !strip_chunk {
+            validate_ancillary(kind, data, &mut state)?;
+        }
         // fcTL begins the next fdAT zlib stream; IEND closes the final one.
         if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
             fdat_frames
@@ -472,7 +479,7 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
         }
 
         validate_animation_control(kind, data, &mut state)?;
-        if compressed_zlib_offset(kind, data).is_some() {
+        if !strip_chunk && compressed_zlib_offset(kind, data).is_some() {
             compressed_metadata_streams += 1;
             if compressed_metadata_streams > MAX_COMPRESSED_METADATA_STREAMS {
                 return Err(Error::new(
@@ -509,7 +516,7 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
             fdat.try_reserve(data.len() - 4)
                 .map_err(|_| Error::new("could not allocate PNG frame stream"))?;
             fdat.extend_from_slice(&data[4..]);
-        } else if state.saw_idat {
+        } else if state.saw_idat && !strip_chunk {
             state.after_idat_run = true;
         }
 
@@ -557,7 +564,7 @@ fn parse(input: &[u8]) -> Result<ParsedPng<'_>> {
         idat_decoded_size,
         fdat_frames,
         fdat_decoded_sizes,
-        has_unknown_unsafe_ancillary,
+        has_rewrite_sensitive_ancillary,
     })
 }
 
@@ -818,6 +825,15 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             return Err(Error::new("invalid PNG tIME"));
         }
         state.saw_time = true;
+    }
+    if kind == *b"caBX" {
+        // Content Credentials are bound to the PNG datastream and cannot be
+        // updated by a Deflate optimizer. PNG additionally permits only one
+        // caBX and requires it to precede IDAT.
+        if state.saw_cabx || state.saw_idat {
+            return Err(Error::new("invalid PNG caBX"));
+        }
+        state.saw_cabx = true;
     }
     validate_compressed_metadata(kind, data)?;
 
@@ -2063,13 +2079,18 @@ fn append_chunk(output: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) -> Result<()> 
 }
 
 fn should_strip(kind: [u8; 4], options: &Options) -> bool {
-    options.strip_metadata && (is_strippable_metadata(kind) || is_unknown_unsafe_ancillary(kind))
+    should_strip_kind(kind, options.strip_metadata)
+}
+
+fn should_strip_kind(kind: [u8; 4], strip_metadata: bool) -> bool {
+    strip_metadata && (is_strippable_metadata(kind) || is_unknown_unsafe_ancillary(kind))
 }
 
 fn is_strippable_metadata(kind: [u8; 4]) -> bool {
     matches!(
         &kind,
         b"bKGD"
+            | b"caBX"
             | b"cHRM"
             | b"cICP"
             | b"cLLI"
@@ -2077,6 +2098,7 @@ fn is_strippable_metadata(kind: [u8; 4]) -> bool {
             | b"gAMA"
             | b"hIST"
             | b"iCCP"
+            | b"iDOT"
             | b"iTXt"
             | b"mDCV"
             | b"pHYs"
@@ -2085,6 +2107,7 @@ fn is_strippable_metadata(kind: [u8; 4]) -> bool {
             | b"sPLT"
             | b"sRGB"
             | b"sTER"
+            | b"dSIG"
             | b"tEXt"
             | b"tIME"
             | b"zTXt"
@@ -2101,6 +2124,14 @@ fn is_known_ancillary(kind: [u8; 4]) -> bool {
 
 fn is_unknown_unsafe_ancillary(kind: [u8; 4]) -> bool {
     kind[0] & 0x20 != 0 && !is_known_ancillary(kind) && kind[3] & 0x20 == 0
+}
+
+fn is_rewrite_sensitive_ancillary(kind: [u8; 4]) -> bool {
+    // caBX and dSIG authenticate original datastream bytes; iDOT describes
+    // Apple's original IDAT layout. Columbo cannot rebuild any of them after
+    // changing critical chunks, so default mode takes the same conservative
+    // path used for an unrecognized unsafe-to-copy ancillary chunk.
+    matches!(&kind, b"caBX" | b"dSIG" | b"iDOT") || is_unknown_unsafe_ancillary(kind)
 }
 
 fn valid_chunk_type(kind: [u8; 4]) -> bool {
@@ -2198,6 +2229,29 @@ mod tests {
     }
 
     #[test]
+    fn strip_does_not_turn_bad_metadata_crc_into_a_repair() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        let mut bad_cabx = chunk(*b"caBX", b"credential");
+        *bad_cabx.last_mut().unwrap() ^= 1;
+        input.extend(bad_cabx);
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for strip_metadata in [false, true] {
+            let error = optimize(
+                &input,
+                &Options {
+                    strip_metadata,
+                    ..Options::default()
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.message(), "bad PNG chunk CRC");
+        }
+    }
+
+    #[test]
     fn rejects_nonconsecutive_idat_chunks() {
         let mut input = SIGNATURE.to_vec();
         let mut ihdr = [0_u8; 13];
@@ -2223,7 +2277,7 @@ mod tests {
 
         let result = optimize(&input, &Options::default()).unwrap();
         assert!(result.data.len() <= input.len());
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         assert_maximum_flevel(&parsed.idat);
     }
 
@@ -2234,7 +2288,7 @@ mod tests {
         input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
         input.extend(chunk(*b"IEND", &[]));
 
-        assert_eq!(deflate_stream_count(&input).unwrap(), 1);
+        assert_eq!(deflate_stream_count(&input, false).unwrap(), 1);
     }
 
     #[test]
@@ -2247,8 +2301,8 @@ mod tests {
         input.extend(chunk(*b"zTXt", &text));
         input.extend(chunk(*b"IEND", &[]));
 
-        assert_eq!(deflate_stream_count(&input).unwrap(), 2);
-        let parsed = parse(&input).unwrap();
+        assert_eq!(deflate_stream_count(&input, false).unwrap(), 2);
+        let parsed = parse(&input, false).unwrap();
         assert_eq!(
             metadata_stream_ids(&parsed)
                 .unwrap()
@@ -2307,7 +2361,7 @@ mod tests {
         let result = optimize(&input, &options).unwrap();
         assert!(result.timed_out);
         assert!(result.data.len() <= input.len());
-        parse(&result.data).unwrap();
+        parse(&result.data, false).unwrap();
     }
 
     #[test]
@@ -2492,7 +2546,7 @@ mod tests {
         let result = optimize(&input, &Options::default()).unwrap();
         assert_eq!(input.len() - result.data.len(), 108);
 
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         assert_eq!(
             parsed
                 .chunks
@@ -2696,7 +2750,7 @@ mod tests {
             input.extend(chunk(*b"zTXt", b"k\0\0"));
         }
 
-        let error = match parse(&input) {
+        let error = match parse(&input, false) {
             Err(error) => error,
             Ok(_) => panic!("excess compressed metadata should fail"),
         };
@@ -2842,7 +2896,7 @@ mod tests {
             ..Options::default()
         };
         let result = optimize(&input, &options).unwrap();
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         assert_eq!(
             parsed
                 .chunks
@@ -2865,7 +2919,7 @@ mod tests {
         input.extend(chunk(*b"IEND", &[]));
 
         let result = optimize(&input, &Options::default()).unwrap();
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         let preserved = parsed
             .chunks
             .iter()
@@ -2891,6 +2945,105 @@ mod tests {
     }
 
     #[test]
+    fn preserves_or_explicitly_strips_rewrite_sensitive_metadata() {
+        for (kind, data) in [
+            (*b"caBX", b"credential".as_slice()),
+            (*b"dSIG", b"signature".as_slice()),
+            (*b"iDOT", &[0_u8; 28][..]),
+        ] {
+            let zlib = black_scanline_zlib();
+            let mut input = SIGNATURE.to_vec();
+            input.extend(chunk(*b"IHDR", &ihdr()));
+            input.extend(chunk(kind, data));
+            input.extend(chunk(*b"IDAT", &zlib[..5]));
+            input.extend(chunk(*b"IDAT", &zlib[5..]));
+            input.extend(chunk(*b"IEND", &[]));
+
+            let preserved = optimize(&input, &Options::default()).unwrap();
+            assert_eq!(preserved.data, input, "{}", String::from_utf8_lossy(&kind));
+
+            let stripped = optimize(
+                &input,
+                &Options {
+                    strip_metadata: true,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse(&stripped.data, false).unwrap();
+            assert!(parsed.chunks.iter().all(|chunk| chunk.kind != kind));
+            assert_eq!(
+                parsed
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.kind == *b"IDAT")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_cabx_is_removed_only_in_strip_mode() {
+        for layout in 0..3 {
+            let zlib = black_scanline_zlib();
+            let mut input = SIGNATURE.to_vec();
+            input.extend(chunk(*b"IHDR", &ihdr()));
+            if layout == 0 {
+                input.extend(chunk(*b"caBX", b"first"));
+                input.extend(chunk(*b"caBX", b"second"));
+            }
+            if layout == 2 {
+                input.extend(chunk(*b"IDAT", &zlib[..5]));
+                input.extend(chunk(*b"caBX", b"interrupted IDAT"));
+                input.extend(chunk(*b"IDAT", &zlib[5..]));
+            } else {
+                input.extend(chunk(*b"IDAT", &zlib));
+            }
+            if layout == 1 {
+                input.extend(chunk(*b"caBX", b"misordered"));
+            }
+            input.extend(chunk(*b"IEND", &[]));
+
+            let error = optimize(&input, &Options::default()).unwrap_err();
+            assert_eq!(error.message(), "invalid PNG caBX");
+            assert!(deflate_stream_count(&input, false).is_err());
+
+            let options = Options {
+                strip_metadata: true,
+                ..Options::default()
+            };
+            assert_eq!(deflate_stream_count(&input, true).unwrap(), 1);
+            let stripped = optimize(&input, &options).unwrap();
+            let parsed = parse(&stripped.data, false).unwrap();
+            assert!(!parsed.chunks.iter().any(|chunk| chunk.kind == *b"caBX"));
+        }
+    }
+
+    #[test]
+    fn malformed_supported_metadata_is_removed_only_in_strip_mode() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"sCAL", b"\x01width\0"));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let error = optimize(&input, &Options::default()).unwrap_err();
+        assert_eq!(error.message(), "invalid PNG sCAL");
+
+        let stripped = optimize(
+            &input,
+            &Options {
+                strip_metadata: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse(&stripped.data, false).unwrap();
+        assert!(!parsed.chunks.iter().any(|chunk| chunk.kind == *b"sCAL"));
+    }
+
+    #[test]
     fn rebuilds_apng_frame_streams_and_sequence_numbers() {
         let zlib = black_scanline_zlib();
         let mut input = SIGNATURE.to_vec();
@@ -2910,7 +3063,7 @@ mod tests {
 
         let result = optimize(&input, &Options::default()).unwrap();
         assert!(result.data.len() <= input.len());
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         assert_eq!(parsed.fdat_frames.len(), 1);
         assert_eq!(parsed.fdat_decoded_sizes, [2]);
         assert_maximum_flevel(&parsed.idat);
@@ -2931,7 +3084,7 @@ mod tests {
         input.extend(chunk(*b"fdAT", &2_u32.to_be_bytes()));
         input.extend(chunk(*b"IEND", &[]));
 
-        let error = match parse(&input) {
+        let error = match parse(&input, false) {
             Err(error) => error,
             Ok(_) => panic!("sequence-number-only fdAT should be rejected"),
         };
@@ -2957,7 +3110,7 @@ mod tests {
             },
         )
         .unwrap();
-        let parsed = parse(&result.data).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
         let metadata = parsed
             .chunks
             .iter()
@@ -2987,7 +3140,7 @@ mod tests {
             ..Options::default()
         };
         let result = optimize(&input, &options).unwrap();
-        parse(&result.data).unwrap();
+        parse(&result.data, false).unwrap();
     }
 
     #[test]
