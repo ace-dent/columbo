@@ -201,8 +201,8 @@ chunk walks.
   and byte-level behaviour.
 - `cargo test --doc` runs the doctest examples in `src/lib.rs` and
   `src/deflate/model.rs`.
-- `tests/benchmark.rs` provides benchmarks against the benchmark corpus.
-- `CONTRIBUTING.md` describes the merging workflow and the GNU/Linux
+- `benches/benchmark.rs` provides Criterion benchmarks: `cargo bench`.
+- `docs/CONTRIBUTING.md` describes the merging workflow and the GNU/Linux
   validation expectations.
 
 ## Performance contract

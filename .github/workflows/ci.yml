@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,9 +49,25 @@ jobs:
         run: cargo clippy -- -D warnings
 
   build-release:
-    name: Release build
-    runs-on: ubuntu-latest
+    name: Release (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     needs: [test, lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: columbo-linux-x86_64
+            binary: target/release/columbo
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: columbo-macos-arm64
+            binary: target/release/columbo
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: columbo-windows-x86_64
+            binary: target/release/columbo.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -65,5 +82,5 @@ jobs:
       - name: Archive binary
         uses: actions/upload-artifact@v4
         with:
-          name: columbo-linux-x86_64
-          path: target/release/columbo
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.binary }}

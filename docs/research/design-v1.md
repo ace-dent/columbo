@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed — awaiting Wira's approval before implementation.
+Superseded by v0.5.0. This document describes the original v1 design proposal (implemented in branch `local-v1`). The current architecture is documented in `docs/architecture.md`.
 
 ## Language
 
