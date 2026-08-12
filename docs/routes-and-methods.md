@@ -139,11 +139,11 @@ flowchart TD
     PAPNGB -- "Yes" --> PPAR["Up to 8 fixed worker lanes<br/>Shared floor per image stream"]
     PAPNGB -- "No" --> SHAREDPNG["Shared floor per serial image job"]
     PZIP --> ZMAX{"--max"}
-    ZMAX -- "No" --> ZDEFAULT["Complete default archive pass"]
-    ZMAX -- "Yes" --> ZBOUND{"Bounded archive work"}
-    ZBOUND -- "Yes" --> ZRACE["Complete default archive + direct-Max<br/>original archive in parallel"]
+    ZMAX -- "No" --> ZDEFAULT["Complete default archive pass<br/>uniform members may use worker lanes"]
+    ZMAX -- "Yes" --> ZBOUND{"At least 1 Deflate member; nonuniform archive ≤8 MiB<br/>optimizable decoded work ≤64 MiB"}
+    ZBOUND -- "Yes" --> ZRACE["Complete Default archive + Established-source Max<br/>in parallel; no duplicate ordinary floor"]
     ZRACE --> ZREFINE["Refine completed Default archive<br/>and select byte/bit winner"]
-    ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · complete default archive"]
+    ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · complete Default archive<br/>uniform members may use worker lanes"]
     ZPHASE1 --> ZTIME{"Time remains"}
     ZTIME -- "No" --> ZWIN["Return phase-1 floor"]
     ZTIME -- "Yes" --> ZPHASE2["🔴 Phase 2 · refine finished archive<br/>Shared floors and actual remainder"]
@@ -158,13 +158,13 @@ mean that separate members share a Huffman tree, candidate, or worker.
 | Auto detection | In order: PNG signature, GZIP signature, recognizable ZIP structure, recognizable zlib method/window byte, then raw Deflate. | 🟢 |
 | Raw / top-level zlib | Uses `Complete`; default and max route families run serially. | 🔴 |
 | GZIP | Up to 16,384 concatenated members run serially in source order with one file deadline and cumulative decoded budget; every raw member uses `Shared`. | 🟡 |
-| PNG metadata | Compressed `zTXt`, compressed `iTXt`, and `iCCP` zlib streams use `Shared`. A stream not selected for stripping and no larger than 4,096 bytes may receive a 100 ms probe, under a 64 MiB compressed-plus-decoded probe-work budget. A non-winning probe is retried during normal definitive reconstruction; the unknown-unsafe-ancillary early return is the exception. | 🟡 |
+| PNG metadata | Compressed `zTXt`, compressed `iTXt`, and `iCCP` zlib streams use `Shared`. A quiet non-Max stream not selected for stripping and no larger than 4,096 bytes may receive a 100 ms probe, under a 64 MiB compressed-plus-decoded probe-work budget. Max instead precomputes and caches complete Default metadata floors before image search when aggregate compressed metadata is ≤64 MiB. If time remains after image work, reconstruction continues each cached floor through `Established` Max routes; the second validation uses its known exact decoded size and does not charge the container budget twice. Larger sets retain the streaming schedule. The unknown-unsafe-ancillary early return is the exception. | 🟡 |
 | PNG / APNG image data | IDAT is always its own job. Exact-compressed duplicate fdAT frames share one optimization job only when both compressed bytes and exact decoded size match. Every IDAT/fdAT stream must decode to the exact IHDR/fcTL scanline size, including Adam7 passes. Exactly one job uses `CompleteThenBounded`; two or more use `Shared`. Bounded multi-image Max work (≤8 MiB compressed and ≤64 MiB decoded in aggregate) uses up to eight fixed worker lanes with a 4% container margin; each lane runs its small-to-large slice serially. Other work retains the serial small-first schedule. | 🔴 |
 | PNG single-image Max | For ≤8 MiB compressed and ≤64 MiB decoded, the main `CompleteThenBounded` lineage races an early transformed lineage only when the source has a same-distance graph above the complete 512-match bound, or when a 2+-block stream of ≤768 KiB would otherwise serialize exact Default. The early lineage spends one fifth on an ordinary parent, then refines it through `Established`; the exact Default lineage remains the quality floor. | 🔴 |
 | PNG decoded-equivalent frame reuse | After serial job optimization, checksum/size groups are decoded and byte-compared before the best compressed spelling is reused. Retained comparison data is capped at 32 MiB and comparison work at 64 MiB. | 🟡 |
 | PNG unsafe ancillary fallback | If an unknown ancillary chunk is unsafe to copy and `--strip` does not remove it, Columbo validates every image stream and then preserves the complete source PNG. Metadata syntax was parsed and any completed metadata probe was validated, but an unprobed metadata payload is not definitively decoded on this early return. | 🟢 |
-| ZIP default | Unencrypted, nonempty method-8 entries are optimization jobs and run serially, largest first, using `Complete` and one archive deadline; unencrypted stored entries are validated but not Deflate-optimized. Encrypted entries are preserved without payload decoding. | 🟡 |
-| ZIP max | For archives ≤8 MiB with ≤64 MiB total optimizable decoded data, the complete Default archive and a direct-Max original-source archive run concurrently; the caller also refines the finished Default archive with the actual remainder. Larger archives retain the sequential two-phase path. Entry scheduling remains small-first in Max refinement, and all complete archives are selected by bytes then meaningful bits. | 🔴 |
+| ZIP member scheduling | Unencrypted, nonempty method-8 entries are optimization jobs; unencrypted stored entries are validated but not Deflate-optimized, and encrypted entries are preserved without payload decoding. Default is largest-first and Max is small-first. A quiet archive with at least eight optimizable members, no member owning more than one eighth of compressed payload, input ≤8 MiB, and decoded work ≤64 MiB uses up to eight balanced worker slices. Each Max worker budgets only its own serial slice. Other passes remain serial. | 🟡–🔴 |
+| ZIP max archive lineages | An archive with at least one optimizable member races its complete Default archive against direct original-source Max when member work is nonuniform, input is ≤8 MiB, and total optimizable decoded work is ≤64 MiB. The direct branch uses the validated source as `Established`, so it does not rebuild the ordinary floor owned by the Default branch. Larger archives complete Default once and refine it with the actual remainder. Uniform many-member and stored-only archives also use that single-lineage outer schedule because a second complete archive adds no useful work. All complete archives are selected by bytes then meaningful bits. | 🔴 |
 
 ### Raw-stream route tree
 
@@ -507,8 +507,13 @@ Other duplicate-work controls include:
 - Deduplicating exact compressed APNG frames with matching decoded geometry
   before optimization.
 - Exact decoded comparison before cross-frame compressed-stream reuse.
-- Scheduling one direct-Max ZIP archive beside the exact Default archive,
-  instead of making every original-source route wait behind Default feedback.
+- Racing `Established` source-Max ZIP work beside exact Default only for
+  bounded nonuniform archives, without rebuilding an ordinary floor in the
+  direct branch.
+- Completing one outer ZIP lineage for uniform many-member archives and
+  distributing independent members across balanced worker slices.
+- Ordering distinct compact-split parents by their completed byte/bit score,
+  while retaining every parent for a sufficiently long Max run.
 - Selecting one compact source-token owner when proven and source-max beams
   would substantially overlap.
 - Pricing bounded grouping ranges once before selecting the least-cost ordered
@@ -516,12 +521,13 @@ Other duplicate-work controls include:
 
 ## Multithreading
 
-Columbo does not parallelize files supplied to the CLI. Default mode, PNG
-metadata, GZIP members, and standalone raw/top-level-zlib planning remain
-algorithmically serial. In bounded `--max` work, it may overlap independent
-raw routes, APNG image streams, the two useful single-image PNG lineages, or
-complete ZIP archive lineages. Every site has explicit compressed, decoded,
-or model bounds and rejoins before wrapper reconstruction.
+Columbo does not parallelize files supplied to the CLI. PNG metadata, GZIP
+members, and standalone raw/top-level-zlib planning remain algorithmically
+serial. A structurally uniform many-member ZIP may parallelize independent
+members in either mode. In bounded `--max` work, Columbo may also overlap
+independent raw routes, APNG image streams, the two useful single-image PNG
+lineages, or complete ZIP archive lineages. Every site has explicit compressed,
+decoded, or model bounds and rejoins before wrapper reconstruction.
 
 Broad candidate-route overlap requires **all** of M5: max mode, a bounded floor
 policy, compressed bytes ≤8 MiB, decoded bytes ≤64 MiB, and parsed-model
@@ -533,7 +539,8 @@ is no persistent thread pool or CLI thread-count option.
 
 | Internal thread site | When it runs | Work split | Indicator |
 | --- | --- | --- | --- |
-| ZIP archive lineages | Max; input ≤8 MiB; total decoded bytes of optimizable entries ≤64 MiB. | One worker runs direct Max from the original archive while the caller completes Default and refines that finished archive. The byte/bit best complete archive wins. | 🔴 |
+| ZIP archive lineages | Max; at least one optimizable member; nonuniform member distribution; input ≤8 MiB; total decoded bytes of optimizable entries ≤64 MiB. | One worker runs original-source Max from `Established` while the caller owns all ordinary Default work and later refines that finished archive. The byte/bit best complete archive wins without duplicating a floor route. | 🔴 |
+| Uniform ZIP members | Default or Max; quiet mode; at least eight optimizable entries; largest compressed member ≤1/8 of their aggregate; input ≤8 MiB; aggregate decoded bytes ≤64 MiB. | Up to eight balanced contiguous slices of the mode's entry order. Each worker owns cloned entry metadata/output and, in Max, divides time using only its own serial slice. The outer archive lineage is not duplicated. | 🟡–🔴 |
 | Single-image PNG lineages | Max; compressed ≤8 MiB; exact decoded image bytes ≤64 MiB; source either exceeds the 512-match complete graph or is a 2+-block ≤768 KiB serial-floor class. | One worker builds a quick ordinary parent and continues it through `Established`; the caller preserves exact Default and the direct bounded routes. | 🔴 |
 | Multi-image PNG jobs | Max; at least two unique jobs; aggregate compressed ≤8 MiB; aggregate exact decoded bytes ≤64 MiB. | Up to eight fixed lanes receive balanced contiguous slices of the small-to-large job order. Each lane runs its jobs serially with child-grace-aware proportional time; 4% remains for parse, join, and rebuild work. | 🔴 |
 | Initial bounded max phase | M5 plus the individual M1/M2/M8/M9 route gates and G0. | Up to four named workers for deft4j, no-split, initial source max, and initial proven feedback; caller builds/reuses the floor lineage. `Shared` generally overlaps only eligible multi-block deft work with its floor. | 🔴 |
@@ -577,8 +584,9 @@ the internal scheduler described here.
 | Original raw-candidate preservation | Keeps compatible raw Deflate source bytes as the relaxed fallback; strict repairs are the documented exception. Wrapper-level reconstruction or normalization can still change container bytes. | 🟢 | **Columbo** |
 | One-bit output selection | At equal byte length, any positive meaningful-Deflate-bit saving—including one bit—sets `bits_saved` and permits a CLI write. Padding-only changes do not. | 🟢 | **Columbo** |
 | Complete / CompleteThenBounded / Shared / Established floors | Selects standalone, single-image PNG, multi-stream, or already-retained-parent deadline behavior without exposing wrapper policy as a public option. | 🟡 | **Columbo** |
-| Parallel ZIP max lineages | On bounded archives, races exact Default and direct original-source Max, then also refines the completed Default archive. Larger archives use the sequential two-phase equivalent. | 🔴 | **Columbo** |
-| PNG compressed-metadata probe | Gives small supported ancillary zlib streams a bounded early probe, retrying non-winners during normal reconstruction; the unknown-unsafe-ancillary early return preserves the source first. | 🟡 | Original **Columbo C** behavior, bounded Rust implementation |
+| Parallel ZIP max lineages | For nonuniform archives with optimizable work within 8 MiB input and 64 MiB decoded bounds, races exact Default and an `Established` original-source Max branch, then refines the completed Default archive. The direct branch does not rebuild ordinary work. Larger, uniform, or stored-only archives complete Default once before Max refinement. | 🔴 | **Columbo** |
+| Parallel uniform ZIP members | Runs balanced slices of at least eight similarly distributed independent members without duplicating the archive lineage; Max workers receive slice-local schedules. | 🟡–🔴 | **Columbo Rust** |
+| PNG compressed-metadata scheduling | Gives small supported ancillary zlib streams a bounded early probe in non-Max quiet runs. For bounded aggregate metadata, Max first caches complete Default floors so later image work cannot consume their opportunity, then spends any remainder on `Established` descendants without rebuilding or double-charging the floor; the unknown-unsafe-ancillary early return preserves the source first. | 🟡 | Original **Columbo C** probe; **Columbo Rust** floor preservation |
 | Exact PNG image geometry | Computes filtered IDAT/fdAT byte counts from IHDR/fcTL, including Adam7, and requires each zlib stream to decode to that exact size. | 🟢 | **PNG/APNG / Columbo** |
 | Parallel PNG Max scheduling | Races distinct bounded single-image lineages and assigns independent APNG streams to at most eight fixed lanes, with explicit memory and wall-clock headroom. | 🔴 | **Columbo** |
 | PNG duplicate and equivalent-frame reuse | Shares optimization for exact-compressed fdAT frames only when decoded geometry also matches, then uses bounded exact decoded comparison before reusing a better spelling across equivalent frames. IDAT remains a separate job. | 🟡 | **Columbo** |
@@ -635,7 +643,7 @@ the internal scheduler described here.
 | Floor-seeded max continuation | Starts max planning from a completed rewritten floor without rebuilding the already-secured token-preserving comparison floor. | 🔴 | **Columbo** |
 | Source max route | Applies the broad original-source token, table, split, merge, grouping, and boundary planner. | 🔴 | **Columbo** |
 | Rewritten-seed refinement | Reparses a selected complete rewrite and runs max again unless an exact fixed point is known. | 🔴 | **Columbo** |
-| Compact split floor | Prices bounded eighth splits on eligible completed parents, preserving complete progress at deadline. | 🟡 | **Columbo** |
+| Compact split floor | Prices bounded eighth splits on eligible completed parents, preserving complete progress at deadline. Distinct parents are attempted in completed byte/meaningful-bit order, retaining original route order on an exact score tie, but remain eligible when sufficient Max time is available because split gains are not monotone in parent size. | 🟡 | **Columbo** |
 | Terminal merge | Greedily merges an eligible selected Huffman seed with deterministic floors, followed by at most two ordinary replays while time remains. | 🟡 | **Columbo** |
 | Fixed-point suppression | Avoids another max replay when an unexpired exhaustive pass reproduced the exact bytes and meaningful-bit count. | 🟢 | **Columbo** |
 

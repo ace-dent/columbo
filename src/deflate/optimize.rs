@@ -2664,9 +2664,10 @@ fn build_prepared_compact_source_split_floors(
     identity: StreamIdentity,
     deadline: &Deadline,
 ) -> Result<Option<Candidate>> {
+    let seeds = ordered_compact_split_seeds(seeds);
     let mut candidate = None;
     let mut attempted = false;
-    for seed in seeds.into_iter().flatten() {
+    for seed in seeds {
         // Always finish one eligible structural parent. Later independent
         // parents start only inside the soft schedule; a larger max budget
         // naturally evaluates all of them.
@@ -2681,6 +2682,18 @@ fn build_prepared_compact_source_split_floors(
         }
     }
     Ok(candidate)
+}
+
+fn ordered_compact_split_seeds(seeds: [Option<&CompactSplitSeed>; 3]) -> Vec<&CompactSplitSeed> {
+    // A smaller completed parent is the strongest general prior for a useful
+    // split descendant: it already carries the best known token spellings and
+    // table choices, while the split route adds only new structural cuts.
+    // Split pricing is not monotone, so retain every distinct parent when the
+    // deadline permits; ordering merely ensures that a bounded run evaluates
+    // its most promising complete lineage first.
+    let mut seeds: Vec<_> = seeds.into_iter().flatten().collect();
+    seeds.sort_by_key(|seed| (seed.data.len(), seed.bits));
+    seeds
 }
 
 fn refine_with_compact_source_split_floor(
@@ -4373,6 +4386,38 @@ mod tests {
             1,
             std::slice::from_ref(&tree_block),
         ));
+    }
+
+    #[test]
+    fn compact_split_parents_are_ordered_by_complete_stream_score() {
+        fn seed(bytes: usize, bits: u64) -> CompactSplitSeed {
+            CompactSplitSeed {
+                data: vec![0; bytes],
+                bits,
+                stream: parse_stream(&[0x03, 0x00], 1).unwrap(),
+            }
+        }
+
+        let largest = seed(12, 80);
+        let bit_tie = seed(10, 79);
+        let smallest = seed(10, 78);
+        let ordered =
+            ordered_compact_split_seeds([Some(&largest), Some(&bit_tie), Some(&smallest)]);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|seed| (seed.data.len(), seed.bits))
+                .collect::<Vec<_>>(),
+            [(10, 78), (10, 79), (12, 80)]
+        );
+
+        let tied_first = seed(10, 78);
+        let tied_second = seed(10, 78);
+        let ordered =
+            ordered_compact_split_seeds([Some(&tied_first), Some(&tied_second), Some(&largest)]);
+        assert!(std::ptr::eq(ordered[0], &tied_first));
+        assert!(std::ptr::eq(ordered[1], &tied_second));
     }
 
     #[test]

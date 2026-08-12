@@ -24,14 +24,17 @@ const MODEL_ALLOCATION_ERROR: &str = "could not allocate ZIP entry model";
 const LOCAL_ALLOCATION_ERROR: &str = "could not allocate ZIP local entry";
 
 // Max keeps an exact Default archive as a quality floor while exploring a
-// separate direct-Max archive. Running those independent branches together
-// prevents slow Default feedback on one member from delaying useful Max work
-// on another. Bound both retained input and decoded models because the two
-// complete branches temporarily require separate archive and Deflate arenas.
+// separate direct-Max archive. The direct branch treats its validated source
+// stream as an established floor instead of rebuilding ordinary work already
+// owned by the Default branch. Bound both retained input and decoded models
+// because the two complete branches still use separate archive and Deflate
+// arenas.
 const PARALLEL_MAX_ARCHIVE_INPUT: usize = 8 * 1_024 * 1_024;
 const PARALLEL_MAX_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
+const PARALLEL_MEMBER_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
+const PARALLEL_ARCHIVE_MEMBER_WORKERS: usize = 8;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     local: Vec<u8>,
     local_size_before: usize,
@@ -116,10 +119,8 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 /// Build Default-seeded and direct-Max archives inside the same wall-clock
 /// window, then retain the byte-first winner.
 ///
-/// The raw optimizer already avoids rebuilding a complete Default route when
-/// given a shared container floor. This archive-level pairing therefore makes
-/// original-source Max routes available immediately without rebuilding the
-/// expensive Default route inside that branch. Refining the completed Default
+/// `Established` makes original-source Max routes available immediately while
+/// the caller owns all ordinary Default work. Refining the completed Default
 /// archive remains useful rather than duplicate work: its rewritten block and
 /// token choices expose a distinct search basin that the source branch cannot
 /// necessarily reach.
@@ -129,7 +130,7 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
         let max_worker = thread::Builder::new()
             .name("columbo-zip-direct-max".into())
             .spawn_scoped(scope, || {
-                optimize_once(input, options, DefaultFloor::Shared)
+                optimize_once(input, options, DefaultFloor::Established)
             });
 
         let mut floor_options = options.clone();
@@ -231,13 +232,45 @@ fn parallel_max_archive_is_bounded(input: &[u8]) -> bool {
     else {
         return false;
     };
-    entries
-        .iter()
-        .filter(|entry| entry_is_optimizable(entry))
-        .try_fold(0_u64, |total, entry| {
-            total.checked_add(u64::from(entry.uncompressed_size))
-        })
-        .is_some_and(|decoded| decoded <= PARALLEL_MAX_ARCHIVE_DECODED)
+    parallel_max_entry_work_is_bounded(&entries)
+}
+
+fn parallel_max_entry_work_is_bounded(entries: &[Entry]) -> bool {
+    let mut total_decoded = 0_u64;
+    let mut has_optimizable_entry = false;
+    for entry in entries.iter().filter(|entry| entry_is_optimizable(entry)) {
+        has_optimizable_entry = true;
+        total_decoded = match total_decoded.checked_add(u64::from(entry.uncompressed_size)) {
+            Some(total) if total <= PARALLEL_MAX_ARCHIVE_DECODED => total,
+            Some(_) | None => return false,
+        };
+    }
+
+    has_optimizable_entry && !uniformly_distributed_member_work(entries)
+}
+
+fn uniformly_distributed_member_work(entries: &[Entry]) -> bool {
+    let mut member_count = 0_usize;
+    let mut total_compressed = 0_u64;
+    let mut largest_compressed = 0_u64;
+    for entry in entries.iter().filter(|entry| entry_is_optimizable(entry)) {
+        member_count += 1;
+        let compressed = u64::from(entry.compressed_size_before);
+        let Some(total) = total_compressed.checked_add(compressed) else {
+            return false;
+        };
+        total_compressed = total;
+        largest_compressed = largest_compressed.max(compressed);
+    }
+
+    // Two complete archive branches duplicate parser and floor setup for every
+    // member. That overlap pays when a few substantial members own most work,
+    // because their independent basins can run together. On a broad, uniform
+    // set no member owns even one eighth of the compressed payload; completing
+    // Default once and refining it gives more members useful search time.
+    // This is a structural work-distribution rule, not a filename or elapsed-
+    // time gate, and sufficient Max time still evaluates the same lineages.
+    member_count >= 8 && largest_compressed.saturating_mul(8) <= total_compressed
 }
 
 fn combined_savings(original_bytes: usize, floor: &Optimization, refined: &Optimization) -> u64 {
@@ -333,28 +366,35 @@ fn optimize_once(
     // source order.
     let build_order = optimization_order(&entries, options.exhaustive)?;
     let schedule = options.exhaustive.then(|| ZipSchedule::new(&entries));
-    let mut timed_out = false;
-    for index in build_order {
-        let mut call_options = deadline.options_for_call(options);
-        if let Some(schedule) = schedule {
-            call_options.timeout =
-                schedule.timeout_for(options.timeout, deadline.remaining(), &entries[index]);
-        }
-        let mut build_entry = || {
-            build_local_entry(
-                input,
-                central_offset,
-                &mut entries[index],
-                &call_options,
-                raw_default_floor,
-            )
-        };
-        timed_out |= if let Some(stream_id) = stream_ids[index] {
-            crate::progress::with_stream_group(stream_id, &[], build_entry)?
-        } else {
-            build_entry()?
-        };
-    }
+    let parallel_uniform_members = !options.visual
+        && input.len() <= PARALLEL_MAX_ARCHIVE_INPUT
+        && expanded_size <= PARALLEL_MEMBER_ARCHIVE_DECODED
+        && uniformly_distributed_member_work(&entries);
+    let timed_out = if parallel_uniform_members {
+        build_uniform_entries_parallel(
+            input,
+            central_offset,
+            &mut entries,
+            &stream_ids,
+            &build_order,
+            options,
+            raw_default_floor,
+            &deadline,
+            schedule,
+        )?
+    } else {
+        build_entries_serial(
+            input,
+            central_offset,
+            &mut entries,
+            &stream_ids,
+            &build_order,
+            options,
+            raw_default_floor,
+            &deadline,
+            schedule,
+        )?
+    };
     let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
         total.checked_add(entry.source_deflate_bits)
     });
@@ -511,6 +551,222 @@ fn preflight_local_entries(
     Ok(physical_order)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_entries_serial(
+    input: &[u8],
+    central_offset: usize,
+    entries: &mut [Entry],
+    stream_ids: &[Option<usize>],
+    build_order: &[usize],
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+    deadline: &SearchDeadline,
+    schedule: Option<ZipSchedule>,
+) -> Result<bool> {
+    let mut timed_out = false;
+    for &index in build_order {
+        timed_out |= build_scheduled_entry(
+            input,
+            central_offset,
+            &mut entries[index],
+            stream_ids[index],
+            options,
+            raw_default_floor,
+            deadline,
+            schedule,
+        )?;
+    }
+    Ok(timed_out)
+}
+
+/// Optimize a broad set of similarly sized independent members concurrently.
+///
+/// This path is selected only after the archive-wide input and decoded-memory
+/// bounds have passed. Each worker owns cloned entry metadata and its output;
+/// immutable archive bytes are shared, and results rejoin before reconstruction.
+#[allow(clippy::too_many_arguments)]
+fn build_uniform_entries_parallel(
+    input: &[u8],
+    central_offset: usize,
+    entries: &mut [Entry],
+    stream_ids: &[Option<usize>],
+    build_order: &[usize],
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+    deadline: &SearchDeadline,
+    schedule: Option<ZipSchedule>,
+) -> Result<bool> {
+    let optimizable_count = build_order
+        .iter()
+        .take_while(|&&index| entry_is_optimizable(&entries[index]))
+        .count();
+    let (optimizable, remaining) = build_order.split_at(optimizable_count);
+    // The structural caller currently guarantees at least eight jobs. Keep a
+    // serial fallback here as well so a future scheduling change cannot turn
+    // an empty worker set into a division by zero.
+    if optimizable.is_empty() {
+        return build_entries_serial(
+            input,
+            central_offset,
+            entries,
+            stream_ids,
+            build_order,
+            options,
+            raw_default_floor,
+            deadline,
+            schedule,
+        );
+    }
+    let worker_count = optimizable.len().min(PARALLEL_ARCHIVE_MEMBER_WORKERS);
+    let jobs_per_worker = optimizable.len() / worker_count;
+    let workers_with_extra_job = optimizable.len() % worker_count;
+
+    let (completed, mut timed_out) = thread::scope(|scope| -> Result<_> {
+        let mut workers = Vec::new();
+        workers
+            .try_reserve_exact(worker_count)
+            .map_err(|_| Error::new("could not allocate ZIP member workers"))?;
+        let mut completed = Vec::new();
+        completed
+            .try_reserve_exact(optimizable.len())
+            .map_err(|_| Error::new("could not allocate ZIP member results"))?;
+
+        let mut start = 0_usize;
+        for worker_index in 0..worker_count {
+            let count = jobs_per_worker + usize::from(worker_index < workers_with_extra_job);
+            let jobs = &optimizable[start..start + count];
+            start += count;
+            let worker = thread::Builder::new()
+                .name(format!("columbo-zip-members-{worker_index}"))
+                .spawn_scoped(scope, || {
+                    build_entry_batch(
+                        input,
+                        central_offset,
+                        entries,
+                        stream_ids,
+                        jobs,
+                        options,
+                        raw_default_floor,
+                        deadline,
+                        schedule,
+                    )
+                });
+            match worker {
+                Ok(worker) => workers.push(worker),
+                Err(_) => completed.extend(build_entry_batch(
+                    input,
+                    central_offset,
+                    entries,
+                    stream_ids,
+                    jobs,
+                    options,
+                    raw_default_floor,
+                    deadline,
+                    schedule,
+                )?),
+            }
+        }
+
+        let mut timed_out = false;
+        for worker in workers {
+            let results = match worker.join() {
+                Ok(results) => results?,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            completed.extend(results);
+        }
+        for (_, _, entry_timed_out) in &completed {
+            timed_out |= *entry_timed_out;
+        }
+        Ok((completed, timed_out))
+    })?;
+
+    for (index, entry, _) in completed {
+        entries[index] = entry;
+    }
+    for &index in remaining {
+        timed_out |= build_scheduled_entry(
+            input,
+            central_offset,
+            &mut entries[index],
+            stream_ids[index],
+            options,
+            raw_default_floor,
+            deadline,
+            schedule,
+        )?;
+    }
+    Ok(timed_out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_entry_batch(
+    input: &[u8],
+    central_offset: usize,
+    entries: &[Entry],
+    stream_ids: &[Option<usize>],
+    jobs: &[usize],
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+    deadline: &SearchDeadline,
+    schedule: Option<ZipSchedule>,
+) -> Result<Vec<(usize, Entry, bool)>> {
+    // These jobs run serially on one worker while sibling slices overlap in
+    // wall time. Divide the worker's allowance among only this slice; using
+    // the whole archive denominator would underfund every parallel member.
+    let schedule = schedule.map(|_| ZipSchedule::new_for_indices(entries, jobs));
+    let mut completed = Vec::new();
+    completed
+        .try_reserve_exact(jobs.len())
+        .map_err(|_| Error::new("could not allocate ZIP member results"))?;
+    for &index in jobs {
+        let mut entry = entries[index].clone();
+        let timed_out = build_scheduled_entry(
+            input,
+            central_offset,
+            &mut entry,
+            stream_ids[index],
+            options,
+            raw_default_floor,
+            deadline,
+            schedule,
+        )?;
+        completed.push((index, entry, timed_out));
+    }
+    Ok(completed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_scheduled_entry(
+    input: &[u8],
+    central_offset: usize,
+    entry: &mut Entry,
+    stream_id: Option<usize>,
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+    deadline: &SearchDeadline,
+    schedule: Option<ZipSchedule>,
+) -> Result<bool> {
+    let mut call_options = deadline.options_for_call(options);
+    if let Some(schedule) = schedule {
+        call_options.timeout = schedule.timeout_for(options.timeout, deadline.remaining(), entry);
+    }
+    let mut build_entry = || {
+        build_local_entry(
+            input,
+            central_offset,
+            entry,
+            &call_options,
+            raw_default_floor,
+        )
+    };
+    if let Some(stream_id) = stream_id {
+        crate::progress::with_stream_group(stream_id, &[], build_entry)
+    } else {
+        build_entry()
+    }
+}
+
 fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>> {
     let mut order = Vec::new();
     order
@@ -569,28 +825,39 @@ struct ZipSchedule {
 
 impl ZipSchedule {
     fn new(entries: &[Entry]) -> Self {
+        Self::from_entries(entries.iter())
+    }
+
+    fn new_for_indices(entries: &[Entry], indices: &[usize]) -> Self {
+        Self::from_entries(indices.iter().map(|&index| &entries[index]))
+    }
+
+    fn from_entries<'a, I>(entries: I) -> Self
+    where
+        I: Iterator<Item = &'a Entry> + Clone,
+    {
         let largest_size = entries
-            .iter()
+            .clone()
             .filter(|entry| entry_is_optimizable(entry))
             .map(|entry| entry.compressed_size_before)
             .max()
             .unwrap_or(0);
         let reserved_largest_offset = entries
-            .iter()
+            .clone()
             .filter(|entry| {
                 entry_is_optimizable(entry) && entry.compressed_size_before == largest_size
             })
             .map(|entry| entry.local_offset_before)
             .max()
             .unwrap_or(0);
-        let use_effective_weights = entries.iter().any(|entry| {
+        let use_effective_weights = entries.clone().any(|entry| {
             entry_is_optimizable(entry)
                 && entry.compressed_size_before == largest_size
                 && u64::from(entry.compressed_size_before) * 100
                     >= u64::from(entry.uncompressed_size) * 98
         });
         let mut total_weight = 0.0_f64;
-        for entry in entries.iter().filter(|entry| entry_is_optimizable(entry)) {
+        for entry in entries.filter(|entry| entry_is_optimizable(entry)) {
             let weight = zip_stream_weight(entry, use_effective_weights);
             total_weight += weight;
         }
@@ -1357,6 +1624,27 @@ mod tests {
             false,
         );
         assert!(!parallel_max_archive_is_bounded(&oversized));
+    }
+
+    #[test]
+    fn parallel_max_archive_avoids_duplicate_work_on_uniform_member_sets() {
+        let stored_only: Vec<_> = (0..8).map(|index| ordering_entry(0, 100, index)).collect();
+        assert!(!parallel_max_entry_work_is_bounded(&stored_only));
+
+        let uniform: Vec<_> = (0..8)
+            .map(|index| {
+                let mut entry = ordering_entry(8, 100, index);
+                entry.uncompressed_size = 200;
+                entry
+            })
+            .collect();
+        assert!(!parallel_max_entry_work_is_bounded(&uniform));
+
+        // A dominant member gives the independent archive branches useful,
+        // different work even when the archive also contains many tiny files.
+        let mut skewed = uniform;
+        skewed[0].compressed_size_before = 101;
+        assert!(parallel_max_entry_work_is_bounded(&skewed));
     }
 
     #[test]

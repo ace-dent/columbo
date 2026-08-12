@@ -18,6 +18,13 @@ const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const MAX_EXACT_REUSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXACT_REUSE_WORK_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_METADATA_PROBE_WORK_BYTES: u64 = 64 * 1024 * 1024;
+// Max must not discard affordable Default savings in compressed metadata just
+// because an image route spends the shared file deadline first. Precompute the
+// complete non-Max metadata floors when their aggregate compressed size fits
+// the same bounded work class as speculative metadata probes, then reuse those
+// results during reconstruction. Larger metadata sets retain the streaming
+// schedule so caching cannot duplicate an attacker-sized portion of the input.
+const MAX_CACHED_METADATA_FLOOR_BYTES: u64 = MAX_METADATA_PROBE_WORK_BYTES;
 // A single-image Max run can retain exact Default and direct-Max raw models
 // together. Keep that combined working set within the same broad bounds used
 // for independent raw-route arenas.
@@ -114,6 +121,7 @@ struct CompressedBodyOptimization {
     replacement: Option<Vec<u8>>,
     source_deflate_bits: u64,
     output_deflate_bits: u64,
+    decoded_size: Option<u64>,
 }
 
 pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result<usize> {
@@ -151,7 +159,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     for (index, chunk) in parsed.chunks.iter().enumerate() {
         // Detailed modes give each physical metadata stream one definitive
         // card. Quiet runs retain the cheap speculative probe schedule.
-        if options.verbose || options.visual {
+        if options.verbose || options.visual || options.exhaustive {
             continue;
         }
         if should_strip(chunk.kind, options) {
@@ -218,6 +226,14 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         }
         budget.timed_out = timed_out_before_probe;
     }
+
+    precompute_max_metadata_floors(
+        &parsed,
+        &metadata_stream_ids,
+        options,
+        &mut budget,
+        &mut quick_replacements,
+    )?;
 
     let (optimized_idat, optimized_frames) = optimize_image_streams(
         &parsed.idat,
@@ -311,8 +327,20 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                 if compressed_zlib_offset(chunk.kind, chunk.data).is_some() =>
             {
                 let replacement = if let Some(replacement) = &quick_replacements[index] {
-                    try_clone_compressed_body(replacement)
-                        .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?
+                    let mut refine_metadata = || {
+                        refine_cached_compressed_body(
+                            chunk.kind,
+                            chunk.data,
+                            replacement,
+                            options,
+                            &mut budget,
+                        )
+                    };
+                    if let Some(stream_id) = metadata_stream_ids[index] {
+                        crate::progress::with_stream_group(stream_id, &[], refine_metadata)?
+                    } else {
+                        refine_metadata()?
+                    }
                 } else {
                     let mut optimize_metadata = || {
                         optimize_compressed_body(
@@ -364,6 +392,135 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         output_deflate_bits,
         budget.timed_out,
     ))
+}
+
+/// Cache the complete Default result for a bounded set of metadata streams.
+///
+/// PNG uses one file-wide search deadline. Without this phase, a single image
+/// Max route can spend that deadline before reconstruction reaches zTXt, iTXt,
+/// or iCCP, causing Max to return a worse whole file than Default. Building the
+/// inexpensive metadata floor first is broadly valid: Max retains every
+/// completed Default candidate and later optional work only adds alternatives.
+fn precompute_max_metadata_floors(
+    parsed: &ParsedPng<'_>,
+    metadata_stream_ids: &[Option<usize>],
+    options: &Options,
+    budget: &mut DecodeBudget,
+    cached: &mut [Option<CompressedBodyOptimization>],
+) -> Result<()> {
+    if !options.exhaustive {
+        return Ok(());
+    }
+
+    let compressed_bytes = parsed
+        .chunks
+        .iter()
+        .filter(|chunk| !should_strip(chunk.kind, options))
+        .filter_map(|chunk| {
+            compressed_zlib_offset(chunk.kind, chunk.data)
+                .map(|offset| (chunk.data.len() - offset) as u64)
+        })
+        .try_fold(0_u64, u64::checked_add);
+    if match compressed_bytes {
+        Some(bytes) => bytes > MAX_CACHED_METADATA_FLOOR_BYTES,
+        None => true,
+    } {
+        return Ok(());
+    }
+
+    let mut floor_options = options.clone();
+    floor_options.exhaustive = false;
+    for (index, chunk) in parsed.chunks.iter().enumerate() {
+        if should_strip(chunk.kind, options)
+            || compressed_zlib_offset(chunk.kind, chunk.data).is_none()
+        {
+            continue;
+        }
+
+        let mut optimize_metadata = || {
+            optimize_compressed_body(
+                chunk.kind,
+                chunk.data,
+                &floor_options,
+                DefaultFloor::Complete,
+                budget,
+            )
+        };
+        let optimized = if let Some(stream_id) = metadata_stream_ids[index] {
+            crate::progress::with_stream_group(stream_id, &[], optimize_metadata)?
+        } else {
+            optimize_metadata()?
+        }
+        .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
+        cached[index] = Some(optimized);
+    }
+    Ok(())
+}
+
+/// Continue a cached metadata floor through Max without rebuilding Default.
+///
+/// The definitive floor already charged this physical stream to the file's
+/// decoded-data budget. This replay decodes the same bytes for validation, so
+/// it uses the known exact size as a local ceiling and does not charge the
+/// container budget twice. If the image routes spent the shared deadline, the
+/// completed floor is returned immediately.
+fn refine_cached_compressed_body(
+    kind: [u8; 4],
+    source_data: &[u8],
+    floor: &CompressedBodyOptimization,
+    options: &Options,
+    budget: &mut DecodeBudget,
+) -> Result<CompressedBodyOptimization> {
+    let Some(decoded_size) = floor.decoded_size else {
+        return try_clone_compressed_body(floor)
+            .ok_or_else(|| Error::new("could not allocate PNG metadata result"));
+    };
+    if !options.exhaustive || budget.deadline.remaining().is_zero() {
+        return try_clone_compressed_body(floor)
+            .ok_or_else(|| Error::new("could not allocate PNG metadata result"));
+    }
+
+    let floor_data = floor.replacement.as_deref().unwrap_or(source_data);
+    let zlib_offset = compressed_zlib_offset(kind, floor_data)
+        .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
+    let call_options = budget.deadline.options_for_call(options);
+    let refined = run_png_zlib(
+        &floor_data[zlib_offset..],
+        &call_options,
+        decoded_size,
+        true,
+        DefaultFloor::Established,
+    )?;
+    budget.timed_out |= refined.timed_out;
+    let info = refined
+        .info
+        .as_ref()
+        .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
+    if info.size != decoded_size {
+        return Err(Error::new("invalid compressed PNG metadata"));
+    }
+
+    let body_len = zlib_offset
+        .checked_add(refined.data.len())
+        .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
+    let refined_wins = body_len < floor_data.len()
+        || (body_len == floor_data.len() && info.deflate_bits < floor.output_deflate_bits);
+    if !refined_wins {
+        return try_clone_compressed_body(floor)
+            .ok_or_else(|| Error::new("could not allocate PNG metadata result"));
+    }
+
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len)
+        .map_err(|_| Error::new("could not allocate PNG compressed metadata"))?;
+    body.extend_from_slice(&floor_data[..zlib_offset]);
+    body.extend_from_slice(&refined.data);
+    Ok(CompressedBodyOptimization {
+        replacement: Some(body),
+        source_deflate_bits: floor.source_deflate_bits,
+        output_deflate_bits: info.deflate_bits,
+        decoded_size: Some(decoded_size),
+    })
 }
 
 fn supported_compressed_metadata(chunk: &Chunk<'_>) -> bool {
@@ -1509,6 +1666,7 @@ fn try_clone_compressed_body(
         },
         source_deflate_bits: optimized.source_deflate_bits,
         output_deflate_bits: optimized.output_deflate_bits,
+        decoded_size: optimized.decoded_size,
     })
 }
 
@@ -2002,6 +2160,7 @@ fn optimize_compressed_body(
         .as_ref()
         .map_or(0, |info| info.source_deflate_bits);
     let output_deflate_bits = optimized.info.as_ref().map_or(0, |info| info.deflate_bits);
+    let decoded_size = optimized.info.as_ref().map(|info| info.size);
     let body_len = zlib_offset
         .checked_add(optimized.data.len())
         .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
@@ -2017,6 +2176,7 @@ fn optimize_compressed_body(
             replacement: None,
             source_deflate_bits,
             output_deflate_bits: source_deflate_bits,
+            decoded_size,
         }));
     }
     let mut body = Vec::new();
@@ -2028,6 +2188,7 @@ fn optimize_compressed_body(
         replacement: Some(body),
         source_deflate_bits,
         output_deflate_bits,
+        decoded_size,
     }))
 }
 
@@ -3141,6 +3302,79 @@ mod tests {
         };
         let result = optimize(&input, &options).unwrap();
         parse(&result.data, false).unwrap();
+    }
+
+    #[test]
+    fn bounded_max_precomputes_complete_metadata_floors() {
+        let mut metadata = b"Comment\0\0".to_vec();
+        metadata.extend_from_slice(&super::super::same_byte_bit_win_zlib());
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"zTXt", &metadata));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let parsed = parse(&input, false).unwrap();
+        let stream_ids = metadata_stream_ids(&parsed).unwrap();
+        let mut cached = Vec::new();
+        cached.resize_with(parsed.chunks.len(), || None);
+        let mut budget = DecodeBudget {
+            remaining: options.max_decoded_bytes,
+            timed_out: false,
+            deadline: SearchDeadline::new(&options),
+        };
+
+        precompute_max_metadata_floors(&parsed, &stream_ids, &options, &mut budget, &mut cached)
+            .unwrap();
+
+        let metadata_index = parsed
+            .chunks
+            .iter()
+            .position(|chunk| chunk.kind == *b"zTXt")
+            .unwrap();
+        let floor = cached[metadata_index]
+            .as_ref()
+            .expect("Max should retain a bounded complete metadata floor");
+        assert!(floor.replacement.is_some());
+        assert!(floor.output_deflate_bits < floor.source_deflate_bits);
+        assert_eq!(floor.decoded_size, Some(168));
+        assert_eq!(
+            options.max_decoded_bytes - budget.remaining,
+            168,
+            "the cached floor should charge decoded metadata exactly once"
+        );
+
+        let remaining_after_floor = budget.remaining;
+        let metadata_chunk = &parsed.chunks[metadata_index];
+        let refined = refine_cached_compressed_body(
+            metadata_chunk.kind,
+            metadata_chunk.data,
+            floor,
+            &options,
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(
+            budget.remaining, remaining_after_floor,
+            "a Max descendant must not charge the same decoded stream twice"
+        );
+        let floor_len = floor
+            .replacement
+            .as_ref()
+            .map_or(metadata_chunk.data.len(), Vec::len);
+        let refined_len = refined
+            .replacement
+            .as_ref()
+            .map_or(metadata_chunk.data.len(), Vec::len);
+        assert!(
+            (refined_len, refined.output_deflate_bits) <= (floor_len, floor.output_deflate_bits),
+            "Max must retain the complete metadata floor"
+        );
     }
 
     #[test]
