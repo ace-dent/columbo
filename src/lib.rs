@@ -20,6 +20,7 @@ mod deflate;
 mod error;
 mod format;
 mod options;
+mod presentation;
 mod progress;
 mod terminal;
 

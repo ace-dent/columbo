@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod presentation;
 mod terminal;
 
 use std::env;
@@ -16,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use columbo::{optimize, Format, Options, MAX_TIMEOUT, MIN_TIMEOUT};
+use presentation::{format_duration as format_elapsed, plural, plural_u64};
 
 const PROGRAM_NAME: &str = "columbo";
 const PROGRAM_VERSION: &str = concat!(
@@ -31,7 +33,7 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct Command {
     format: Format,
     options: Options,
-    input: PathBuf,
+    inputs: Vec<PathBuf>,
     destination: Destination,
 }
 
@@ -83,10 +85,81 @@ struct ExecutionTimings {
     total: Duration,
 }
 
+struct InputReport<'a> {
+    path: &'a Path,
+    index: usize,
+    count: usize,
+    bytes: usize,
+}
+
+struct OptimizationReport {
+    bytes: usize,
+    bits_saved: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CautionDestination {
+enum OutputChannel {
     Stdout,
     Stderr,
+}
+
+impl OutputChannel {
+    fn color_enabled(self) -> bool {
+        match self {
+            Self::Stdout => terminal::stdout_color_enabled(),
+            Self::Stderr => terminal::stderr_color_enabled(),
+        }
+    }
+
+    fn write(self, operation: impl FnOnce(&mut dyn Write) -> io::Result<()>) {
+        let result = match self {
+            Self::Stdout => operation(&mut io::stdout().lock()),
+            Self::Stderr => operation(&mut io::stderr().lock()),
+        };
+        let _ = result;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportMode {
+    Default,
+    Verbose,
+    Visual,
+}
+
+impl ReportMode {
+    fn for_options(options: &Options) -> Self {
+        if options.visual {
+            Self::Visual
+        } else if options.verbose {
+            Self::Verbose
+        } else {
+            Self::Default
+        }
+    }
+
+    fn channel(self) -> OutputChannel {
+        match self {
+            Self::Verbose => OutputChannel::Stdout,
+            Self::Default | Self::Visual => OutputChannel::Stderr,
+        }
+    }
+
+    fn detailed(self) -> bool {
+        !matches!(self, Self::Default)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Verbose => "verbose",
+            Self::Visual => "visual",
+        }
+    }
+
+    fn reports_timeout(self) -> bool {
+        self.detailed()
+    }
 }
 
 enum ParsedCommand {
@@ -125,17 +198,15 @@ fn main() -> ExitCode {
 fn run() -> std::result::Result<(), u8> {
     let command = match parse_args(env::args_os().skip(1)) {
         Ok(ParsedCommand::Help) => {
-            let _ = print_usage(&mut io::stdout(), terminal::stdout_color_enabled());
+            OutputChannel::Stdout
+                .write(|output| print_usage(output, OutputChannel::Stdout.color_enabled()));
             return Ok(());
         }
         Ok(ParsedCommand::Run(command)) => command,
         Err(error) => {
-            if let Some(message) = error.message {
-                eprintln!("{message}");
-            }
-            if error.show_usage {
-                let _ = print_usage(&mut io::stderr(), terminal::stderr_color_enabled());
-            }
+            OutputChannel::Stderr.write(|output| {
+                print_cli_error(output, error, OutputChannel::Stderr.color_enabled())
+            });
             return Err(2);
         }
     };
@@ -144,64 +215,105 @@ fn run() -> std::result::Result<(), u8> {
 }
 
 fn execute(command: Command) -> std::result::Result<(), u8> {
-    let overwrites_input = command.destination.overwrites_input(&command.input);
-    let detailed = command.options.verbose || command.options.visual;
+    let report_mode = ReportMode::for_options(&command.options);
+    if command.options.visual && !visual_terminal_available() {
+        eprintln!("visual mode needs an interactive terminal; continuing without the live display");
+    }
+
+    let input_count = command.inputs.len();
+    let mut failed = false;
+    let mut caution_printed = false;
+    for (index, input) in command.inputs.iter().enumerate() {
+        // Each input owns its complete read/optimize/write lifetime. Besides
+        // making the processing order explicit, this releases potentially
+        // large buffers before the next file starts.
+        if execute_file(
+            &command,
+            report_mode,
+            input,
+            index,
+            input_count,
+            &mut caution_printed,
+        )
+        .is_err()
+        {
+            failed = true;
+        }
+    }
+
+    if failed {
+        Err(1)
+    } else {
+        Ok(())
+    }
+}
+
+fn execute_file(
+    command: &Command,
+    report_mode: ReportMode,
+    input_path: &Path,
+    input_index: usize,
+    input_count: usize,
+    caution_printed: &mut bool,
+) -> std::result::Result<(), u8> {
+    let overwrites_input = command.destination.overwrites_input(input_path);
+    let detailed = report_mode.detailed();
     let total_started = detailed.then(Instant::now);
     let read_started = detailed.then(Instant::now);
-    let input = match read_file(&command.input, command.options.max_input_bytes) {
+    let input = match read_file(input_path, command.options.max_input_bytes) {
         Ok(bytes) => bytes,
         Err(ReadError::TooLarge) => {
-            eprintln!("input exceeds the 1 GiB file-size limit");
+            eprintln!("input {:?} exceeds the 1 GiB file-size limit", input_path);
             return Err(1);
         }
         Err(ReadError::Allocation) => {
-            eprintln!("not enough memory to read input");
+            eprintln!("not enough memory to read input {:?}", input_path);
             return Err(1);
         }
         Err(ReadError::Io) => {
             // Path's Debug formatter escapes terminal control characters.
-            eprintln!("could not read {:?}", command.input);
+            eprintln!("could not read {:?}", input_path);
             return Err(1);
         }
     };
     let read_elapsed = read_started.map_or(Duration::ZERO, |started| started.elapsed());
+    let input_report = InputReport {
+        path: input_path,
+        index: input_index,
+        count: input_count,
+        bytes: input.len(),
+    };
 
-    if command.options.verbose {
-        let _ = print_detailed_header(&mut io::stdout(), &command, input.len(), read_elapsed);
-    } else if command.options.visual {
-        let _ = print_detailed_header(&mut io::stderr(), &command, input.len(), read_elapsed);
+    if detailed {
+        report_mode.channel().write(|output| {
+            print_detailed_header(output, report_mode, command, &input_report, read_elapsed)
+        });
     }
 
-    match strict_mode_caution_destination(&command.options) {
-        Some(CautionDestination::Stdout) => {
-            let _ = print_strict_mode_caution(&mut io::stdout(), terminal::stdout_color_enabled());
-        }
-        Some(CautionDestination::Stderr) => {
-            let _ = print_strict_mode_caution(&mut io::stderr(), terminal::stderr_color_enabled());
-        }
-        None => {}
+    // Strictness is a batch-wide policy, so one caution is sufficient even
+    // though each input receives its own detailed header and result.
+    if !command.options.strict && !*caution_printed {
+        let channel = report_mode.channel();
+        channel.write(|output| print_strict_mode_caution(output, channel.color_enabled()));
+        *caution_printed = true;
     }
 
     let optimize_started = detailed.then(Instant::now);
-    if command.options.visual && !visual_terminal_available() {
-        eprintln!("visual mode needs an interactive terminal; continuing without the live display");
-    }
-    let mut spinner = Spinner::start(
-        command.options.exhaustive && !command.options.verbose && !command.options.visual,
-    );
+    let mut spinner =
+        Spinner::start(command.options.exhaustive && report_mode == ReportMode::Default);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
     let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
     let optimized = match result {
         Ok(result) => result,
         Err(error) => {
-            eprintln!("optimize failed: {error}");
+            eprintln!("could not optimize {:?}: {error}", input_path);
             return Err(1);
         }
     };
 
     let write_started = detailed.then(Instant::now);
-    let output_action = match command.destination.output_path(&command.input) {
+    let output_action = match command.destination.output_path(input_path) {
         None => OutputAction::DryRun,
         Some(output) if optimized.bits_saved != 0 => {
             let written = if overwrites_input {
@@ -251,21 +363,10 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
         Duration::ZERO
     };
 
-    if optimized.timed_out {
-        match &output_action {
-            OutputAction::DryRun => eprintln!(
-                "Timeout triggered after {} seconds; reporting best result found so far.",
-                command.options.timeout.as_secs()
-            ),
-            OutputAction::WrittenOptimized(_) => eprintln!(
-                "Timeout triggered after {} seconds; wrote best output found so far.",
-                command.options.timeout.as_secs()
-            ),
-            OutputAction::CopiedOriginal(_) | OutputAction::Preserved(_) => eprintln!(
-                "Timeout triggered after {} seconds; no smaller output was written.",
-                command.options.timeout.as_secs()
-            ),
-        }
+    if optimized.timed_out && report_mode.reports_timeout() {
+        report_mode
+            .channel()
+            .write(|output| print_timeout_notice(output, &output_action, command.options.timeout));
     }
     let timings = ExecutionTimings {
         read: read_elapsed,
@@ -273,89 +374,124 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
         write: write_elapsed,
         total: total_started.map_or(Duration::ZERO, |started| started.elapsed()),
     };
-    if command.options.verbose {
-        let _ = print_detailed_result(
-            &mut io::stdout(),
+    let optimization_report = OptimizationReport {
+        bytes: optimized.data.len(),
+        bits_saved: optimized.bits_saved,
+    };
+    report_mode.channel().write(|output| {
+        print_result(
+            output,
+            report_mode,
+            &input_report,
             &output_action,
-            input.len(),
-            optimized.data.len(),
-            optimized.bits_saved,
+            &optimization_report,
             &timings,
-        );
-    } else if command.options.visual {
-        let _ = print_detailed_result(
-            &mut io::stderr(),
-            &output_action,
-            input.len(),
-            optimized.data.len(),
-            optimized.bits_saved,
-            &timings,
-        );
-    } else {
-        print_quiet_result(
-            &output_action,
-            input.len(),
-            optimized.data.len(),
-            optimized.bits_saved,
-        );
-    }
+        )
+    });
     Ok(())
 }
 
-fn print_quiet_result(
+fn print_result(
+    output: &mut dyn Write,
+    report_mode: ReportMode,
+    input: &InputReport<'_>,
     action: &OutputAction,
-    input_bytes: usize,
-    optimized_bytes: usize,
-    bits_saved: u64,
-) {
-    match action {
-        OutputAction::DryRun => {
-            eprintln!("{input_bytes} -> {optimized_bytes} bytes (dry run; no output written)")
+    optimized: &OptimizationReport,
+    timings: &ExecutionTimings,
+) -> io::Result<()> {
+    match report_mode {
+        ReportMode::Default => print_quiet_result(output, input, action, optimized),
+        ReportMode::Verbose | ReportMode::Visual => {
+            print_detailed_result(output, input, action, optimized, timings)
         }
-        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => eprintln!(
-            "{input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
+    }
+}
+
+fn print_quiet_result(
+    output: &mut dyn Write,
+    input: &InputReport<'_>,
+    action: &OutputAction,
+    optimized: &OptimizationReport,
+) -> io::Result<()> {
+    let input_name = display_name(input.path);
+    let input_bytes = input.bytes;
+    let optimized_bytes = optimized.bytes;
+    let bits_saved = optimized.bits_saved;
+    match action {
+        OutputAction::DryRun => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (dry run; no output written)"
+        ),
+        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
             plural_u64(bits_saved, "bit", "bits")
         ),
-        OutputAction::WrittenOptimized(_) => {
-            eprintln!("{input_bytes} -> {optimized_bytes} bytes");
-        }
-        OutputAction::CopiedOriginal(output) => eprintln!(
-            "{input_bytes} -> {input_bytes} bytes \
-             (no savings; copied original to {:?})",
-            output
+        OutputAction::WrittenOptimized(_) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes"
         ),
-        OutputAction::Preserved(output) => eprintln!(
-            "{input_bytes} -> {input_bytes} bytes \
+        OutputAction::CopiedOriginal(output_path) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
+             (no savings; copied original to {:?})",
+            output_path
+        ),
+        OutputAction::Preserved(output_path) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
              (no savings; left {:?} unchanged)",
-            output
+            output_path
+        ),
+    }
+}
+
+fn print_timeout_notice(
+    output: &mut dyn Write,
+    action: &OutputAction,
+    timeout: Duration,
+) -> io::Result<()> {
+    let seconds = timeout.as_secs();
+    match action {
+        OutputAction::DryRun => writeln!(
+            output,
+            "Timeout triggered after {seconds} seconds; reporting best result found so far."
+        ),
+        OutputAction::WrittenOptimized(_) => writeln!(
+            output,
+            "Timeout triggered after {seconds} seconds; wrote best output found so far."
+        ),
+        OutputAction::CopiedOriginal(_) | OutputAction::Preserved(_) => writeln!(
+            output,
+            "Timeout triggered after {seconds} seconds; no smaller output was written."
         ),
     }
 }
 
 fn print_detailed_header(
     output: &mut dyn Write,
+    report_mode: ReportMode,
     command: &Command,
-    input_bytes: usize,
+    input: &InputReport<'_>,
     read_elapsed: Duration,
 ) -> io::Result<()> {
-    let input_name = command
-        .input
-        .file_name()
-        .unwrap_or(command.input.as_os_str());
-    let report_mode = if command.options.visual {
-        "visual"
-    } else {
-        "verbose"
-    };
+    let input_name = display_name(input.path);
     writeln!(output)?;
-    let title = format!("{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · {report_mode}");
+    let title = format!(
+        "{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · {}",
+        report_mode.label()
+    );
     writeln!(output, "{title}")?;
     writeln!(output, "{}", "─".repeat(title.chars().count()))?;
+    if input.count > 1 {
+        writeln!(output, "File     {} of {}", input.index + 1, input.count)?;
+    }
     writeln!(
         output,
-        "Input    {:?} · {input_bytes} {} · read {}",
+        "Input    {:?} · {} {} · read {}",
         input_name,
-        plural_bytes(input_bytes),
+        input.bytes,
+        plural(input.bytes, "byte", "bytes"),
         format_elapsed(read_elapsed)
     )?;
     let strictness = if command.options.strict {
@@ -393,33 +529,22 @@ fn print_strict_mode_caution(output: &mut dyn Write, color: bool) -> io::Result<
     )
 }
 
-fn strict_mode_caution_destination(options: &Options) -> Option<CautionDestination> {
-    if options.strict {
-        None
-    } else if options.verbose {
-        Some(CautionDestination::Stdout)
-    } else {
-        Some(CautionDestination::Stderr)
-    }
-}
-
 fn print_detailed_result(
     output: &mut dyn Write,
+    input: &InputReport<'_>,
     action: &OutputAction,
-    input_bytes: usize,
-    output_bytes: usize,
-    bits_saved: u64,
+    optimized: &OptimizationReport,
     timings: &ExecutionTimings,
 ) -> io::Result<()> {
     writeln!(output)?;
     writeln!(output, "Result")?;
     match action {
         OutputAction::WrittenOptimized(path) => {
-            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            let output_name = display_name(path);
             writeln!(output, "  Output  {:?}", output_name)?;
         }
         OutputAction::CopiedOriginal(path) => {
-            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            let output_name = display_name(path);
             writeln!(
                 output,
                 "  Output  {:?} · original copied · no savings",
@@ -427,7 +552,7 @@ fn print_detailed_result(
             )?;
         }
         OutputAction::Preserved(path) => {
-            let output_name = path.file_name().unwrap_or(path.as_os_str());
+            let output_name = display_name(path);
             writeln!(
                 output,
                 "  Output  {:?} · preserved · no savings",
@@ -438,9 +563,11 @@ fn print_detailed_result(
     }
     writeln!(
         output,
-        "  Size    {input_bytes} → {output_bytes} {} · {}",
-        plural_bytes(output_bytes),
-        describe_optimization_change(input_bytes, output_bytes, bits_saved)
+        "  Size    {} → {} {} · {}",
+        input.bytes,
+        optimized.bytes,
+        plural(optimized.bytes, "byte", "bytes"),
+        describe_optimization_change(input.bytes, optimized.bytes, optimized.bits_saved)
     )?;
     if !action.wrote_file() {
         writeln!(
@@ -462,6 +589,10 @@ fn print_detailed_result(
     }
 }
 
+fn display_name(path: &Path) -> &OsStr {
+    path.file_name().unwrap_or(path.as_os_str())
+}
+
 fn describe_optimization_change(
     input_bytes: usize,
     output_bytes: usize,
@@ -477,35 +608,6 @@ fn describe_optimization_change(
     }
 }
 
-fn format_elapsed(duration: Duration) -> String {
-    if duration < Duration::from_millis(1) {
-        format!("{} µs", duration.subsec_micros())
-    } else if duration < Duration::from_secs(1) {
-        let centimilliseconds = (duration.subsec_micros() + 5) / 10;
-        format!(
-            "{}.{:02} ms",
-            centimilliseconds / 100,
-            centimilliseconds % 100
-        )
-    } else if duration < Duration::from_secs(10) {
-        let mut seconds = duration.as_secs();
-        let mut centiseconds = (duration.subsec_micros() + 5_000) / 10_000;
-        if centiseconds == 100 {
-            seconds += 1;
-            centiseconds = 0;
-        }
-        format!("{seconds}.{centiseconds:02} s")
-    } else {
-        let mut seconds = duration.as_secs();
-        let mut deciseconds = (duration.subsec_millis() + 50) / 100;
-        if deciseconds == 10 {
-            seconds = seconds.saturating_add(1);
-            deciseconds = 0;
-        }
-        format!("{seconds}.{deciseconds} s")
-    }
-}
-
 fn describe_byte_change(input_bytes: usize, output_bytes: usize) -> String {
     match input_bytes.cmp(&output_bytes) {
         std::cmp::Ordering::Greater => {
@@ -516,32 +618,16 @@ fn describe_byte_change(input_bytes: usize, output_bytes: usize) -> String {
             let percentage_hundredths = (saved * 10_000 + input_bytes / 2) / input_bytes;
             format!(
                 "saved {saved} {} ({}.{:02}%)",
-                plural_bytes(saved),
+                plural(saved, "byte", "bytes"),
                 percentage_hundredths / 100,
                 percentage_hundredths % 100
             )
         }
         std::cmp::Ordering::Less => {
             let added = output_bytes - input_bytes;
-            format!("added {added} {}", plural_bytes(added))
+            format!("added {added} {}", plural(added, "byte", "bytes"))
         }
         std::cmp::Ordering::Equal => "unchanged".to_owned(),
-    }
-}
-
-fn plural_bytes(count: usize) -> &'static str {
-    if count == 1 {
-        "byte"
-    } else {
-        "bytes"
-    }
-}
-
-fn plural_u64(count: u64, singular: &'static str, plural: &'static str) -> &'static str {
-    if count == 1 {
-        singular
-    } else {
-        plural
     }
 }
 
@@ -630,42 +716,27 @@ fn parse_args(arguments: impl IntoIterator<Item = OsString>) -> Result<ParsedCom
         ));
     }
 
-    let (input, destination) = if dry_run {
-        match positional.as_slice() {
-            [input] => (PathBuf::from(input), Destination::DryRun),
-            [_, _] => {
-                return Err(CliError::message(
-                    "--dry-run does not accept a positional output filename; \
-                     --out is ignored in dry-run mode",
-                    true,
-                ));
-            }
-            _ => return Err(CliError::usage()),
-        }
+    if positional.is_empty() {
+        return Err(CliError::usage());
+    }
+    if positional.len() > 1 && output.is_some() {
+        return Err(CliError::message(
+            "--out cannot be used when processing multiple input files",
+            true,
+        ));
+    }
+
+    let inputs = positional.into_iter().map(PathBuf::from).collect();
+    let destination = if dry_run {
+        Destination::DryRun
     } else {
-        match positional.as_slice() {
-            [input] => {
-                let destination = output.map_or(Destination::InPlace, Destination::Explicit);
-                (PathBuf::from(input), destination)
-            }
-            [input, legacy_output] if output.is_none() => (
-                PathBuf::from(input),
-                Destination::Explicit(PathBuf::from(legacy_output)),
-            ),
-            [_, _] => {
-                return Err(CliError::message(
-                    "--out cannot be combined with a positional output filename",
-                    true,
-                ));
-            }
-            _ => return Err(CliError::usage()),
-        }
+        output.map_or(Destination::InPlace, Destination::Explicit)
     };
 
     Ok(ParsedCommand::Run(Command {
         format,
         options,
-        input,
+        inputs,
         destination,
     }))
 }
@@ -753,6 +824,16 @@ fn output_error() -> CliError {
     CliError::message("--out requires an output filename", false)
 }
 
+fn print_cli_error(output: &mut dyn Write, error: CliError, color: bool) -> io::Result<()> {
+    if let Some(message) = error.message {
+        writeln!(output, "{message}")?;
+    }
+    if error.show_usage {
+        print_usage(output, color)?;
+    }
+    Ok(())
+}
+
 fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(
         output,
@@ -766,10 +847,10 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "usage: {} [options] [--out file] input",
+        "usage: {} [options] input [input ...]",
         PROGRAM_NAME
     )?;
-    writeln!(output, "       {} --dry-run [options] input", PROGRAM_NAME)?;
+    writeln!(output, "       {} [options] --out file input", PROGRAM_NAME)?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
     writeln!(output, "  -h, --help             show this help and exit")?;
@@ -791,7 +872,7 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     )?;
     writeln!(
         output,
-        "      --out <file>       write to file instead of optimizing input in place"
+        "      --out <file>       write one input to file instead of optimizing it in place"
     )?;
     writeln!(
         output,
@@ -825,6 +906,10 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(
         output,
         "By default, PNG/GZIP/ZIP metadata and comments are preserved."
+    )?;
+    writeln!(
+        output,
+        "Multiple inputs are processed sequentially; --out accepts only one input."
     )?;
     writeln!(
         output,
@@ -1277,12 +1362,25 @@ mod tests {
         let verbose = parsed_command(["--verbose", "--dry-run", "in"]);
         let mut visual_header = Vec::new();
         let mut verbose_header = Vec::new();
-        print_detailed_header(&mut visual_header, &visual, 1_024, Duration::from_millis(2))
-            .unwrap();
+        let input = InputReport {
+            path: Path::new("in"),
+            index: 0,
+            count: 1,
+            bytes: 1_024,
+        };
+        print_detailed_header(
+            &mut visual_header,
+            ReportMode::Visual,
+            &visual,
+            &input,
+            Duration::from_millis(2),
+        )
+        .unwrap();
         print_detailed_header(
             &mut verbose_header,
+            ReportMode::Verbose,
             &verbose,
-            1_024,
+            &input,
             Duration::from_millis(2),
         )
         .unwrap();
@@ -1306,12 +1404,15 @@ mod tests {
         assert!(visual_header.ends_with("Mode     normal · strict · dry run\n"));
 
         let mut result = Vec::new();
+        let optimized = OptimizationReport {
+            bytes: 1_000,
+            bits_saved: 192,
+        };
         print_detailed_result(
             &mut result,
+            &input,
             &OutputAction::DryRun,
-            1_024,
-            1_000,
-            192,
+            &optimized,
             &ExecutionTimings {
                 read: Duration::from_millis(2),
                 optimize: Duration::from_millis(30),
@@ -1325,6 +1426,135 @@ mod tests {
         assert!(result.contains("Output  not written · dry run"));
         assert!(result.contains("Size    1024 → 1000 bytes · saved 24 bytes (2.34%)"));
         assert!(result.contains("Time    32.00 ms total"));
+    }
+
+    #[test]
+    fn default_result_prefixes_the_quoted_input_filename() {
+        let mut result = Vec::new();
+        let input = InputReport {
+            path: Path::new("directory/abc.file"),
+            index: 0,
+            count: 1,
+            bytes: 100,
+        };
+        let optimized = OptimizationReport {
+            bytes: 90,
+            bits_saved: 80,
+        };
+        print_quiet_result(
+            &mut result,
+            &input,
+            &OutputAction::WrittenOptimized(PathBuf::from("output.file")),
+            &optimized,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(result).unwrap(),
+            "\"abc.file\" 100 -> 90 bytes\n"
+        );
+    }
+
+    #[test]
+    fn verbose_and_visual_share_the_detailed_result_renderer() {
+        let input = InputReport {
+            path: Path::new("directory/abc.file"),
+            index: 0,
+            count: 1,
+            bytes: 100,
+        };
+        let optimized = OptimizationReport {
+            bytes: 90,
+            bits_saved: 80,
+        };
+        let timings = ExecutionTimings {
+            read: Duration::from_millis(1),
+            optimize: Duration::from_millis(2),
+            write: Duration::ZERO,
+            total: Duration::from_millis(3),
+        };
+        let mut verbose = Vec::new();
+        let mut visual = Vec::new();
+        print_result(
+            &mut verbose,
+            ReportMode::Verbose,
+            &input,
+            &OutputAction::DryRun,
+            &optimized,
+            &timings,
+        )
+        .unwrap();
+        print_result(
+            &mut visual,
+            ReportMode::Visual,
+            &input,
+            &OutputAction::DryRun,
+            &optimized,
+            &timings,
+        )
+        .unwrap();
+
+        assert_eq!(verbose, visual);
+        let detailed = String::from_utf8(verbose).unwrap();
+        assert!(detailed.starts_with("\nResult\n"));
+        assert!(detailed.contains("Size    100 → 90 bytes · saved 10 bytes (10.00%)"));
+    }
+
+    #[test]
+    fn timeout_notice_describes_the_output_action() {
+        let timeout = Duration::from_secs(180);
+        for (action, expected) in [
+            (OutputAction::DryRun, "reporting best result found so far"),
+            (
+                OutputAction::WrittenOptimized(PathBuf::from("out")),
+                "wrote best output found so far",
+            ),
+            (
+                OutputAction::Preserved(PathBuf::from("out")),
+                "no smaller output was written",
+            ),
+        ] {
+            let mut notice = Vec::new();
+            print_timeout_notice(&mut notice, &action, timeout).unwrap();
+            let notice = String::from_utf8(notice).unwrap();
+            assert!(notice.starts_with("Timeout triggered after 180 seconds; "));
+            assert!(notice.contains(expected));
+        }
+    }
+
+    #[test]
+    fn timeout_notice_is_limited_to_verbose_and_visual_modes() {
+        assert!(!ReportMode::for_options(&parsed_options(["in"])).reports_timeout());
+        assert!(ReportMode::for_options(&parsed_options(["--verbose", "in"])).reports_timeout());
+        assert!(ReportMode::for_options(&parsed_options(["--visual", "in"])).reports_timeout());
+    }
+
+    #[test]
+    fn verbose_and_visual_batch_headers_report_the_file_position() {
+        for (flag, mode) in [("--verbose", "verbose"), ("--visual", "visual")] {
+            let command = parsed_command([flag, "first", "second", "third"]);
+            let mut header = Vec::new();
+            let input = InputReport {
+                path: Path::new("second"),
+                index: 1,
+                count: 3,
+                bytes: 42,
+            };
+
+            print_detailed_header(
+                &mut header,
+                ReportMode::for_options(&command.options),
+                &command,
+                &input,
+                Duration::ZERO,
+            )
+            .unwrap();
+
+            let header = String::from_utf8(header).unwrap();
+            assert!(header.contains(&format!("· {mode}\n")));
+            assert!(header.contains("File     2 of 3\n"));
+            assert!(header.contains("Input    \"second\" · 42 bytes"));
+        }
     }
 
     #[test]
@@ -1345,31 +1575,40 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_mode_caution_is_routed_in_default_verbose_and_visual_modes() {
+    fn report_modes_have_one_consistent_output_channel() {
         let strict = parsed_command(["in"]);
         let default = parsed_command(["--strict", "0", "in"]);
         let verbose = parsed_command(["--strict", "0", "--verbose", "in"]);
         let visual = parsed_command(["--strict", "0", "--visual", "in"]);
 
-        assert_eq!(strict_mode_caution_destination(&strict.options), None);
-        assert_eq!(
-            strict_mode_caution_destination(&default.options),
-            Some(CautionDestination::Stderr)
-        );
-        assert_eq!(
-            strict_mode_caution_destination(&verbose.options),
-            Some(CautionDestination::Stdout)
-        );
-        assert_eq!(
-            strict_mode_caution_destination(&visual.options),
-            Some(CautionDestination::Stderr)
-        );
+        assert!(strict.options.strict);
+        assert!(!default.options.strict);
+        assert!(!verbose.options.strict);
+        assert!(!visual.options.strict);
+
+        let default = ReportMode::for_options(&default.options);
+        assert_eq!(default, ReportMode::Default);
+        assert_eq!(default.channel(), OutputChannel::Stderr);
+        assert!(!default.detailed());
+        assert!(!default.reports_timeout());
+
+        let verbose = ReportMode::for_options(&verbose.options);
+        assert_eq!(verbose, ReportMode::Verbose);
+        assert_eq!(verbose.channel(), OutputChannel::Stdout);
+        assert!(verbose.detailed());
+        assert!(verbose.reports_timeout());
+
+        let visual = ReportMode::for_options(&visual.options);
+        assert_eq!(visual, ReportMode::Visual);
+        assert_eq!(visual.channel(), OutputChannel::Stderr);
+        assert!(visual.detailed());
+        assert!(visual.reports_timeout());
     }
 
     #[test]
-    fn output_defaults_in_place_and_accepts_oxipng_forms() {
+    fn output_defaults_in_place_and_accepts_oxipng_forms_for_one_input() {
         let default = parsed_command(["in"]);
-        assert_eq!(default.input, Path::new("in"));
+        assert_eq!(default.inputs, [PathBuf::from("in")]);
         assert!(matches!(default.destination, Destination::InPlace));
 
         for command in [
@@ -1377,24 +1616,35 @@ mod tests {
             parsed_command(["in", "--out", "out"]),
             parsed_command(["--out=out", "in"]),
         ] {
-            assert_eq!(command.input, Path::new("in"));
+            assert_eq!(command.inputs, [PathBuf::from("in")]);
             assert!(matches!(
                 command.destination,
                 Destination::Explicit(path) if path == Path::new("out")
             ));
         }
 
-        // Retain the old positional destination as a compatibility alias,
-        // while all help and repository tooling use --out.
-        assert!(matches!(
-            parsed_command(["in", "out"]).destination,
-            Destination::Explicit(path) if path == Path::new("out")
-        ));
         assert!(matches!(
             parsed_command(["--out=-output", "in"]).destination,
             Destination::Explicit(path) if path == Path::new("-output")
         ));
-        assert_eq!(parsed_command(["--", "-input"]).input, Path::new("-input"));
+        assert_eq!(
+            parsed_command(["--", "-input"]).inputs,
+            [PathBuf::from("-input")]
+        );
+    }
+
+    #[test]
+    fn positional_paths_are_all_sequential_inputs() {
+        let command = parsed_command(["one", "two", "three"]);
+        assert_eq!(
+            command.inputs,
+            [
+                PathBuf::from("one"),
+                PathBuf::from("two"),
+                PathBuf::from("three")
+            ]
+        );
+        assert!(matches!(command.destination, Destination::InPlace));
     }
 
     #[test]
@@ -1410,7 +1660,7 @@ mod tests {
             ),
             (
                 vec!["--out", "out", "in", "legacy"],
-                "--out cannot be combined with a positional output filename",
+                "--out cannot be used when processing multiple input files",
             ),
             (vec!["--out"], "--out requires an output filename"),
             (
@@ -1463,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn dry_run_accepts_out_but_rejects_a_legacy_positional_output() {
+    fn dry_run_accepts_multiple_inputs_and_ignores_out_for_one_input() {
         for command in [
             parsed_command(["-d", "in"]),
             parsed_command(["--dry-run", "in"]),
@@ -1471,21 +1721,25 @@ mod tests {
             parsed_command(["--dry-run", "--out", "ignored", "in"]),
             parsed_command(["in", "--out=ignored", "--dry-run"]),
         ] {
-            assert_eq!(command.input, Path::new("in"));
+            assert_eq!(command.inputs, [PathBuf::from("in")]);
             assert!(command.destination.is_dry_run());
         }
 
-        let output_error =
-            match parse_args(["--dry-run", "in", "out"].into_iter().map(OsString::from)) {
-                Err(error) => error,
-                Ok(_) => panic!("dry-run output filename should fail"),
-            };
+        let batch = parsed_command(["--dry-run", "in", "out"]);
+        assert_eq!(batch.inputs, [PathBuf::from("in"), PathBuf::from("out")]);
+        assert!(batch.destination.is_dry_run());
+
+        let output_error = match parse_args(
+            ["--dry-run", "--out", "ignored", "in", "out"]
+                .into_iter()
+                .map(OsString::from),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("batch --out should fail"),
+        };
         assert_eq!(
             output_error.message.as_deref(),
-            Some(
-                "--dry-run does not accept a positional output filename; \
-                 --out is ignored in dry-run mode"
-            )
+            Some("--out cannot be used when processing multiple input files")
         );
         assert!(output_error.show_usage);
 
@@ -1497,6 +1751,32 @@ mod tests {
             assert!(error.message.is_none());
             assert!(error.show_usage);
         }
+    }
+
+    #[test]
+    fn batch_inputs_accept_all_per_file_processing_options() {
+        let command = parsed_command([
+            "--dry-run",
+            "--raw",
+            "--strip",
+            "--max",
+            "--strict",
+            "0",
+            "--verbose",
+            "--timeout",
+            "10",
+            "one",
+            "two",
+        ]);
+
+        assert_eq!(command.format, Format::Raw);
+        assert!(command.options.strip_metadata);
+        assert!(command.options.exhaustive);
+        assert!(!command.options.strict);
+        assert!(command.options.verbose);
+        assert_eq!(command.options.timeout, Duration::from_secs(10));
+        assert!(command.destination.is_dry_run());
+        assert_eq!(command.inputs, [PathBuf::from("one"), PathBuf::from("two")]);
     }
 
     #[test]
@@ -1533,12 +1813,14 @@ mod tests {
         assert!(!help.contains("--zlib"));
         assert!(!help.contains("--gzip"));
         assert!(!help.contains("--zip"));
-        assert!(help.contains("usage: columbo [options] [--out file] input"));
-        assert!(help.contains("columbo --dry-run [options] input"));
+        assert!(help.contains("usage: columbo [options] input [input ...]"));
+        assert!(help.contains("columbo [options] --out file input"));
         assert!(help.contains("-d, --dry-run"));
         assert!(help.contains("--out <file>"));
-        assert!(help.contains("instead of optimizing input in place"));
+        assert!(help.contains("instead of optimizing it in place"));
         assert!(help.contains("without writing output"));
+        assert!(help.contains("Multiple inputs are processed sequentially"));
+        assert!(help.contains("--out accepts only one input"));
         assert!(help.contains("meaningful Deflate bit is saved"));
         assert!(help.contains("Advanced:"));
         assert!(help.contains("--raw"));
@@ -1598,13 +1880,61 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input: input.clone(),
+            inputs: vec![input.clone()],
             destination: Destination::DryRun,
         })
         .unwrap();
 
         assert_eq!(fs::read(&input).unwrap(), [0x03, 0x00]);
         assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn batch_continues_sequentially_after_a_file_error() {
+        let source = [
+            0x75, 0xc0, 0x41, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x21, 0x6d, 0xf8, 0x37, 0xb5, 0x7f,
+            0x97, 0x03, 0xcb, 0xb2, 0x3c, 0x82, 0x20, 0x08, 0x0e,
+        ];
+        let expected = optimize(&source, Format::Raw, &Options::default()).unwrap();
+        assert_eq!(expected.bits_saved, 1);
+
+        let directory = unique_test_directory();
+        let missing = directory.join("missing.deflate");
+        let valid = directory.join("valid.deflate");
+        fs::write(&valid, source).unwrap();
+
+        let result = execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            inputs: vec![missing, valid.clone()],
+            destination: Destination::InPlace,
+        });
+
+        assert_eq!(result, Err(1));
+        assert_eq!(fs::read(valid).unwrap(), expected.data);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn batch_dry_run_leaves_every_input_unchanged() {
+        let directory = unique_test_directory();
+        let first = directory.join("first.deflate");
+        let second = directory.join("second.deflate");
+        fs::write(&first, [0x03, 0x00]).unwrap();
+        fs::write(&second, [0x03, 0x00]).unwrap();
+
+        execute(Command {
+            format: Format::Raw,
+            options: Options::default(),
+            inputs: vec![first.clone(), second.clone()],
+            destination: Destination::DryRun,
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(first).unwrap(), [0x03, 0x00]);
+        assert_eq!(fs::read(second).unwrap(), [0x03, 0x00]);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1621,7 +1951,7 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input: input.clone(),
+            inputs: vec![input.clone()],
             destination: Destination::InPlace,
         })
         .unwrap();
@@ -1643,7 +1973,7 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input,
+            inputs: vec![input],
             destination: Destination::Explicit(output.clone()),
         })
         .unwrap();
@@ -1662,7 +1992,7 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input,
+            inputs: vec![input],
             destination: Destination::Explicit(output.clone()),
         })
         .unwrap();
@@ -1687,7 +2017,7 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input: input.clone(),
+            inputs: vec![input.clone()],
             destination: Destination::InPlace,
         })
         .unwrap();
@@ -1708,7 +2038,7 @@ mod tests {
         execute(Command {
             format: Format::Raw,
             options: Options::default(),
-            input: input.clone(),
+            inputs: vec![input.clone()],
             destination: Destination::InPlace,
         })
         .unwrap();

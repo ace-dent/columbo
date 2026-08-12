@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::{terminal, Options};
 
-use super::{BlockEncoding, BlockReport, CandidateProgress, StreamProgress};
+use super::{write_format_summary, BlockEncoding, BlockReport, CandidateProgress, StreamProgress};
 
 const DEFAULT_COLUMNS: usize = 80;
 const MAX_TERMINAL_COLUMNS: usize = 4_096;
@@ -369,10 +369,7 @@ impl Renderer {
         let (margin_width, card_width) = card_dimensions(self.columns);
         let margin = " ".repeat(margin_width);
         let mut output = io::stderr().lock();
-        let _ = writeln!(output, "Format   {format}");
-        if let Some(deflate_streams) = self.deflate_streams {
-            let _ = writeln!(output, "Deflate streams  {deflate_streams}");
-        }
+        let _ = write_format_summary(&mut output, format, self.deflate_streams);
         let _ = writeln!(output);
         let full_legend = format!(
             "{} stored  {} fixed  {} dynamic  {} boundary  {} working  {} changed  {} saved",

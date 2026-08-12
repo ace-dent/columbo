@@ -7,9 +7,12 @@
 //! standard error. Both consume the same low-frequency optimizer checkpoints.
 
 use std::cell::{Cell, RefCell};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+pub(crate) use crate::presentation::format_duration;
+use crate::presentation::{plural, plural_u64};
 use crate::{Format, Options};
 
 mod visual;
@@ -20,6 +23,37 @@ static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
 const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgressMode {
+    Disabled,
+    Verbose,
+    Visual,
+}
+
+impl ProgressMode {
+    fn for_options(options: &Options) -> Self {
+        if visual::enabled(options) {
+            Self::Visual
+        } else if options.verbose {
+            Self::Verbose
+        } else {
+            Self::Disabled
+        }
+    }
+
+    fn enabled(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    fn verbose(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+
+    fn visual(self) -> bool {
+        matches!(self, Self::Visual)
+    }
+}
 
 thread_local! {
     static STREAM_GROUP: RefCell<Option<StreamGroup>> = const { RefCell::new(None) };
@@ -176,12 +210,10 @@ pub(crate) struct StreamProgress {
 #[derive(Clone, Copy)]
 pub(crate) struct Progress {
     color: bool,
-    enabled: bool,
+    mode: ProgressMode,
     optimizer_started: Instant,
     slice_budget: bool,
     stream_id: usize,
-    verbose: bool,
-    visual: bool,
 }
 
 impl Progress {
@@ -191,17 +223,14 @@ impl Progress {
         stream: StreamProgress,
         source_report: Option<BlockReport>,
     ) -> Self {
-        let visual = visual::enabled(options);
-        let verbose = options.verbose && !visual;
-        if !verbose && !visual {
+        let mode = ProgressMode::for_options(options);
+        if !mode.enabled() {
             return Self {
                 color: false,
-                enabled: false,
+                mode,
                 optimizer_started,
                 slice_budget: false,
                 stream_id: 0,
-                verbose: false,
-                visual: false,
             };
         }
 
@@ -210,8 +239,8 @@ impl Progress {
             || NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
             |group| group.id,
         );
-        let color = terminal_color_enabled();
-        if visual {
+        let color = mode.verbose() && terminal_color_enabled();
+        if mode.visual() {
             visual::begin(
                 stream_id,
                 group
@@ -263,30 +292,28 @@ impl Progress {
 
         Self {
             color,
-            enabled: true,
+            mode,
             optimizer_started,
             slice_budget: group.is_some_and(|group| group.slice_budget),
             stream_id,
-            verbose,
-            visual,
         }
     }
 
     pub(crate) fn enabled(self) -> bool {
-        self.enabled
+        self.mode.enabled()
     }
 
     pub(crate) fn normalization(self, blocks: usize, elapsed: Duration) {
-        if !self.enabled || blocks == 0 {
+        if !self.mode.enabled() || blocks == 0 {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(
                 self.stream_id,
                 &format!("Strict normalization · {blocks} blocks"),
             );
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!(
@@ -300,10 +327,10 @@ impl Progress {
     }
 
     pub(crate) fn same_distance_opportunities(self, report: SameDistanceProgress) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             let status = if report.runs == 0 {
                 "Source parsed · no adjacent match runs".to_owned()
             } else {
@@ -314,7 +341,7 @@ impl Progress {
             };
             visual::activity(self.stream_id, &status);
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         if report.runs == 0 {
@@ -343,17 +370,17 @@ impl Progress {
     }
 
     pub(crate) fn routes(self) {
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(self.stream_id, "Choosing optimization routes");
-        } else if self.enabled {
+        } else if self.mode.enabled() {
             println!();
             println!("  S{} Routes", self.stream_id);
         }
     }
 
     pub(crate) fn start(self, name: &'static str) -> RouteStep {
-        if self.enabled {
-            if self.visual {
+        if self.mode.enabled() {
+            if self.mode.visual() {
                 visual::route_started(self.stream_id, name);
             } else {
                 println!("  S{} {} {name}…", self.stream_id, arrow(self.color));
@@ -385,7 +412,7 @@ impl Progress {
     ) -> (RouteStep, RouteProgress) {
         let step = self.start(name);
         let heartbeat_interval = route_heartbeat_interval(budget);
-        let route_started = self.enabled.then(Instant::now);
+        let route_started = self.mode.enabled().then(Instant::now);
         let details = RouteProgress {
             best_bits: Cell::new(None),
             best_blocks: Cell::new(0),
@@ -393,7 +420,7 @@ impl Progress {
             completed: Cell::new(0),
             current_tokens: Cell::new(None),
             deadline_reached: Cell::new(false),
-            enabled: self.enabled,
+            mode: self.mode,
             finalizing_after_soft_deadline: Cell::new(false),
             heartbeat_emitted: Cell::new(false),
             heartbeat_interval,
@@ -406,20 +433,18 @@ impl Progress {
             total: Cell::new(0),
             unit_plural: Cell::new("items"),
             unit_singular: Cell::new("item"),
-            verbose: self.verbose,
-            visual: self.visual,
         };
         (step, details)
     }
 
     pub(crate) fn candidate(self, name: &'static str, candidate: CandidateProgress) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::candidate(self.stream_id, name, &candidate);
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         let marker = if candidate.profitable {
@@ -440,9 +465,9 @@ impl Progress {
     }
 
     pub(crate) fn skipped(self, name: &'static str, reason: &'static str) {
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(self.stream_id, &format!("{name} skipped · {reason}"));
-        } else if self.enabled {
+        } else if self.mode.enabled() {
             println!(
                 "  S{}   {} {name} skipped · {reason}",
                 self.stream_id,
@@ -452,13 +477,13 @@ impl Progress {
     }
 
     pub(crate) fn blocks(self, report: Option<BlockReport>) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::final_plan(self.stream_id, report.as_ref());
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!();
@@ -504,10 +529,10 @@ impl Progress {
         source_bits: u64,
         timed_out: bool,
     ) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::finish(
                 self.stream_id,
                 selected_route,
@@ -519,7 +544,7 @@ impl Progress {
                 self.slice_budget,
             );
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!(
@@ -557,7 +582,7 @@ pub(crate) struct RouteProgress {
     completed: Cell<usize>,
     current_tokens: Cell<Option<usize>>,
     deadline_reached: Cell<bool>,
-    enabled: bool,
+    mode: ProgressMode,
     finalizing_after_soft_deadline: Cell<bool>,
     heartbeat_emitted: Cell<bool>,
     heartbeat_interval: Duration,
@@ -570,8 +595,6 @@ pub(crate) struct RouteProgress {
     total: Cell<usize>,
     unit_plural: Cell<&'static str>,
     unit_singular: Cell<&'static str>,
-    verbose: bool,
-    visual: bool,
 }
 
 impl RouteProgress {
@@ -583,7 +606,7 @@ impl RouteProgress {
             completed: Cell::new(0),
             current_tokens: Cell::new(None),
             deadline_reached: Cell::new(false),
-            enabled: false,
+            mode: ProgressMode::Disabled,
             finalizing_after_soft_deadline: Cell::new(false),
             heartbeat_emitted: Cell::new(false),
             heartbeat_interval: MAX_ROUTE_HEARTBEAT,
@@ -596,26 +619,24 @@ impl RouteProgress {
             total: Cell::new(0),
             unit_plural: Cell::new("items"),
             unit_singular: Cell::new("item"),
-            verbose: false,
-            visual: false,
         }
     }
 
     pub(crate) fn enabled(&self) -> bool {
-        self.enabled
+        self.mode.enabled()
     }
 
     pub(crate) fn deadline_reached(&self) {
-        if self.enabled {
+        if self.mode.enabled() {
             self.deadline_reached.set(true);
         }
     }
 
     pub(crate) fn finalizing_after_soft_deadline(&self, grace: Duration) {
-        if !self.enabled || self.finalizing_after_soft_deadline.replace(true) {
+        if !self.mode.enabled() || self.finalizing_after_soft_deadline.replace(true) {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(
                 self.stream_id,
                 &format!(
@@ -624,7 +645,7 @@ impl RouteProgress {
                 ),
             );
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!(
@@ -635,7 +656,7 @@ impl RouteProgress {
     }
 
     pub(crate) fn deadline_was_reached(&self) -> bool {
-        self.enabled && self.deadline_reached.get()
+        self.mode.enabled() && self.deadline_reached.get()
     }
 
     pub(crate) fn phase(
@@ -645,7 +666,7 @@ impl RouteProgress {
         singular: &'static str,
         plural: &'static str,
     ) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
         self.phase.set(name);
@@ -657,10 +678,10 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
-        if self.visual {
+        if self.mode.visual() {
             visual::work(self.stream_id, name, 0, total);
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!(
@@ -674,9 +695,9 @@ impl RouteProgress {
 
     /// Update the current work position without printing a line per item.
     pub(crate) fn advance(&self, completed: usize) {
-        if self.enabled {
+        if self.mode.enabled() {
             self.completed.set(completed.min(self.total.get()));
-            if self.visual {
+            if self.mode.visual() {
                 visual::work(
                     self.stream_id,
                     self.phase.get(),
@@ -689,10 +710,10 @@ impl RouteProgress {
 
     /// Identify the block currently being searched for heartbeat context.
     pub(crate) fn item(&self, current: usize, tokens: usize) {
-        if self.enabled {
+        if self.mode.enabled() {
             self.completed.set(current.min(self.total.get()));
             self.current_tokens.set(Some(tokens));
-            if self.visual {
+            if self.mode.visual() {
                 visual::work(
                     self.stream_id,
                     self.phase.get(),
@@ -708,9 +729,9 @@ impl RouteProgress {
     /// Unlike `phase`, this emits no immediate line and does not reset the
     /// silence timer. It is safe to call at existing block/merge boundaries.
     pub(crate) fn activity(&self, name: &'static str) {
-        if self.enabled {
+        if self.mode.enabled() {
             self.phase.set(name);
-            if self.visual {
+            if self.mode.visual() {
                 visual::work(self.stream_id, name, self.completed.get(), self.total.get());
             }
         }
@@ -718,10 +739,10 @@ impl RouteProgress {
 
     /// Print a periodic status line from an existing deadline probe.
     pub(crate) fn heartbeat(&self) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
-        if self.visual {
+        if self.mode.visual() {
             visual::work(
                 self.stream_id,
                 self.phase.get(),
@@ -785,7 +806,7 @@ impl RouteProgress {
 
     /// Report one complete internal candidate and retain the best bit count.
     pub(crate) fn checkpoint(&self, name: &'static str, bits: u64, blocks: usize) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
         let previous = self.best_bits.get();
@@ -800,10 +821,10 @@ impl RouteProgress {
         }
         self.last_reported.set(Some(Instant::now()));
 
-        if self.visual {
+        if self.mode.visual() {
             visual::checkpoint(self.stream_id, name, bits, blocks, improved);
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
 
@@ -843,7 +864,7 @@ impl RouteProgress {
     }
 
     pub(crate) fn replay_started(&self, round: usize, limit: usize, blocks: usize, bits: u64) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
         self.phase.set("Replanning emitted stream");
@@ -855,7 +876,7 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
-        if self.visual {
+        if self.mode.visual() {
             visual::work(
                 self.stream_id,
                 "Replanning emitted stream",
@@ -863,7 +884,7 @@ impl RouteProgress {
                 limit,
             );
         }
-        if !self.verbose {
+        if !self.mode.verbose() {
             return;
         }
         println!(
@@ -884,7 +905,7 @@ impl RouteProgress {
         elapsed: Duration,
         accepted: bool,
     ) {
-        if !self.enabled {
+        if !self.mode.enabled() {
             return;
         }
         self.completed.set(round);
@@ -892,10 +913,10 @@ impl RouteProgress {
         if accepted {
             self.best_bits.set(Some(after_bits));
             self.best_blocks.set(blocks);
-            if self.visual {
+            if self.mode.visual() {
                 visual::checkpoint(self.stream_id, "Replay accepted", after_bits, blocks, true);
             }
-            if !self.verbose {
+            if !self.mode.verbose() {
                 return;
             }
             println!(
@@ -907,10 +928,10 @@ impl RouteProgress {
                 plural(blocks, "block", "blocks")
             );
         } else {
-            if self.visual {
+            if self.mode.visual() {
                 visual::activity(self.stream_id, "Replay stable · best retained");
             }
-            if !self.verbose {
+            if !self.mode.verbose() {
                 return;
             }
             println!(
@@ -923,12 +944,12 @@ impl RouteProgress {
     }
 
     pub(crate) fn replay_stopped(&self, round: usize, elapsed: Duration, reason: &'static str) {
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(
                 self.stream_id,
                 &format!("Replay {round} stopped · {reason}"),
             );
-        } else if self.enabled {
+        } else if self.mode.enabled() {
             println!(
                 "  S{}       {} Replay {round} · {} · {reason}",
                 self.stream_id,
@@ -939,9 +960,9 @@ impl RouteProgress {
     }
 
     pub(crate) fn stopped(&self, reason: &'static str) {
-        if self.visual {
+        if self.mode.visual() {
             visual::activity(self.stream_id, reason);
-        } else if self.enabled {
+        } else if self.mode.enabled() {
             println!(
                 "  S{}       {} {reason} · {} route elapsed",
                 self.stream_id,
@@ -968,7 +989,7 @@ impl RouteStep {
             return;
         };
         let elapsed = started.elapsed();
-        if self.progress.visual {
+        if self.progress.mode.visual() {
             match candidate.as_ref() {
                 Some(candidate) => visual::candidate(self.progress.stream_id, self.name, candidate),
                 None => visual::activity(
@@ -977,7 +998,7 @@ impl RouteStep {
                 ),
             }
         }
-        if !self.progress.verbose {
+        if !self.progress.mode.verbose() {
             return;
         }
         match candidate {
@@ -1014,10 +1035,10 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
-        if self.progress.visual {
+        if self.progress.mode.visual() {
             visual::activity(self.progress.stream_id, &format!("{} complete", self.name));
         }
-        if !self.progress.verbose {
+        if !self.progress.mode.verbose() {
             return;
         }
         println!(
@@ -1033,10 +1054,10 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
-        if self.progress.visual {
+        if self.progress.mode.visual() {
             visual::activity(self.progress.stream_id, &format!("{} failed", self.name));
         }
-        if !self.progress.verbose {
+        if !self.progress.mode.verbose() {
             return;
         }
         println!(
@@ -1062,19 +1083,30 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         Format::Gzip => "GZIP",
         Format::Zip => "ZIP",
     };
-    if visual::enabled(options) {
-        visual::format_detected(label, deflate_streams);
-    } else if options.verbose {
-        println!("Format   {label}");
-        if let Some(deflate_streams) = deflate_streams {
-            println!("Deflate streams  {deflate_streams}");
+    match ProgressMode::for_options(options) {
+        ProgressMode::Visual => visual::format_detected(label, deflate_streams),
+        ProgressMode::Verbose => {
+            let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
         }
+        ProgressMode::Disabled => {}
     }
+}
+
+fn write_format_summary(
+    output: &mut dyn Write,
+    format: &str,
+    deflate_streams: Option<usize>,
+) -> io::Result<()> {
+    writeln!(output, "Format   {format}")?;
+    if let Some(deflate_streams) = deflate_streams {
+        writeln!(output, "Deflate streams  {deflate_streams}")?;
+    }
+    Ok(())
 }
 
 /// Whether block-plan snapshots will be consumed by a progress renderer.
 pub(crate) fn reports_enabled(options: &Options) -> bool {
-    options.verbose || visual::enabled(options)
+    ProgressMode::for_options(options).enabled()
 }
 
 fn duplicate_stream_suffix(duplicates: &[usize]) -> String {
@@ -1087,35 +1119,6 @@ fn duplicate_stream_suffix(duplicates: &[usize]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" · duplicates {identifiers}")
-}
-
-pub(crate) fn format_duration(duration: Duration) -> String {
-    if duration < Duration::from_millis(1) {
-        format!("{} µs", duration.subsec_micros())
-    } else if duration < Duration::from_secs(1) {
-        let centimilliseconds = (duration.subsec_micros() + 5) / 10;
-        format!(
-            "{}.{:02} ms",
-            centimilliseconds / 100,
-            centimilliseconds % 100
-        )
-    } else if duration < Duration::from_secs(10) {
-        let mut seconds = duration.as_secs();
-        let mut centiseconds = (duration.subsec_micros() + 5_000) / 10_000;
-        if centiseconds == 100 {
-            seconds += 1;
-            centiseconds = 0;
-        }
-        format!("{seconds}.{centiseconds:02} s")
-    } else {
-        let mut seconds = duration.as_secs();
-        let mut deciseconds = (duration.subsec_millis() + 50) / 100;
-        if deciseconds == 10 {
-            seconds = seconds.saturating_add(1);
-            deciseconds = 0;
-        }
-        format!("{seconds}.{deciseconds} s")
-    }
 }
 
 pub(crate) fn describe_bit_change(reference_bits: u64, candidate_bits: u64) -> String {
@@ -1144,22 +1147,6 @@ fn format_bit_count(bits: u64) -> String {
 
 fn terminal_color_enabled() -> bool {
     crate::terminal::stdout_color_enabled()
-}
-
-fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 {
-        singular
-    } else {
-        plural
-    }
-}
-
-fn plural_u64<'a>(count: u64, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 {
-        singular
-    } else {
-        plural
-    }
 }
 
 fn arrow(color: bool) -> &'static str {
@@ -1222,6 +1209,16 @@ mod tests {
         assert_eq!(format_duration(Duration::from_millis(999)), "999.00 ms");
         assert_eq!(format_duration(Duration::from_secs(1)), "1.00 s");
         assert_eq!(format_duration(Duration::from_secs(10)), "10.0 s");
+    }
+
+    #[test]
+    fn verbose_and_visual_share_the_format_summary_rows() {
+        let mut summary = Vec::new();
+        write_format_summary(&mut summary, "ZIP", Some(3)).unwrap();
+        assert_eq!(
+            String::from_utf8(summary).unwrap(),
+            "Format   ZIP\nDeflate streams  3\n"
+        );
     }
 
     #[test]
