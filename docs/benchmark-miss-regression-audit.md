@@ -24,15 +24,15 @@ replays are retained under `work/*-final-broad-sample.json` and
 | Benchmark | Completed rows | Miss rows | Unique miss files | Miss classification | Prior-result regression files | Errors |
 | --- | ---: | ---: | ---: | --- | ---: | ---: |
 | DeflOpt | 1,914 | 15 | 9 | 15 strict-policy rows | 10 | 0 |
-| Defluff | 66 | 2 | 2 | 2 strict-policy rows | 0 | 0 |
+| Defluff (`--strict 0`) | 66 | 0 | 0 | — | 0 | 0 |
 | timed deft4j | 1,621 | 21 | 21 | 20 strict-policy rows; 1 PNG preservation-policy row | 11 | 0 |
-| Combined | 3,601 | 38 | 30 | 37 strict-policy rows; 1 PNG preservation-policy row; no unclassified row | 19 unique | 0 |
+| Combined | 3,601 | 36 | 28 | 35 strict-policy rows; 1 PNG preservation-policy row; no unclassified row | 19 unique | 0 |
 
-The complete DeflOpt and Defluff reports were refreshed with the final build.
-The deft4j report remains the recorded historical journal, with every miss
-separately replayed on the final build. All final reports, samples, miss
-replays, and the priority guard use binary SHA-256
-`c8eea2e26a2a6300a3212fbf843a60fc27d5ed4272d5e03430c5631eb2716a44`.
+The complete DeflOpt report and deft4j miss replays use final-build binary
+SHA-256 `c8eea2e26a2a6300a3212fbf843a60fc27d5ed4272d5e03430c5631eb2716a44`.
+The complete like-for-like Defluff refresh uses the current distribution
+binary SHA-256
+`8ae993583b7ea95291e5eb185d7ea7d8f60b639a96ed3e94f538c75283003261`.
 
 ## DeflOpt misses
 
@@ -57,21 +57,21 @@ The complete final-build refresh covers all 15 rows above. Max was never worse
 than its completed Default result, and every strict miss reached parity or
 better in a same-binary relaxed audit.
 
-## Defluff misses
+## Defluff comparison
 
-The complete final-build Defluff run has 66 rows, no error, and no
-prior-result regression. Its only two misses have the same strict-output
-cause as their corresponding non-hard DeflOpt cases, but are distinct corpus
-files. Both reach parity or better with `--strict 0`; they are not Default
-search failures.
+Defluff permits compatibility-sensitive empty or singleton Huffman alphabets,
+so its benchmark now invokes Columbo with `--strict 0` for a like-for-like
+comparison. Default Columbo remains strict and continues to emit complete
+Huffman codes for compatibility with old Windows Explorer decoders.
 
-| File | Bytes | Bits | Relaxed bytes | Relaxed bits |
-| --- | ---: | ---: | ---: | ---: |
-| `pkmn-bw-hard/023-Ekans-2.png` | 1 | 5 | 0 | -1 |
-| `pkmn-bw-hard/060-Poliwag-2.png` | 1 | 4 | -1 | -7 |
+The complete relaxed run has 66 rows, no errors, no prior-result regressions,
+and no misses. The two former strict-policy differences are now resolved in
+the benchmark: `pkmn-bw-hard/023-Ekans-2.png` is equal in file bytes and one
+Deflate bit better, while `pkmn-bw-hard/060-Poliwag-2.png` is one byte and
+seven bits better than Defluff.
 
-Across all 66 files, strict Default Columbo is 22 bytes and 243 meaningful
-Deflate bits smaller than Defluff in aggregate.
+Across all 66 files, relaxed Columbo is 27 bytes and 273 meaningful Deflate
+bits smaller than Defluff in aggregate.
 
 ## Timed deft4j misses
 
