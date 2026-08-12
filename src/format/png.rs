@@ -106,7 +106,6 @@ struct ParseState {
 
 struct DecodeBudget {
     remaining: u64,
-    timed_out: bool,
     deadline: SearchDeadline,
 }
 
@@ -140,7 +139,6 @@ pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
-        timed_out: false,
         deadline: SearchDeadline::new(options),
     };
     let parsed = parse(input, options.strip_metadata)?;
@@ -185,7 +183,6 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         let mut quick_options = options.clone();
         quick_options.timeout = quick_options.timeout.min(Duration::from_millis(100));
         let remaining_before_probe = budget.remaining;
-        let timed_out_before_probe = budget.timed_out;
         let probe_allowance = remaining_before_probe.min(probe_work_remaining);
         budget.remaining = probe_allowance;
         let probe = optimize_compressed_body(
@@ -206,7 +203,6 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                 // repeat the same near-limit decode.
                 probe_work_remaining = 0;
                 budget.remaining = remaining_before_probe;
-                budget.timed_out = timed_out_before_probe;
                 continue;
             }
             Err(error) => return Err(error),
@@ -224,7 +220,6 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         } else {
             budget.remaining = remaining_before_probe.saturating_sub(decoded_work);
         }
-        budget.timed_out = timed_out_before_probe;
     }
 
     precompute_max_metadata_floors(
@@ -240,6 +235,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         parsed.idat_decoded_size,
         &parsed.fdat_frames,
         &parsed.fdat_decoded_sizes,
+        parsed.chunks.iter().any(|chunk| {
+            !should_strip(chunk.kind, options) && supported_compressed_metadata(chunk)
+        }),
         options,
         &mut budget,
     )?;
@@ -266,7 +264,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             data,
             source_deflate_bits,
             source_deflate_bits,
-            budget.timed_out,
+            budget.deadline.is_expired(),
         ));
     }
 
@@ -390,7 +388,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         output,
         source_deflate_bits,
         output_deflate_bits,
-        budget.timed_out,
+        budget.deadline.is_expired(),
     ))
 }
 
@@ -491,7 +489,6 @@ fn refine_cached_compressed_body(
         true,
         DefaultFloor::Established,
     )?;
-    budget.timed_out |= refined.timed_out;
     let info = refined
         .info
         .as_ref()
@@ -1200,8 +1197,10 @@ fn image_job_stream_group(job: ImageJob, representatives: &[usize]) -> (usize, V
 // but only the raw Deflate searches receive the proportional slices below.
 // Reserve ten percent outside the non-largest slices (twenty percent for a
 // container with more than 32 unique image streams). The final largest stream
-// receives the remaining search time; the raw optimizer's global ten-percent
-// plus one-second grace replaces the former PNG-specific recovery allowance.
+// receives the remaining initial search time. Streams that exhaust those fair
+// shares are queued for weighted reclaim passes using real time left after all
+// initial work. The raw optimizer's ten-percent-plus-one-second grace applies
+// within each admitted slice; only the container deadline is a file timeout.
 const NON_LARGEST_IMAGE_SEARCH_FRACTION: f64 = 0.90;
 const MANY_IMAGE_SEARCH_FRACTION: f64 = 0.80;
 const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
@@ -1216,6 +1215,7 @@ fn optimize_image_streams(
     idat_decoded_size: u64,
     frames: &[Vec<u8>],
     frame_decoded_sizes: &[u64],
+    has_later_streams: bool,
     options: &Options,
     budget: &mut DecodeBudget,
 ) -> Result<(FrameOptimization, Vec<FrameOptimization>)> {
@@ -1306,8 +1306,9 @@ fn optimize_image_streams(
         && !options.visual
         && !budget.deadline.remaining().is_zero()
         && parallel_multi_image_is_bounded(total_weight, total_decoded_size);
-    if parallel_multi_image {
-        let (results, timed_out) = optimize_image_jobs_parallel(
+    let mut results = if parallel_multi_image {
+        let phase_fraction = if has_later_streams { 0.86 } else { 0.96 };
+        let results = optimize_image_jobs_parallel(
             &jobs,
             idat,
             idat_decoded_size,
@@ -1317,17 +1318,18 @@ fn optimize_image_streams(
             options,
             // Reserve a small container margin outside child raw-route grace
             // for per-stream parsing, worker joins, and PNG reconstruction.
-            scale_duration(budget.deadline.remaining(), 0.96),
+            scale_duration(budget.deadline.remaining(), phase_fraction),
         )?;
-        for (job, result) in results {
-            store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
-        }
         // Every unique stream was validated against its exact IHDR/fcTL size.
         // Charge duplicate frames as well, but only once after all workers have
         // rejoined so no thread mutates the shared file budget.
         budget.remaining -= total_decoded_size;
-        budget.timed_out |= timed_out;
+        results
     } else {
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(jobs.len())
+            .map_err(|_| Error::new("could not allocate PNG frame results"))?;
         for job in jobs {
             let weight = match job {
                 ImageJob::Idat => idat.len(),
@@ -1335,9 +1337,14 @@ fn optimize_image_streams(
             };
             let mut call_options = options.clone();
             let file_remaining = budget.deadline.remaining();
+            let image_remaining = if has_later_streams {
+                scale_duration(file_remaining, NON_LARGEST_IMAGE_SEARCH_FRACTION)
+            } else {
+                file_remaining
+            };
             call_options.timeout = image_stream_timeout(
                 options.timeout,
-                file_remaining,
+                image_remaining,
                 weight,
                 total_weight,
                 non_largest_fraction,
@@ -1372,12 +1379,34 @@ fn optimize_image_streams(
             };
             let result = if options.visual || options.verbose {
                 let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
-                crate::progress::with_stream_group(stream_id, &duplicates, optimize_job)?
+                if call_options.timeout < file_remaining {
+                    crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?
+                } else {
+                    crate::progress::with_stream_group(stream_id, &duplicates, optimize_job)?
+                }
             } else {
                 optimize_job()?
             };
-            store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
+            results.push((job, result));
         }
+        results
+    };
+
+    reclaim_timed_out_image_jobs(
+        &mut results,
+        idat,
+        idat_decoded_size,
+        frames,
+        frame_decoded_sizes,
+        &representative_weights,
+        &representatives,
+        image_floor,
+        has_later_streams,
+        options,
+        &budget.deadline,
+    )?;
+    for (job, result) in results {
+        store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
     }
 
     for (index, &representative) in representatives.iter().enumerate() {
@@ -1410,8 +1439,7 @@ fn optimize_image_streams(
         complete.push(frame.expect("every APNG frame has a representative result"));
     }
 
-    budget.timed_out |=
-        reuse_best_exact_frames(&mut complete, &mut || budget.deadline.remaining().is_zero());
+    let _ = reuse_best_exact_frames(&mut complete, &mut || budget.deadline.remaining().is_zero());
     Ok((
         optimized_idat.expect("the IDAT job is always present"),
         complete,
@@ -1432,6 +1460,114 @@ fn store_image_job_result(
         ImageJob::Idat => *optimized_idat = Some(result),
         ImageJob::Frame(index) => optimized_frames[index] = Some(result),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reclaim_timed_out_image_jobs(
+    results: &mut [(ImageJob, zlib::StreamOptimization)],
+    idat: &[u8],
+    idat_decoded_size: u64,
+    frames: &[Vec<u8>],
+    frame_decoded_sizes: &[u64],
+    representative_weights: &[usize],
+    representatives: &[usize],
+    default_floor: DefaultFloor,
+    has_later_streams: bool,
+    options: &Options,
+    deadline: &SearchDeadline,
+) -> Result<()> {
+    let mut pending = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, result))| result.timed_out.then_some(index))
+        .collect::<Vec<_>>();
+    if pending.is_empty() || deadline.is_expired() {
+        return Ok(());
+    }
+
+    // Leave a final share for compressed PNG metadata, which is reconstructed
+    // after the image streams. Files containing only image streams can reclaim
+    // the complete actual remainder.
+    let reclaim_started = Instant::now();
+    let reclaim_allowance = if has_later_streams {
+        scale_duration(deadline.remaining(), NON_LARGEST_IMAGE_SEARCH_FRACTION)
+    } else {
+        deadline.remaining()
+    };
+
+    while !pending.is_empty() && !deadline.is_expired() {
+        let remaining = reclaim_allowance
+            .saturating_sub(reclaim_started.elapsed())
+            .min(deadline.remaining());
+        if remaining.is_zero() {
+            break;
+        }
+        let total_weight = pending.iter().try_fold(0_usize, |total, &index| {
+            total.checked_add(image_job_weight(
+                results[index].0,
+                idat,
+                representative_weights,
+            ))
+        });
+        let Some(mut remaining_weight) = total_weight.filter(|&weight| weight != 0) else {
+            break;
+        };
+        let mut still_pending = Vec::new();
+        still_pending
+            .try_reserve_exact(pending.len())
+            .map_err(|_| Error::new("could not allocate PNG frame schedule"))?;
+
+        for (position, &result_index) in pending.iter().enumerate() {
+            let file_remaining = reclaim_allowance
+                .saturating_sub(reclaim_started.elapsed())
+                .min(deadline.remaining());
+            if file_remaining.is_zero() {
+                break;
+            }
+            let job = results[result_index].0;
+            let weight = image_job_weight(job, idat, representative_weights);
+            let last = position + 1 == pending.len();
+            let timeout = if last {
+                file_remaining
+            } else {
+                scale_duration(
+                    file_remaining,
+                    weight as f64 / remaining_weight as f64 * 0.95,
+                )
+            };
+            remaining_weight = remaining_weight.saturating_sub(weight);
+            if timeout.is_zero() {
+                continue;
+            }
+
+            let mut retry_options = options.clone();
+            retry_options.timeout = timeout;
+            let (stream, expected_decoded_size) =
+                image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
+            let retry_job =
+                || run_png_image_zlib(stream, &retry_options, expected_decoded_size, default_floor);
+            let retry = if options.visual || options.verbose {
+                let (stream_id, duplicates) = image_job_stream_group(job, representatives);
+                crate::progress::with_stream_reclaim(stream_id, &duplicates, !last, retry_job)?
+            } else {
+                retry_job()?
+            };
+            let retry_timed_out = retry.timed_out;
+            if zlib_optimization_is_better(&retry, &results[result_index].1) {
+                results[result_index].1 = retry;
+            } else {
+                // The same search completed under the larger allowance. Even
+                // when its bytes tie the incumbent, this stream no longer
+                // needs another reclamation pass.
+                results[result_index].1.timed_out = retry_timed_out;
+            }
+            if retry_timed_out && !deadline.is_expired() {
+                still_pending.push(result_index);
+            }
+        }
+        pending = still_pending;
+    }
+    Ok(())
 }
 
 fn image_job_source<'a>(
@@ -1463,7 +1599,8 @@ fn parallel_multi_image_is_bounded(total_compressed: usize, total_decoded: u64) 
 /// Jobs are already sorted small-to-large. Contiguous balanced slices leave
 /// the largest stream in the shortest final slice when the division is uneven,
 /// preserving the serial scheduler's preference without a work-stealing queue
-/// or shared mutable state.
+/// or shared mutable state. Slice-limited results return to the caller for a
+/// work-conserving serial reclaim pass under the one file deadline.
 #[allow(clippy::too_many_arguments)]
 fn optimize_image_jobs_parallel(
     jobs: &[ImageJob],
@@ -1474,7 +1611,7 @@ fn optimize_image_jobs_parallel(
     representative_weights: &[usize],
     options: &Options,
     phase_timeout: Duration,
-) -> Result<(Vec<(ImageJob, zlib::StreamOptimization)>, bool)> {
+) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
     let worker_count = jobs.len().min(PARALLEL_MAX_IMAGE_WORKERS);
     let jobs_per_worker = jobs.len() / worker_count;
     let workers_with_extra_job = jobs.len() % worker_count;
@@ -1485,7 +1622,6 @@ fn optimize_image_jobs_parallel(
             .try_reserve_exact(worker_count)
             .map_err(|_| Error::new("could not allocate PNG image workers"))?;
         let mut fallback_results = Vec::new();
-        let mut fallback_timed_out = false;
         let mut start = 0_usize;
         for worker_index in 0..worker_count {
             let count = jobs_per_worker + usize::from(worker_index < workers_with_extra_job);
@@ -1511,7 +1647,7 @@ fn optimize_image_jobs_parallel(
                 // slice on the caller while successfully spawned workers
                 // continue their own slices.
                 Err(_) => {
-                    let (mut results, timed_out) = optimize_image_job_slice(
+                    let mut results = optimize_image_job_slice(
                         worker_jobs,
                         idat,
                         idat_decoded_size,
@@ -1522,20 +1658,18 @@ fn optimize_image_jobs_parallel(
                         phase_timeout,
                     )?;
                     fallback_results.append(&mut results);
-                    fallback_timed_out |= timed_out;
                 }
             }
         }
 
         for worker in workers {
-            let (mut results, timed_out) = match worker.join() {
+            let mut results = match worker.join() {
                 Ok(result) => result?,
                 Err(payload) => std::panic::resume_unwind(payload),
             };
             fallback_results.append(&mut results);
-            fallback_timed_out |= timed_out;
         }
-        Ok((fallback_results, fallback_timed_out))
+        Ok(fallback_results)
     })
 }
 
@@ -1549,7 +1683,7 @@ fn optimize_image_job_slice(
     representative_weights: &[usize],
     options: &Options,
     phase_timeout: Duration,
-) -> Result<(Vec<(ImageJob, zlib::StreamOptimization)>, bool)> {
+) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
     let total_weight = jobs.iter().try_fold(0_usize, |total, &job| {
         total.checked_add(image_job_weight(job, idat, representative_weights))
     });
@@ -1558,7 +1692,6 @@ fn optimize_image_job_slice(
     results
         .try_reserve_exact(jobs.len())
         .map_err(|_| Error::new("could not allocate PNG frame results"))?;
-    let mut timed_out = false;
     for &job in jobs {
         let weight = image_job_weight(job, idat, representative_weights);
         let mut call_options = options.clone();
@@ -1572,10 +1705,9 @@ fn optimize_image_job_slice(
             expected_decoded_size,
             DefaultFloor::Shared,
         )?;
-        timed_out |= optimized.timed_out;
         results.push((job, optimized));
     }
-    Ok((results, timed_out))
+    Ok(results)
 }
 
 /// Divide one worker's wall allowance while accounting for every child raw
@@ -1968,7 +2100,6 @@ fn optimize_single_image_max_parallel(
         ));
     }
     budget.remaining -= info.size;
-    budget.timed_out |= selected.timed_out;
     Ok(selected)
 }
 
@@ -2114,7 +2245,6 @@ fn optimize_scheduled_png_image_zlib(
         return Err(Error::new("PNG image data size does not match IHDR"));
     }
     budget.remaining -= info.size;
-    budget.timed_out |= result.timed_out;
     Ok(result)
 }
 
@@ -2140,7 +2270,6 @@ fn optimize_png_zlib_with_options(
         }
         budget.remaining -= info.size;
     }
-    budget.timed_out |= result.timed_out;
     Ok(result)
 }
 
@@ -2737,7 +2866,6 @@ mod tests {
         };
         let mut budget = DecodeBudget {
             remaining: options.max_decoded_bytes,
-            timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
 
@@ -2746,6 +2874,7 @@ mod tests {
             2,
             &[invalid_frame],
             &[0],
+            false,
             &options,
             &mut budget,
         )
@@ -2987,14 +3116,20 @@ mod tests {
             };
             let mut budget = DecodeBudget {
                 remaining: options.max_decoded_bytes,
-                timed_out: false,
                 deadline: SearchDeadline::new(&options),
             };
 
             let started = std::time::Instant::now();
-            let (optimized_idat, optimized_frames) =
-                optimize_image_streams(&source_idat, 2, &frames, &[2; 12], &options, &mut budget)
-                    .unwrap();
+            let (optimized_idat, optimized_frames) = optimize_image_streams(
+                &source_idat,
+                2,
+                &frames,
+                &[2; 12],
+                false,
+                &options,
+                &mut budget,
+            )
+            .unwrap();
 
             assert!(started.elapsed() < Duration::from_secs(2));
             assert_eq!(optimized_frames.len(), frames.len());
@@ -3004,6 +3139,41 @@ mod tests {
                 .zip(&source_lengths)
                 .all(|(frame, &source_len)| frame.data.len() <= source_len));
         }
+    }
+
+    #[test]
+    fn image_scheduler_reclaims_a_local_slice_without_a_file_timeout() {
+        let idat = black_scanline_zlib();
+        let slice_options = Options {
+            timeout: Duration::ZERO,
+            ..Options::default()
+        };
+        let initial = run_png_image_zlib(&idat, &slice_options, 2, DefaultFloor::Shared).unwrap();
+        assert!(initial.timed_out);
+
+        let options = Options {
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let deadline = SearchDeadline::new(&options);
+        let mut results = vec![(ImageJob::Idat, initial)];
+        reclaim_timed_out_image_jobs(
+            &mut results,
+            &idat,
+            2,
+            &[],
+            &[],
+            &[],
+            &[],
+            DefaultFloor::Shared,
+            false,
+            &options,
+            &deadline,
+        )
+        .unwrap();
+
+        assert!(!results[0].1.timed_out);
+        assert!(!deadline.is_expired());
     }
 
     #[test]
@@ -3019,11 +3189,11 @@ mod tests {
         };
         let mut budget = DecodeBudget {
             remaining: options.max_decoded_bytes,
-            timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
         let error =
-            optimize_image_streams(&idat, 0, &frames, &[2, 2], &options, &mut budget).unwrap_err();
+            optimize_image_streams(&idat, 0, &frames, &[2, 2], false, &options, &mut budget)
+                .unwrap_err();
         assert_eq!(
             error.message(),
             "decoded PNG data exceeds configured safety limit"
@@ -3035,10 +3205,9 @@ mod tests {
         };
         let mut budget = DecodeBudget {
             remaining: options.max_decoded_bytes,
-            timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
-        optimize_image_streams(&idat, 0, &frames, &[2, 2], &options, &mut budget).unwrap();
+        optimize_image_streams(&idat, 0, &frames, &[2, 2], false, &options, &mut budget).unwrap();
         assert_eq!(budget.remaining, 0);
     }
 
@@ -3301,6 +3470,7 @@ mod tests {
             ..Options::default()
         };
         let result = optimize(&input, &options).unwrap();
+        assert!(!result.timed_out);
         parse(&result.data, false).unwrap();
     }
 
@@ -3325,7 +3495,6 @@ mod tests {
         cached.resize_with(parsed.chunks.len(), || None);
         let mut budget = DecodeBudget {
             remaining: options.max_decoded_bytes,
-            timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
 
@@ -3423,7 +3592,6 @@ mod tests {
         };
         let mut budget = DecodeBudget {
             remaining: options.max_decoded_bytes,
-            timed_out: false,
             deadline: SearchDeadline::new(&options),
         };
 

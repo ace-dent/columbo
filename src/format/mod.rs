@@ -104,6 +104,10 @@ impl SearchDeadline {
     pub(super) fn remaining(&self) -> Duration {
         self.timeout.saturating_sub(self.started.elapsed())
     }
+
+    pub(super) fn is_expired(&self) -> bool {
+        self.started.elapsed() >= self.timeout
+    }
 }
 
 pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Result<Optimization> {
@@ -218,6 +222,13 @@ mod tests {
         };
 
         assert_eq!(expired.options_for_call(&options).timeout, Duration::ZERO);
+        assert!(expired.is_expired());
+
+        let active = SearchDeadline {
+            started: Instant::now(),
+            timeout: Duration::from_secs(10),
+        };
+        assert!(!active.is_expired());
     }
 
     #[test]

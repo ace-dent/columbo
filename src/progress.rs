@@ -29,6 +29,8 @@ thread_local! {
 struct StreamGroup {
     id: usize,
     duplicates: Vec<usize>,
+    note: Option<&'static str>,
+    slice_budget: bool,
 }
 
 struct StreamGroupGuard(Option<StreamGroup>);
@@ -51,10 +53,47 @@ pub(crate) fn with_stream_group<T>(
     duplicates: &[usize],
     operation: impl FnOnce() -> T,
 ) -> T {
+    with_stream_context(id, duplicates, None, false, operation)
+}
+
+/// Associate an optimizer invocation with a proportional stream search slice.
+pub(crate) fn with_stream_slice<T>(
+    id: usize,
+    duplicates: &[usize],
+    note: Option<&'static str>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    with_stream_context(id, duplicates, note, true, operation)
+}
+
+pub(crate) fn with_stream_reclaim<T>(
+    id: usize,
+    duplicates: &[usize],
+    slice_budget: bool,
+    operation: impl FnOnce() -> T,
+) -> T {
+    with_stream_context(
+        id,
+        duplicates,
+        Some("reclaimed time"),
+        slice_budget,
+        operation,
+    )
+}
+
+fn with_stream_context<T>(
+    id: usize,
+    duplicates: &[usize],
+    note: Option<&'static str>,
+    slice_budget: bool,
+    operation: impl FnOnce() -> T,
+) -> T {
     let previous = STREAM_GROUP.with(|group| {
         group.replace(Some(StreamGroup {
             id,
             duplicates: duplicates.to_vec(),
+            note,
+            slice_budget,
         }))
     });
     let _guard = StreamGroupGuard(previous);
@@ -139,6 +178,7 @@ pub(crate) struct Progress {
     color: bool,
     enabled: bool,
     optimizer_started: Instant,
+    slice_budget: bool,
     stream_id: usize,
     verbose: bool,
     visual: bool,
@@ -158,6 +198,7 @@ impl Progress {
                 color: false,
                 enabled: false,
                 optimizer_started,
+                slice_budget: false,
                 stream_id: 0,
                 verbose: false,
                 visual: false,
@@ -176,6 +217,7 @@ impl Progress {
                 group
                     .as_ref()
                     .map_or(&[][..], |group| group.duplicates.as_slice()),
+                group.as_ref().and_then(|group| group.note),
                 &stream,
                 source_report,
             );
@@ -184,8 +226,12 @@ impl Progress {
             let duplicates = group.as_ref().map_or_else(String::new, |group| {
                 duplicate_stream_suffix(&group.duplicates)
             });
+            let note = group
+                .as_ref()
+                .and_then(|group| group.note)
+                .map_or_else(String::new, |note| format!(" · {note}"));
             println!(
-                "{}Deflate stream {stream_id}{duplicates}{}",
+                "{}Deflate stream {stream_id}{note}{duplicates}{}",
                 cyan(color),
                 reset(color)
             );
@@ -219,6 +265,7 @@ impl Progress {
             color,
             enabled: true,
             optimizer_started,
+            slice_budget: group.is_some_and(|group| group.slice_budget),
             stream_id,
             verbose,
             visual,
@@ -469,6 +516,7 @@ impl Progress {
                 source_bits,
                 self.optimizer_started.elapsed(),
                 timed_out,
+                self.slice_budget,
             );
         }
         if !self.verbose {
@@ -485,7 +533,11 @@ impl Progress {
             describe_bit_change(source_bits, output_bits),
             format_duration(self.optimizer_started.elapsed()),
             if timed_out {
-                " · deadline reached"
+                if self.slice_budget {
+                    " · search slice reached"
+                } else {
+                    " · deadline reached"
+                }
             } else {
                 ""
             }

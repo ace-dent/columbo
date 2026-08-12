@@ -57,6 +57,7 @@ pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usiz
 pub(super) fn begin(
     stream_id: usize,
     duplicates: &[usize],
+    note: Option<&'static str>,
     stream: &StreamProgress,
     source_report: Option<BlockReport>,
 ) {
@@ -68,6 +69,7 @@ pub(super) fn begin(
         renderer.active = Some(StreamView {
             id: stream_id,
             duplicates: duplicates.to_vec(),
+            note,
             source_bits: stream.meaningful_bits,
             source_blocks: stream.blocks,
             source_bytes: stream.compressed_bytes,
@@ -218,6 +220,7 @@ pub(super) fn finish(
     source_bits: u64,
     elapsed: Duration,
     timed_out: bool,
+    slice_budget: bool,
 ) {
     with_renderer(|renderer| {
         let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
@@ -231,7 +234,15 @@ pub(super) fn finish(
             "✓ {route} · {} · {}{}",
             bit_change(source_bits, output_bits),
             super::format_duration(elapsed),
-            if timed_out { " · deadline" } else { "" }
+            if timed_out {
+                if slice_budget {
+                    " · search slice"
+                } else {
+                    " · deadline"
+                }
+            } else {
+                ""
+            }
         );
         renderer.redraw(RedrawUrgency::Immediate);
         renderer.active = None;
@@ -484,6 +495,7 @@ impl Renderer {
 struct StreamView {
     id: usize,
     duplicates: Vec<usize>,
+    note: Option<&'static str>,
     source_bits: u64,
     source_blocks: usize,
     source_bytes: usize,
@@ -573,16 +585,22 @@ fn render_card(
 }
 
 fn stream_title(view: &StreamView) -> String {
-    if view.duplicates.is_empty() {
-        return format!("Stream {:02}", view.id);
+    let mut title = format!("Stream {:02}", view.id);
+    if let Some(note) = view.note {
+        title.push_str(" · ");
+        title.push_str(note);
     }
-    let duplicates = view
-        .duplicates
-        .iter()
-        .map(|stream| format!("{stream:02}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Stream {:02} · duplicates {duplicates}", view.id)
+    if !view.duplicates.is_empty() {
+        let duplicates = view
+            .duplicates
+            .iter()
+            .map(|stream| format!("{stream:02}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        title.push_str(" · duplicates ");
+        title.push_str(&duplicates);
+    }
+    title
 }
 
 struct CellLayout {
@@ -1560,6 +1578,7 @@ mod tests {
         let view = StreamView {
             id: 1,
             duplicates: Vec::new(),
+            note: None,
             source_bits: 1_000,
             source_blocks: 2,
             source_bytes: 125,
@@ -1606,6 +1625,7 @@ mod tests {
         let view = StreamView {
             id: 2,
             duplicates: vec![5, 8],
+            note: None,
             source_bits: 8,
             source_blocks: 1,
             source_bytes: 1,
@@ -1622,6 +1642,13 @@ mod tests {
         assert_eq!(stream_title(&view), "Stream 02 · duplicates 05, 08");
         let [heading, ..] = render_card(&view, 80, false, Glyphs::for_unicode(true));
         assert_eq!(heading, "Stream 02 · duplicates 05, 08");
+
+        let mut reclaimed = view;
+        reclaimed.note = Some("reclaimed time");
+        assert_eq!(
+            stream_title(&reclaimed),
+            "Stream 02 · reclaimed time · duplicates 05, 08"
+        );
     }
 
     #[test]

@@ -370,7 +370,7 @@ fn optimize_once(
         && input.len() <= PARALLEL_MAX_ARCHIVE_INPUT
         && expanded_size <= PARALLEL_MEMBER_ARCHIVE_DECODED
         && uniformly_distributed_member_work(&entries);
-    let timed_out = if parallel_uniform_members {
+    let timed_out_entries = if parallel_uniform_members {
         build_uniform_entries_parallel(
             input,
             central_offset,
@@ -395,6 +395,18 @@ fn optimize_once(
             schedule,
         )?
     };
+    reclaim_timed_out_entries(
+        input,
+        central_offset,
+        &mut entries,
+        &stream_ids,
+        timed_out_entries,
+        options,
+        raw_default_floor,
+        &deadline,
+        schedule,
+    )?;
+    let timed_out = deadline.is_expired();
     let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
         total.checked_add(entry.source_deflate_bits)
     });
@@ -562,10 +574,13 @@ fn build_entries_serial(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
-) -> Result<bool> {
-    let mut timed_out = false;
+) -> Result<Vec<usize>> {
+    let mut timed_out = Vec::new();
+    timed_out
+        .try_reserve_exact(build_order.len())
+        .map_err(|_| Error::new("could not allocate ZIP member schedule"))?;
     for &index in build_order {
-        timed_out |= build_scheduled_entry(
+        if build_scheduled_entry(
             input,
             central_offset,
             &mut entries[index],
@@ -574,7 +589,9 @@ fn build_entries_serial(
             raw_default_floor,
             deadline,
             schedule,
-        )?;
+        )? {
+            timed_out.push(index);
+        }
     }
     Ok(timed_out)
 }
@@ -595,7 +612,7 @@ fn build_uniform_entries_parallel(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
-) -> Result<bool> {
+) -> Result<Vec<usize>> {
     let optimizable_count = build_order
         .iter()
         .take_while(|&&index| entry_is_optimizable(&entries[index]))
@@ -621,7 +638,7 @@ fn build_uniform_entries_parallel(
     let jobs_per_worker = optimizable.len() / worker_count;
     let workers_with_extra_job = optimizable.len() % worker_count;
 
-    let (completed, mut timed_out) = thread::scope(|scope| -> Result<_> {
+    let completed = thread::scope(|scope| -> Result<_> {
         let mut workers = Vec::new();
         workers
             .try_reserve_exact(worker_count)
@@ -667,7 +684,6 @@ fn build_uniform_entries_parallel(
             }
         }
 
-        let mut timed_out = false;
         for worker in workers {
             let results = match worker.join() {
                 Ok(results) => results?,
@@ -675,17 +691,21 @@ fn build_uniform_entries_parallel(
             };
             completed.extend(results);
         }
-        for (_, _, entry_timed_out) in &completed {
-            timed_out |= *entry_timed_out;
-        }
-        Ok((completed, timed_out))
+        Ok(completed)
     })?;
 
-    for (index, entry, _) in completed {
+    let mut timed_out = Vec::new();
+    timed_out
+        .try_reserve_exact(build_order.len())
+        .map_err(|_| Error::new("could not allocate ZIP member schedule"))?;
+    for (index, entry, entry_timed_out) in completed {
         entries[index] = entry;
+        if entry_timed_out {
+            timed_out.push(index);
+        }
     }
     for &index in remaining {
-        timed_out |= build_scheduled_entry(
+        if build_scheduled_entry(
             input,
             central_offset,
             &mut entries[index],
@@ -694,7 +714,9 @@ fn build_uniform_entries_parallel(
             raw_default_floor,
             deadline,
             schedule,
-        )?;
+        )? {
+            timed_out.push(index);
+        }
     }
     Ok(timed_out)
 }
@@ -747,9 +769,11 @@ fn build_scheduled_entry(
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
 ) -> Result<bool> {
-    let mut call_options = deadline.options_for_call(options);
+    let file_remaining = deadline.remaining();
+    let mut call_options = options.clone();
+    call_options.timeout = call_options.timeout.min(file_remaining);
     if let Some(schedule) = schedule {
-        call_options.timeout = schedule.timeout_for(options.timeout, deadline.remaining(), entry);
+        call_options.timeout = schedule.timeout_for(options.timeout, file_remaining, entry);
     }
     let mut build_entry = || {
         build_local_entry(
@@ -761,10 +785,92 @@ fn build_scheduled_entry(
         )
     };
     if let Some(stream_id) = stream_id {
-        crate::progress::with_stream_group(stream_id, &[], build_entry)
+        if call_options.timeout < file_remaining {
+            crate::progress::with_stream_slice(stream_id, &[], None, build_entry)
+        } else {
+            crate::progress::with_stream_group(stream_id, &[], build_entry)
+        }
     } else {
         build_entry()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reclaim_timed_out_entries(
+    input: &[u8],
+    central_offset: usize,
+    entries: &mut [Entry],
+    stream_ids: &[Option<usize>],
+    mut pending: Vec<usize>,
+    options: &Options,
+    raw_default_floor: DefaultFloor,
+    deadline: &SearchDeadline,
+    schedule: Option<ZipSchedule>,
+) -> Result<()> {
+    pending.retain(|&index| entry_is_optimizable(&entries[index]));
+    while !pending.is_empty() && !deadline.is_expired() {
+        let use_effective_weights = schedule.is_some_and(|schedule| schedule.use_effective_weights);
+        let mut remaining_weight = pending.iter().fold(0.0_f64, |total, &index| {
+            total + zip_stream_weight(&entries[index], use_effective_weights)
+        });
+        if remaining_weight <= 0.0 {
+            break;
+        }
+        let mut still_pending = Vec::new();
+        still_pending
+            .try_reserve_exact(pending.len())
+            .map_err(|_| Error::new("could not allocate ZIP member schedule"))?;
+
+        for (position, &index) in pending.iter().enumerate() {
+            let file_remaining = deadline.remaining();
+            if file_remaining.is_zero() {
+                break;
+            }
+            let weight = zip_stream_weight(&entries[index], use_effective_weights);
+            let last = position + 1 == pending.len();
+            let timeout = if last {
+                file_remaining
+            } else {
+                scale_duration(file_remaining, weight / remaining_weight * 0.95)
+            };
+            remaining_weight = (remaining_weight - weight).max(0.0);
+            if timeout.is_zero() {
+                continue;
+            }
+
+            let mut candidate = entries[index].clone();
+            candidate.local.clear();
+            candidate.compressed_size_after = candidate.compressed_size_before;
+            candidate.output_deflate_bits = candidate.source_deflate_bits;
+            let mut retry_options = options.clone();
+            retry_options.timeout = timeout;
+            let mut retry = || {
+                build_local_entry(
+                    input,
+                    central_offset,
+                    &mut candidate,
+                    &retry_options,
+                    raw_default_floor,
+                )
+            };
+            let retry_timed_out = if let Some(stream_id) = stream_ids[index] {
+                crate::progress::with_stream_reclaim(stream_id, &[], !last, retry)?
+            } else {
+                retry()?
+            };
+            if candidate.compressed_size_after < entries[index].compressed_size_after
+                || (candidate.compressed_size_after == entries[index].compressed_size_after
+                    && candidate.output_deflate_bits < entries[index].output_deflate_bits)
+            {
+                entries[index] = candidate;
+            }
+            if retry_timed_out && !deadline.is_expired() {
+                still_pending.push(index);
+            }
+        }
+        pending = still_pending;
+    }
+    Ok(())
 }
 
 fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>> {
@@ -807,8 +913,10 @@ fn entry_is_optimizable(entry: &Entry) -> bool {
 /// Divide max mode's file-wide deadline between independent ZIP members.
 ///
 /// Small members run first and receive a proportional slice. The final largest
-/// member inherits the actual remainder, so time unused by the earlier slices
-/// is not lost even when several members tie for largest. Nearly incompressible
+/// member inherits the actual initial remainder, then every member that yielded
+/// its slice is eligible for a weighted reclaim pass using actual time left.
+/// Thus unused time is not lost even when several members tie for largest.
+/// Nearly incompressible
 /// archives use their small amount of compression slack as the weight;
 /// otherwise huge stored-like members would crowd useful work on small,
 /// compressible entries out of the schedule. The proportional denominator
@@ -1561,6 +1669,60 @@ mod tests {
         assert!(result.timed_out);
         assert!(result.data.len() < input.len());
         optimize(&result.data, &Options::default()).unwrap();
+    }
+
+    #[test]
+    fn local_member_slice_is_reclaimed_without_a_file_timeout() {
+        let deflate = [
+            0x00, 0x01, 0x00, 0xfe, 0xff, b'x', 0x01, 0x01, 0x00, 0xfe, 0xff, b'y',
+        ];
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"xy"), 2, false, false);
+        let eocd_offset = find_end_of_central_directory(&input).unwrap();
+        let eocd = &input[eocd_offset..eocd_offset + 22];
+        let central_offset = le32(eocd, 16) as usize;
+        let mut entries = parse_central_entries(&input, central_offset, eocd_offset, 1, false)
+            .expect("synthetic archive should parse");
+        preflight_local_entries(&input, central_offset, &mut entries).unwrap();
+
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let deadline = SearchDeadline::new(&options);
+        let deliberately_tiny_slice = ZipSchedule {
+            largest_size: u32::MAX,
+            reserved_largest_offset: usize::MAX,
+            total_weight: f64::MAX,
+            use_effective_weights: false,
+        };
+        let local_timed_out = build_scheduled_entry(
+            &input,
+            central_offset,
+            &mut entries[0],
+            None,
+            &options,
+            DefaultFloor::Shared,
+            &deadline,
+            Some(deliberately_tiny_slice),
+        )
+        .unwrap();
+        assert!(local_timed_out);
+        assert!(!deadline.is_expired());
+
+        reclaim_timed_out_entries(
+            &input,
+            central_offset,
+            &mut entries,
+            &[None],
+            vec![0],
+            &options,
+            DefaultFloor::Shared,
+            &deadline,
+            Some(deliberately_tiny_slice),
+        )
+        .unwrap();
+        assert!(!deadline.is_expired());
     }
 
     #[test]
