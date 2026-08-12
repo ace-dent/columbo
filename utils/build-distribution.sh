@@ -97,6 +97,8 @@ if [ "$TARGET" = "x86_64-pc-windows-gnu" ] && \
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
 fi
 
+PINNED_RUSTC=$(rustup which --toolchain "$TOOLCHAIN" rustc)
+RUSTC="$PINNED_RUSTC" \
 RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
     rustup run "$TOOLCHAIN" cargo build --locked --profile distribution \
         --target "$TARGET" -Z build-std
