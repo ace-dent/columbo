@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use crate::checksum::crc32_update;
-use crate::deflate::{optimize_raw_prefix_with_floor, DefaultFloor};
+use crate::deflate::{optimize_raw_prefix_with_floor_and_grace, DefaultFloor};
 use crate::{Error, Optimization, Options, Result};
 
 use std::thread;
@@ -33,6 +33,20 @@ const PARALLEL_MAX_ARCHIVE_INPUT: usize = 8 * 1_024 * 1_024;
 const PARALLEL_MAX_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_MEMBER_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ARCHIVE_MEMBER_WORKERS: usize = 8;
+
+/// Which structurally bounded member sets may use the parallel entry builder.
+///
+/// Ordinary archive work parallelizes only a broad, evenly distributed set,
+/// where member concurrency avoids leaving many small independent streams
+/// idle. During the bounded Max archive race, the caller also lets the
+/// mandatory Default sibling parallelize any set of at least two independent
+/// Deflate members. Completing that quality floor sooner leaves more of the
+/// same file-wide deadline for its distinct refinement lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ParallelMemberPolicy {
+    UniformWorkOnly,
+    AnyIndependentWork,
+}
 
 #[derive(Clone, Debug)]
 struct Entry {
@@ -106,10 +120,15 @@ pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     if !options.exhaustive {
-        return optimize_once(input, options, DefaultFloor::Complete);
+        return optimize_once(
+            input,
+            options,
+            DefaultFloor::Complete,
+            ParallelMemberPolicy::UniformWorkOnly,
+        );
     }
 
-    if !options.visual && parallel_max_archive_is_bounded(input) {
+    if parallel_max_archive_is_bounded(input) {
         return optimize_max_parallel(input, options);
     }
 
@@ -130,22 +149,43 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
         let max_worker = thread::Builder::new()
             .name("columbo-zip-direct-max".into())
             .spawn_scoped(scope, || {
-                optimize_once(input, options, DefaultFloor::Established)
+                crate::progress::with_route_lineage("direct max", || {
+                    optimize_once(
+                        input,
+                        options,
+                        DefaultFloor::Established,
+                        ParallelMemberPolicy::UniformWorkOnly,
+                    )
+                })
             });
 
         let mut floor_options = options.clone();
         floor_options.exhaustive = false;
-        let floor = optimize_once(input, &floor_options, DefaultFloor::Complete);
+        let floor = crate::progress::with_route_lineage("default floor", || {
+            optimize_once(
+                input,
+                &floor_options,
+                DefaultFloor::Complete,
+                ParallelMemberPolicy::AnyIndependentWork,
+            )
+        });
 
         let max_worker = match max_worker {
             Ok(worker) => worker,
             // Thread creation failure is not an optimization failure. Finish
             // the established sequential route using the Default result and
             // whatever part of the original allowance remains.
-            Err(_) => return refine_complete_floor(input, options, started, floor?),
+            Err(_) => {
+                return crate::progress::with_route_lineage("refined default", || {
+                    refine_complete_floor(input, options, started, floor?)
+                });
+            }
         };
-        let refined_floor =
-            floor.and_then(|floor| refine_complete_floor(input, options, started, floor));
+        let refined_floor = floor.and_then(|floor| {
+            crate::progress::with_route_lineage("refined default", || {
+                refine_complete_floor(input, options, started, floor)
+            })
+        });
         let direct = match max_worker.join() {
             Ok(result) => result?,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -158,7 +198,12 @@ fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimizati
     let started = Instant::now();
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
-    let floor = optimize_once(input, &floor_options, DefaultFloor::Complete)?;
+    let floor = optimize_once(
+        input,
+        &floor_options,
+        DefaultFloor::Complete,
+        ParallelMemberPolicy::UniformWorkOnly,
+    )?;
     refine_complete_floor(input, options, started, floor)
 }
 
@@ -182,7 +227,12 @@ fn refine_complete_floor(
 
     let mut max_options = options.clone();
     max_options.timeout = remaining;
-    let mut refined = optimize_once(&floor.data, &max_options, DefaultFloor::Shared)?;
+    let mut refined = optimize_once(
+        &floor.data,
+        &max_options,
+        DefaultFloor::Shared,
+        ParallelMemberPolicy::UniformWorkOnly,
+    )?;
     let refined_wins = refined.data.len() < floor.data.len()
         || (refined.data.len() == floor.data.len() && refined.bits_saved != 0);
     if !refined_wins {
@@ -273,6 +323,21 @@ fn uniformly_distributed_member_work(entries: &[Entry]) -> bool {
     member_count >= 8 && largest_compressed.saturating_mul(8) <= total_compressed
 }
 
+fn should_parallelize_members(
+    input_size: usize,
+    expanded_size: u64,
+    entries: &[Entry],
+    optimizable_members: usize,
+    policy: ParallelMemberPolicy,
+) -> bool {
+    if input_size > PARALLEL_MAX_ARCHIVE_INPUT || expanded_size > PARALLEL_MEMBER_ARCHIVE_DECODED {
+        return false;
+    }
+
+    uniformly_distributed_member_work(entries)
+        || (policy == ParallelMemberPolicy::AnyIndependentWork && optimizable_members >= 2)
+}
+
 fn combined_savings(original_bytes: usize, floor: &Optimization, refined: &Optimization) -> u64 {
     match original_bytes.cmp(&refined.data.len()) {
         std::cmp::Ordering::Greater => u64::try_from(original_bytes - refined.data.len())
@@ -290,6 +355,7 @@ fn optimize_once(
     input: &[u8],
     options: &Options,
     raw_default_floor: DefaultFloor,
+    parallel_member_policy: ParallelMemberPolicy,
 ) -> Result<Optimization> {
     let deadline = SearchDeadline::new(options);
     let eocd_offset = find_end_of_central_directory(input)
@@ -366,12 +432,19 @@ fn optimize_once(
     // source order.
     let build_order = optimization_order(&entries, options.exhaustive)?;
     let schedule = options.exhaustive.then(|| ZipSchedule::new(&entries));
-    let parallel_uniform_members = !options.visual
-        && input.len() <= PARALLEL_MAX_ARCHIVE_INPUT
-        && expanded_size <= PARALLEL_MEMBER_ARCHIVE_DECODED
-        && uniformly_distributed_member_work(&entries);
-    let timed_out_entries = if parallel_uniform_members {
-        build_uniform_entries_parallel(
+    let optimizable_members = build_order
+        .iter()
+        .take_while(|&&index| entry_is_optimizable(&entries[index]))
+        .count();
+    let parallel_members = should_parallelize_members(
+        input.len(),
+        expanded_size,
+        &entries,
+        optimizable_members,
+        parallel_member_policy,
+    );
+    let timed_out_entries = if parallel_members {
+        build_entries_parallel(
             input,
             central_offset,
             &mut entries,
@@ -596,13 +669,13 @@ fn build_entries_serial(
     Ok(timed_out)
 }
 
-/// Optimize a broad set of similarly sized independent members concurrently.
+/// Optimize a structurally bounded set of independent members concurrently.
 ///
 /// This path is selected only after the archive-wide input and decoded-memory
 /// bounds have passed. Each worker owns cloned entry metadata and its output;
 /// immutable archive bytes are shared, and results rejoin before reconstruction.
 #[allow(clippy::too_many_arguments)]
-fn build_uniform_entries_parallel(
+fn build_entries_parallel(
     input: &[u8],
     central_offset: usize,
     entries: &mut [Entry],
@@ -775,6 +848,7 @@ fn build_scheduled_entry(
     if let Some(schedule) = schedule {
         call_options.timeout = schedule.timeout_for(options.timeout, file_remaining, entry);
     }
+    let grace = deadline.grace_for_call(call_options.timeout);
     let mut build_entry = || {
         build_local_entry(
             input,
@@ -782,6 +856,7 @@ fn build_scheduled_entry(
             entry,
             &call_options,
             raw_default_floor,
+            grace,
         )
     };
     if let Some(stream_id) = stream_id {
@@ -844,6 +919,7 @@ fn reclaim_timed_out_entries(
             candidate.output_deflate_bits = candidate.source_deflate_bits;
             let mut retry_options = options.clone();
             retry_options.timeout = timeout;
+            let grace = deadline.grace_for_call(timeout);
             let mut retry = || {
                 build_local_entry(
                     input,
@@ -851,6 +927,7 @@ fn reclaim_timed_out_entries(
                     &mut candidate,
                     &retry_options,
                     raw_default_floor,
+                    grace,
                 )
             };
             let retry_timed_out = if let Some(stream_id) = stream_ids[index] {
@@ -1100,6 +1177,7 @@ fn build_local_entry(
     entry: &mut Entry,
     options: &Options,
     default_floor: DefaultFloor,
+    grace: Duration,
 ) -> Result<bool> {
     let position = entry.local_offset_before;
     let layout = local_entry_layout(input, central_offset, entry)?;
@@ -1134,11 +1212,12 @@ fn build_local_entry(
             return Err(Error::new("ZIP stored member CRC or size mismatch"));
         }
     } else if entry.method == 8 {
-        let raw = optimize_raw_prefix_with_floor(
+        let raw = optimize_raw_prefix_with_floor_and_grace(
             source_payload,
             options,
             u64::from(entry.uncompressed_size),
             default_floor,
+            grace,
         )
         .map_err(|error| {
             if error.message().contains("internal memory safety") {
@@ -1417,6 +1496,103 @@ mod tests {
         output
     }
 
+    fn archive_with_reverse_central_order(decoded_entries: &[&[u8]]) -> Vec<u8> {
+        assert!(decoded_entries.len() <= u16::MAX as usize);
+        let mut output = Vec::new();
+        let mut names = Vec::new();
+        let mut local_offsets = Vec::new();
+        let mut crcs = Vec::new();
+        let mut compressed_sizes = Vec::new();
+
+        for (index, &decoded) in decoded_entries.iter().enumerate() {
+            let decoded_size = u16::try_from(decoded.len()).unwrap();
+            let mut payload = vec![0x01]; // Final stored Deflate block.
+            payload.extend_from_slice(&decoded_size.to_le_bytes());
+            payload.extend_from_slice(&(!decoded_size).to_le_bytes());
+            payload.extend_from_slice(decoded);
+            let crc = crc32_update(0, decoded);
+            let name = format!("member-{index}").into_bytes();
+            local_offsets.push(output.len() as u32);
+            output.extend_from_slice(&LOCAL_FILE_HEADER.to_le_bytes());
+            output.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+            output.extend_from_slice(&0_u16.to_le_bytes()); // flags
+            output.extend_from_slice(&8_u16.to_le_bytes()); // Deflate
+            output.extend_from_slice(&[0; 4]); // time and date
+            output.extend_from_slice(&crc.to_le_bytes());
+            output.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(decoded.len() as u32).to_le_bytes());
+            output.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            output.extend_from_slice(&0_u16.to_le_bytes()); // extra length
+            output.extend_from_slice(&name);
+            output.extend_from_slice(payload.as_slice());
+            names.push(name);
+            crcs.push(crc);
+            compressed_sizes.push(payload.len() as u32);
+        }
+
+        let central_offset = output.len() as u32;
+        for index in (0..decoded_entries.len()).rev() {
+            let name = &names[index];
+            output.extend_from_slice(&CENTRAL_DIRECTORY_HEADER.to_le_bytes());
+            output.extend_from_slice(&20_u16.to_le_bytes()); // version made by
+            output.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+            output.extend_from_slice(&0_u16.to_le_bytes()); // flags
+            output.extend_from_slice(&8_u16.to_le_bytes()); // Deflate
+            output.extend_from_slice(&[0; 4]); // time and date
+            output.extend_from_slice(&crcs[index].to_le_bytes());
+            output.extend_from_slice(&compressed_sizes[index].to_le_bytes());
+            output.extend_from_slice(&(decoded_entries[index].len() as u32).to_le_bytes());
+            output.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            output.extend_from_slice(&0_u16.to_le_bytes()); // extra length
+            output.extend_from_slice(&0_u16.to_le_bytes()); // comment length
+            output.extend_from_slice(&[0; 8]); // disk and attributes
+            output.extend_from_slice(&local_offsets[index].to_le_bytes());
+            output.extend_from_slice(name);
+        }
+        let central_size = output.len() as u32 - central_offset;
+
+        output.extend_from_slice(&END_OF_CENTRAL_DIRECTORY.to_le_bytes());
+        output.extend_from_slice(&[0; 4]); // disk numbers
+        output.extend_from_slice(&(decoded_entries.len() as u16).to_le_bytes());
+        output.extend_from_slice(&(decoded_entries.len() as u16).to_le_bytes());
+        output.extend_from_slice(&central_size.to_le_bytes());
+        output.extend_from_slice(&central_offset.to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes()); // comment length
+        output
+    }
+
+    fn uniform_archive_with_reverse_central_order(entry_count: usize) -> Vec<u8> {
+        archive_with_reverse_central_order(&vec![b"x".as_slice(); entry_count])
+    }
+
+    fn archive_entry_names(input: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let eocd_offset = find_end_of_central_directory(input).unwrap();
+        let eocd = &input[eocd_offset..];
+        let central_offset = le32(eocd, 16) as usize;
+        let mut entries =
+            parse_central_entries(input, central_offset, eocd_offset, le16(eocd, 10), false)
+                .unwrap();
+        let physical_order = preflight_local_entries(input, central_offset, &mut entries).unwrap();
+
+        let physical = physical_order
+            .into_iter()
+            .map(|index| {
+                let offset = entries[index].local_offset_before;
+                let name_length = le16(&input[offset..], 26) as usize;
+                input[offset + 30..offset + 30 + name_length].to_vec()
+            })
+            .collect();
+        let central = entries
+            .iter()
+            .map(|entry| {
+                let offset = entry.central_offset;
+                let name_length = le16(&input[offset..], 28) as usize;
+                input[offset + 46..offset + 46 + name_length].to_vec()
+            })
+            .collect();
+        (physical, central)
+    }
+
     #[test]
     fn accepts_an_empty_classic_archive() {
         let input = [
@@ -1441,6 +1617,75 @@ mod tests {
 
         assert_eq!(optimization_order(&entries, false).unwrap(), [2, 0, 1]);
         assert_eq!(optimization_order(&entries, true).unwrap(), [0, 2, 1]);
+    }
+
+    #[test]
+    fn parallel_optimization_preserves_local_and_central_order() {
+        let input = uniform_archive_with_reverse_central_order(8);
+        let source_order = archive_entry_names(&input);
+        assert_ne!(source_order.0, source_order.1);
+
+        let result = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::from_millis(200),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(archive_entry_names(&result.data), source_order);
+    }
+
+    #[test]
+    fn detailed_reporting_keeps_parallel_member_optimization_enabled() {
+        let input = uniform_archive_with_reverse_central_order(8);
+        let quiet_options = Options {
+            exhaustive: true,
+            timeout: Duration::from_millis(200),
+            ..Options::default()
+        };
+        let quiet = optimize(&input, &quiet_options).unwrap();
+
+        let mut verbose_options = quiet_options.clone();
+        verbose_options.verbose = true;
+        let verbose = optimize(&input, &verbose_options).unwrap();
+
+        let mut visual_options = quiet_options;
+        visual_options.visual = true;
+        let visual = optimize(&input, &visual_options).unwrap();
+
+        assert_eq!(verbose.data, quiet.data);
+        assert_eq!(verbose.bits_saved, quiet.bits_saved);
+        assert_eq!(visual.data, quiet.data);
+        assert_eq!(visual.bits_saved, quiet.bits_saved);
+    }
+
+    #[test]
+    fn detailed_reporting_keeps_bounded_default_floor_parallelism_enabled() {
+        let input = archive_with_reverse_central_order(&[b"x", b"a longer independent member"]);
+        assert!(parallel_max_archive_is_bounded(&input));
+
+        let quiet_options = Options {
+            exhaustive: true,
+            timeout: Duration::from_millis(200),
+            ..Options::default()
+        };
+        let quiet = optimize(&input, &quiet_options).unwrap();
+
+        let mut verbose_options = quiet_options.clone();
+        verbose_options.verbose = true;
+        let verbose = optimize(&input, &verbose_options).unwrap();
+
+        let mut visual_options = quiet_options;
+        visual_options.visual = true;
+        let visual = optimize(&input, &visual_options).unwrap();
+
+        assert_eq!(verbose.data, quiet.data);
+        assert_eq!(verbose.bits_saved, quiet.bits_saved);
+        assert_eq!(visual.data, quiet.data);
+        assert_eq!(visual.bits_saved, quiet.bits_saved);
     }
 
     #[test]
@@ -1807,6 +2052,47 @@ mod tests {
         let mut skewed = uniform;
         skewed[0].compressed_size_before = 101;
         assert!(parallel_max_entry_work_is_bounded(&skewed));
+    }
+
+    #[test]
+    fn bounded_default_floor_parallelizes_independent_members() {
+        let entries = [ordering_entry(8, 100, 0), ordering_entry(8, 1_000, 1)];
+        let expanded_size = entries
+            .iter()
+            .map(|entry| u64::from(entry.uncompressed_size))
+            .sum();
+
+        assert!(!should_parallelize_members(
+            2_000,
+            expanded_size,
+            &entries,
+            entries.len(),
+            ParallelMemberPolicy::UniformWorkOnly,
+        ));
+        assert!(should_parallelize_members(
+            2_000,
+            expanded_size,
+            &entries,
+            entries.len(),
+            ParallelMemberPolicy::AnyIndependentWork,
+        ));
+
+        // The broader floor policy never bypasses the retained-input or
+        // aggregate-decoded-memory bounds.
+        assert!(!should_parallelize_members(
+            PARALLEL_MAX_ARCHIVE_INPUT + 1,
+            expanded_size,
+            &entries,
+            entries.len(),
+            ParallelMemberPolicy::AnyIndependentWork,
+        ));
+        assert!(!should_parallelize_members(
+            2_000,
+            PARALLEL_MEMBER_ARCHIVE_DECODED + 1,
+            &entries,
+            entries.len(),
+            ParallelMemberPolicy::AnyIndependentWork,
+        ));
     }
 
     #[test]

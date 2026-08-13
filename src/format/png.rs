@@ -123,6 +123,15 @@ struct CompressedBodyOptimization {
     decoded_size: Option<u64>,
 }
 
+fn empty_chunk_replacements(chunk_count: usize) -> Result<Vec<Option<CompressedBodyOptimization>>> {
+    let mut replacements = Vec::new();
+    replacements
+        .try_reserve_exact(chunk_count)
+        .map_err(|_| Error::new("could not allocate PNG chunk model"))?;
+    replacements.resize_with(chunk_count, || None);
+    Ok(replacements)
+}
+
 pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result<usize> {
     let parsed = parse(input, strip_metadata)?;
     let compressed_metadata = parsed
@@ -148,16 +157,10 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     // Columbo C implementation so a profile or text comment cannot consume the
     // image stream's search time. If that pass finds no reduction,
     // reconstruction gives it one normal pass.
-    let mut quick_replacements = Vec::new();
-    quick_replacements
-        .try_reserve_exact(parsed.chunks.len())
-        .map_err(|_| Error::new("could not allocate PNG chunk model"))?;
-    quick_replacements.resize_with(parsed.chunks.len(), || None);
+    let mut quick_replacements = empty_chunk_replacements(parsed.chunks.len())?;
     let mut probe_work_remaining = MAX_METADATA_PROBE_WORK_BYTES;
     for (index, chunk) in parsed.chunks.iter().enumerate() {
-        // Detailed modes give each physical metadata stream one definitive
-        // card. Quiet runs retain the cheap speculative probe schedule.
-        if options.verbose || options.visual || options.exhaustive {
+        if options.exhaustive {
             continue;
         }
         if should_strip(chunk.kind, options) {
@@ -185,13 +188,22 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         let remaining_before_probe = budget.remaining;
         let probe_allowance = remaining_before_probe.min(probe_work_remaining);
         budget.remaining = probe_allowance;
-        let probe = optimize_compressed_body(
-            chunk.kind,
-            chunk.data,
-            &quick_options,
-            DefaultFloor::Shared,
-            &mut budget,
-        );
+        let mut run_probe = || {
+            optimize_compressed_body(
+                chunk.kind,
+                chunk.data,
+                &quick_options,
+                DefaultFloor::Shared,
+                &mut budget,
+            )
+        };
+        let probe = if options.verbose || options.visual {
+            let stream_id = metadata_stream_ids[index]
+                .expect("every supported compressed metadata chunk has a stream identifier");
+            crate::progress::with_stream_slice(stream_id, &[], Some("metadata probe"), run_probe)
+        } else {
+            run_probe()
+        };
         let decoded_work = probe_allowance.saturating_sub(budget.remaining);
         probe_work_remaining = probe_work_remaining.saturating_sub(decoded_work);
         let replacement = match probe {
@@ -222,25 +234,125 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         }
     }
 
-    precompute_max_metadata_floors(
-        &parsed,
-        &metadata_stream_ids,
-        options,
-        &mut budget,
-        &mut quick_replacements,
-    )?;
+    let metadata_compressed_bytes = compressed_metadata_bytes(&parsed, options);
+    let parallel_metadata_floor = options.exhaustive
+        // APNG already parallelizes bounded independent image streams. Avoid
+        // nesting another worker layer, which would compete with those image
+        // routes and make deadline-sensitive quality less predictable.
+        && parsed.fdat_frames.is_empty()
+        && metadata_compressed_bytes
+            .is_some_and(|bytes| bytes != 0 && bytes <= MAX_CACHED_METADATA_FLOOR_BYTES);
 
-    let (optimized_idat, optimized_frames) = optimize_image_streams(
-        &parsed.idat,
-        parsed.idat_decoded_size,
-        &parsed.fdat_frames,
-        &parsed.fdat_decoded_sizes,
-        parsed.chunks.iter().any(|chunk| {
-            !should_strip(chunk.kind, options) && supported_compressed_metadata(chunk)
-        }),
-        options,
-        &mut budget,
-    )?;
+    let (optimized_idat, optimized_frames) = if parallel_metadata_floor {
+        // Image data and compressed metadata are independent Deflate streams.
+        // Building their mandatory Max-mode Default floors serially lets a
+        // tiny profile consume a material part of a short image allowance.
+        // Run the image work beside the bounded metadata-floor pass instead.
+        // Reserve the images' exact decoded size from the metadata worker's
+        // budget up front, so concurrency cannot weaken the file-wide safety
+        // limit or charge a physical stream twice.
+        let image_decoded_bytes =
+            total_image_decoded_bytes(parsed.idat_decoded_size, &parsed.fdat_decoded_sizes)?;
+        if image_decoded_bytes > budget.remaining {
+            return Err(Error::new(
+                "decoded PNG data exceeds configured safety limit",
+            ));
+        }
+        let image_budget_bytes = budget.remaining;
+        // Copy the container's clock, not merely its configured duration. A
+        // fresh deadline here would give the worker back time already spent
+        // parsing and probing metadata, weakening the file-wide timeout.
+        let image_deadline = budget.deadline;
+
+        thread::scope(|scope| -> Result<_> {
+            // Keep the dominant image search on the caller thread. Besides
+            // avoiding a hand-off for the largest stream, this preserves warm
+            // parser and route state while the smaller ancillary floor moves
+            // to the worker.
+            let metadata_budget_bytes = image_budget_bytes - image_decoded_bytes;
+            let parsed_ref = &parsed;
+            let metadata_stream_ids_ref = &metadata_stream_ids;
+            let metadata_worker = match thread::Builder::new()
+                .name("columbo-png-metadata-floor".into())
+                .spawn_scoped(scope, move || -> Result<_> {
+                    let mut metadata_budget = DecodeBudget {
+                        remaining: metadata_budget_bytes,
+                        deadline: image_deadline,
+                    };
+                    let mut metadata_floors = empty_chunk_replacements(parsed_ref.chunks.len())?;
+                    precompute_max_metadata_floors(
+                        parsed_ref,
+                        metadata_stream_ids_ref,
+                        options,
+                        &mut metadata_budget,
+                        &mut metadata_floors,
+                    )?;
+                    Ok((metadata_budget, metadata_floors))
+                }) {
+                Ok(worker) => worker,
+                Err(_) => {
+                    precompute_max_metadata_floors(
+                        &parsed,
+                        &metadata_stream_ids,
+                        options,
+                        &mut budget,
+                        &mut quick_replacements,
+                    )?;
+                    return optimize_image_streams(
+                        &parsed.idat,
+                        parsed.idat_decoded_size,
+                        &parsed.fdat_frames,
+                        &parsed.fdat_decoded_sizes,
+                        image_work_needs_metadata_reserve(
+                            options,
+                            metadata_compressed_bytes.unwrap_or(0),
+                        ),
+                        options,
+                        &mut budget,
+                    );
+                }
+            };
+
+            let mut image_budget = DecodeBudget {
+                remaining: image_budget_bytes,
+                deadline: image_deadline,
+            };
+            let image_result = optimize_image_streams(
+                &parsed.idat,
+                parsed.idat_decoded_size,
+                &parsed.fdat_frames,
+                &parsed.fdat_decoded_sizes,
+                image_work_needs_metadata_reserve(options, metadata_compressed_bytes.unwrap_or(0)),
+                options,
+                &mut image_budget,
+            );
+            let metadata_result = match metadata_worker.join() {
+                Ok(result) => result,
+                Err(payload) => std::panic::resume_unwind(payload),
+            };
+            let (metadata_budget, metadata_floors) = metadata_result?;
+            budget = metadata_budget;
+            quick_replacements = metadata_floors;
+            image_result
+        })?
+    } else {
+        precompute_max_metadata_floors(
+            &parsed,
+            &metadata_stream_ids,
+            options,
+            &mut budget,
+            &mut quick_replacements,
+        )?;
+        optimize_image_streams(
+            &parsed.idat,
+            parsed.idat_decoded_size,
+            &parsed.fdat_frames,
+            &parsed.fdat_decoded_sizes,
+            image_work_needs_metadata_reserve(options, metadata_compressed_bytes.unwrap_or(0)),
+            options,
+            &mut budget,
+        )?
+    };
     let mut source_deflate_bits = frame_source_bits(&optimized_idat)?;
     let mut output_deflate_bits = frame_output_bits(&optimized_idat)?;
     for frame in &optimized_frames {
@@ -392,13 +504,38 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     ))
 }
 
+/// Whether image work must leave time for a mandatory metadata pass.
+///
+/// Max has already cached a complete Default floor for every supported
+/// compressed metadata stream before reaching image scheduling. Its later
+/// metadata refinement is optional and may consume only the actual remainder;
+/// it must not shorten the dominant image search. Default has no cached floor,
+/// so it still reserves time whenever compressed metadata follows.
+fn image_work_needs_metadata_reserve(options: &Options, metadata_bytes: u64) -> bool {
+    !options.exhaustive && metadata_bytes != 0
+}
+
 /// Cache the complete Default result for a bounded set of metadata streams.
 ///
 /// PNG uses one file-wide search deadline. Without this phase, a single image
 /// Max route can spend that deadline before reconstruction reaches zTXt, iTXt,
-/// or iCCP, causing Max to return a worse whole file than Default. Building the
-/// inexpensive metadata floor first is broadly valid: Max retains every
-/// completed Default candidate and later optional work only adds alternatives.
+/// or iCCP, causing Max to return a worse whole file than Default. Building a
+/// complete metadata floor is broadly valid: Max retains every completed
+/// Default candidate and later optional work only adds alternatives. Bounded
+/// static-PNG Max runs may overlap this pass with independent image work in
+/// every reporting mode.
+fn compressed_metadata_bytes(parsed: &ParsedPng<'_>, options: &Options) -> Option<u64> {
+    parsed
+        .chunks
+        .iter()
+        .filter(|chunk| !should_strip(chunk.kind, options))
+        .filter_map(|chunk| {
+            compressed_zlib_offset(chunk.kind, chunk.data)
+                .map(|offset| (chunk.data.len() - offset) as u64)
+        })
+        .try_fold(0_u64, u64::checked_add)
+}
+
 fn precompute_max_metadata_floors(
     parsed: &ParsedPng<'_>,
     metadata_stream_ids: &[Option<usize>],
@@ -410,16 +547,7 @@ fn precompute_max_metadata_floors(
         return Ok(());
     }
 
-    let compressed_bytes = parsed
-        .chunks
-        .iter()
-        .filter(|chunk| !should_strip(chunk.kind, options))
-        .filter_map(|chunk| {
-            compressed_zlib_offset(chunk.kind, chunk.data)
-                .map(|offset| (chunk.data.len() - offset) as u64)
-        })
-        .try_fold(0_u64, u64::checked_add);
-    if match compressed_bytes {
+    if match compressed_metadata_bytes(parsed, options) {
         Some(bytes) => bytes > MAX_CACHED_METADATA_FLOOR_BYTES,
         None => true,
     } {
@@ -1205,6 +1333,13 @@ const NON_LARGEST_IMAGE_SEARCH_FRACTION: f64 = 0.90;
 const MANY_IMAGE_SEARCH_FRACTION: f64 = 0.80;
 const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
 
+fn total_image_decoded_bytes(idat: u64, frames: &[u64]) -> Result<u64> {
+    frames
+        .iter()
+        .try_fold(idat, |total, &size| total.checked_add(size))
+        .ok_or_else(|| Error::new("decoded PNG data exceeds configured safety limit"))
+}
+
 /// Optimize the IDAT stream and each unique APNG frame under one file budget.
 ///
 /// Small streams run first so a large IDAT cannot consume the whole deadline.
@@ -1222,10 +1357,7 @@ fn optimize_image_streams(
     if frames.len() != frame_decoded_sizes.len() {
         return Err(Error::new("invalid APNG frame model"));
     }
-    let total_decoded_size = frame_decoded_sizes
-        .iter()
-        .try_fold(idat_decoded_size, |total, &size| total.checked_add(size))
-        .ok_or_else(|| Error::new("decoded PNG data exceeds configured safety limit"))?;
+    let total_decoded_size = total_image_decoded_bytes(idat_decoded_size, frame_decoded_sizes)?;
     if total_decoded_size > budget.remaining {
         return Err(Error::new(
             "decoded PNG data exceeds configured safety limit",
@@ -1303,7 +1435,6 @@ fn optimize_image_streams(
     };
     let parallel_multi_image = options.exhaustive
         && !single_image
-        && !options.visual
         && !budget.deadline.remaining().is_zero()
         && parallel_multi_image_is_bounded(total_weight, total_decoded_size);
     let mut results = if parallel_multi_image {
@@ -1315,6 +1446,7 @@ fn optimize_image_streams(
             frames,
             frame_decoded_sizes,
             &representative_weights,
+            &representatives,
             options,
             // Reserve a small container margin outside child raw-route grace
             // for per-stream parsing, worker joins, and PNG reconstruction.
@@ -1609,6 +1741,7 @@ fn optimize_image_jobs_parallel(
     frames: &[Vec<u8>],
     frame_decoded_sizes: &[u64],
     representative_weights: &[usize],
+    representatives: &[usize],
     options: &Options,
     phase_timeout: Duration,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
@@ -1637,6 +1770,7 @@ fn optimize_image_jobs_parallel(
                         frames,
                         frame_decoded_sizes,
                         representative_weights,
+                        representatives,
                         options,
                         phase_timeout,
                     )
@@ -1654,6 +1788,7 @@ fn optimize_image_jobs_parallel(
                         frames,
                         frame_decoded_sizes,
                         representative_weights,
+                        representatives,
                         options,
                         phase_timeout,
                     )?;
@@ -1681,6 +1816,7 @@ fn optimize_image_job_slice(
     frames: &[Vec<u8>],
     frame_decoded_sizes: &[u64],
     representative_weights: &[usize],
+    representatives: &[usize],
     options: &Options,
     phase_timeout: Duration,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
@@ -1699,12 +1835,17 @@ fn optimize_image_job_slice(
             parallel_image_job_timeout(phase_timeout, jobs.len(), weight, total_weight);
         let (stream, expected_decoded_size) =
             image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
-        let optimized = run_png_image_zlib(
-            stream,
-            &call_options,
-            expected_decoded_size,
-            DefaultFloor::Shared,
-        )?;
+        let optimize_job = || {
+            run_png_image_zlib(
+                stream,
+                &call_options,
+                expected_decoded_size,
+                DefaultFloor::Shared,
+            )
+        };
+        let (stream_id, duplicates) = image_job_stream_group(job, representatives);
+        let optimized =
+            crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?;
         results.push((job, optimized));
     }
     Ok(results)
@@ -2059,6 +2200,10 @@ fn optimize_single_image_max_parallel(
     let selected = thread::scope(|scope| {
         let early_worker = run_early_lineage
             .then(|| {
+                // A child thread has no physical-stream presentation context,
+                // so suppress only its duplicate UI. These flags do not gate
+                // routes, deadlines, candidate selection, or memory policy;
+                // every optimization field remains identical to the caller.
                 let mut quiet_options = options.clone();
                 quiet_options.verbose = false;
                 quiet_options.visual = false;
@@ -3472,6 +3617,102 @@ mod tests {
         let result = optimize(&input, &options).unwrap();
         assert!(!result.timed_out);
         parse(&result.data, false).unwrap();
+    }
+
+    #[test]
+    fn metadata_probe_policy_is_identical_in_detailed_modes() {
+        let metadata_zlib = [0x78, 0x9c, 0xab, 0x00, 0x00, 0x00, 0x79, 0x00, 0x79];
+        let mut metadata = b"Comment\0\0".to_vec();
+        metadata.extend_from_slice(&metadata_zlib);
+
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"zTXt", &metadata));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let quiet_options = Options {
+            max_decoded_bytes: 3,
+            ..Options::default()
+        };
+        let quiet = optimize(&input, &quiet_options).unwrap();
+
+        let mut verbose_options = quiet_options.clone();
+        verbose_options.verbose = true;
+        let verbose = optimize(&input, &verbose_options).unwrap();
+
+        let mut visual_options = quiet_options;
+        visual_options.visual = true;
+        let visual = optimize(&input, &visual_options).unwrap();
+
+        assert_eq!(verbose.data, quiet.data);
+        assert_eq!(verbose.bits_saved, quiet.bits_saved);
+        assert_eq!(visual.data, quiet.data);
+        assert_eq!(visual.bits_saved, quiet.bits_saved);
+    }
+
+    #[test]
+    fn reporting_modes_do_not_change_the_mandatory_metadata_reserve() {
+        for (exhaustive, metadata_bytes, expected) in
+            [(false, 0, false), (false, 1, true), (true, 1, false)]
+        {
+            let quiet = Options {
+                exhaustive,
+                ..Options::default()
+            };
+            let mut verbose = quiet.clone();
+            verbose.verbose = true;
+            let mut visual = quiet.clone();
+            visual.visual = true;
+
+            assert_eq!(
+                image_work_needs_metadata_reserve(&quiet, metadata_bytes),
+                expected
+            );
+            assert_eq!(
+                image_work_needs_metadata_reserve(&verbose, metadata_bytes),
+                expected
+            );
+            assert_eq!(
+                image_work_needs_metadata_reserve(&visual, metadata_bytes),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_max_metadata_floor_preserves_the_combined_decode_budget() {
+        let metadata_zlib = [0x78, 0x9c, 0xab, 0x00, 0x00, 0x00, 0x79, 0x00, 0x79];
+        let mut metadata = b"Comment\0\0".to_vec();
+        metadata.extend_from_slice(&metadata_zlib);
+
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"zTXt", &metadata));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::from_millis(20),
+            max_decoded_bytes: 3,
+            ..Options::default()
+        };
+        let result = optimize(&input, &options).unwrap();
+        parse(&result.data, false).unwrap();
+
+        let error = optimize(
+            &input,
+            &Options {
+                max_decoded_bytes: 2,
+                ..options
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "decoded PNG data exceeds configured safety limit"
+        );
     }
 
     #[test]

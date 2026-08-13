@@ -3,11 +3,12 @@
 //! Interactive Deflate stream map.
 //!
 //! The renderer deliberately avoids an alternate screen. Each completed
-//! stream leaves two block rows and one information row in scrollback, while
-//! only the current card is redrawn. This remains useful for archives with
-//! many members and avoids needing terminal-height discovery or an input/event
-//! dependency.
+//! stream leaves two block rows and one information row in scrollback. When a
+//! container optimizes several streams concurrently, their cards share one
+//! bounded live region and are redrawn together. This remains useful for
+//! archives with many members and avoids needing terminal-height discovery.
 
+use std::collections::BTreeMap;
 use std::env;
 #[cfg(unix)]
 use std::fs::File;
@@ -55,6 +56,7 @@ pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usiz
 }
 
 pub(super) fn begin(
+    report_id: usize,
     stream_id: usize,
     duplicates: &[usize],
     note: Option<&'static str>,
@@ -63,37 +65,38 @@ pub(super) fn begin(
 ) {
     with_renderer(|renderer| {
         renderer.print_header();
-        // Container implementations finish streams serially. If an error path
-        // ever skipped `finish`, do not overwrite that older card in place.
-        renderer.rendered_line_widths = None;
-        renderer.active = Some(StreamView {
-            id: stream_id,
-            duplicates: duplicates.to_vec(),
-            note,
-            source_bits: stream.meaningful_bits,
-            source_blocks: stream.blocks,
-            source_bytes: stream.compressed_bytes,
-            source_report: source_report.clone(),
-            output_bits: stream.meaningful_bits,
-            output_bytes: stream.compressed_bytes,
-            output_report: source_report,
-            change_highlight_draws: 0,
-            pulse: 0,
-            status: format!(
-                "Parsed {} decoded · {}",
-                format_bytes_u64(stream.decoded_bytes),
-                super::format_duration(stream.parse_elapsed)
-            ),
-            work: None,
-        });
+        renderer.views.insert(
+            report_id,
+            StreamView {
+                id: stream_id,
+                duplicates: duplicates.to_vec(),
+                note,
+                source_bits: stream.meaningful_bits,
+                source_blocks: stream.blocks,
+                source_bytes: stream.compressed_bytes,
+                source_report: source_report.clone(),
+                output_bits: stream.meaningful_bits,
+                output_bytes: stream.compressed_bytes,
+                output_report: source_report,
+                change_highlight_draws: 0,
+                finished: false,
+                pulse: 0,
+                status: format!(
+                    "Parsed {} decoded · {}",
+                    format_bytes_u64(stream.decoded_bytes),
+                    super::format_duration(stream.parse_elapsed)
+                ),
+                work: None,
+            },
+        );
         renderer.redraw(RedrawUrgency::Immediate);
     });
     ensure_animator();
 }
 
-pub(super) fn route_started(stream_id: usize, name: &str) {
+pub(super) fn route_started(report_id: usize, name: &str) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         view.status.clear();
@@ -106,9 +109,9 @@ pub(super) fn route_started(stream_id: usize, name: &str) {
     });
 }
 
-pub(super) fn activity(stream_id: usize, status: &str) {
+pub(super) fn activity(report_id: usize, status: &str) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         view.status.clear();
@@ -118,9 +121,9 @@ pub(super) fn activity(stream_id: usize, status: &str) {
     });
 }
 
-pub(super) fn work(stream_id: usize, status: &str, completed: usize, total: usize) {
+pub(super) fn work(report_id: usize, status: &str, completed: usize, total: usize) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         view.status.clear();
@@ -130,9 +133,9 @@ pub(super) fn work(stream_id: usize, status: &str, completed: usize, total: usiz
     });
 }
 
-pub(super) fn checkpoint(stream_id: usize, name: &str, bits: u64, blocks: usize, improved: bool) {
+pub(super) fn checkpoint(report_id: usize, name: &str, bits: u64, blocks: usize, improved: bool) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         view.status = if improved {
@@ -148,9 +151,9 @@ pub(super) fn checkpoint(stream_id: usize, name: &str, bits: u64, blocks: usize,
     });
 }
 
-pub(super) fn candidate(stream_id: usize, name: &str, candidate: &CandidateProgress) {
+pub(super) fn candidate(report_id: usize, name: &str, candidate: &CandidateProgress) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         let improved = is_smaller(
@@ -183,9 +186,9 @@ pub(super) fn candidate(stream_id: usize, name: &str, candidate: &CandidateProgr
     });
 }
 
-pub(super) fn final_plan(stream_id: usize, report: Option<&BlockReport>) {
+pub(super) fn final_plan(report_id: usize, report: Option<&BlockReport>) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         if let Some(report) = report {
@@ -213,7 +216,7 @@ pub(super) fn final_plan(stream_id: usize, report: Option<&BlockReport>) {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish(
-    stream_id: usize,
+    report_id: usize,
     route: &str,
     output_bytes: usize,
     output_bits: u64,
@@ -223,12 +226,13 @@ pub(super) fn finish(
     slice_budget: bool,
 ) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.active.as_mut().filter(|view| view.id == stream_id) else {
+        let Some(view) = renderer.views.get_mut(&report_id) else {
             return;
         };
         view.output_bytes = output_bytes;
         view.output_bits = output_bits;
         view.change_highlight_draws = 0;
+        view.finished = true;
         view.work = None;
         view.status = format!(
             "✓ {route} · {} · {}{}",
@@ -245,9 +249,12 @@ pub(super) fn finish(
             }
         );
         renderer.redraw(RedrawUrgency::Immediate);
-        renderer.active = None;
-        // The final card remains in scrollback; the next stream appends below.
-        renderer.rendered_line_widths = None;
+        if renderer.views.values().all(|view| view.finished) {
+            renderer.views.clear();
+            // The completed cards remain in scrollback; the next stream
+            // appends below instead of erasing the completed batch.
+            renderer.rendered_line_widths = None;
+        }
     });
 }
 
@@ -271,29 +278,31 @@ fn ensure_animator() {
                 let mut renderer = renderer
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let Some(view) = renderer.active.as_mut() else {
-                    continue;
-                };
-                if view.work.is_none() {
-                    continue;
+                let mut animate = false;
+                for view in renderer.views.values_mut() {
+                    if !view.finished && view.work.is_some() {
+                        view.pulse = view.pulse.wrapping_add(1);
+                        animate = true;
+                    }
                 }
-                view.pulse = view.pulse.wrapping_add(1);
-                renderer.redraw(RedrawUrgency::Coalesced);
+                if animate {
+                    renderer.redraw(RedrawUrgency::Coalesced);
+                }
             });
     });
 }
 
 #[derive(Default)]
 struct Renderer {
-    active: Option<StreamView>,
     columns: usize,
     deflate_streams: Option<usize>,
     format: Option<&'static str>,
     header_printed: bool,
     last_draw: Option<Instant>,
     last_resize_check: Option<Instant>,
-    rendered_line_widths: Option<[usize; 4]>,
+    rendered_line_widths: Option<Vec<usize>>,
     unicode: bool,
+    views: BTreeMap<usize, StreamView>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -356,6 +365,16 @@ impl Glyphs {
 }
 
 impl Renderer {
+    fn ordered_views(&self) -> Vec<(usize, &StreamView)> {
+        let mut views: Vec<_> = self
+            .views
+            .iter()
+            .map(|(&report_id, view)| (report_id, view))
+            .collect();
+        views.sort_unstable_by_key(|(report_id, view)| (view.id, *report_id));
+        views
+    }
+
     fn print_header(&mut self) {
         if self.header_printed {
             return;
@@ -441,19 +460,20 @@ impl Renderer {
         {
             return;
         }
-        let Some(view) = self.active.as_ref() else {
+        if self.views.is_empty() {
             return;
-        };
+        }
         let glyphs = Glyphs::for_unicode(self.unicode);
-        let lines = render_card(view, self.columns, color_enabled(), glyphs);
-        let line_widths = [
-            ansi_visible_width(&lines[0]),
-            ansi_visible_width(&lines[1]),
-            ansi_visible_width(&lines[2]),
-            ansi_visible_width(&lines[3]),
-        ];
+        let ordered_views = self.ordered_views();
+        let mut cards = Vec::with_capacity(ordered_views.len());
+        let mut line_widths = Vec::with_capacity(self.views.len().saturating_mul(4));
+        for (_, view) in ordered_views {
+            let lines = render_card(view, self.columns, color_enabled(), glyphs);
+            line_widths.extend(lines.iter().map(|line| ansi_visible_width(line)));
+            cards.push(lines);
+        }
         let mut terminal = io::stderr().lock();
-        if let Some(previous_widths) = self.rendered_line_widths {
+        if let Some(previous_widths) = self.rendered_line_widths.as_deref() {
             let rows = physical_rows(previous_widths, self.columns);
             if rows != 0 {
                 // A resize can reflow each old logical line over several
@@ -462,11 +482,13 @@ impl Renderer {
                 let _ = write!(terminal, "\x1b[{rows}A\r\x1b[0J");
             }
         }
-        for line in lines {
-            let _ = writeln!(terminal, "\r\x1b[2K{line}");
+        for lines in cards {
+            for line in lines {
+                let _ = writeln!(terminal, "\r\x1b[2K{line}");
+            }
         }
         let _ = terminal.flush();
-        if let Some(view) = self.active.as_mut() {
+        for view in self.views.values_mut() {
             view.change_highlight_draws = view.change_highlight_draws.saturating_sub(1);
         }
         self.rendered_line_widths = Some(line_widths);
@@ -501,6 +523,7 @@ struct StreamView {
     output_bytes: usize,
     output_report: Option<BlockReport>,
     change_highlight_draws: u8,
+    finished: bool,
     pulse: usize,
     status: String,
     work: Option<WorkPosition>,
@@ -1482,11 +1505,11 @@ fn ansi_visible_width(text: &str) -> usize {
     width
 }
 
-fn physical_rows(line_widths: [usize; 4], terminal_width: usize) -> usize {
+fn physical_rows(line_widths: &[usize], terminal_width: usize) -> usize {
     let terminal_width = terminal_width.max(1);
     line_widths
-        .into_iter()
-        .map(|width| width.max(1).div_ceil(terminal_width))
+        .iter()
+        .map(|&width| width.max(1).div_ceil(terminal_width))
         .sum()
 }
 
@@ -1561,6 +1584,41 @@ mod tests {
         }
     }
 
+    fn idle_view(stream_id: usize) -> StreamView {
+        StreamView {
+            id: stream_id,
+            duplicates: Vec::new(),
+            note: None,
+            source_bits: 8,
+            source_blocks: 1,
+            source_bytes: 1,
+            source_report: None,
+            output_bits: 8,
+            output_bytes: 1,
+            output_report: None,
+            change_highlight_draws: 0,
+            finished: false,
+            pulse: 0,
+            status: String::new(),
+            work: None,
+        }
+    }
+
+    #[test]
+    fn concurrent_trials_remain_distinct_and_render_in_physical_stream_order() {
+        let mut renderer = Renderer::default();
+        renderer.views.insert(20, idle_view(2));
+        renderer.views.insert(10, idle_view(2));
+        renderer.views.insert(30, idle_view(1));
+
+        let order: Vec<_> = renderer
+            .ordered_views()
+            .into_iter()
+            .map(|(report_id, view)| (view.id, report_id))
+            .collect();
+        assert_eq!(order, [(1, 30), (2, 10), (2, 20)]);
+    }
+
     #[test]
     fn card_is_left_aligned_bounded_and_shows_savings_inside_aligned_blocks() {
         let source = report(
@@ -1584,6 +1642,7 @@ mod tests {
             output_bytes: 94,
             output_report: Some(output),
             change_highlight_draws: 0,
+            finished: false,
             pulse: 0,
             status: "candidate".to_owned(),
             work: None,
@@ -1631,6 +1690,7 @@ mod tests {
             output_bytes: 1,
             output_report: None,
             change_highlight_draws: 0,
+            finished: false,
             pulse: 0,
             status: String::new(),
             work: None,
@@ -1845,8 +1905,8 @@ mod tests {
     #[test]
     fn resize_accounting_includes_reflowed_physical_rows() {
         assert_eq!(ansi_visible_width("\x1b[96m▓▓\x1b[0m"), 2);
-        assert_eq!(physical_rows([9, 108, 108, 100], 120), 4);
-        assert_eq!(physical_rows([9, 108, 108, 100], 80), 7);
+        assert_eq!(physical_rows(&[9, 108, 108, 100], 120), 4);
+        assert_eq!(physical_rows(&[9, 108, 108, 100], 80), 7);
     }
 
     #[test]

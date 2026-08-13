@@ -43,14 +43,16 @@ pub struct Options {
     /// output.
     ///
     /// Reporting is deliberately kept out of hot token and Huffman loops.
-    /// Quiet and verbose runs use the same optimization and memory policies.
+    /// Default, verbose, and visual runs use the same routes, worker
+    /// parallelism, optimization budgets, and memory policies.
     pub verbose: bool,
     /// Show an interactive two-row map for every Deflate stream.
     ///
     /// The source row remains fixed while the output row follows the best
     /// complete candidate found so far. Visual reporting is enabled only when
     /// standard error is an interactive terminal; redirected runs remain free
-    /// of ANSI cursor-control sequences.
+    /// of ANSI cursor-control sequences. Enabling it never substitutes a
+    /// cheaper optimization schedule for the standard engine.
     pub visual: bool,
     /// Remove supported wrapper metadata, including embedded credentials and
     /// signatures, while rebuilding the file.

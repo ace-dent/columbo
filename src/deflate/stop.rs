@@ -31,6 +31,7 @@ pub(crate) fn initial_bounded_phase_share(remaining: Duration) -> Duration {
 pub(crate) struct Deadline {
     pub(crate) started: Instant,
     pub(crate) duration: Duration,
+    pub(crate) grace: Duration,
     // Timeout and route-cancellation flags share one atomic so a hot search
     // probe performs only one synchronization load. The flags carry no data,
     // so relaxed ordering is sufficient.
@@ -38,10 +39,16 @@ pub(crate) struct Deadline {
 }
 
 impl Deadline {
+    #[cfg(test)]
     pub(crate) fn new(started: Instant, duration: Duration) -> Self {
+        Self::with_grace(started, duration, timeout_grace(duration))
+    }
+
+    pub(crate) fn with_grace(started: Instant, duration: Duration, grace: Duration) -> Self {
         Self {
             started,
             duration,
+            grace,
             state: AtomicU8::new(0),
         }
     }
@@ -73,7 +80,7 @@ impl Deadline {
         if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
             return true;
         }
-        let hard_duration = self.duration.saturating_add(timeout_grace(self.duration));
+        let hard_duration = self.duration.saturating_add(self.grace);
         if self.started.elapsed() < hard_duration {
             return false;
         }

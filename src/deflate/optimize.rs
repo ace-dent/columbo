@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::progress::{
     reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
@@ -283,6 +283,22 @@ pub(crate) fn optimize_raw_prefix_with_floor(
     decoded_limit: u64,
     default_floor: DefaultFloor,
 ) -> Result<RawOptimization> {
+    optimize_raw_prefix_with_floor_and_grace(
+        input,
+        options,
+        decoded_limit,
+        default_floor,
+        timeout_grace(options.timeout),
+    )
+}
+
+pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
+    input: &[u8],
+    options: &Options,
+    decoded_limit: u64,
+    default_floor: DefaultFloor,
+    grace: Duration,
+) -> Result<RawOptimization> {
     if input.len() as u64 > options.max_input_bytes {
         return Err(Error::new("input exceeds configured safety limit"));
     }
@@ -330,7 +346,7 @@ pub(crate) fn optimize_raw_prefix_with_floor(
         });
     }
     progress.routes();
-    let deadline = Deadline::new(started, options.timeout);
+    let deadline = Deadline::with_grace(started, options.timeout, grace);
 
     // Prefix callers need the exact bytes occupied by the first stream. Any
     // unused high bits in its final byte belong to that stream's byte-level
@@ -1477,7 +1493,7 @@ fn build_source_max_candidate_verbose(
     let mut monitored_expired = || {
         details.heartbeat();
         if deadline.soft_expired() {
-            details.finalizing_after_soft_deadline(timeout_grace(deadline.duration));
+            details.finalizing_after_soft_deadline(deadline.grace);
         }
         let should_stop = expired.reached();
         if should_stop && deadline.was_triggered() {

@@ -81,6 +81,7 @@ pub(super) fn scale_duration(duration: Duration, factor: f64) -> Duration {
 /// A container may hold many independent Deflate streams, but `--timeout`
 /// applies to the file as a whole. Raw optimizers remain self-contained and
 /// thread-safe; the wrapper passes each one only the search time still left.
+#[derive(Clone, Copy)]
 pub(super) struct SearchDeadline {
     started: Instant,
     timeout: Duration,
@@ -107,6 +108,30 @@ impl SearchDeadline {
 
     pub(super) fn is_expired(&self) -> bool {
         self.started.elapsed() >= self.timeout
+    }
+
+    /// Give grace only to a call that owns the file's actual remainder.
+    ///
+    /// Proportional child slices are scheduling boundaries, not independent
+    /// user timeouts. Multiplying the one-second grace by every container
+    /// stream would starve later streams and exceed the documented file-wide
+    /// allowance.
+    pub(super) fn grace_for_call(&self, call_timeout: Duration) -> Duration {
+        let elapsed = self.started.elapsed();
+        let soft_remaining = self.timeout.saturating_sub(elapsed);
+        if call_timeout < soft_remaining {
+            if self.timeout.is_zero() {
+                return Duration::ZERO;
+            }
+            return scale_duration(
+                crate::deflate::timeout_grace(self.timeout),
+                call_timeout.as_secs_f64() / self.timeout.as_secs_f64(),
+            );
+        }
+        self.timeout
+            .saturating_add(crate::deflate::timeout_grace(self.timeout))
+            .saturating_sub(elapsed)
+            .saturating_sub(call_timeout)
     }
 }
 
@@ -229,6 +254,24 @@ mod tests {
             timeout: Duration::from_secs(10),
         };
         assert!(!active.is_expired());
+    }
+
+    #[test]
+    fn only_a_child_owning_the_file_remainder_receives_global_grace() {
+        let options = Options {
+            timeout: Duration::from_secs(10),
+            ..Options::default()
+        };
+        let deadline = SearchDeadline::new(&options);
+
+        assert_eq!(
+            deadline.grace_for_call(Duration::from_secs(1)),
+            Duration::from_millis(200)
+        );
+        let remainder = deadline.remaining();
+        let grace = deadline.grace_for_call(remainder);
+        assert!(grace > Duration::from_millis(1_900));
+        assert!(grace <= Duration::from_secs(2));
     }
 
     #[test]
