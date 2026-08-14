@@ -3,7 +3,6 @@
 //! Planning and emission for one structural Deflate block.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::Arc;
 
 use crate::{Error, Options, Result};
@@ -396,32 +395,59 @@ impl CanonicalPlanCache {
 }
 
 fn canonical_plan_fingerprint(block: &ParsedBlock, options: &Options) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    block.tokens.len().hash(&mut hasher);
-    for token in block.tokens.iter() {
-        token.hash(&mut hasher);
+    // This is a bounded cache-bucket accelerator, never an identity proof.
+    // Exact token, frequency, source-tree, and policy comparisons follow every
+    // bucket hit. Hash the canonical token state directly instead of running a
+    // cryptographic-strength SipHash over the tokens and then over both derived
+    // frequency arrays. Omitting the source-tree seed may lengthen a rare
+    // collision chain, but cannot produce a false cache hit.
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    mix_plan_fingerprint(&mut fingerprint, block.tokens.len() as u64);
+    for &token in block.tokens.iter() {
+        match token {
+            Token::Literal(value) => {
+                mix_plan_fingerprint(&mut fingerprint, u64::from(value));
+            }
+            Token::Match {
+                length,
+                distance,
+                length_symbol,
+                distance_symbol,
+                length_extra,
+                distance_extra,
+                length_extra_bits,
+                distance_extra_bits,
+            } => {
+                mix_plan_fingerprint(
+                    &mut fingerprint,
+                    1_u64 << 63
+                        | u64::from(length)
+                        | (u64::from(distance) << 16)
+                        | (u64::from(length_symbol) << 32)
+                        | (u64::from(distance_symbol) << 48)
+                        | (u64::from(length_extra_bits) << 56),
+                );
+                mix_plan_fingerprint(
+                    &mut fingerprint,
+                    u64::from(length_extra)
+                        | (u64::from(distance_extra) << 16)
+                        | (u64::from(distance_extra_bits) << 32),
+                );
+            }
+        }
     }
-    block.literal_frequencies.hash(&mut hasher);
-    block.distance_frequencies.hash(&mut hasher);
-    hash_dynamic_plan(block.original_dynamic.as_ref(), &mut hasher);
-    options.strict.hash(&mut hasher);
-    options.exhaustive.hash(&mut hasher);
-    hasher.finish()
+    mix_plan_fingerprint(
+        &mut fingerprint,
+        u64::from(options.strict) | (u64::from(options.exhaustive) << 1),
+    );
+    fingerprint
 }
 
-fn hash_dynamic_plan(dynamic: Option<&DynamicPlan>, hasher: &mut impl Hasher) {
-    dynamic.is_some().hash(hasher);
-    let Some(dynamic) = dynamic else {
-        return;
-    };
-    dynamic.literal_lengths.hash(hasher);
-    dynamic.distance_lengths.hash(hasher);
-    dynamic.code_length_lengths.hash(hasher);
-    dynamic.rle.hash(hasher);
-    dynamic.hlit.hash(hasher);
-    dynamic.hdist.hash(hasher);
-    dynamic.hclen.hash(hasher);
-    dynamic.bits.hash(hasher);
+#[inline]
+fn mix_plan_fingerprint(fingerprint: &mut u64, value: u64) {
+    *fingerprint ^= value;
+    *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    *fingerprint ^= *fingerprint >> 32;
 }
 
 /// Plan one block through a completed route-local canonical kernel.
