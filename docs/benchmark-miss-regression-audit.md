@@ -23,21 +23,22 @@ replays are retained under `work/*-final-broad-sample.json` and
 
 | Benchmark | Completed rows | Recorded miss rows | Unique recorded miss files | Current disposition | Prior-result regression files | Errors |
 | --- | ---: | ---: | ---: | --- | ---: | ---: |
-| DeflOpt | 1,914 | 15 | 9 | 15 strict-policy rows | 10 | 0 |
+| DeflOpt | 1,914 | 15 | 9 | 15 strict-policy rows | 5 | 0 |
 | Defluff (`--strict 0`) | 66 | 0 | 0 | — | 0 | 0 |
-| timed deft4j | 1,621 | 22 | 22 | 20 strict-policy rows; 1 PNG preservation-policy row; 1 fixed engine row | 11 | 0 |
-| Combined | 3,601 | 37 | 29 | 35 strict-policy rows; 1 PNG preservation-policy row; 1 fixed engine row; no unclassified row | 19 unique | 0 |
+| timed deft4j | 1,621 | 22 | 22 | 20 strict-policy rows; 1 PNG preservation-policy row; 1 fixed engine row | 12 | 0 |
+| Combined | 3,601 | 37 | 29 | 35 strict-policy rows; 1 PNG preservation-policy row; 1 fixed engine row; no unclassified row | 16 unique | 0 |
 
 The accepted candidate fixes the recorded
 `oxipng/profile_gray_disallow_color.png` engine miss, leaving 21 timed-deft4j
 differences in 21 files. Every remaining difference has a confirmed strict or
 safe-preservation policy explanation.
 
-The complete DeflOpt report and deft4j miss replays use final-build binary
-SHA-256 `c8eea2e26a2a6300a3212fbf843a60fc27d5ed4272d5e03430c5631eb2716a44`.
-The complete like-for-like Defluff refresh uses the current distribution
-binary SHA-256
-`8ae993583b7ea95291e5eb185d7ea7d8f60b639a96ed3e94f538c75283003261`.
+The complete DeflOpt and like-for-like Defluff refreshes use the current
+distribution binary SHA-256
+`5d8aa667026dbfe7edff9b5917dcaf7352354e54ebaa477cda8e893250e41650`.
+The complete timed-deft4j journal and its miss replays use an earlier binary;
+the accepted candidate results below are kept separate so executable hashes
+are not mixed within a journal.
 The accepted PNG and ZIP fixes were validated with current distribution binary
 SHA-256 `29d432780240255ab15cfe61c2a3f98a87392c51cdbc50617dbba336b6c349f6`;
 their focused and broad samples are recorded separately so the complete
@@ -45,10 +46,12 @@ journals do not mix executable hashes.
 
 ## DeflOpt misses
 
-Every DeflOpt miss reaches parity or better when rerun with `--strict 0`.
-Default mode must remain strictly compliant by default, so these are documented
-policy differences rather than search failures. Deltas below are the largest
-strict delta recorded for the file; positive means Columbo is larger.
+Every DeflOpt miss reached parity or better in the earlier `--strict 0`
+classification audit. Default mode must remain strictly compliant by default,
+so these are documented policy differences rather than search failures. The
+latest complete run records the same 15 strict deltas for later investigation
+without rerunning relaxed audits. Deltas below are the largest strict delta
+recorded for the file; positive means Columbo is larger.
 
 | File | Affected modes | Bytes | Bits | Relaxed audit |
 | --- | --- | ---: | ---: | --- |
@@ -62,9 +65,9 @@ strict delta recorded for the file; positive means Columbo is larger.
 | `small/T_Grass.png` | Default, Max | 2 | 15 | parity or better |
 | `small/profle.png` | Default | 1 | 1 | parity |
 
-The complete final-build refresh covers all 15 rows above. Max was never worse
-than its completed Default result, and every strict miss reached parity or
-better in a same-binary relaxed audit.
+The complete current-binary refresh covers all 15 rows above, and Max was never
+worse than its completed Default result. The prior relaxed audit remains the
+classification evidence; it is not represented as current-hash row metadata.
 
 ## Defluff comparison
 
@@ -126,9 +129,9 @@ the report snapshot so its provenance remains explicit.
 
 ## Prior-result regressions
 
-The benchmark journals contain 10 DeflOpt and 11 deft4j rows whose advantage
-over the same reference fell by more than 10%. Defluff has none. Two files
-occur in both larger journals, leaving 19 unique files. These annotations
+The benchmark journals contain 5 DeflOpt and 12 deft4j rows whose advantage
+over the same reference fell by more than 10%. Defluff has none. One file
+occurs in both larger journals, leaving 16 unique files. These annotations
 compare Columbo with an older Columbo result; they are not reference misses
 unless the file also appears above. They are an investigation backlog, not a
 reason to interrupt a complete benchmark refresh.
@@ -137,23 +140,20 @@ reason to interrupt a complete benchmark refresh.
 | --- | --- | --- |
 | `css-ig-net/barchart.png` | DeflOpt | Current run saves 14 bits, 2 fewer than its previous result. |
 | `css-ig-net/compose.png` | DeflOpt | Current run remains 16 bytes / 131 bits ahead of DeflOpt, but lost 2 bytes / 15 bits of prior advantage. |
-| `css-ig-net/sample_21-fs8.png` | deft4j | Current guard passes after the compact-split parent-order change. |
-| `css-ig-net/sample_33-fs8.png` | deft4j | Current guard passes after the same general ordering rule. |
-| `css-ig-net/test-convertir-truecoloralpha-trns.png` | deft4j | Current guard ties its historical file size and is 4 bits above its floor. |
-| `medium/loupe-fs8.png` | DeflOpt | Current run saves 1 byte / 14 bits, losing 1 byte / 4 bits of prior advantage. |
-| `medium/menu.png` | DeflOpt | Current guard passes. |
-| `medium/te_syntax.png` | DeflOpt | Current guard passes after the metadata-floor scheduling change. |
-| `medium/284.png` | deft4j | Current guard is 1 byte / 3 bits above its historical floor. |
-| `medium/Mittens.png` | deft4j | Current guard is 1 bit above its historical floor. |
+| `css-ig-net/sample_14.png` | deft4j | Current journal remains 18 bytes / 148 bits ahead of deft4j. |
+| `css-ig-net/sample_59.png` | deft4j | Current journal remains 15 bytes / 117 bits ahead of deft4j. |
+| `medium/284.png` | deft4j | Current journal remains 4 bytes / 36 bits ahead of deft4j. |
+| `medium/Matrix.png` | deft4j | Current journal remains 341 bytes / 2,732 bits ahead of deft4j. |
+| `medium/Mittens.png` | deft4j | Current journal remains 2 bits ahead of deft4j. |
+| `medium/te_syntax.png` | deft4j | Current journal remains 5 bytes / 43 bits ahead of deft4j. |
+| `oxipng/grayscale_8_should_be_grayscale_1.png` | DeflOpt | Current run remains 15 bytes / 126 bits ahead of DeflOpt, but lost 3 bytes / 19 bits of prior advantage. |
 | `oxipng/grayscale_8_should_be_palette_8.png` | DeflOpt | Current run remains 420 bytes / 3,364 bits ahead of DeflOpt, but lost 84 bytes / 667 bits of prior advantage. |
-| `oxipng/palette_8_should_be_palette_8.png` | deft4j | Current guard is 15 bytes / 123 bits above its historical floor; the rejected competing-lineage experiment caused much larger broad losses. |
-| `oxipng/rgba_16_should_be_palette_2.png` | deft4j | Current guard is 6 bytes / 51 bits above its historical floor; it shares the same competing-lineage trade-off. |
-| `pkmn-bw/000-Logo-2.png` | both | Current DeflOpt run saves 4 bits, 2 fewer than its previous result; the guard records the same 2-bit floor difference. |
-| `small/carwheel.png` | DeflOpt | Current guard passes. |
-| `small/check.png` | DeflOpt | Current guard passes. |
-| `small/present.png` | both | Current DeflOpt run saves 15 bits, 2 fewer than its previous result; the guard records the same 2-bit floor difference. |
-| `8x8-zip/Grid.playdate-pulp.zip` | deft4j | Current guard passes. |
-| `8x8-zip/Symbols.playdate-pulp.zip` | deft4j | Current guard passes. |
+| `oxipng/palette_8_should_be_palette_8.png` | deft4j | Current journal remains 88 bytes / 699 bits ahead of deft4j. |
+| `oxipng/profile_gray_disallow_color.png` | deft4j | The recorded journal miss is fixed by the accepted current candidate described above. |
+| `oxipng/rgba_16_should_be_palette_2.png` | deft4j | Current journal remains 3 bytes / 25 bits ahead of deft4j. |
+| `pkmn-bw/000-Logo-2.png` | both | Current DeflOpt run saves 4 bits and the deft4j journal saves 2 bits; both lost 2 bits of prior advantage. |
+| `small/present.png` | deft4j | Current journal remains 2 bytes / 17 bits ahead of deft4j. |
+| `medium-zip/samples.zip` | deft4j | Current journal remains 23 bytes / 192 bits ahead of deft4j. |
 
 The previous full guard run predated the accepted fixes and failed 19 of its 40
 files. The final-build rerun reduced that to 13 of 40. All three repaired
@@ -283,13 +283,13 @@ a meaningful-bit difference within the same file size.
   The two former strict-mode differences are independently confirmed policy
   cases; aggregate relaxed results are 27 bytes / 273 bits smaller than
   Defluff.
-- The complete final-build DeflOpt refresh contains exactly 1,914 current-hash
+- The complete current-build DeflOpt refresh contains exactly 1,914 current-hash
   rows for all 957 eligible pairs in Default and Max: no duplicate, missing,
-  orphan, error, stale-hash, or Max-below-Default row. Default totals 385,418
-  bytes / 3,056,651 bits smaller than DeflOpt; Max totals 586,956 bytes /
-  4,669,051 bits smaller. All 15 miss rows reach parity or better in their
-  recorded relaxed audit, and all 10 confirmed prior-result regressions are
-  retained in the public report for later investigation.
+  orphan, error, stale-hash, or Max-below-Default row. Default totals 385,419
+  bytes / 3,056,660 bits smaller than DeflOpt; Max totals 587,128 bytes /
+  4,670,417 bits smaller. All 15 strict-policy miss rows and all 5 confirmed
+  prior-result regressions are retained in the public report for later
+  investigation; earlier relaxed audits provide their policy classification.
 - The final 22-row timed-deft4j family sample has no error and totals 1,735
   bytes / 13,912 bits smaller. Its only two misses are strict-policy
   differences: relaxed same-build audits reach parity or better on
