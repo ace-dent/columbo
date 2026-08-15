@@ -77,11 +77,18 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         };
         if raw.timed_out {
             pending.push(index);
+        } else if options.verbose || options.visual {
+            crate::progress::complete_stream_group(index + 1, &[]);
         }
         results[index] = Some(raw);
     }
 
     reclaim_timed_out_members(input, &members, &mut results, pending, options, &deadline)?;
+    if options.verbose || options.visual {
+        for index in 0..members.len() {
+            crate::progress::complete_stream_group(index + 1, &[]);
+        }
+    }
 
     let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
     let mut source_deflate_bits = 0_u64;

@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 
-//! Interactive Deflate stream map.
+//! Ordered Deflate stream map.
 //!
-//! The renderer deliberately avoids an alternate screen. Each completed
-//! stream leaves two block rows and one information row in scrollback. When a
-//! container optimizes several streams concurrently, their cards share one
-//! bounded live region and are redrawn together. This remains useful for
-//! archives with many members and avoids needing terminal-height discovery.
+//! Optimizer workers update cached stream views and never write terminal
+//! control sequences. The reporting coordinator emits immutable cards as
+//! complete physical streams become available in order. This preserves
+//! readable scrollback without weakening multi-stream parallelism.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -16,8 +15,7 @@ use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{terminal, Options};
 
@@ -28,18 +26,12 @@ const MAX_TERMINAL_COLUMNS: usize = 4_096;
 const CARD_WIDTH_NUMERATOR: usize = 9;
 const CARD_WIDTH_DENOMINATOR: usize = 10;
 const MIN_CARD_COLUMNS: usize = 24;
-const REDRAW_INTERVAL: Duration = Duration::from_millis(80);
-// Hold each cursor state long enough to remain visible during expensive token
-// and split searches. Two states make this a one-second blink cycle.
-const ANIMATION_INTERVAL: Duration = Duration::from_millis(500);
-const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const CHANGE_HIGHLIGHT_DRAWS: u8 = 1;
 const STORED_COLOR: &str = "\x1b[33m";
 const FIXED_COLOR: &str = "\x1b[36m";
 const DYNAMIC_COLOR: &str = "\x1b[96m";
 
 static RENDERER: OnceLock<Mutex<Renderer>> = OnceLock::new();
-static ANIMATOR_STARTED: OnceLock<()> = OnceLock::new();
 
 pub(super) fn enabled(options: &Options) -> bool {
     options.visual
@@ -49,6 +41,7 @@ pub(super) fn enabled(options: &Options) -> bool {
 
 pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usize>) {
     with_renderer(|renderer| {
+        renderer.reset();
         renderer.format = Some(format);
         renderer.deflate_streams = deflate_streams;
         renderer.print_header();
@@ -89,9 +82,7 @@ pub(super) fn begin(
                 work: None,
             },
         );
-        renderer.redraw(RedrawUrgency::Immediate);
     });
-    ensure_animator();
 }
 
 pub(super) fn route_started(report_id: usize, name: &str) {
@@ -105,7 +96,6 @@ pub(super) fn route_started(report_id: usize, name: &str) {
             completed: 0,
             total: 0,
         });
-        renderer.redraw(RedrawUrgency::Immediate);
     });
 }
 
@@ -117,7 +107,6 @@ pub(super) fn activity(report_id: usize, status: &str) {
         view.status.clear();
         view.status.push_str(status);
         view.work = None;
-        renderer.redraw(RedrawUrgency::Coalesced);
     });
 }
 
@@ -129,7 +118,6 @@ pub(super) fn work(report_id: usize, status: &str, completed: usize, total: usiz
         view.status.clear();
         view.status.push_str(status);
         view.work = Some(WorkPosition { completed, total });
-        renderer.redraw(RedrawUrgency::Coalesced);
     });
 }
 
@@ -147,7 +135,6 @@ pub(super) fn checkpoint(report_id: usize, name: &str, bits: u64, blocks: usize,
             format!("{name} checked · best retained")
         };
         view.work = None;
-        renderer.redraw(RedrawUrgency::Coalesced);
     });
 }
 
@@ -182,7 +169,6 @@ pub(super) fn candidate(report_id: usize, name: &str, candidate: &CandidateProgr
             view.status = format!("{name} checked · best retained");
         }
         view.work = None;
-        renderer.redraw(RedrawUrgency::Coalesced);
     });
 }
 
@@ -210,7 +196,6 @@ pub(super) fn final_plan(report_id: usize, report: Option<&BlockReport>) {
             view.status = "Final block plan · details unavailable".to_owned();
         }
         view.work = None;
-        renderer.redraw(RedrawUrgency::Coalesced);
     });
 }
 
@@ -248,48 +233,36 @@ pub(super) fn finish(
                 ""
             }
         );
-        renderer.redraw(RedrawUrgency::Immediate);
-        if renderer.views.values().all(|view| view.finished) {
-            renderer.views.clear();
-            // The completed cards remain in scrollback; the next stream
-            // appends below instead of erasing the completed batch.
-            renderer.rendered_line_widths = None;
-        }
     });
 }
 
-fn with_renderer(operation: impl FnOnce(&mut Renderer)) {
+pub(super) fn finish_file() {
+    with_renderer(Renderer::emit_finished);
+}
+
+pub(super) fn take_finished_stream(stream_id: usize) -> Option<Vec<[String; 4]>> {
+    with_renderer(|renderer| renderer.take_finished_stream(stream_id))
+}
+
+pub(super) fn emit_cards(cards: Vec<[String; 4]>) {
+    if cards.is_empty() {
+        return;
+    }
+    let mut terminal = io::stderr().lock();
+    for lines in cards {
+        for line in lines {
+            let _ = writeln!(terminal, "{line}");
+        }
+    }
+    let _ = terminal.flush();
+}
+
+fn with_renderer<T>(operation: impl FnOnce(&mut Renderer) -> T) -> T {
     let renderer = RENDERER.get_or_init(|| Mutex::new(Renderer::default()));
     let mut renderer = renderer
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    operation(&mut renderer);
-}
-
-fn ensure_animator() {
-    ANIMATOR_STARTED.get_or_init(|| {
-        let _ = thread::Builder::new()
-            .name("columbo-visual".to_owned())
-            .spawn(|| loop {
-                thread::park_timeout(ANIMATION_INTERVAL);
-                let Some(renderer) = RENDERER.get() else {
-                    continue;
-                };
-                let mut renderer = renderer
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut animate = false;
-                for view in renderer.views.values_mut() {
-                    if !view.finished && view.work.is_some() {
-                        view.pulse = view.pulse.wrapping_add(1);
-                        animate = true;
-                    }
-                }
-                if animate {
-                    renderer.redraw(RedrawUrgency::Coalesced);
-                }
-            });
-    });
+    operation(&mut renderer)
 }
 
 #[derive(Default)]
@@ -298,17 +271,8 @@ struct Renderer {
     deflate_streams: Option<usize>,
     format: Option<&'static str>,
     header_printed: bool,
-    last_draw: Option<Instant>,
-    last_resize_check: Option<Instant>,
-    rendered_line_widths: Option<Vec<usize>>,
     unicode: bool,
     views: BTreeMap<usize, StreamView>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RedrawUrgency {
-    Coalesced,
-    Immediate,
 }
 
 #[derive(Clone, Copy)]
@@ -365,14 +329,72 @@ impl Glyphs {
 }
 
 impl Renderer {
+    fn reset(&mut self) {
+        self.columns = 0;
+        self.deflate_streams = None;
+        self.format = None;
+        self.header_printed = false;
+        self.unicode = false;
+        self.views.clear();
+    }
+
     fn ordered_views(&self) -> Vec<(usize, &StreamView)> {
         let mut views: Vec<_> = self
             .views
             .iter()
             .map(|(&report_id, view)| (report_id, view))
             .collect();
-        views.sort_unstable_by_key(|(report_id, view)| (view.id, *report_id));
+        views.sort_unstable_by_key(|(report_id, view)| {
+            (view.id, super::report_order(view.note), *report_id)
+        });
         views
+    }
+
+    fn take_finished_stream(&mut self, stream_id: usize) -> Option<Vec<[String; 4]>> {
+        if self
+            .views
+            .values()
+            .any(|view| view.id == stream_id && !view.finished)
+        {
+            return None;
+        }
+        let mut report_ids: Vec<_> = self
+            .views
+            .iter()
+            .filter_map(|(&report_id, view)| (view.id == stream_id).then_some(report_id))
+            .collect();
+        report_ids.sort_unstable_by_key(|report_id| {
+            let view = &self.views[report_id];
+            (super::report_order(view.note), *report_id)
+        });
+        let color = color_enabled();
+        let glyphs = Glyphs::for_unicode(self.unicode);
+        Some(
+            report_ids
+                .into_iter()
+                .filter_map(|report_id| self.views.remove(&report_id))
+                .map(|view| render_card(&view, self.columns, color, glyphs))
+                .collect(),
+        )
+    }
+
+    fn emit_finished(&mut self) {
+        if self.views.is_empty() {
+            self.reset();
+            return;
+        }
+        // Keep the width captured with the header. Earlier immutable cards may
+        // already be in scrollback, so resampling after a resize would make
+        // later cards visually inconsistent with the same file.
+        let glyphs = Glyphs::for_unicode(self.unicode);
+        let cards: Vec<_> = self
+            .ordered_views()
+            .into_iter()
+            .filter(|(_, view)| view.finished)
+            .map(|(_, view)| render_card(view, self.columns, color_enabled(), glyphs))
+            .collect();
+        emit_cards(cards);
+        self.reset();
     }
 
     fn print_header(&mut self) {
@@ -384,44 +406,29 @@ impl Renderer {
         self.unicode = glyphs.unicode;
         let format = self.format.unwrap_or("Deflate");
         self.columns = terminal_columns();
-        self.last_resize_check = Some(Instant::now());
         let (margin_width, card_width) = card_dimensions(self.columns);
         let margin = " ".repeat(margin_width);
         let mut output = io::stderr().lock();
         let _ = write_format_summary(&mut output, format, self.deflate_streams);
         let _ = writeln!(output);
         let full_legend = format!(
-            "{} stored  {} fixed  {} dynamic  {} boundary  {} working  {} changed  {} saved",
-            glyphs.stored,
-            glyphs.fixed,
-            glyphs.dynamic,
-            glyphs.boundary,
-            glyphs.working,
-            glyphs.changed,
-            glyphs.saved
+            "{} stored  {} fixed  {} dynamic  {} boundary  {} saved",
+            glyphs.stored, glyphs.fixed, glyphs.dynamic, glyphs.boundary, glyphs.saved
         );
         let compact_legend = format!(
-            "{} stored  {} fixed  {} dynamic  {} edge  {} work  {} change  {} saved",
-            glyphs.stored,
-            glyphs.fixed,
-            glyphs.dynamic,
-            glyphs.boundary,
-            glyphs.working,
-            glyphs.changed,
-            glyphs.saved
+            "{} stored  {} fixed  {} dynamic  {} edge  {} saved",
+            glyphs.stored, glyphs.fixed, glyphs.dynamic, glyphs.boundary, glyphs.saved
         );
-        let (legend, boundary_label, working_label, changed_label) =
-            if visible_width(&full_legend) <= card_width {
-                (&full_legend, "boundary", "working", "changed")
-            } else {
-                (&compact_legend, "edge", "work", "change")
-            };
+        let (legend, boundary_label) = if visible_width(&full_legend) <= card_width {
+            (&full_legend, "boundary")
+        } else {
+            (&compact_legend, "edge")
+        };
         if visible_width(legend) <= card_width {
             let _ = writeln!(
                 output,
                 "{margin}{}{stored}{} stored  {}{fixed}{} fixed  {}{dynamic}{} dynamic  \
-                 {boundary} {boundary_label}  {working} {working_label}  \
-                 {changed} {changed_label}  {saved} saved",
+                 {boundary} {boundary_label}  {saved} saved",
                 style(color, STORED_COLOR),
                 reset(color),
                 style(color, FIXED_COLOR),
@@ -432,8 +439,6 @@ impl Renderer {
                 fixed = glyphs.fixed,
                 dynamic = glyphs.dynamic,
                 boundary = glyphs.boundary,
-                working = glyphs.working,
-                changed = glyphs.changed,
                 saved = glyphs.saved,
             );
         } else {
@@ -446,68 +451,6 @@ impl Renderer {
         let _ = writeln!(output);
         let _ = output.flush();
         self.header_printed = true;
-    }
-
-    fn redraw(&mut self, urgency: RedrawUrgency) {
-        let now = Instant::now();
-        let resized = self.refresh_columns(now);
-        if urgency == RedrawUrgency::Coalesced
-            && !resized
-            && self.rendered_line_widths.is_some()
-            && self
-                .last_draw
-                .is_some_and(|last| now.duration_since(last) < REDRAW_INTERVAL)
-        {
-            return;
-        }
-        if self.views.is_empty() {
-            return;
-        }
-        let glyphs = Glyphs::for_unicode(self.unicode);
-        let ordered_views = self.ordered_views();
-        let mut cards = Vec::with_capacity(ordered_views.len());
-        let mut line_widths = Vec::with_capacity(self.views.len().saturating_mul(4));
-        for (_, view) in ordered_views {
-            let lines = render_card(view, self.columns, color_enabled(), glyphs);
-            line_widths.extend(lines.iter().map(|line| ansi_visible_width(line)));
-            cards.push(lines);
-        }
-        let mut terminal = io::stderr().lock();
-        if let Some(previous_widths) = self.rendered_line_widths.as_deref() {
-            let rows = physical_rows(previous_widths, self.columns);
-            if rows != 0 {
-                // A resize can reflow each old logical line over several
-                // physical rows. Return to the beginning of that reflowed
-                // card and clear it before drawing the new bounded version.
-                let _ = write!(terminal, "\x1b[{rows}A\r\x1b[0J");
-            }
-        }
-        for lines in cards {
-            for line in lines {
-                let _ = writeln!(terminal, "\r\x1b[2K{line}");
-            }
-        }
-        let _ = terminal.flush();
-        for view in self.views.values_mut() {
-            view.change_highlight_draws = view.change_highlight_draws.saturating_sub(1);
-        }
-        self.rendered_line_widths = Some(line_widths);
-        self.last_draw = Some(now);
-    }
-
-    fn refresh_columns(&mut self, now: Instant) -> bool {
-        if self.columns != 0
-            && self
-                .last_resize_check
-                .is_some_and(|last| now.duration_since(last) < RESIZE_POLL_INTERVAL)
-        {
-            return false;
-        }
-        self.last_resize_check = Some(now);
-        let columns = terminal_columns();
-        let resized = self.columns != 0 && columns != self.columns;
-        self.columns = columns;
-        resized
     }
 }
 
@@ -1485,34 +1428,6 @@ fn visible_width(text: &str) -> usize {
     text.chars().count()
 }
 
-fn ansi_visible_width(text: &str) -> usize {
-    let mut characters = text.chars();
-    let mut width = 0_usize;
-    while let Some(character) = characters.next() {
-        if character != '\x1b' {
-            width += 1;
-            continue;
-        }
-        if characters.next() != Some('[') {
-            continue;
-        }
-        for control in characters.by_ref() {
-            if ('@'..='~').contains(&control) {
-                break;
-            }
-        }
-    }
-    width
-}
-
-fn physical_rows(line_widths: &[usize], terminal_width: usize) -> usize {
-    let terminal_width = terminal_width.max(1);
-    line_widths
-        .iter()
-        .map(|&width| width.max(1).div_ceil(terminal_width))
-        .sum()
-}
-
 fn color_enabled() -> bool {
     terminal::stderr_color_enabled()
 }
@@ -1894,19 +1809,6 @@ mod tests {
             ),
             "▓◇▓▓▓"
         );
-    }
-
-    #[test]
-    fn working_cursor_uses_a_visible_one_second_blink_cycle() {
-        assert_eq!(ANIMATION_INTERVAL, Duration::from_millis(500));
-        assert!(REDRAW_INTERVAL < ANIMATION_INTERVAL);
-    }
-
-    #[test]
-    fn resize_accounting_includes_reflowed_physical_rows() {
-        assert_eq!(ansi_visible_width("\x1b[96m▓▓\x1b[0m"), 2);
-        assert_eq!(physical_rows(&[9, 108, 108, 100], 120), 4);
-        assert_eq!(physical_rows(&[9, 108, 108, 100], 80), 7);
     }
 
     #[test]

@@ -17,7 +17,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use columbo::{optimize, Format, Options, MAX_TIMEOUT, MIN_TIMEOUT};
-use presentation::{format_duration as format_elapsed, plural, plural_u64};
+use presentation::{
+    countdown_seconds, format_duration as format_elapsed, plural, plural_u64, write_spinner_line,
+};
 
 const PROGRAM_NAME: &str = "columbo";
 const PROGRAM_VERSION: &str = concat!(
@@ -217,7 +219,7 @@ fn run() -> std::result::Result<(), u8> {
 fn execute(command: Command) -> std::result::Result<(), u8> {
     let report_mode = ReportMode::for_options(&command.options);
     if command.options.visual && !visual_terminal_available() {
-        eprintln!("visual mode needs an interactive terminal; continuing without the live display");
+        eprintln!("visual mode needs an interactive terminal; continuing without stream maps");
     }
 
     let input_count = command.inputs.len();
@@ -299,8 +301,7 @@ fn execute_file(
     }
 
     let optimize_started = detailed.then(Instant::now);
-    let mut spinner =
-        Spinner::start(command.options.exhaustive && report_mode == ReportMode::Default);
+    let mut spinner = Spinner::start(report_mode == ReportMode::Default, command.options.timeout);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
     let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -856,11 +857,11 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(output, "  -h, --help             show this help and exit")?;
     writeln!(
         output,
-        "  -v, --verbose          show live route timings, bit gains, and block choices"
+        "  -v, --verbose          show ordered route timings, bit gains, and block choices"
     )?;
     writeln!(
         output,
-        "      --visual           show a live Deflate block map with aligned in/out rows"
+        "      --visual           show ordered Deflate block maps with aligned in/out rows"
     )?;
     writeln!(
         output,
@@ -1229,8 +1230,8 @@ fn visual_terminal_available() -> bool {
 }
 
 impl Spinner {
-    fn start(enabled: bool) -> Self {
-        if !enabled || !io::stderr().is_terminal() {
+    fn start(enabled: bool, timeout: Duration) -> Self {
+        if !enabled || !visual_terminal_available() {
             return Self {
                 running: None,
                 worker: None,
@@ -1240,26 +1241,31 @@ impl Spinner {
         let running = Arc::new(AtomicBool::new(true));
         let worker_running = Arc::clone(&running);
         let color = terminal::stderr_color_enabled();
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
         let worker = thread::spawn(move || {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut frame = 0;
+            let mut drawn = false;
             // Avoid flashing a spinner for work that completes quickly.
             thread::park_timeout(Duration::from_millis(300));
             while worker_running.load(Ordering::Relaxed) {
-                if color {
-                    eprint!(
-                        "\r\x1b[36m{}\x1b[0m maximizing compression...",
-                        FRAMES[frame]
-                    );
-                } else {
-                    eprint!("\r{} maximizing compression...", FRAMES[frame]);
+                let seconds = countdown_seconds(deadline.saturating_duration_since(Instant::now()));
+                {
+                    let stderr = io::stderr();
+                    let mut output = stderr.lock();
+                    let _ = write_spinner_line(&mut output, FRAMES[frame], seconds, None, color);
+                    let _ = output.flush();
                 }
-                let _ = io::stderr().flush();
+                drawn = true;
                 frame = (frame + 1) % FRAMES.len();
-                thread::park_timeout(Duration::from_millis(200));
+                thread::park_timeout(Duration::from_millis(500));
             }
-            eprint!("\r\x1b[K");
-            let _ = io::stderr().flush();
+            if drawn {
+                eprint!("\r\x1b[K");
+                let _ = io::stderr().flush();
+            }
         });
         Self {
             running: Some(running),
@@ -1824,9 +1830,9 @@ mod tests {
         assert!(help.contains("meaningful Deflate bit is saved"));
         assert!(help.contains("Advanced:"));
         assert!(help.contains("--raw"));
-        assert!(help.contains("live route timings, bit gains, and block choices"));
+        assert!(help.contains("ordered route timings, bit gains, and block choices"));
         assert!(help.contains("--visual"));
-        assert!(help.contains("live Deflate block map with aligned in/out rows"));
+        assert!(help.contains("ordered Deflate block maps with aligned in/out rows"));
         assert!(!help.contains('\x1b'));
 
         let mut colored_help = Vec::new();

@@ -32,8 +32,8 @@ Each `input` may be a PNG/APNG, GZIP, ZIP, or zlib file; its format is detected 
 ### Options
 
 - `-h`, `--help`: Show command-line help and exit.
-- `-v`, `--verbose`: Show route timings, bit gains, and final block choices.
-- `--visual`: Show a live Deflate block map. Requires an interactive terminal and cannot be combined with `--verbose`.
+- `-v`, `--verbose`: Show completed stream reports in physical order, including route timings, bit gains, and final block choices.
+- `--visual`: Show completed Deflate block maps in physical stream order. Requires an interactive terminal and cannot be combined with `--verbose`.
 - `-m`, `--max`: Enable slower block-boundary and token-spelling searches for potentially smaller output.
 - `-d`, `--dry-run`: Run the complete optimization for each input and report savings without writing files. It accepts multiple positional inputs; `--out` remains ignored only for a single-input dry run and is rejected for a batch.
 - `--out <file>`: Write a single input to `file` instead of modifying it. It cannot be used with multiple inputs.
@@ -43,12 +43,6 @@ Each `input` may be a PNG/APNG, GZIP, ZIP, or zlib file; its format is detected 
 - `--raw`: Treat the input as a headerless RFC 1951 Deflate stream instead of detecting a wrapper.
 
 Options that take a value also accept `--out=<file>`, `--timeout=<seconds>`, and `--strict=<0|1>`.
-
-Default mode writes one compact, filename-prefixed result per input to standard
-error. Verbose mode writes its complete append-only report to standard output;
-Visual mode writes its live TUI and detailed summary to standard error. Error
-diagnostics always use standard error. A file-wide timeout notice is shown only
-in Verbose or Visual mode.
 
 ### Examples
 

@@ -151,7 +151,7 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
     };
     crate::progress::format_detected(options, detected, deflate_streams);
 
-    match detected {
+    let result = match detected {
         Format::Auto | Format::Raw => super::deflate::optimize_raw(input, options)
             .map(|raw| {
                 Optimization::from_metrics(
@@ -173,7 +173,9 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         Format::Zlib => zlib::optimize(input, options),
         Format::Gzip => gzip::optimize(input, options),
         Format::Zip => zip::optimize(input, options),
-    }
+    };
+    crate::progress::finish_file(options);
+    result
 }
 
 pub(crate) fn deflate_stream_count(

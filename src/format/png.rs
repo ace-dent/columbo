@@ -231,6 +231,11 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             budget.remaining = remaining_before_probe;
         } else {
             budget.remaining = remaining_before_probe.saturating_sub(decoded_work);
+            if options.verbose || options.visual {
+                let stream_id = metadata_stream_ids[index]
+                    .expect("every supported compressed metadata chunk has a stream identifier");
+                crate::progress::complete_stream_group(stream_id, &[]);
+            }
         }
     }
 
@@ -468,6 +473,12 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
                     }
                     .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?
                 };
+                if options.verbose || options.visual {
+                    let stream_id = metadata_stream_ids[index].expect(
+                        "every supported compressed metadata chunk has a stream identifier",
+                    );
+                    crate::progress::complete_stream_group(stream_id, &[]);
+                }
                 source_deflate_bits = source_deflate_bits
                     .checked_add(replacement.source_deflate_bits)
                     .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
@@ -1519,6 +1530,10 @@ fn optimize_image_streams(
             } else {
                 optimize_job()?
             };
+            if !result.timed_out && (options.verbose || options.visual) {
+                let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
+                crate::progress::complete_stream_group(stream_id, &duplicates);
+            }
             results.push((job, result));
         }
         results
@@ -1537,6 +1552,12 @@ fn optimize_image_streams(
         options,
         &budget.deadline,
     )?;
+    if options.verbose || options.visual {
+        for (job, _) in &results {
+            let (stream_id, duplicates) = image_job_stream_group(*job, &representatives);
+            crate::progress::complete_stream_group(stream_id, &duplicates);
+        }
+    }
     for (job, result) in results {
         store_image_job_result(job, result, &mut optimized_idat, &mut optimized);
     }
@@ -1846,6 +1867,9 @@ fn optimize_image_job_slice(
         let (stream_id, duplicates) = image_job_stream_group(job, representatives);
         let optimized =
             crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?;
+        if !optimized.timed_out && (options.verbose || options.visual) {
+            crate::progress::complete_stream_group(stream_id, &duplicates);
+        }
         results.push((job, optimized));
     }
     Ok(results)

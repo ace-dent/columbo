@@ -33,6 +33,10 @@ const PARALLEL_MAX_ARCHIVE_INPUT: usize = 8 * 1_024 * 1_024;
 const PARALLEL_MAX_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_MEMBER_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ARCHIVE_MEMBER_WORKERS: usize = 8;
+const ZIP_NORMAL_PRODUCER: u8 = crate::progress::PRIMARY_STREAM_PRODUCER;
+const ZIP_DEFAULT_FLOOR_PRODUCER: u8 = 1;
+const ZIP_DIRECT_MAX_PRODUCER: u8 = 2;
+const ZIP_REFINED_DEFAULT_PRODUCER: u8 = 3;
 
 /// Which structurally bounded member sets may use the parallel entry builder.
 ///
@@ -120,11 +124,13 @@ pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     if !options.exhaustive {
+        configure_stream_producers(options, &[ZIP_NORMAL_PRODUCER]);
         return optimize_once(
             input,
             options,
             DefaultFloor::Complete,
             ParallelMemberPolicy::UniformWorkOnly,
+            ZIP_NORMAL_PRODUCER,
         );
     }
 
@@ -133,6 +139,12 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     }
 
     optimize_max_sequential(input, options)
+}
+
+fn configure_stream_producers(options: &Options, producers: &[u8]) {
+    if options.verbose || options.visual {
+        crate::progress::set_stream_producers(producers);
+    }
 }
 
 /// Build Default-seeded and direct-Max archives inside the same wall-clock
@@ -144,6 +156,14 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 /// token choices expose a distinct search basin that the source branch cannot
 /// necessarily reach.
 fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization> {
+    configure_stream_producers(
+        options,
+        &[
+            ZIP_DEFAULT_FLOOR_PRODUCER,
+            ZIP_DIRECT_MAX_PRODUCER,
+            ZIP_REFINED_DEFAULT_PRODUCER,
+        ],
+    );
     thread::scope(|scope| {
         let started = Instant::now();
         let max_worker = thread::Builder::new()
@@ -155,6 +175,7 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
                         options,
                         DefaultFloor::Established,
                         ParallelMemberPolicy::UniformWorkOnly,
+                        ZIP_DIRECT_MAX_PRODUCER,
                     )
                 })
             });
@@ -167,6 +188,7 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
                 &floor_options,
                 DefaultFloor::Complete,
                 ParallelMemberPolicy::AnyIndependentWork,
+                ZIP_DEFAULT_FLOOR_PRODUCER,
             )
         });
 
@@ -176,6 +198,10 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
             // the established sequential route using the Default result and
             // whatever part of the original allowance remains.
             Err(_) => {
+                configure_stream_producers(
+                    options,
+                    &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
+                );
                 return crate::progress::with_route_lineage("refined default", || {
                     refine_complete_floor(input, options, started, floor?)
                 });
@@ -195,6 +221,10 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
 }
 
 fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimization> {
+    configure_stream_producers(
+        options,
+        &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
+    );
     let started = Instant::now();
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
@@ -203,6 +233,7 @@ fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimizati
         &floor_options,
         DefaultFloor::Complete,
         ParallelMemberPolicy::UniformWorkOnly,
+        ZIP_DEFAULT_FLOOR_PRODUCER,
     )?;
     refine_complete_floor(input, options, started, floor)
 }
@@ -222,6 +253,9 @@ fn refine_complete_floor(
     let remaining = options.timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         floor.timed_out = true;
+        if options.verbose || options.visual {
+            crate::progress::complete_all_stream_producers(ZIP_REFINED_DEFAULT_PRODUCER);
+        }
         return Ok(floor);
     }
 
@@ -232,6 +266,7 @@ fn refine_complete_floor(
         &max_options,
         DefaultFloor::Shared,
         ParallelMemberPolicy::UniformWorkOnly,
+        ZIP_REFINED_DEFAULT_PRODUCER,
     )?;
     let refined_wins = refined.data.len() < floor.data.len()
         || (refined.data.len() == floor.data.len() && refined.bits_saved != 0);
@@ -356,6 +391,7 @@ fn optimize_once(
     options: &Options,
     raw_default_floor: DefaultFloor,
     parallel_member_policy: ParallelMemberPolicy,
+    stream_producer: u8,
 ) -> Result<Optimization> {
     let deadline = SearchDeadline::new(options);
     let eocd_offset = find_end_of_central_directory(input)
@@ -454,6 +490,7 @@ fn optimize_once(
             raw_default_floor,
             &deadline,
             schedule,
+            stream_producer,
         )?
     } else {
         build_entries_serial(
@@ -466,6 +503,7 @@ fn optimize_once(
             raw_default_floor,
             &deadline,
             schedule,
+            stream_producer,
         )?
     };
     reclaim_timed_out_entries(
@@ -478,6 +516,7 @@ fn optimize_once(
         raw_default_floor,
         &deadline,
         schedule,
+        stream_producer,
     )?;
     let timed_out = deadline.is_expired();
     let source_deflate_bits = entries.iter().try_fold(0_u64, |total, entry| {
@@ -647,6 +686,7 @@ fn build_entries_serial(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
+    stream_producer: u8,
 ) -> Result<Vec<usize>> {
     let mut timed_out = Vec::new();
     timed_out
@@ -662,6 +702,7 @@ fn build_entries_serial(
             raw_default_floor,
             deadline,
             schedule,
+            stream_producer,
         )? {
             timed_out.push(index);
         }
@@ -685,6 +726,7 @@ fn build_entries_parallel(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
+    stream_producer: u8,
 ) -> Result<Vec<usize>> {
     let optimizable_count = build_order
         .iter()
@@ -705,11 +747,13 @@ fn build_entries_parallel(
             raw_default_floor,
             deadline,
             schedule,
+            stream_producer,
         );
     }
     let worker_count = optimizable.len().min(PARALLEL_ARCHIVE_MEMBER_WORKERS);
     let jobs_per_worker = optimizable.len() / worker_count;
     let workers_with_extra_job = optimizable.len() % worker_count;
+    let route_lineage = crate::progress::current_route_lineage();
 
     let completed = thread::scope(|scope| -> Result<_> {
         let mut workers = Vec::new();
@@ -729,17 +773,20 @@ fn build_entries_parallel(
             let worker = thread::Builder::new()
                 .name(format!("columbo-zip-members-{worker_index}"))
                 .spawn_scoped(scope, || {
-                    build_entry_batch(
-                        input,
-                        central_offset,
-                        entries,
-                        stream_ids,
-                        jobs,
-                        options,
-                        raw_default_floor,
-                        deadline,
-                        schedule,
-                    )
+                    crate::progress::with_optional_route_lineage(route_lineage, || {
+                        build_entry_batch(
+                            input,
+                            central_offset,
+                            entries,
+                            stream_ids,
+                            jobs,
+                            options,
+                            raw_default_floor,
+                            deadline,
+                            schedule,
+                            stream_producer,
+                        )
+                    })
                 });
             match worker {
                 Ok(worker) => workers.push(worker),
@@ -753,6 +800,7 @@ fn build_entries_parallel(
                     raw_default_floor,
                     deadline,
                     schedule,
+                    stream_producer,
                 )?),
             }
         }
@@ -787,6 +835,7 @@ fn build_entries_parallel(
             raw_default_floor,
             deadline,
             schedule,
+            stream_producer,
         )? {
             timed_out.push(index);
         }
@@ -805,6 +854,7 @@ fn build_entry_batch(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
+    stream_producer: u8,
 ) -> Result<Vec<(usize, Entry, bool)>> {
     // These jobs run serially on one worker while sibling slices overlap in
     // wall time. Divide the worker's allowance among only this slice; using
@@ -825,6 +875,7 @@ fn build_entry_batch(
             raw_default_floor,
             deadline,
             schedule,
+            stream_producer,
         )?;
         completed.push((index, entry, timed_out));
     }
@@ -841,6 +892,7 @@ fn build_scheduled_entry(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
+    stream_producer: u8,
 ) -> Result<bool> {
     let file_remaining = deadline.remaining();
     let mut call_options = options.clone();
@@ -859,7 +911,7 @@ fn build_scheduled_entry(
             grace,
         )
     };
-    if let Some(stream_id) = stream_id {
+    let timed_out = if let Some(stream_id) = stream_id {
         if call_options.timeout < file_remaining {
             crate::progress::with_stream_slice(stream_id, &[], None, build_entry)
         } else {
@@ -867,7 +919,13 @@ fn build_scheduled_entry(
         }
     } else {
         build_entry()
+    }?;
+    if !timed_out && (options.verbose || options.visual) {
+        if let Some(stream_id) = stream_id {
+            crate::progress::complete_stream_producer(stream_id, &[], stream_producer);
+        }
     }
+    Ok(timed_out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -881,6 +939,7 @@ fn reclaim_timed_out_entries(
     raw_default_floor: DefaultFloor,
     deadline: &SearchDeadline,
     schedule: Option<ZipSchedule>,
+    stream_producer: u8,
 ) -> Result<()> {
     pending.retain(|&index| entry_is_optimizable(&entries[index]));
     while !pending.is_empty() && !deadline.is_expired() {
@@ -946,6 +1005,11 @@ fn reclaim_timed_out_entries(
             }
         }
         pending = still_pending;
+    }
+    if options.verbose || options.visual {
+        for stream_id in stream_ids.iter().flatten() {
+            crate::progress::complete_stream_producer(*stream_id, &[], stream_producer);
+        }
     }
     Ok(())
 }
@@ -1950,6 +2014,7 @@ mod tests {
             DefaultFloor::Shared,
             &deadline,
             Some(deliberately_tiny_slice),
+            ZIP_NORMAL_PRODUCER,
         )
         .unwrap();
         assert!(local_timed_out);
@@ -1965,6 +2030,7 @@ mod tests {
             DefaultFloor::Shared,
             &deadline,
             Some(deliberately_tiny_slice),
+            ZIP_NORMAL_PRODUCER,
         )
         .unwrap();
         assert!(!deadline.is_expired());

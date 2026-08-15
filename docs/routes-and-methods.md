@@ -165,8 +165,17 @@ compact per-file result to one line.
 
 Reporting is observational. Default, verbose, and visual modes use the same
 route gates, deadlines, candidate ordering, memory bounds, and worker
-parallelism. Detailed output may interleave updates from independent streams,
-but it never serializes or replaces their optimization work.
+parallelism. Detailed stream updates are cached by the worker that produced
+them. One file-level coordinator emits each completed physical stream as soon
+as every earlier stream and every producer for that stream are final. Timed-out
+jobs remain cached through reclaim passes; ZIP Max similarly waits for all of a
+stream's archive lineages. Reporting never serializes or replaces optimization
+work. Every interactive CLI mode shows an `optimizing` spinner and timeout
+countdown on standard error during work. Verbose and Visual also show how many
+physical streams have completed at least one optimizer report, even when an
+earlier stream is temporarily holding those reports in source order. The
+coordinator clears the spinner around each ordered report, then resumes it
+until the complete file finishes.
 
 | Wrapper route | Exact gate and scheduling behavior | Indicator |
 | --- | --- | --- |
@@ -565,7 +574,7 @@ is no persistent thread pool or CLI thread-count option.
 | Generic single-image PNG phase | `CompleteThenBounded`, M5, G0, and M6=`GenericParallel`. | One source-max worker while the caller builds the floor→seeded-max lineage. | 🔴 |
 | Bounded PNG follow-up | `CompleteThenBounded`, G0, and bounded refinement remains. A source-max worker additionally requires M5 and no completed or suppressing source-max route. A compact-split worker instead requires at least one prepared weak-deft parent: multiple nonempty blocks, <2% direct deft gain, ≤16 KiB compressed, ≤128 KiB decoded, 2–4 nonempty non-stored blocks, ≤16 Ki tokens, and at least one block with ≥16 tokens and ≥128 decoded bytes. | Optional source-max and compact-split workers run while the caller refines the deft lineage. | 🔴 |
 | Floor-seeded bounded grouping | The standalone grouping descendant from M7 is selected; grouping has 2–128 blocks, no stored source block, twice its retained payload storage is ≤48 MiB, and independently planning each source does not select a stored representation. | Up to four workers—further limited by available hardware threads and block count—price ranges beginning at assigned source blocks. Results return to source order, and the final best segmentation is selected serially. | 🟡 |
-| CLI spinner | Quiet interactive max run with terminal stderr. | Presentation-only thread: 300 ms delay, then roughly 200 ms updates. It performs no optimization. | 🟢 |
+| CLI spinner | Every mode on interactive terminal stderr; detailed modes begin after format preflight. | Presentation-only thread: 300 ms delay, then roughly 500 ms updates. Every frame says `optimizing` and counts down the file timeout; Verbose and Visual atomically count physical streams that have completed at least one report as `checked/total`. Where terminal styling is allowed, the line is bold, its cursor uses 16-colour cyan, and the final three countdown seconds use 16-colour red. Detailed-mode spinners pause around ordered reports, resume during remaining work, and stop before the footer. It performs no optimization and does not affect scheduling or budgets. | 🟢 |
 
 The ordinary stream planner deliberately prices bounded ranges serially; the
 parallel range-pricing step is used only by the floor-seeded grouping
@@ -680,11 +689,14 @@ has the narrower metadata-validation behavior described in the wrapper table.
 writing output. It combines with `--verbose`, which reports route timings,
 same-distance opportunities, candidate bit gains, the `Pricing block
 boundaries` phase, selected route, and final block plan. Concurrent Verbose
-updates carry their physical stream number, and related header lines are
-written atomically. Visual mode keeps a separately keyed card for every live
-optimizer trial, orders cards by physical stream, and distinguishes concurrent
-ZIP Default and direct-Max lineages. Quiet, Verbose, and Visual runs use the
-same optimization, scheduling, and memory policies.
+updates are cached as complete reports and written in physical stream order as
+the contiguous completed prefix advances. Visual mode similarly retains the
+final card for each optimizer trial and emits ordered, immutable cards without
+cursor rewinds. A stream waits for all possible reclaim passes and ZIP Max
+lineages before its report becomes eligible.
+Concurrent ZIP Default and direct-Max lineages remain distinctly labelled.
+Quiet, Verbose, and Visual runs use the same optimization, scheduling, and
+memory policies.
 
 ## Attribution
 

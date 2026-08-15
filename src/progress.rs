@@ -1,18 +1,23 @@
 // SPDX-License-Identifier: MIT
 
-//! Dependency-free human progress reporting.
+//! Dependency-free human optimization reporting.
 //!
-//! Verbose mode is append-only on standard output, so redirected reports remain
-//! readable. Visual mode delegates to a bounded-width terminal stream card on
-//! standard error. Both consume the same low-frequency optimizer checkpoints.
+//! Worker threads cache stream-labelled events instead of writing concurrently.
+//! A file-level coordinator appends each completed physical stream as soon as
+//! every one of its producers has finished and all earlier streams are ready.
 
 use std::cell::{Cell, RefCell};
-use std::io::{self, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fmt::{self, Write as _};
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::presentation::format_duration;
-use crate::presentation::{plural, plural_u64};
+use crate::presentation::{countdown_seconds, plural, plural_u64, write_spinner_line};
 use crate::{Format, Options};
 
 mod visual;
@@ -25,15 +30,490 @@ static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
 // identity separate from the human-facing stream number so their concurrent
 // updates never overwrite each other.
 static NEXT_REPORT_ID: AtomicUsize = AtomicUsize::new(1);
+static VERBOSE_REPORTS: OnceLock<Mutex<VerboseReports>> = OnceLock::new();
+static REPORT_SPINNER: OnceLock<Mutex<Option<ReportSpinner>>> = OnceLock::new();
+static REPORT_COORDINATOR: OnceLock<Mutex<ReportCoordinator>> = OnceLock::new();
+static REPORT_EMITTER: OnceLock<Mutex<()>> = OnceLock::new();
+static SPINNER_PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
+static SPINNER_PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
+pub(crate) const PRIMARY_STREAM_PRODUCER: u8 = 0;
+const MAX_CACHED_VERBOSE_BYTES: usize = 64 * 1_024 * 1_024;
 const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
+const SPINNER_DELAY: Duration = Duration::from_millis(300);
+const SPINNER_INTERVAL: Duration = Duration::from_millis(500);
+
+struct ReportSpinner {
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ReportSpinner {
+    fn start(deadline: Instant) -> Option<Self> {
+        if !io::stderr().is_terminal() || env::var_os("TERM").is_some_and(|term| term == "dumb") {
+            return None;
+        }
+
+        let running = Arc::new(AtomicBool::new(true));
+        let worker_running = Arc::clone(&running);
+        let color = crate::terminal::stderr_color_enabled();
+        let worker = thread::Builder::new()
+            .name("columbo-report-spinner".into())
+            .spawn(move || {
+                const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let mut frame = 0;
+                let mut drawn = false;
+                thread::park_timeout(SPINNER_DELAY);
+                while worker_running.load(Ordering::Relaxed) {
+                    let done = SPINNER_PROGRESS_DONE.load(Ordering::Relaxed);
+                    let total = SPINNER_PROGRESS_TOTAL.load(Ordering::Relaxed);
+                    let seconds =
+                        countdown_seconds(deadline.saturating_duration_since(Instant::now()));
+                    {
+                        let stderr = io::stderr();
+                        let mut output = stderr.lock();
+                        let checked = (total != 0).then_some((done, total));
+                        let _ =
+                            write_spinner_line(&mut output, FRAMES[frame], seconds, checked, color);
+                        let _ = output.flush();
+                    }
+                    drawn = true;
+                    frame = (frame + 1) % FRAMES.len();
+                    thread::park_timeout(SPINNER_INTERVAL);
+                }
+                if drawn {
+                    eprint!("\r\x1b[K");
+                    let _ = io::stderr().flush();
+                }
+            })
+            .ok()?;
+        Some(Self {
+            running,
+            worker: Some(worker),
+        })
+    }
+
+    fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            worker.thread().unpark();
+            let _ = worker.join();
+        }
+    }
+}
+
+fn start_report_spinner(deadline: Instant) {
+    stop_report_spinner();
+    let spinner = ReportSpinner::start(deadline);
+    let slot = REPORT_SPINNER.get_or_init(|| Mutex::new(None));
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = spinner;
+}
+
+fn stop_report_spinner() {
+    let Some(slot) = REPORT_SPINNER.get() else {
+        return;
+    };
+    let spinner = slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(spinner) = spinner {
+        spinner.stop();
+    }
+}
+
+#[derive(Default)]
+struct VerboseReports {
+    cached_bytes: usize,
+    reports: BTreeMap<usize, VerboseReport>,
+}
+
+struct VerboseReport {
+    finished: bool,
+    order: u8,
+    stream_id: usize,
+    text: String,
+    truncated: bool,
+}
+
+impl VerboseReports {
+    fn reset(&mut self) {
+        self.cached_bytes = 0;
+        self.reports.clear();
+    }
+
+    fn insert(&mut self, report_id: usize, stream_id: usize, order: u8, mut text: String) {
+        let truncated = self.cached_bytes.saturating_add(text.len()) > MAX_CACHED_VERBOSE_BYTES;
+        if truncated {
+            text.clear();
+        } else {
+            self.cached_bytes += text.len();
+        }
+        self.reports.insert(
+            report_id,
+            VerboseReport {
+                finished: false,
+                order,
+                stream_id,
+                text,
+                truncated,
+            },
+        );
+    }
+
+    fn append(&mut self, report_id: usize, arguments: fmt::Arguments<'_>) {
+        let Some(report) = self.reports.get_mut(&report_id) else {
+            return;
+        };
+        if report.truncated {
+            return;
+        }
+        let mut line = String::new();
+        let _ = line.write_fmt(arguments);
+        line.push('\n');
+        if self.cached_bytes.saturating_add(line.len()) > MAX_CACHED_VERBOSE_BYTES {
+            report.truncated = true;
+            return;
+        }
+        self.cached_bytes += line.len();
+        report.text.push_str(&line);
+    }
+
+    fn finish(&mut self, report_id: usize) {
+        if let Some(report) = self.reports.get_mut(&report_id) {
+            report.finished = true;
+        }
+    }
+
+    fn take_finished_stream(&mut self, stream_id: usize) -> Option<Vec<VerboseReport>> {
+        if self
+            .reports
+            .values()
+            .any(|report| report.stream_id == stream_id && !report.finished)
+        {
+            return None;
+        }
+        let mut report_ids: Vec<_> = self
+            .reports
+            .iter()
+            .filter_map(|(&report_id, report)| (report.stream_id == stream_id).then_some(report_id))
+            .collect();
+        report_ids.sort_unstable_by_key(|report_id| {
+            let report = &self.reports[report_id];
+            (report.order, *report_id)
+        });
+        let mut finished = Vec::with_capacity(report_ids.len());
+        for report_id in report_ids {
+            let report = self
+                .reports
+                .remove(&report_id)
+                .expect("a collected verbose report remains cached");
+            self.cached_bytes = self.cached_bytes.saturating_sub(report.text.len());
+            finished.push(report);
+        }
+        Some(finished)
+    }
+
+    fn take_finished_in_stream_order(&mut self) -> Vec<VerboseReport> {
+        let mut reports: Vec<_> = std::mem::take(&mut self.reports)
+            .into_iter()
+            .filter_map(|(report_id, report)| report.finished.then_some((report_id, report)))
+            .collect();
+        reports.sort_unstable_by_key(|(report_id, report)| {
+            (report.stream_id, report.order, *report_id)
+        });
+        self.cached_bytes = 0;
+        reports.into_iter().map(|(_, report)| report).collect()
+    }
+}
+
+fn with_verbose_reports<T>(operation: impl FnOnce(&mut VerboseReports) -> T) -> T {
+    let reports = VERBOSE_REPORTS.get_or_init(|| Mutex::new(VerboseReports::default()));
+    let mut reports = reports
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    operation(&mut reports)
+}
+
+fn reset_verbose_reports() {
+    with_verbose_reports(VerboseReports::reset);
+}
+
+fn begin_verbose_report(report_id: usize, stream_id: usize, order: u8, text: String) {
+    with_verbose_reports(|reports| reports.insert(report_id, stream_id, order, text));
+}
+
+fn append_verbose_report(report_id: usize, arguments: fmt::Arguments<'_>) {
+    with_verbose_reports(|reports| reports.append(report_id, arguments));
+}
+
+fn finish_verbose_report(report_id: usize) {
+    with_verbose_reports(|reports| reports.finish(report_id));
+}
+
+fn write_verbose_reports(reports: Vec<VerboseReport>) {
+    if reports.is_empty() {
+        return;
+    }
+    let mut output = io::stdout().lock();
+    for report in reports {
+        let _ = output.write_all(report.text.as_bytes());
+        if report.truncated {
+            let _ = writeln!(
+                output,
+                "  S{} … remaining verbose details omitted; 64 MiB report cache reached",
+                report.stream_id
+            );
+        }
+    }
+    let _ = output.flush();
+}
+
+fn flush_verbose_reports() {
+    write_verbose_reports(with_verbose_reports(
+        VerboseReports::take_finished_in_stream_order,
+    ));
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ProgressMode {
     Disabled,
     Verbose,
     Visual,
+}
+
+struct ReportCoordinator {
+    active: bool,
+    checked_count: usize,
+    checked_streams: Vec<bool>,
+    completed_producers: BTreeMap<usize, BTreeSet<u8>>,
+    deadline: Option<Instant>,
+    expected_producers: BTreeSet<u8>,
+    mode: ProgressMode,
+    next_stream_id: usize,
+    report_streams: BTreeMap<usize, ReportStreams>,
+    sealed_streams: BTreeSet<usize>,
+    total_streams: usize,
+}
+
+struct ReportStreams {
+    duplicates: Vec<usize>,
+    primary: usize,
+}
+
+impl Default for ReportCoordinator {
+    fn default() -> Self {
+        Self {
+            active: false,
+            checked_count: 0,
+            checked_streams: Vec::new(),
+            completed_producers: BTreeMap::new(),
+            deadline: None,
+            expected_producers: BTreeSet::new(),
+            mode: ProgressMode::Disabled,
+            next_stream_id: 1,
+            report_streams: BTreeMap::new(),
+            sealed_streams: BTreeSet::new(),
+            total_streams: 0,
+        }
+    }
+}
+
+impl ReportCoordinator {
+    fn reset(&mut self, mode: ProgressMode, total_streams: usize, timeout: Duration) {
+        self.active = mode.enabled();
+        self.checked_count = 0;
+        self.checked_streams.clear();
+        self.checked_streams
+            .resize(total_streams.saturating_add(1), false);
+        self.completed_producers.clear();
+        self.deadline = Instant::now().checked_add(timeout);
+        self.expected_producers.clear();
+        self.expected_producers.insert(PRIMARY_STREAM_PRODUCER);
+        self.mode = mode;
+        self.next_stream_id = 1;
+        self.report_streams.clear();
+        self.sealed_streams.clear();
+        self.total_streams = total_streams;
+        self.publish_spinner_progress();
+    }
+
+    fn set_expected_producers(&mut self, producers: &[u8]) {
+        self.expected_producers.clear();
+        self.expected_producers.extend(producers.iter().copied());
+        for stream_id in self.next_stream_id..=self.total_streams {
+            self.update_sealed(stream_id);
+        }
+    }
+
+    fn register_report(&mut self, report_id: usize, stream_id: usize, duplicates: &[usize]) {
+        self.report_streams.insert(
+            report_id,
+            ReportStreams {
+                duplicates: duplicates.to_vec(),
+                primary: stream_id,
+            },
+        );
+    }
+
+    fn finish_report(&mut self, report_id: usize) {
+        let Some(streams) = self.report_streams.remove(&report_id) else {
+            return;
+        };
+        for stream_id in std::iter::once(streams.primary).chain(streams.duplicates) {
+            let Some(checked) = self.checked_streams.get_mut(stream_id) else {
+                continue;
+            };
+            if !*checked {
+                *checked = true;
+                self.checked_count = self.checked_count.saturating_add(1);
+            }
+        }
+        self.publish_spinner_progress();
+    }
+
+    fn complete(&mut self, stream_id: usize, duplicates: &[usize], producer: u8) {
+        for stream_id in std::iter::once(stream_id).chain(duplicates.iter().copied()) {
+            if stream_id < self.next_stream_id || stream_id > self.total_streams {
+                continue;
+            }
+            self.completed_producers
+                .entry(stream_id)
+                .or_default()
+                .insert(producer);
+            self.update_sealed(stream_id);
+        }
+    }
+
+    fn complete_all(&mut self, producer: u8) {
+        for stream_id in self.next_stream_id..=self.total_streams {
+            self.completed_producers
+                .entry(stream_id)
+                .or_default()
+                .insert(producer);
+            self.update_sealed(stream_id);
+        }
+    }
+
+    fn update_sealed(&mut self, stream_id: usize) {
+        if self
+            .completed_producers
+            .get(&stream_id)
+            .is_some_and(|done| {
+                self.expected_producers
+                    .iter()
+                    .all(|producer| done.contains(producer))
+            })
+        {
+            self.sealed_streams.insert(stream_id);
+        } else {
+            self.sealed_streams.remove(&stream_id);
+        }
+    }
+
+    fn next_sealed(&self) -> Option<usize> {
+        (self.next_stream_id <= self.total_streams
+            && self.sealed_streams.contains(&self.next_stream_id))
+        .then_some(self.next_stream_id)
+    }
+
+    fn advance(&mut self, stream_id: usize) {
+        debug_assert_eq!(self.next_stream_id, stream_id);
+        self.sealed_streams.remove(&stream_id);
+        self.completed_producers.remove(&stream_id);
+        self.next_stream_id = self.next_stream_id.saturating_add(1);
+    }
+
+    fn finish(&mut self) {
+        self.active = false;
+        for stream_id in self.next_stream_id..=self.total_streams {
+            self.sealed_streams.insert(stream_id);
+        }
+    }
+
+    fn publish_spinner_progress(&self) {
+        SPINNER_PROGRESS_DONE.store(self.checked_count, Ordering::Relaxed);
+        SPINNER_PROGRESS_TOTAL.store(self.total_streams, Ordering::Relaxed);
+    }
+}
+
+fn with_report_coordinator<T>(operation: impl FnOnce(&mut ReportCoordinator) -> T) -> T {
+    let coordinator = REPORT_COORDINATOR.get_or_init(|| Mutex::new(ReportCoordinator::default()));
+    let mut coordinator = coordinator
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    operation(&mut coordinator)
+}
+
+/// Declare the complete set of independent producers for every physical stream.
+///
+/// ZIP Max registers its archive lineages before starting them. A stream is
+/// released only after all registered lineages, including their reclaim
+/// passes, have reported completion.
+pub(crate) fn set_stream_producers(producers: &[u8]) {
+    with_report_coordinator(|coordinator| coordinator.set_expected_producers(producers));
+    emit_ready_streams();
+}
+
+pub(crate) fn complete_stream_group(id: usize, duplicates: &[usize]) {
+    complete_stream_producer(id, duplicates, PRIMARY_STREAM_PRODUCER);
+}
+
+pub(crate) fn complete_stream_producer(id: usize, duplicates: &[usize], producer: u8) {
+    with_report_coordinator(|coordinator| coordinator.complete(id, duplicates, producer));
+    emit_ready_streams();
+}
+
+pub(crate) fn complete_all_stream_producers(producer: u8) {
+    with_report_coordinator(|coordinator| coordinator.complete_all(producer));
+    emit_ready_streams();
+}
+
+fn emit_ready_streams() {
+    let emitter = REPORT_EMITTER.get_or_init(|| Mutex::new(()));
+    let _emitter = emitter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut verbose = Vec::new();
+    let mut visual_cards = Vec::new();
+
+    while let Some((mode, stream_id)) = with_report_coordinator(|coordinator| {
+        coordinator
+            .next_sealed()
+            .map(|stream_id| (coordinator.mode, stream_id))
+    }) {
+        let ready = match mode {
+            ProgressMode::Verbose => {
+                let reports =
+                    with_verbose_reports(|reports| reports.take_finished_stream(stream_id));
+                reports.map(|reports| {
+                    verbose.extend(reports);
+                })
+            }
+            ProgressMode::Visual => visual::take_finished_stream(stream_id).map(|cards| {
+                visual_cards.extend(cards);
+            }),
+            ProgressMode::Disabled => Some(()),
+        };
+        if ready.is_none() {
+            break;
+        }
+        with_report_coordinator(|coordinator| coordinator.advance(stream_id));
+    }
+
+    if verbose.is_empty() && visual_cards.is_empty() {
+        return;
+    }
+    stop_report_spinner();
+    write_verbose_reports(verbose);
+    visual::emit_cards(visual_cards);
+    let restart = with_report_coordinator(|coordinator| {
+        coordinator.active.then_some(coordinator.deadline).flatten()
+    });
+    if let Some(deadline) = restart {
+        start_report_spinner(deadline);
+    }
 }
 
 impl ProgressMode {
@@ -100,6 +580,20 @@ pub(crate) fn with_route_lineage<T>(note: &'static str, operation: impl FnOnce()
     let previous = ROUTE_LINEAGE.with(|lineage| lineage.replace(Some(note)));
     let _guard = RouteLineageGuard(previous);
     operation()
+}
+
+pub(crate) fn current_route_lineage() -> Option<&'static str> {
+    ROUTE_LINEAGE.with(Cell::get)
+}
+
+pub(crate) fn with_optional_route_lineage<T>(
+    note: Option<&'static str>,
+    operation: impl FnOnce() -> T,
+) -> T {
+    match note {
+        Some(note) => with_route_lineage(note, operation),
+        None => operation(),
+    }
 }
 
 /// Associate one optimizer invocation with its physical container stream.
@@ -288,19 +782,16 @@ impl Progress {
                 .as_ref()
                 .and_then(|group| group.note)
                 .map_or_else(String::new, |note| format!(" · {note}"));
-            // One stdout lock keeps another worker from inserting its stream
-            // header between these related lines. Every detail line also
-            // carries the physical stream number for later interleaved work.
-            let mut output = io::stdout().lock();
-            let _ = writeln!(output);
+            let mut report = String::new();
+            let _ = writeln!(report);
             let _ = writeln!(
-                output,
+                report,
                 "{}Deflate stream {stream_id}{note}{duplicates}{}",
                 cyan(color),
                 reset(color)
             );
             let _ = writeln!(
-                output,
+                report,
                 "  S{stream_id} Source · {} {} · {} meaningful {} · {} {}{}",
                 stream.compressed_bytes,
                 plural(stream.compressed_bytes, "byte", "bytes"),
@@ -319,13 +810,28 @@ impl Progress {
                 }
             );
             let _ = writeln!(
-                output,
+                report,
                 "  S{stream_id} Parsed · {} · {} decoded {}",
                 format_duration(stream.parse_elapsed),
                 stream.decoded_bytes,
                 plural_u64(stream.decoded_bytes, "byte", "bytes"),
             );
+            begin_verbose_report(
+                report_id,
+                stream_id,
+                report_order(group.as_ref().and_then(|group| group.note)),
+                report,
+            );
         }
+        with_report_coordinator(|coordinator| {
+            coordinator.register_report(
+                report_id,
+                stream_id,
+                group
+                    .as_ref()
+                    .map_or(&[][..], |group| group.duplicates.as_slice()),
+            )
+        });
 
         Self {
             color,
@@ -341,6 +847,10 @@ impl Progress {
         self.mode.enabled()
     }
 
+    fn write_verbose(self, arguments: fmt::Arguments<'_>) {
+        append_verbose_report(self.report_id, arguments);
+    }
+
     pub(crate) fn normalization(self, blocks: usize, elapsed: Duration) {
         if !self.mode.enabled() || blocks == 0 {
             return;
@@ -354,14 +864,14 @@ impl Progress {
         if !self.mode.verbose() {
             return;
         }
-        println!(
+        self.write_verbose(format_args!(
             "  S{} {} Strict normalization · {} · canonicalized {} {}",
             self.stream_id,
             success(self.color),
             format_duration(elapsed),
             blocks,
             plural(blocks, "block", "blocks")
-        );
+        ));
     }
 
     pub(crate) fn same_distance_opportunities(self, report: SameDistanceProgress) {
@@ -383,13 +893,13 @@ impl Progress {
             return;
         }
         if report.runs == 0 {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{} Matches · no adjacent same-distance runs in the joined source token stream",
                 self.stream_id
-            );
+            ));
             return;
         }
-        println!(
+        self.write_verbose(format_args!(
             "  S{} Matches · joined source token stream · {} {} / {} {} / {} decoded {} · {} direct {} · {} {} · up to {} removable {}",
             self.stream_id,
             report.runs,
@@ -404,15 +914,15 @@ impl Progress {
             plural(report.repartition_runs, "repartition", "repartitions"),
             report.tokens_removable,
             plural(report.tokens_removable, "token", "tokens"),
-        );
+        ));
     }
 
     pub(crate) fn routes(self) {
         if self.mode.visual() {
             visual::activity(self.report_id, "Choosing optimization routes");
         } else if self.mode.enabled() {
-            println!();
-            println!("  S{} Routes", self.stream_id);
+            self.write_verbose(format_args!(""));
+            self.write_verbose(format_args!("  S{} Routes", self.stream_id));
         }
     }
 
@@ -421,7 +931,11 @@ impl Progress {
             if self.mode.visual() {
                 visual::route_started(self.report_id, name);
             } else {
-                println!("  S{} {} {name}…", self.stream_id, arrow(self.color));
+                self.write_verbose(format_args!(
+                    "  S{} {} {name}…",
+                    self.stream_id,
+                    arrow(self.color)
+                ));
             }
             RouteStep {
                 name,
@@ -491,7 +1005,7 @@ impl Progress {
         } else {
             neutral(self.color)
         };
-        println!(
+        self.write_verbose(format_args!(
             "  S{}   {} {name} · {} {} / {} {} · {}",
             self.stream_id,
             marker,
@@ -500,18 +1014,18 @@ impl Progress {
             candidate.bits,
             plural_u64(candidate.bits, "bit", "bits"),
             describe_bit_change(candidate.reference_bits, candidate.bits)
-        );
+        ));
     }
 
     pub(crate) fn skipped(self, name: &'static str, reason: &'static str) {
         if self.mode.visual() {
             visual::activity(self.report_id, &format!("{name} skipped · {reason}"));
         } else if self.mode.enabled() {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}   {} {name} skipped · {reason}",
                 self.stream_id,
                 neutral(self.color)
-            );
+            ));
         }
     }
 
@@ -525,15 +1039,18 @@ impl Progress {
         if !self.mode.verbose() {
             return;
         }
-        println!();
-        println!("  S{} Final block plan", self.stream_id);
+        self.write_verbose(format_args!(""));
+        self.write_verbose(format_args!("  S{} Final block plan", self.stream_id));
         let Some(report) = report else {
-            println!("  S{}   · Details unavailable", self.stream_id);
+            self.write_verbose(format_args!(
+                "  S{}   · Details unavailable",
+                self.stream_id
+            ));
             return;
         };
 
         for (index, block) in report.blocks.iter().enumerate() {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}   #{:<3} {:>8} → {:<8} · {} decoded {} · {} {} · {} {} · starts at bit {}{}",
                 self.stream_id,
                 index + 1,
@@ -547,16 +1064,16 @@ impl Progress {
                 plural_u64(block.output_bits, "bit", "bits"),
                 block.alignment,
                 if block.final_block { " · final" } else { "" }
-            );
+            ));
         }
         if report.total_blocks > report.blocks.len() {
             let omitted = report.total_blocks - report.blocks.len();
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}   … {} additional {} omitted",
                 self.stream_id,
                 omitted,
                 plural(omitted, "block", "blocks"),
-            );
+            ));
         }
     }
 
@@ -573,7 +1090,7 @@ impl Progress {
         }
         if self.mode.visual() {
             visual::finish(
-                self.stream_id,
+                self.report_id,
                 selected_route,
                 output_bytes,
                 output_bits,
@@ -583,33 +1100,37 @@ impl Progress {
                 self.slice_budget,
             );
         }
-        if !self.mode.verbose() {
-            return;
-        }
-        println!(
-            "  S{} {} Selected {selected_route} · {} {} / {} {} · {} · {}{}",
-            self.stream_id,
-            success(self.color),
-            output_bytes,
-            plural(output_bytes, "byte", "bytes"),
-            output_bits,
-            plural_u64(output_bits, "bit", "bits"),
-            describe_bit_change(source_bits, output_bits),
-            format_duration(self.optimizer_started.elapsed()),
-            if timed_out {
-                if self.slice_budget {
-                    " · search slice reached"
+        if self.mode.verbose() {
+            self.write_verbose(format_args!(
+                "  S{} {} Selected {selected_route} · {} {} / {} {} · {} · {}{}",
+                self.stream_id,
+                success(self.color),
+                output_bytes,
+                plural(output_bytes, "byte", "bytes"),
+                output_bits,
+                plural_u64(output_bits, "bit", "bits"),
+                describe_bit_change(source_bits, output_bits),
+                format_duration(self.optimizer_started.elapsed()),
+                if timed_out {
+                    if self.slice_budget {
+                        " · search slice reached"
+                    } else {
+                        " · deadline reached"
+                    }
                 } else {
-                    " · deadline reached"
+                    ""
                 }
-            } else {
-                ""
-            }
-        );
+            ));
+            finish_verbose_report(self.report_id);
+        }
+        with_report_coordinator(|coordinator| coordinator.finish_report(self.report_id));
+        // A scheduler may already have sealed this stream while the final
+        // report update was racing to the cache. Recheck the ordered head.
+        emit_ready_streams();
     }
 }
 
-/// Live context for one long-running route.
+/// Cached context for one long-running route.
 ///
 /// Every method is a no-op when progress reporting is disabled. Interior
 /// mutability lets the deadline callback and planner share this reporter
@@ -667,6 +1188,10 @@ impl RouteProgress {
         self.mode.enabled()
     }
 
+    fn write_verbose(&self, arguments: fmt::Arguments<'_>) {
+        append_verbose_report(self.report_id, arguments);
+    }
+
     pub(crate) fn deadline_reached(&self) {
         if self.mode.enabled() {
             self.deadline_reached.set(true);
@@ -689,11 +1214,11 @@ impl RouteProgress {
         if !self.mode.verbose() {
             return;
         }
-        println!(
+        self.write_verbose(format_args!(
             "  S{}       · Soft deadline reached · finalizing active candidate · up to {} grace",
             self.stream_id,
             format_duration(grace),
-        );
+        ));
     }
 
     pub(crate) fn deadline_was_reached(&self) -> bool {
@@ -725,13 +1250,13 @@ impl RouteProgress {
         if !self.mode.verbose() {
             return;
         }
-        println!(
+        self.write_verbose(format_args!(
             "  S{}     {} {name} · {} {}",
             self.stream_id,
             arrow(self.color),
             total,
             self::plural(total, singular, plural)
-        );
+        ));
     }
 
     /// Update the current work position without printing a line per item.
@@ -778,7 +1303,7 @@ impl RouteProgress {
         }
     }
 
-    /// Print a periodic status line from an existing deadline probe.
+    /// Cache a periodic status line from an existing deadline probe.
     pub(crate) fn heartbeat(&self) {
         if !self.mode.enabled() {
             return;
@@ -832,7 +1357,7 @@ impl RouteProgress {
                 plural(self.best_blocks.get(), "block", "blocks")
             )
         });
-        println!(
+        self.write_verbose(format_args!(
             "  S{}       {} {} · {} route elapsed{work}{tokens}{best}",
             self.stream_id,
             neutral(self.color),
@@ -842,7 +1367,7 @@ impl RouteProgress {
                     .expect("enabled route progress has a start time")
                     .elapsed()
             )
-        );
+        ));
     }
 
     /// Report one complete internal candidate and retain the best bit count.
@@ -870,7 +1395,7 @@ impl RouteProgress {
         }
 
         if improved {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}       {} {name} · {} · {bits} {} in {blocks} {} · {}",
                 self.stream_id,
                 success(self.color),
@@ -878,20 +1403,20 @@ impl RouteProgress {
                 plural_u64(bits, "bit", "bits"),
                 plural(blocks, "block", "blocks"),
                 describe_bit_change(self.reference_bits, bits)
-            );
+            ));
         } else {
             let behind = bits.saturating_sub(previous.unwrap_or(bits));
             if behind == 0 {
-                println!(
+                self.write_verbose(format_args!(
                     "  S{}       {} {name} · {} · {bits} {} in {blocks} {} · matches current best",
                     self.stream_id,
                     neutral(self.color),
                     format_duration(elapsed),
                     plural_u64(bits, "bit", "bits"),
                     plural(blocks, "block", "blocks")
-                );
+                ));
             } else {
-                println!(
+                self.write_verbose(format_args!(
                     "  S{}       {} {name} · {} · {bits} {} in {blocks} {} · {} behind best",
                     self.stream_id,
                     neutral(self.color),
@@ -899,7 +1424,7 @@ impl RouteProgress {
                     plural_u64(bits, "bit", "bits"),
                     plural(blocks, "block", "blocks"),
                     format_bit_count(behind)
-                );
+                ));
             }
         }
     }
@@ -928,13 +1453,13 @@ impl RouteProgress {
         if !self.mode.verbose() {
             return;
         }
-        println!(
+        self.write_verbose(format_args!(
             "  S{}     {} Replay {round}/{limit} · reparsing {blocks} {} at {bits} {}",
             self.stream_id,
             arrow(self.color),
             plural(blocks, "block", "blocks"),
             plural_u64(bits, "bit", "bits")
-        );
+        ));
     }
 
     pub(crate) fn replay_finished(
@@ -960,14 +1485,14 @@ impl RouteProgress {
             if !self.mode.verbose() {
                 return;
             }
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · saved {} · accepted as {blocks} {}",
                 self.stream_id,
                 success(self.color),
                 format_duration(elapsed),
                 format_bit_count(before_bits.saturating_sub(after_bits)),
                 plural(blocks, "block", "blocks")
-            );
+            ));
         } else {
             if self.mode.visual() {
                 visual::activity(self.report_id, "Replay stable · best retained");
@@ -975,12 +1500,12 @@ impl RouteProgress {
             if !self.mode.verbose() {
                 return;
             }
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · no strict improvement; route stabilized",
                 self.stream_id,
                 neutral(self.color),
                 format_duration(elapsed)
-            );
+            ));
         }
     }
 
@@ -991,12 +1516,12 @@ impl RouteProgress {
                 &format!("Replay {round} stopped · {reason}"),
             );
         } else if self.mode.enabled() {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {reason}",
                 self.stream_id,
                 warning(self.color),
                 format_duration(elapsed)
-            );
+            ));
         }
     }
 
@@ -1004,7 +1529,7 @@ impl RouteProgress {
         if self.mode.visual() {
             visual::activity(self.report_id, reason);
         } else if self.mode.enabled() {
-            println!(
+            self.write_verbose(format_args!(
                 "  S{}       {} {reason} · {} route elapsed",
                 self.stream_id,
                 neutral(self.color),
@@ -1013,7 +1538,7 @@ impl RouteProgress {
                         .expect("enabled route progress has a start time")
                         .elapsed()
                 )
-            );
+            ));
         }
     }
 }
@@ -1049,7 +1574,7 @@ impl RouteStep {
                 } else {
                     neutral(self.progress.color)
                 };
-                println!(
+                self.progress.write_verbose(format_args!(
                     "  S{} {} {} · {} · {} {} / {} {} · {}",
                     self.progress.stream_id,
                     marker,
@@ -1060,15 +1585,15 @@ impl RouteStep {
                     candidate.bits,
                     plural_u64(candidate.bits, "bit", "bits"),
                     describe_bit_change(candidate.reference_bits, candidate.bits)
-                );
+                ));
             }
-            None => println!(
+            None => self.progress.write_verbose(format_args!(
                 "  S{} {} {} · {} · no candidate",
                 self.progress.stream_id,
                 neutral(self.progress.color),
                 self.name,
                 format_duration(elapsed)
-            ),
+            )),
         }
     }
 
@@ -1082,13 +1607,13 @@ impl RouteStep {
         if !self.progress.mode.verbose() {
             return;
         }
-        println!(
+        self.progress.write_verbose(format_args!(
             "  S{} {} {} · {}",
             self.progress.stream_id,
             success(self.progress.color),
             self.name,
             format_duration(started.elapsed())
-        );
+        ));
     }
 
     pub(crate) fn fail(self) {
@@ -1101,13 +1626,13 @@ impl RouteStep {
         if !self.progress.mode.verbose() {
             return;
         }
-        println!(
+        self.progress.write_verbose(format_args!(
             "  S{} {} {} · {} · failed",
             self.progress.stream_id,
             warning(self.progress.color),
             self.name,
             format_duration(started.elapsed())
-        );
+        ));
     }
 }
 
@@ -1124,11 +1649,42 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         Format::Gzip => "GZIP",
         Format::Zip => "ZIP",
     };
-    match ProgressMode::for_options(options) {
-        ProgressMode::Visual => visual::format_detected(label, deflate_streams),
+    let mode = ProgressMode::for_options(options);
+    match mode {
+        ProgressMode::Visual => {
+            NEXT_STREAM_ID.store(1, Ordering::Relaxed);
+            visual::format_detected(label, deflate_streams);
+        }
         ProgressMode::Verbose => {
+            NEXT_STREAM_ID.store(1, Ordering::Relaxed);
+            reset_verbose_reports();
             let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
         }
+        ProgressMode::Disabled => {}
+    }
+    let deadline = with_report_coordinator(|coordinator| {
+        coordinator.reset(mode, deflate_streams.unwrap_or(0), options.timeout);
+        coordinator.deadline
+    });
+    if mode.enabled() {
+        if let Some(deadline) = deadline {
+            start_report_spinner(deadline);
+        }
+    }
+}
+
+/// Emit any remaining stream reports after container work has joined.
+///
+/// Ordinarily each sealed physical stream has already been appended in order.
+/// Force-sealing here retains error-path reports when a container returned
+/// before it could publish all of its normal scheduler completion events.
+pub(crate) fn finish_file(options: &Options) {
+    with_report_coordinator(ReportCoordinator::finish);
+    stop_report_spinner();
+    emit_ready_streams();
+    match ProgressMode::for_options(options) {
+        ProgressMode::Visual => visual::finish_file(),
+        ProgressMode::Verbose => flush_verbose_reports(),
         ProgressMode::Disabled => {}
     }
 }
@@ -1160,6 +1716,18 @@ fn duplicate_stream_suffix(duplicates: &[usize]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" · duplicates {identifiers}")
+}
+
+fn report_order(note: Option<&str>) -> u8 {
+    match note {
+        Some("metadata probe") => 0,
+        Some("default floor") => 1,
+        Some("direct max") => 2,
+        None => 3,
+        Some("refined default") => 4,
+        Some("reclaimed time") => 5,
+        Some(_) => 3,
+    }
 }
 
 pub(crate) fn describe_bit_change(reference_bits: u64, candidate_bits: u64) -> String {
@@ -1260,6 +1828,149 @@ mod tests {
             String::from_utf8(summary).unwrap(),
             "Format   ZIP\nDeflate streams  3\n"
         );
+    }
+
+    #[test]
+    fn cached_verbose_reports_flush_in_physical_stream_order() {
+        let mut reports = VerboseReports::default();
+        reports.insert(30, 1, 0, "stream one\n".to_owned());
+        reports.insert(10, 3, 0, "stream three\n".to_owned());
+        reports.insert(20, 2, 0, "stream two\n".to_owned());
+
+        // Completion order deliberately differs from source order.
+        reports.finish(10);
+        reports.finish(20);
+        reports.finish(30);
+        let ordered: Vec<_> = reports
+            .take_finished_in_stream_order()
+            .into_iter()
+            .map(|report| (report.stream_id, report.text))
+            .collect();
+
+        assert_eq!(
+            ordered,
+            [
+                (1, "stream one\n".to_owned()),
+                (2, "stream two\n".to_owned()),
+                (3, "stream three\n".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_streams_release_only_the_contiguous_physical_prefix() {
+        let mut coordinator = ReportCoordinator::default();
+        coordinator.reset(ProgressMode::Verbose, 4, Duration::from_secs(30));
+
+        coordinator.complete(3, &[], PRIMARY_STREAM_PRODUCER);
+        coordinator.complete(1, &[2], PRIMARY_STREAM_PRODUCER);
+        assert_eq!(coordinator.next_sealed(), Some(1));
+        coordinator.advance(1);
+        assert_eq!(coordinator.next_sealed(), Some(2));
+        coordinator.advance(2);
+        assert_eq!(coordinator.next_sealed(), Some(3));
+        coordinator.advance(3);
+        assert_eq!(coordinator.next_sealed(), None);
+
+        coordinator.complete(4, &[], PRIMARY_STREAM_PRODUCER);
+        assert_eq!(coordinator.next_sealed(), Some(4));
+    }
+
+    #[test]
+    fn checked_progress_counts_each_physical_stream_once() {
+        let mut coordinator = ReportCoordinator::default();
+        coordinator.reset(ProgressMode::Verbose, 4, Duration::from_secs(30));
+
+        coordinator.register_report(10, 3, &[]);
+        coordinator.finish_report(10);
+        assert_eq!(coordinator.checked_count, 1);
+
+        coordinator.register_report(11, 1, &[2]);
+        coordinator.finish_report(11);
+        assert_eq!(coordinator.checked_count, 3);
+
+        coordinator.register_report(12, 1, &[]);
+        coordinator.finish_report(12);
+        assert_eq!(coordinator.checked_count, 3);
+    }
+
+    #[test]
+    fn every_registered_lineage_must_finish_before_a_stream_is_sealed() {
+        let mut coordinator = ReportCoordinator::default();
+        coordinator.reset(ProgressMode::Visual, 2, Duration::from_secs(30));
+        coordinator.set_expected_producers(&[1, 2, 3]);
+
+        coordinator.complete(1, &[], 2);
+        coordinator.complete(1, &[], 1);
+        assert_eq!(coordinator.next_sealed(), None);
+        coordinator.complete(2, &[], 1);
+        coordinator.complete(2, &[], 2);
+        coordinator.complete(2, &[], 3);
+        assert_eq!(coordinator.next_sealed(), None);
+        coordinator.complete(1, &[], 3);
+        assert_eq!(coordinator.next_sealed(), Some(1));
+    }
+
+    #[test]
+    fn one_finished_stream_can_be_removed_without_draining_later_reports() {
+        let mut reports = VerboseReports::default();
+        reports.insert(1, 2, 0, "stream two\n".to_owned());
+        reports.insert(2, 1, 1, "stream one second\n".to_owned());
+        reports.insert(3, 1, 0, "stream one first\n".to_owned());
+        reports.finish(1);
+        reports.finish(2);
+        reports.finish(3);
+
+        let first: Vec<_> = reports
+            .take_finished_stream(1)
+            .unwrap()
+            .into_iter()
+            .map(|report| report.text)
+            .collect();
+        assert_eq!(first, ["stream one first\n", "stream one second\n"]);
+        assert_eq!(reports.reports.len(), 1);
+        assert_eq!(reports.reports[&1].stream_id, 2);
+    }
+
+    #[test]
+    fn incomplete_verbose_reports_are_not_emitted() {
+        let mut reports = VerboseReports::default();
+        reports.insert(1, 1, 0, "complete\n".to_owned());
+        reports.insert(2, 2, 0, "partial\n".to_owned());
+        reports.finish(1);
+
+        let ordered = reports.take_finished_in_stream_order();
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].stream_id, 1);
+        assert_eq!(ordered[0].text, "complete\n");
+    }
+
+    #[test]
+    fn cached_lineages_have_a_stable_order_within_one_stream() {
+        let mut reports = VerboseReports::default();
+        reports.insert(
+            1,
+            4,
+            report_order(Some("refined default")),
+            "refined".to_owned(),
+        );
+        reports.insert(2, 4, report_order(Some("direct max")), "direct".to_owned());
+        reports.insert(
+            3,
+            4,
+            report_order(Some("default floor")),
+            "floor".to_owned(),
+        );
+        reports.finish(1);
+        reports.finish(2);
+        reports.finish(3);
+
+        let ordered: Vec<_> = reports
+            .take_finished_in_stream_order()
+            .into_iter()
+            .map(|report| report.text)
+            .collect();
+        assert_eq!(ordered, ["floor", "direct", "refined"]);
     }
 
     #[test]

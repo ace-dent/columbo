@@ -177,8 +177,9 @@ elapsed-time gates:
   supported metadata, APNG, or large-image guard floors.
 - **Observational reporting:** Default, verbose, and visual modes share route
   gates, deadlines, candidate order, memory policy, and worker parallelism.
-  Detailed modes wrap the same work with stream-labelled events; they do not
-  serialize ZIP/APNG workers or replace a route with a cheaper schedule.
+  Detailed modes cache stream-labelled reports and emit them as the ordered
+  physical-stream prefix becomes final; they do not serialize ZIP/APNG workers
+  or replace a route with a cheaper schedule.
 - **Compact-split parent priority:** distinct complete parents are ordered by
   their actual byte count and meaningful bits. Every parent remains eligible
   when Max has sufficient time, because split gains are not assumed monotone.
