@@ -2,6 +2,8 @@
 
 //! Dynamic-header construction and exact bit accounting.
 
+use std::collections::HashMap;
+
 use super::huffman::{
     code_length_tree_shape_is_valid, make_columbo_rle_pseudofrequencies, make_lengths,
     make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
@@ -18,6 +20,168 @@ use super::model::{
 use super::stop::SearchStop;
 
 const INF: u64 = u64::MAX / 4;
+const MAX_HEADER_PLAN_CACHE_ENTRIES: usize = 512;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HeaderPlanCacheStats {
+    pub(crate) lookups: usize,
+    pub(crate) hits: usize,
+    pub(crate) misses: usize,
+    pub(crate) inserts: usize,
+    pub(crate) collision_checks: usize,
+    pub(crate) saturated: usize,
+}
+
+struct CachedHeaderPlan {
+    fingerprint: u64,
+    next_same_hash: Option<usize>,
+    exhaustive: bool,
+    rle_mask: u8,
+    /// A complete dynamic plan priced with zero payload bits.
+    kernel: DynamicPlan,
+}
+
+/// Bounded route-local cache for completed dynamic-header kernels.
+///
+/// The selected header depends only on the exact trimmed literal/distance
+/// length sequences and header-search policy. Token order, symbol frequencies,
+/// and match extra bits affect only the additive payload cost, which callers
+/// continue to calculate independently. Hashes select a collision chain; every
+/// hit verifies both complete length sequences and policy before reuse.
+pub(crate) struct HeaderPlanCache {
+    first_by_hash: HashMap<u64, usize>,
+    entries: Vec<CachedHeaderPlan>,
+    stats: HeaderPlanCacheStats,
+    max_entries: usize,
+}
+
+impl Default for HeaderPlanCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HeaderPlanCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            first_by_hash: HashMap::new(),
+            entries: Vec::new(),
+            stats: HeaderPlanCacheStats::default(),
+            max_entries: MAX_HEADER_PLAN_CACHE_ENTRIES,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_limit(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            ..Self::new()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stats(&self) -> HeaderPlanCacheStats {
+        self.stats
+    }
+
+    fn price(
+        &mut self,
+        literal_lengths: &[u8],
+        distance_lengths: &[u8],
+        data_bits: u64,
+        exhaustive: bool,
+        rle_mask: u8,
+    ) -> Option<DynamicPlan> {
+        let fingerprint =
+            header_plan_fingerprint(literal_lengths, distance_lengths, exhaustive, rle_mask);
+        self.stats.lookups = self.stats.lookups.saturating_add(1);
+        let mut candidate = self.first_by_hash.get(&fingerprint).copied();
+        while let Some(index) = candidate {
+            self.stats.collision_checks = self.stats.collision_checks.saturating_add(1);
+            let entry = self.entries.get(index)?;
+            let next = entry.next_same_hash;
+            let matches = entry.fingerprint == fingerprint
+                && entry.exhaustive == exhaustive
+                && entry.rle_mask == rle_mask
+                && entry.kernel.literal_lengths == literal_lengths
+                && entry.kernel.distance_lengths == distance_lengths;
+            if matches {
+                let mut plan = entry.kernel.try_clone()?;
+                plan.bits = plan.bits.checked_add(data_bits)?;
+                self.stats.hits = self.stats.hits.saturating_add(1);
+                return Some(plan);
+            }
+            candidate = next;
+        }
+        self.stats.misses = self.stats.misses.saturating_add(1);
+
+        let mut kernel = plan_for_trimmed_lengths_uncached(
+            literal_lengths,
+            distance_lengths,
+            0,
+            exhaustive,
+            rle_mask,
+        )?;
+        let Some(mut plan) = kernel.try_clone() else {
+            kernel.bits = kernel.bits.checked_add(data_bits)?;
+            return Some(kernel);
+        };
+        plan.bits = plan.bits.checked_add(data_bits)?;
+        self.insert(fingerprint, exhaustive, rle_mask, kernel);
+        Some(plan)
+    }
+
+    fn insert(&mut self, fingerprint: u64, exhaustive: bool, rle_mask: u8, kernel: DynamicPlan) {
+        if self.entries.len() >= self.max_entries {
+            self.stats.saturated = self.stats.saturated.saturating_add(1);
+            return;
+        }
+        if self.entries.try_reserve(1).is_err() || self.first_by_hash.try_reserve(1).is_err() {
+            self.stats.saturated = self.stats.saturated.saturating_add(1);
+            return;
+        }
+        let next_same_hash = self.first_by_hash.get(&fingerprint).copied();
+        let index = self.entries.len();
+        self.entries.push(CachedHeaderPlan {
+            fingerprint,
+            next_same_hash,
+            exhaustive,
+            rle_mask,
+            kernel,
+        });
+        self.first_by_hash.insert(fingerprint, index);
+        self.stats.inserts = self.stats.inserts.saturating_add(1);
+    }
+}
+
+fn header_plan_fingerprint(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    exhaustive: bool,
+    rle_mask: u8,
+) -> u64 {
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+    mix_header_plan_fingerprint(&mut fingerprint, literal_lengths.len() as u64);
+    for &length in literal_lengths {
+        mix_header_plan_fingerprint(&mut fingerprint, u64::from(length));
+    }
+    mix_header_plan_fingerprint(&mut fingerprint, distance_lengths.len() as u64);
+    for &length in distance_lengths {
+        mix_header_plan_fingerprint(&mut fingerprint, u64::from(length));
+    }
+    mix_header_plan_fingerprint(
+        &mut fingerprint,
+        u64::from(exhaustive) | (u64::from(rle_mask) << 1),
+    );
+    fingerprint
+}
+
+#[inline]
+fn mix_header_plan_fingerprint(fingerprint: &mut u64, value: u64) {
+    *fingerprint ^= value;
+    *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    *fingerprint ^= *fingerprint >> 32;
+}
 
 /// Which deft4j header spelling governs a source-state decision.
 ///
@@ -174,6 +338,7 @@ pub(crate) fn score_existing_dynamic(
     Some(plan)
 }
 
+#[cfg(test)]
 pub(crate) fn best_dynamic_plan(
     tokens: &[Token],
     literal_frequencies: &[u32; 286],
@@ -182,6 +347,29 @@ pub(crate) fn best_dynamic_plan(
     strict: bool,
     exhaustive: bool,
     stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    best_dynamic_plan_cached(
+        tokens,
+        literal_frequencies,
+        distance_frequencies,
+        original,
+        strict,
+        exhaustive,
+        stop,
+        &mut HeaderPlanCache::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn best_dynamic_plan_cached(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    original: Option<&DynamicPlan>,
+    strict: bool,
+    exhaustive: bool,
+    stop: &mut SearchStop<'_>,
+    header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
     let extra_bits = token_extra_bits(tokens);
     let source_exact = original.and_then(|plan| score_existing_dynamic(tokens, plan, strict));
@@ -201,11 +389,12 @@ pub(crate) fn best_dynamic_plan(
                 extra_bits,
             );
             if let Some(data_bits) = data_bits {
-                if let Some(repacked) = plan_for_explicit_lengths_with_cost(
+                if let Some(repacked) = plan_for_explicit_lengths_with_cost_cached(
                     &source.literal_lengths,
                     &source.distance_lengths,
                     data_bits,
                     exhaustive,
+                    header_cache,
                 ) {
                     keep_better(&mut best, repacked);
                 }
@@ -249,9 +438,13 @@ pub(crate) fn best_dynamic_plan(
                 extra_bits,
             );
             if let Some(data_bits) = data_bits {
-                if let Some(candidate) =
-                    plan_for_explicit_lengths_with_cost(literal, distance, data_bits, exhaustive)
-                {
+                if let Some(candidate) = plan_for_explicit_lengths_with_cost_cached(
+                    literal,
+                    distance,
+                    data_bits,
+                    exhaustive,
+                    header_cache,
+                ) {
                     keep_better(&mut best, candidate);
                 }
             }
@@ -736,6 +929,7 @@ pub(crate) fn plan_columbo_balanced_tree_candidate(
             }
         }
     }
+
     best
 }
 
@@ -1123,6 +1317,31 @@ pub(crate) fn plan_for_explicit_lengths_with_cost(
     )
 }
 
+fn plan_for_explicit_lengths_with_cost_cached(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+    exhaustive: bool,
+    cache: &mut HeaderPlanCache,
+) -> Option<DynamicPlan> {
+    let hlit = trim_literal(literal_lengths);
+    let hdist = trim_distance(distance_lengths);
+    let literal_lengths = &literal_lengths[..hlit];
+    let distance_lengths = &distance_lengths[..hdist];
+    if !payload_tree_shape_is_valid(literal_lengths, false)
+        || !payload_tree_shape_is_valid(distance_lengths, true)
+    {
+        return None;
+    }
+    cache.price(
+        literal_lengths,
+        distance_lengths,
+        data_bits,
+        exhaustive,
+        0xff,
+    )
+}
+
 /// Score a dynamic header with deft4j beta-17's ordered header grid.
 ///
 /// Columbo's ordinary planner intentionally considers a wider family of
@@ -1456,6 +1675,22 @@ fn deft4j_pack_code_lengths(lengths: &[u8], options: Deft4jPackOptions) -> Optio
 }
 
 fn plan_for_trimmed_lengths(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+    exhaustive: bool,
+    rle_mask: u8,
+) -> Option<DynamicPlan> {
+    plan_for_trimmed_lengths_uncached(
+        literal_lengths,
+        distance_lengths,
+        data_bits,
+        exhaustive,
+        rle_mask,
+    )
+}
+
+fn plan_for_trimmed_lengths_uncached(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     data_bits: u64,
@@ -2627,6 +2862,100 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_plan_cache_reuses_only_the_header_kernel() {
+        let mut literal_lengths = [0_u8; 257];
+        literal_lengths[0] = 1;
+        literal_lengths[256] = 1;
+        let distance_lengths = [1_u8];
+        let mut cache = HeaderPlanCache::with_limit(2);
+
+        let first = plan_for_explicit_lengths_with_cost_cached(
+            &literal_lengths,
+            &distance_lengths,
+            10,
+            false,
+            &mut cache,
+        )
+        .expect("the first header kernel is valid");
+        let second = plan_for_explicit_lengths_with_cost_cached(
+            &literal_lengths,
+            &distance_lengths,
+            25,
+            false,
+            &mut cache,
+        )
+        .expect("the cached header kernel is valid");
+
+        assert_eq!(second.bits, first.bits + 15);
+        assert_eq!(
+            cache.stats(),
+            HeaderPlanCacheStats {
+                lookups: 2,
+                hits: 1,
+                misses: 1,
+                inserts: 1,
+                collision_checks: 1,
+                saturated: 0,
+            }
+        );
+
+        let exhaustive = plan_for_explicit_lengths_with_cost_cached(
+            &literal_lengths,
+            &distance_lengths,
+            25,
+            true,
+            &mut cache,
+        )
+        .expect("header policy produces an independent valid kernel");
+        assert_eq!(exhaustive.bits, second.bits);
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().inserts, 2);
+    }
+
+    #[test]
+    fn header_plan_cache_verifies_lengths_after_a_hash_collision() {
+        let mut first_literal = [0_u8; 257];
+        first_literal[0] = 1;
+        first_literal[256] = 1;
+        let mut second_literal = [0_u8; 257];
+        second_literal[0] = 2;
+        second_literal[1] = 2;
+        second_literal[2] = 2;
+        second_literal[256] = 2;
+        let distance = [1_u8];
+        let mut cache = HeaderPlanCache::new();
+        plan_for_explicit_lengths_with_cost_cached(
+            &first_literal,
+            &distance,
+            10,
+            false,
+            &mut cache,
+        )
+        .expect("the first header kernel is valid");
+
+        let fingerprint = header_plan_fingerprint(&second_literal, &distance, false, 0xff);
+        cache.entries[0].fingerprint = fingerprint;
+        cache.first_by_hash.clear();
+        cache.first_by_hash.insert(fingerprint, 0);
+        let second = plan_for_explicit_lengths_with_cost_cached(
+            &second_literal,
+            &distance,
+            20,
+            false,
+            &mut cache,
+        )
+        .expect("the colliding header kernel is independently planned");
+
+        assert_eq!(second.literal_lengths, second_literal);
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.entries[1].next_same_hash, Some(0));
+        assert_eq!(cache.stats().hits, 0);
+        assert_eq!(cache.stats().misses, 2);
+        assert_eq!(cache.stats().collision_checks, 1);
+    }
 
     #[test]
     fn zopfli_rle_candidate_is_distinct_and_scores_original_counts() {

@@ -497,9 +497,9 @@ stored block, ≤16 Ki tokens total, and at least one block with ≥16 tokens an
 
 ## Candidate reuse and duplicate-work control
 
-The implemented cache is a **route-local block-plan cache**, not a global route
-DAG or interval cache. It stores completed alignment-independent fixed,
-dynamic, and header kernels for identical token states within one planning run.
+Columbo has two bounded route-local caches, not a global route DAG or interval
+cache. The block-plan cache stores completed alignment-independent fixed,
+dynamic, and header results for identical token states within one planning run.
 
 ```mermaid
 flowchart LR
@@ -514,6 +514,12 @@ flowchart LR
     STORE --> ALIGN
     SAFE --> ALIGN
 ```
+
+Inside complete dynamic planning, the header-kernel cache uses a narrower key:
+the exact trimmed literal/distance length sequences and header policy. It can
+therefore reuse deterministic header work across different token orders while
+each caller independently supplies its checked payload cost. The header cache
+has a separate 512-entry cap and never stores incomplete work.
 
 A hash hit is followed by exact verification of token spelling, symbol
 frequencies, source dynamic-tree seed, and strict/default-or-max policy, making
@@ -633,6 +639,7 @@ the internal scheduler described here.
 | All-stored repack | Rechunks adjacent stored payload into legal 65,535-byte blocks without token search. | 🟢 | **RFC 1951 / Columbo** |
 | Strict/relaxed tree-shape policy | Strict completes required alphabets; relaxed permits explicitly supported empty or singleton forms and the compatibility length-258 alias. | 🟢 | **RFC 1951 / Columbo** |
 | Route-local canonical plan cache | Reuses exact-verified completed fixed/dynamic/header kernels within one planning run. Its bounded structural fingerprint omits derived state for speed, but every hit still compares tokens, frequency tables, source tree, and policy exactly. | 🟢 | **Columbo** |
+| Route-local header kernel cache | Reuses a completed zero-payload dynamic-header plan for exact trimmed literal/distance length sequences and header policy, including across different token orders. Hashes only select collision chains; full lengths and policy are verified, and each caller's payload cost is added independently with checked arithmetic. The cache is capped at 512 entries. | 🟢 | **Columbo** |
 | Length-limited Huffman families | Default tries DeflOpt-heap and Columbo order-heap variants; max adds generic, Columbo/Defluff, exact Defluff, and deft4j Java-heap shapes under a capped cross-product. | 🔴 | **DeflOpt / Defluff / deft4j / Columbo** as labelled in source |
 | Header RLE search | Generates each distinct result of the eight repeat-code masks plus balanced/residual variants, then runs feedback, deft4j-pruned headers, and in max a fixed-cost shortest RLE parse. Trees for one spelling are scored exactly from its 19-symbol histogram; the initial DeflOpt trees feed the first feedback pass directly, and owned plans are materialized only for a new winner. | 🔴 | **DeflOpt / deft4j / Columbo** as labelled in source |
 | Adjacency-quantized RLE tree | Max only: quantizes adjacent symbol frequencies into pseudo-weights, builds one RLE-friendly Huffman pair, then prices its complete header and payload against the original frequencies. | 🟡 | Zopfli/Turtledeflate-inspired pseudo-frequency shape; **Columbo** quantizer and exact scoring |

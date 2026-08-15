@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
-use super::header::{best_dynamic_plan, token_bits};
+use super::header::{best_dynamic_plan_cached, token_bits, HeaderPlanCache};
 use super::huffman::{
     fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
@@ -177,8 +177,17 @@ pub(crate) fn plan_reusable_block(
     options: &Options,
     stop: &mut SearchStop<'_>,
 ) -> ReusableBlockPlan {
+    plan_reusable_block_with_header_cache(block, options, stop, &mut HeaderPlanCache::new())
+}
+
+fn plan_reusable_block_with_header_cache(
+    block: &ParsedBlock,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+    header_cache: &mut HeaderPlanCache,
+) -> ReusableBlockPlan {
     let fixed_bits = fixed_block_bits(&block.tokens).unwrap_or(u64::MAX);
-    let dynamic = best_dynamic_plan(
+    let dynamic = best_dynamic_plan_cached(
         &block.tokens,
         &block.literal_frequencies,
         &block.distance_frequencies,
@@ -186,6 +195,7 @@ pub(crate) fn plan_reusable_block(
         options.strict,
         options.exhaustive,
         stop,
+        header_cache,
     );
 
     let (representation, bits) = if dynamic
@@ -245,6 +255,7 @@ pub(crate) struct CanonicalPlanCache {
     stats: CanonicalPlanCacheStats,
     max_entries: usize,
     max_token_bytes: usize,
+    header_cache: HeaderPlanCache,
 }
 
 impl Default for CanonicalPlanCache {
@@ -261,6 +272,7 @@ impl CanonicalPlanCache {
             stats: CanonicalPlanCacheStats::default(),
             max_entries: MAX_CANONICAL_PLAN_CACHE_ENTRIES,
             max_token_bytes: MAX_CANONICAL_PLAN_CACHE_TOKEN_BYTES,
+            header_cache: HeaderPlanCache::new(),
         }
     }
 
@@ -331,7 +343,12 @@ impl CanonicalPlanCache {
         if let Some(plan) = self.lookup_reusable_with_fingerprint(block, options, fingerprint) {
             return plan;
         }
-        let plan = plan_reusable_block(block, options, &mut SearchStop::never());
+        let plan = plan_reusable_block_with_header_cache(
+            block,
+            options,
+            &mut SearchStop::never(),
+            &mut self.header_cache,
+        );
         self.insert(block, options, fingerprint, &plan);
         plan
     }
@@ -860,6 +877,28 @@ mod tests {
                 retained_token_bytes: first.tokens.capacity() * std::mem::size_of::<Token>(),
             }
         );
+    }
+
+    #[test]
+    fn header_cache_reuses_trees_across_distinct_token_orders() {
+        let first = literal_block(b"header kernel reuse");
+        let mut reversed = b"header kernel reuse".to_vec();
+        reversed.reverse();
+        let second = literal_block(&reversed);
+        assert_eq!(first.literal_frequencies, second.literal_frequencies);
+        assert_ne!(first.tokens, second.tokens);
+
+        let options = Options::default();
+        let mut cache = CanonicalPlanCache::new();
+        cache.plan_reusable_complete(&first, &options);
+        let first_header_stats = cache.header_cache.stats();
+        cache.plan_reusable_complete(&second, &options);
+        let second_header_stats = cache.header_cache.stats();
+
+        assert_eq!(cache.stats().hits, 0);
+        assert_eq!(cache.stats().misses, 2);
+        assert!(second_header_stats.hits > first_header_stats.hits);
+        assert!(second_header_stats.inserts >= first_header_stats.inserts);
     }
 
     #[test]

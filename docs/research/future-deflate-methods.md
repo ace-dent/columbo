@@ -48,10 +48,10 @@ candidate.
 | 1 | Distance-side and paired balanced-tree moves | Tiny–small, broad | Bounded default; wider Max | Implemented |
 | 2 | K-best code-length-RLE feedback | Small, broad | Zero-cost ties in default; bounded Max | Explored; not adopted |
 | 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Implemented |
-| 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Proposed |
+| 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Graft explored; not adopted |
 | 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Proposed |
 | 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Proposed |
-| 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Proposed |
+| 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Header kernel implemented |
 | 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Proposed |
 
 Every experiment must retain the original complete candidate and accept a
@@ -74,9 +74,9 @@ For Columbo, every in-scope improvement belongs to one of these areas:
 | Wrapper and container bytes | PNG/APNG, GZIP, ZIP, and zlib reconstruction, metadata handling, duplicate-frame reuse, exact candidate comparison | Format-specific work only; no general Deflate method found |
 | Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split | A second adaptive basin, one local boundary reseat, and a diagnosed forced-split escape |
 | Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites | Header-aware selection among several near-tie spellings rather than one local winner per match or group |
-| Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | Near-optimal tree frontiers and controlled unused-symbol support |
+| Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | A near-optimal tree frontier only after a diagnosed miss; the bounded unused-symbol graft trial found no real-file win |
 | Dynamic header | Eight repeat masks, balanced and zero-continuation packs, DeflOpt/deft4j/Defluff-derived routes, exact shortest RLE for one fixed code-length tree, four feedback passes | Retain several RLE alternatives because the cheapest parse under the current tree need not build the cheapest next tree |
-| Search engineering | Route-local canonical block-plan cache, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Cache fixed-tree header kernels independently of token order; share completed immutable interval kernels across compatible sibling lineages |
+| Search engineering | Route-local canonical block-plan and exact-length header-kernel caches, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Cache frequency-planning kernels; share completed immutable interval kernels across compatible sibling lineages |
 
 This inventory also explains why a new whole-block proven-match lattice is not,
 by itself, a new method. Existing match intervals do not overlap, so under one
@@ -205,9 +205,9 @@ The following distinctions are important when evaluating the proposed work:
   does not retain several near-tie paths per match for a global
   frequency/header beam.
 - The canonical block-plan cache verifies complete token state, source-tree
-  seed, and policy. It is already real route-DAG work, not an unimplemented
-  proposal. A narrower header cache can still reuse work between distinct token
-  orders or routes that produce the same frequencies and tree lengths.
+  seed, and policy. A narrower route-local header cache now reuses completed
+  kernels for exact trimmed literal/distance length sequences and header policy,
+  even when token order differs. Payload bits remain independently priced.
 
 ## Proposed experiments
 
@@ -349,7 +349,7 @@ cross-product with the existing tree families. Source attribution and the
 upstream Apache-2.0 provenance are retained beside the independently written
 transform.
 
-### 4. Header-aware data-tree frontier and unused-symbol grafts
+### 4. Header-aware data-tree frontier — graft explored, not adopted
 
 Ordinary Huffman construction minimizes payload for a fixed symbol set. It
 does not minimize payload plus the cost of describing its code-length
@@ -357,25 +357,32 @@ sequence. Columbo samples this larger objective with several builders,
 pseudo-frequencies, assignments, swaps, and literal-side Kraft moves. A Max
 frontier can generalize those samples without enumerating every tree.
 
-Seed the frontier with the best distinct current trees, then generate bounded
-neighbours such as:
+If a diagnosed miss justifies returning to the frontier, seed it with the best
+distinct current trees and generate bounded neighbours such as:
 
 - the symmetric pair/quad moves above;
 - one generalized Kraft exchange beyond pair/quad, selected from a
   precomputed table whose removed and added code-space weights are exactly
   equal;
 - a near-optimal length histogram produced by forbidding one decision from the
-  winning length-limited construction; and
-- an **unused-symbol graft**: lengthen one rare used leaf from `L` to `L+1`
-  and assign an unused, header-helpful symbol the other `L+1` leaf.
+  winning length-limited construction.
 
-The last move deliberately adds a code that is never emitted. It increases
-payload by the used symbol's frequency but preserves the Kraft sum and can
-create a cheaper code-length run. RFC 1951 requires zero-length symbols not to
-participate; it does not require every participating code to appear in the
-payload. Fixed Deflate trees themselves contain non-emitted symbols. Columbo
-should nevertheless keep this Max-only until strict-decoder corpus testing
-confirms the generated shapes.
+The first bounded prototype tested an **unused-symbol graft**: lengthen one rare
+used leaf from `L` to `L+1` and assign an unused, header-adjacent symbol the
+other `L+1` leaf. This preserves the Kraft sum while spending the used symbol's
+frequency in payload bits. The implementation restricted targets to the
+already-transmitted alphabet span, required the new leaf to join an existing
+equal-length run, retained at most sixteen candidates per alphabet, and
+exact-priced the complete Max header.
+
+The mechanism won a constructed complete-header case, but did not meet the
+real-file threshold. A read-only scan of 800 PNG fixtures covered 1,278 source
+dynamic blocks and found no direct win. Six full Max routes likewise accepted
+no graft. Running the frontier inside every Max rebuild roughly doubled one
+short control, while moving it into the bounded compact cleanup restored the
+runtime but still produced no accepted candidate. The production graft and its
+opportunity counters were therefore removed. Reconsider it only for a
+diagnosed tree shape that exhibits this exact missing move.
 
 For each neighbour, compute the payload delta from frequencies, reject a
 configurable positive margin, then exactly price the complete header. Keep a
@@ -385,7 +392,6 @@ small Pareto frontier over payload bits, header bits, `HLIT`, `HDIST`, and
 Suggested counters:
 
 - unique length histograms and symbol assignments reached;
-- unused-symbol graft opportunities by alphabet and target position;
 - candidates at each payload-deficit band;
 - header-only, payload-only, and combined exact gains; and
 - wins already duplicated by another tree family.
@@ -451,16 +457,28 @@ Do not copy Turtledeflate's repeated recompression loop. Columbo should reuse
 its range index and canonical plan cache, limit the number of new cuts, and
 stop after one pass.
 
-### 7. Header-kernel and wider interval caching
+### 7. Header-kernel and wider interval caching — header kernel implemented
 
 Broader search should be paid for by eliminating duplicated deterministic
-work. Two cache layers are plausible:
+work. The first layer is now implemented:
 
-- a fixed-tree header cache keyed by trimmed literal and distance length
-  sequences plus header-search policy; and
-- a frequency-planning kernel keyed by literal/length frequencies, distance
-  frequencies, match extra-bit total, strict policy, exhaustive policy, and
-  any source-tree seed that participates in candidate generation.
+- a bounded route-local header cache is keyed by the exact trimmed literal and
+  distance length sequences, exhaustive policy, and RLE-mask policy. It stores
+  a completed zero-payload header kernel, verifies the full key after hash
+  lookup, clones it fallibly, and adds each caller's payload bits with checked
+  arithmetic. Distinct token orders can therefore share the deterministic
+  header search without sharing payload identity.
+
+The cache is capped at 512 entries. Focused tests prove policy isolation,
+payload-cost independence, and reuse across different token orders that miss
+the canonical whole-block cache. Runtime instrumentation observed real hits;
+a triplicate short Max control was neutral at 3.99 seconds before and 4.01
+seconds after, with identical output.
+
+The remaining possible layer is a frequency-planning kernel keyed by
+literal/length frequencies, distance frequencies, match extra-bit total,
+strict policy, exhaustive policy, and any source-tree seed that participates
+in candidate generation.
 
 The emitted token order does not change Huffman payload cost, although it still
 matters to final emission and identity verification. Cache only immutable,
@@ -541,10 +559,12 @@ their output safe.
    prototype did not meet the output/runtime threshold and was removed.
 4. Completed: retain exact Zopfli pseudo-frequencies as one differential Max
    candidate after unique complete-plan and final-file wins.
-5. Next: add header-kernel caching before widening data-tree or proven-spelling
-   beams.
-6. Trial the data-tree frontier and unused-symbol grafts.
-7. Trial header-aware proven-spelling composition on diagnosed misses.
+5. Completed: add the bounded route-local header kernel cache and verify reuse
+   across distinct token orders without changing output.
+6. Completed: trial the unused-symbol graft. Its constructed win did not recur
+   across 1,278 source dynamic blocks or six full Max routes, so remove it and
+   defer the broader data-tree frontier until a diagnosed miss justifies it.
+7. Next: trial header-aware proven-spelling composition on diagnosed misses.
 8. Add the second adaptive split basin and one adjacent-boundary reseat.
 9. Consider a forced split only if a remaining substantial miss proves the
    need.
