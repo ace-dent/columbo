@@ -11,7 +11,8 @@ The original Columbo source audit was pinned to commit
 `a95929541930d2f1d6ccacb57a42abe4b4fe0a80` on 12 August 2026. The priority-one
 area was revalidated and implemented against
 `6045adefe671da49d962ffcaa2158f9f197426fe` on 15 August 2026. External projects
-were checked on 12 August. Current-branch links are used where an upstream
+were initially checked on 12 August, and Zopfli's pseudo-frequency source was
+revalidated on 15 August. Current-branch links are used where an upstream
 project does not publish stable source snapshots, so their claims should be
 rechecked before implementation.
 
@@ -34,16 +35,19 @@ currently optimizes separately:
 The first output-changing experiment selected was **symmetric distance-tree
 and paired balanced-tree moves**. It is now implemented. Columbo applies its
 bounded pair and quad Kraft-preserving search to both data alphabets, then
-exactly prices a small paired cross-product. The next broader search to
-investigate is **k-best code-length-RLE feedback**, retaining a few alternate
-RLE parses instead of feeding only one cheapest parse into the next tree
-rebuild.
+exactly prices a small paired cross-product. **K-best code-length-RLE
+feedback** was the next broader search evaluated, but its bounded prototype was
+not retained: one generated header improved by one bit, while the real-file
+sample produced no observed gains and materially increased runtime. The
+subsequent exact Zopfli RLE-friendly pseudo-frequency control produced distinct
+complete-plan and real-file wins, so it is now retained as one paired Max
+candidate.
 
 | Priority | Experiment | Likely benefit | Initial runtime policy | Status |
 | ---: | --- | ---: | --- | --- |
 | 1 | Distance-side and paired balanced-tree moves | Tiny–small, broad | Bounded default; wider Max | Implemented |
-| 2 | K-best code-length-RLE feedback | Small, broad | Zero-cost ties in default; bounded Max | Proposed next |
-| 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Proposed |
+| 2 | K-best code-length-RLE feedback | Small, broad | Zero-cost ties in default; bounded Max | Explored; not adopted |
+| 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Implemented |
 | 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Proposed |
 | 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Proposed |
 | 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Proposed |
@@ -179,9 +183,11 @@ The following distinctions are important when evaluating the proposed work:
 - `tree_candidates` retains up to twenty unique trees per data alphabet and
   exactly prices the literal/distance cross-product. More ordinary tree
   builders alone are unlikely to help.
-- The Max pseudo-frequency candidate changes both data alphabets, but uses
-  Columbo's adjacency quantizer rather than Zopfli's run marking and stride
-  averaging.
+- Max has two independent paired pseudo-frequency candidates. Columbo's
+  adjacency quantizer rounds neighbouring counts onto a logarithmic grid. The
+  Zopfli-compatible control preserves useful equal-count runs and collapses
+  sufficiently long nearby-count strides to their rounded mean. Both build
+  one literal/distance pair and are exact-priced against the original counts.
 - Equal-frequency reassignment and greedy length swaps operate on both data
   alphabets. They change which symbols receive existing lengths; they do not
   enumerate new near-optimal length histograms.
@@ -249,7 +255,7 @@ This was selected first because it is deterministic, small, and exercised a
 clear source asymmetry. Focused tests cover literal and distance pair/quad
 validity, the paired cross-alphabet case, and opportunity counting.
 
-### 2. K-best code-length-RLE feedback
+### 2. K-best code-length-RLE feedback — explored, not adopted
 
 For fixed literal/length and distance code lengths, the possible RLE streams
 form a small acyclic graph over at most 316 decoded lengths. Columbo currently
@@ -292,21 +298,56 @@ length-limited code-length tree for those active symbols. Assert that
 production never reports a cost below the oracle and that the bounded route
 retains its source candidate.
 
-### 3. Exact Zopfli RLE-friendly pseudo-frequencies
+The August 2026 prototype implemented the fixed-cost path frontier and applied
+it only after the selected data tree, avoiding multiplication across the
+literal/distance tree grid. It confirmed that the coupling is real: a
+deterministically generated header improved from 617 to 616 bits when an
+equal-fixed-cost alternate spelling received another tree rebuild. The
+production method was nevertheless rejected at the tested bounds:
 
-Implement Zopfli's published `OptimizeHuffmanForRle` behavior as one additional
-paired literal/distance candidate, then score its payload using the original
-frequencies and run it through Columbo's complete header planner.
+- 20 normal-mode compact PNG comparisons produced identical final byte and
+  meaningful-bit counts, while elapsed time increased from 2.67 to 4.00
+  seconds;
+- eight Max comparisons across compact PNG and zlib inputs produced no byte
+  improvement, and the inspected verbose comparison had the same meaningful
+  bit count; and
+- one isolated Max balanced-tree cleanup increased from about 84 to 178
+  milliseconds.
 
-This is best treated as a control experiment:
+The short-sequence exhaustive oracle was retained as a test of the existing
+scalar `shortest_rle` solver. Reconsider k-best feedback only if a diagnosed
+real-file miss identifies a specific alternate histogram or a substantially
+cheaper frontier representation removes the measured overhead.
 
-- if it produces unique corpus wins, retain it as a Max candidate;
-- if Columbo's adjacency quantizer always ties or wins, remove the duplicate
-  experiment; and
-- if code is closely translated rather than independently reimplemented,
-  retain Zopfli's Apache-2.0 notice and authorship.
+### 3. Exact Zopfli RLE-friendly pseudo-frequencies — implemented
 
-It should not become another cross-product with every existing tree family.
+Columbo now independently implements Zopfli's published
+`OptimizeHuffmanForRle` behavior as one additional paired literal/distance
+candidate. It leaves trailing zeros alone, marks existing runs of at least five
+zeros or seven equal nonzero counts, and replaces eligible nearby-count strides
+with their rounded mean. The resulting trees are validated and their payload
+is scored from the unmodified source frequencies through Columbo's complete
+header planner.
+
+The experiment met the Max retention threshold:
+
+- a deterministic synthetic histogram prices at 4,366 bits, ten bits below
+  Columbo's independent adjacency quantizer;
+- diagnostics on compact real streams found repeated complete-plan wins of
+  one to sixteen bits before later route selection; and
+- in an eleven-file Max comparison against the clean baseline, three priority
+  files retained final gains: `small/present.png` saved another 2 bytes / 16
+  meaningful bits, `medium/Mittens.png` another 13 bytes / 107 bits, and
+  `css-ig-net/barchart.png` another 9 bytes / 72 bits. The other eight files
+  tied the baseline final byte and meaningful-bit result; and
+- a triplicate serial Max timing of one short no-gain control increased from
+  3.41 to 4.18 seconds in total, about 0.26 seconds per file. This measured
+  cost is why the candidate remains Max-only.
+
+The implementation remains one Max-only paired candidate; it does not form a
+cross-product with the existing tree families. Source attribution and the
+upstream Apache-2.0 provenance are retained beside the independently written
+transform.
 
 ### 4. Header-aware data-tree frontier and unused-symbol grafts
 
@@ -496,10 +537,11 @@ their output safe.
 1. Completed: add source opportunity counters for balanced-tree moves.
 2. Completed: implement symmetric distance-tree moves and a tiny paired
    cross-product.
-3. Next: add the short-sequence exhaustive RLE oracle, then bounded k-best RLE
-   feedback.
-4. Trial exact Zopfli pseudo-frequencies as one differential candidate.
-5. Add header-kernel caching before widening data-tree or proven-spelling
+3. Completed: add the short-sequence exhaustive RLE oracle. The bounded k-best
+   prototype did not meet the output/runtime threshold and was removed.
+4. Completed: retain exact Zopfli pseudo-frequencies as one differential Max
+   candidate after unique complete-plan and final-file wins.
+5. Next: add header-kernel caching before widening data-tree or proven-spelling
    beams.
 6. Trial the data-tree frontier and unused-symbol grafts.
 7. Trial header-aware proven-spelling composition on diagnosed misses.

@@ -568,6 +568,75 @@ pub(crate) fn make_columbo_rle_pseudofrequencies<const N: usize>(frequencies: &m
     }
 }
 
+/// Construct Zopfli-compatible RLE-friendly Huffman pseudofrequencies.
+///
+/// This independently implements the published behavior of Zopfli's
+/// `OptimizeHuffmanForRle`: preserve already-useful equal-count runs, then
+/// replace sufficiently long nearby-count strides by their rounded mean.
+/// Trailing zero symbols remain untouched. Callers must build an alternate
+/// tree from these weights and score that tree against the original counts.
+///
+/// Algorithm source and authorship: Google Zopfli, Copyright 2011 Google Inc.,
+/// Lode Vandevenne and Jyrki Alakuijala, Apache License 2.0.
+pub(crate) fn make_zopfli_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
+    let Some(last_nonzero) = frequencies.iter().rposition(|&frequency| frequency != 0) else {
+        return;
+    };
+    let length = last_nonzero + 1;
+    let mut good_for_rle = [false; N];
+
+    let mut run_start = 0;
+    while run_start < length {
+        let count = frequencies[run_start];
+        let mut run_end = run_start + 1;
+        while run_end < length && frequencies[run_end] == count {
+            run_end += 1;
+        }
+        let run_length = run_end - run_start;
+        if (count == 0 && run_length >= 5) || (count != 0 && run_length >= 7) {
+            good_for_rle[run_start..run_end].fill(true);
+        }
+        run_start = run_end;
+    }
+
+    let mut stride = 0_usize;
+    let mut limit = frequencies[0];
+    let mut sum = 0_u64;
+    for symbol in 0..=length {
+        let ends_stride =
+            symbol == length || good_for_rle[symbol] || frequencies[symbol].abs_diff(limit) >= 4;
+        if ends_stride {
+            if stride >= 4 || (stride >= 3 && sum == 0) {
+                let average = if sum == 0 {
+                    0
+                } else {
+                    ((sum + stride as u64 / 2) / stride as u64).max(1)
+                };
+                frequencies[symbol - stride..symbol].fill(average as u32);
+            }
+
+            stride = 0;
+            sum = 0;
+            limit = if symbol + 3 < length {
+                let lookahead = frequencies[symbol..symbol + 4]
+                    .iter()
+                    .map(|&frequency| u64::from(frequency))
+                    .sum::<u64>();
+                ((lookahead + 2) / 4) as u32
+            } else if symbol < length {
+                frequencies[symbol]
+            } else {
+                0
+            };
+        }
+
+        stride += 1;
+        if symbol != length {
+            sum += u64::from(frequencies[symbol]);
+        }
+    }
+}
+
 /// Build Columbo's generic tree with Defluff's package-list depth limiter.
 ///
 /// This is a Columbo hybrid, not Defluff's complete tree builder: it keeps
@@ -1448,6 +1517,41 @@ mod tests {
         make_columbo_rle_pseudofrequencies(&mut frequencies);
 
         assert_eq!(frequencies, [u32::MAX, u32::MAX, 0]);
+    }
+
+    #[test]
+    fn zopfli_rle_pseudofrequencies_collapse_nearby_counts() {
+        let mut frequencies = [10, 11, 12, 13, 50, 0, 0];
+
+        make_zopfli_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(frequencies, [12, 12, 12, 12, 50, 0, 0]);
+    }
+
+    #[test]
+    fn zopfli_rle_pseudofrequencies_preserve_good_runs_and_trailing_zeros() {
+        let mut frequencies = [7, 7, 7, 7, 7, 7, 7, 50, 2, 1, 0, 0, 0, 0, 0, 50, 0, 0];
+        let trailing = frequencies[16..].to_vec();
+
+        make_zopfli_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(&frequencies[..7], &[7; 7]);
+        assert_eq!(&frequencies[10..15], &[0; 5]);
+        assert_eq!(&frequencies[16..], trailing);
+    }
+
+    #[test]
+    fn zopfli_rle_pseudofrequencies_handle_empty_and_maximum_counts() {
+        let mut empty = [0_u32; 8];
+        make_zopfli_rle_pseudofrequencies(&mut empty);
+        assert_eq!(empty, [0; 8]);
+
+        let mut maximum = [u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3, 0];
+        make_zopfli_rle_pseudofrequencies(&mut maximum);
+        assert_eq!(
+            maximum,
+            [u32::MAX - 1, u32::MAX - 1, u32::MAX - 1, u32::MAX - 1, 0,]
+        );
     }
 
     #[test]

@@ -446,11 +446,11 @@ deadline and exact final comparison.
 
 ### Separately: exact Zopfli pseudo-frequencies
 
-An exact `OptimizeHuffmanForRle` candidate is inexpensive and in scope for a
-token-preserving optimizer, but it is a Zopfli method rather than a remaining
-Turtledeflate method. Trial it as one paired literal/distance-tree candidate,
-not another cross-product of every tree family. Any close translation requires
-the proper Apache-2.0 notice.
+An exact `OptimizeHuffmanForRle`-compatible candidate is now implemented, but
+it remains a Zopfli method rather than a Turtledeflate method. Columbo uses it
+as one paired Max-only literal/distance-tree candidate, not another
+cross-product of every tree family. It exact-prices the resulting tree against
+the original frequencies and keeps the source candidate as a fallback.
 
 ## Explicitly out of scope
 
@@ -499,9 +499,10 @@ only uses independently expressed concepts. Turtledeflate's licence is
 therefore an upstream reference, not a Columbo distribution notice.
 
 Turtledeflate's embedded `OptimizeHuffmanForRle` has separate Google Zopfli
-Apache-2.0 provenance. Columbo currently uses an original quantizer rather than
-a translation of that function. If the exact Zopfli route is later translated
-or copied, its licensing and notice requirements must be reviewed separately.
+Apache-2.0 provenance. Columbo retains its original adjacency quantizer and
+also independently implements the published Zopfli-compatible transform.
+Zopfli's source attribution, authorship, and Apache-2.0 provenance are recorded
+beside that implementation; no Turtledeflate source is copied or translated.
 
 ## Primary-source index
 

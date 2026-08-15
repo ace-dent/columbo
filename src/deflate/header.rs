@@ -8,8 +8,8 @@ use super::huffman::{
     make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
     make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
-    make_lengths_order_heap_into, payload_tree_shape_is_valid, Huffman,
-    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid,
+    Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -263,6 +263,21 @@ pub(crate) fn best_dynamic_plan(
     // from the completely priced alternate plan.
     if exhaustive && !stop.reached() {
         if let Some(candidate) = columbo_rle_tree_candidate(
+            literal_frequencies,
+            distance_frequencies,
+            extra_bits,
+            strict,
+            exhaustive,
+        ) {
+            keep_better(&mut best, candidate);
+        }
+    }
+
+    // Differential control for Zopfli's published count-smoothing heuristic.
+    // Keep it as one paired Max candidate so it cannot multiply the existing
+    // literal/distance tree-family grid.
+    if exhaustive && !stop.reached() {
+        if let Some(candidate) = zopfli_rle_tree_candidate(
             literal_frequencies,
             distance_frequencies,
             extra_bits,
@@ -860,6 +875,56 @@ fn columbo_rle_tree_candidate(
     let quantization_changed_tree_weights = pseudo_literal_frequencies != *literal_frequencies
         || pseudo_distance_frequencies != *distance_frequencies;
     if !quantization_changed_tree_weights {
+        return None;
+    }
+
+    ensure_code_symbols(&mut pseudo_literal_frequencies, strict);
+    ensure_distance_symbols(&mut pseudo_distance_frequencies, strict);
+    let literal = make_lengths(&pseudo_literal_frequencies, 15, 0);
+    let distance = make_lengths(&pseudo_distance_frequencies, 15, 0);
+    if literal_frequencies
+        .iter()
+        .zip(&literal)
+        .any(|(&frequency, &length)| frequency != 0 && length == 0)
+        || distance_frequencies
+            .iter()
+            .zip(&distance)
+            .any(|(&frequency, &length)| frequency != 0 && length == 0)
+    {
+        return None;
+    }
+    Huffman::build(&literal)?;
+    Huffman::build(&distance)?;
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        &literal,
+        &distance,
+        extra_bits,
+    )?;
+    plan_for_explicit_lengths_with_cost(&literal, &distance, data_bits, exhaustive)
+}
+
+/// Build one paired data-tree candidate from Zopfli's RLE-friendly counts.
+///
+/// Only the pseudo-frequency transform is imported. Columbo supplies its own
+/// tree builder and complete dynamic-header search, then exact-prices payload
+/// bits using the unmodified source frequencies.
+fn zopfli_rle_tree_candidate(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    strict: bool,
+    exhaustive: bool,
+) -> Option<DynamicPlan> {
+    let mut pseudo_literal_frequencies = *literal_frequencies;
+    let mut pseudo_distance_frequencies = *distance_frequencies;
+    make_zopfli_rle_pseudofrequencies(&mut pseudo_literal_frequencies);
+    make_zopfli_rle_pseudofrequencies(&mut pseudo_distance_frequencies);
+
+    let smoothing_changed_tree_weights = pseudo_literal_frequencies != *literal_frequencies
+        || pseudo_distance_frequencies != *distance_frequencies;
+    if !smoothing_changed_tree_weights {
         return None;
     }
 
@@ -2564,6 +2629,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zopfli_rle_candidate_is_distinct_and_scores_original_counts() {
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[..40].copy_from_slice(&[
+            24, 23, 22, 21, 18, 17, 16, 19, 32, 31, 34, 33, 10, 13, 12, 11, 36, 35, 34, 33, 6, 5,
+            4, 7, 4, 3, 6, 5, 22, 25, 24, 23, 16, 15, 14, 13, 26, 25, 24, 27,
+        ]);
+        literal_frequencies[256] = 1;
+        let mut distance_frequencies = [0_u32; 30];
+        distance_frequencies[..8].copy_from_slice(&[12, 11, 14, 13, 6, 9, 8, 7]);
+
+        let zopfli =
+            zopfli_rle_tree_candidate(&literal_frequencies, &distance_frequencies, 0, true, true)
+                .expect("Zopfli smoothing changes this tree");
+        let columbo =
+            columbo_rle_tree_candidate(&literal_frequencies, &distance_frequencies, 0, true, true)
+                .expect("Columbo quantization changes this tree");
+        assert_eq!(zopfli.bits, 4_366);
+        assert_eq!(columbo.bits, 4_376);
+
+        let data_bits = token_bits_from_frequencies(
+            &literal_frequencies,
+            &distance_frequencies,
+            &zopfli.literal_lengths,
+            &zopfli.distance_lengths,
+            0,
+        )
+        .expect("candidate covers every source symbol");
+        let exactly_priced = plan_for_explicit_lengths_with_cost(
+            &zopfli.literal_lengths,
+            &zopfli.distance_lengths,
+            data_bits,
+            true,
+        )
+        .expect("candidate trees form a valid dynamic block");
+        assert_eq!(zopfli, exactly_priced);
+    }
+
+    fn enumerate_rle_paths(
+        lengths: &[u8],
+        index: usize,
+        current: &mut Vec<RleToken>,
+        output: &mut Vec<Vec<RleToken>>,
+    ) {
+        if index == lengths.len() {
+            output.push(current.clone());
+            return;
+        }
+        let mut run = 1;
+        while index + run < lengths.len() && lengths[index + run] == lengths[index] {
+            run += 1;
+        }
+        let mut visit = |count: usize, symbol: u8, extra: u8| {
+            current.push(RleToken { symbol, extra });
+            enumerate_rle_paths(lengths, index + count, current, output);
+            current.pop();
+        };
+
+        visit(1, lengths[index], 0);
+        if index > 0 && lengths[index] == lengths[index - 1] {
+            for count in 3..=run.min(6) {
+                visit(count, 16, (count - 3) as u8);
+            }
+        }
+        if lengths[index] == 0 {
+            for count in 3..=run.min(10) {
+                visit(count, 17, (count - 3) as u8);
+            }
+            for count in 11..=run.min(138) {
+                visit(count, 18, (count - 11) as u8);
+            }
+        }
+    }
+
+    fn exhaustive_shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
+        let mut spellings = Vec::new();
+        enumerate_rle_paths(lengths, 0, &mut Vec::new(), &mut spellings);
+        spellings.retain(|rle| {
+            rle.iter()
+                .all(|token| costs[usize::from(token.symbol)] != 0)
+        });
+        spellings.sort_by_key(|rle| rle_cost(rle, costs));
+        spellings.into_iter().next()
+    }
+
+    #[test]
     fn token_bits_counts_huffman_codes_and_match_extras_together() {
         let tokens = [
             Token::Literal(b'A'),
@@ -2590,6 +2740,53 @@ mod tests {
             token_bits(&tokens, &literal_lengths, &distance_lengths),
             Some(8 + 7 + 5 + 1 + 1 + 7)
         );
+    }
+
+    #[test]
+    fn shortest_rle_matches_exhaustive_short_sequence_oracle() {
+        let mut cost_sets = Vec::new();
+        let mut balanced = [3_u8; 19];
+        balanced[16] = 2;
+        balanced[17] = 3;
+        balanced[18] = 4;
+        cost_sets.push(balanced);
+        let mut literal_friendly = [5_u8; 19];
+        literal_friendly[0] = 1;
+        literal_friendly[3] = 1;
+        literal_friendly[16] = 7;
+        literal_friendly[17] = 7;
+        literal_friendly[18] = 7;
+        cost_sets.push(literal_friendly);
+        let mut repeat_friendly = [6_u8; 19];
+        repeat_friendly[0] = 4;
+        repeat_friendly[3] = 4;
+        repeat_friendly[16] = 1;
+        repeat_friendly[17] = 1;
+        repeat_friendly[18] = 1;
+        cost_sets.push(repeat_friendly);
+
+        for length in 1..=8 {
+            for mask in 0..1_usize << length {
+                let sequence: Vec<_> = (0..length)
+                    .map(|bit| if mask & (1 << bit) == 0 { 0 } else { 3 })
+                    .collect();
+                for costs in &cost_sets {
+                    assert_eq!(
+                        shortest_rle(&sequence, costs),
+                        exhaustive_shortest_rle(&sequence, costs),
+                        "sequence {sequence:?}, costs {costs:?}",
+                    );
+                }
+            }
+        }
+
+        let long_zero_run = [0_u8; 12];
+        for costs in &cost_sets {
+            assert_eq!(
+                shortest_rle(&long_zero_run, costs),
+                exhaustive_shortest_rle(&long_zero_run, costs),
+            );
+        }
     }
 
     #[test]
