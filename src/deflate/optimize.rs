@@ -4,8 +4,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::progress::{
-    reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
-    RouteProgress, SameDistanceProgress, StreamProgress, MAX_REPORTED_BLOCKS,
+    reports_enabled, BalancedTreeProgress, BlockEncoding, BlockProgress, BlockReport,
+    CandidateProgress, Progress, RouteProgress, SameDistanceProgress, StreamProgress,
+    MAX_REPORTED_BLOCKS,
 };
 use crate::{Error, Options, Result};
 
@@ -13,8 +14,8 @@ use super::bitstream::BitWriter;
 use super::block::{emit_block, plan_block};
 use super::deft4j::plan_source_blocks;
 use super::header::{
-    plan_columbo_pair_lengthen_candidate, plan_columbo_quad_lengthen_candidate,
-    plan_for_explicit_lengths,
+    balanced_tree_opportunities, plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths,
+    BalancedTreeOpportunities,
 };
 use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
@@ -343,6 +344,27 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
             coalescible_runs: opportunities.coalescible_runs,
             repartition_runs: opportunities.repartition_runs,
             tokens_removable: opportunities.tokens_removable,
+        });
+        let mut tree_opportunities = BalancedTreeOpportunities::default();
+        for block in &blocks {
+            let Some(seed) = block.original_dynamic.as_ref() else {
+                continue;
+            };
+            if let Some(opportunities) = balanced_tree_opportunities(
+                &block.literal_frequencies,
+                &block.distance_frequencies,
+                seed,
+            ) {
+                tree_opportunities.add_assign(opportunities);
+            }
+        }
+        progress.balanced_tree_opportunities(BalancedTreeProgress {
+            dynamic_blocks: tree_opportunities.dynamic_blocks,
+            literal_pair_moves: tree_opportunities.literal_pair_moves,
+            literal_quad_moves: tree_opportunities.literal_quad_moves,
+            distance_pair_moves: tree_opportunities.distance_pair_moves,
+            distance_quad_moves: tree_opportunities.distance_quad_moves,
+            paired_prices: tree_opportunities.paired_prices,
         });
     }
     progress.routes();
@@ -2785,38 +2807,22 @@ fn refine_with_compact_balanced_tree_floor(
     let Some(seed) = block.original_dynamic.as_ref() else {
         return Ok(None);
     };
-    // Default's bounded feedback floors gain broadly from the cheap pair move.
-    // In Max, matched streams already have several independent token and
-    // boundary lineages; repeating this tree search there can delay larger
-    // wins. Keep Max's pair move for the empty-distance case that motivated it.
-    let pair = (!options.exhaustive
+    // Default's bounded feedback floors gain broadly from the cheap literal
+    // pair move. Matched Max streams omit that standalone family, but still
+    // price distance moves and the bounded paired cross-alphabet search.
+    let price_literal_pair = !options.exhaustive
         || block
             .distance_frequencies
             .iter()
-            .all(|&frequency| frequency == 0))
-    .then(|| {
-        plan_columbo_pair_lengthen_candidate(
-            &block.tokens,
-            &block.literal_frequencies,
-            &block.distance_frequencies,
-            seed,
-            options.exhaustive,
-        )
-    })
-    .flatten();
-    let dynamic = [
-        pair,
-        plan_columbo_quad_lengthen_candidate(
-            &block.tokens,
-            &block.literal_frequencies,
-            &block.distance_frequencies,
-            seed,
-            options.exhaustive,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .min_by_key(|candidate| candidate.bits);
+            .all(|&frequency| frequency == 0);
+    let dynamic = plan_columbo_balanced_tree_candidate(
+        &block.tokens,
+        &block.literal_frequencies,
+        &block.distance_frequencies,
+        seed,
+        options.exhaustive,
+        price_literal_pair,
+    );
     let Some(mut dynamic) = dynamic else {
         return Ok(None);
     };

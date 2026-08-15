@@ -1,0 +1,511 @@
+<!-- SPDX-License-Identifier: MIT -->
+
+# Further existing-stream Deflate optimization research
+
+This document identifies additional compression methods that remain in scope
+after the current Columbo implementation. It is primarily a proposal; the
+status column and implementation notes distinguish experiments that have since
+entered the source.
+
+The original Columbo source audit was pinned to commit
+`a95929541930d2f1d6ccacb57a42abe4b4fe0a80` on 12 August 2026. The priority-one
+area was revalidated and implemented against
+`6045adefe671da49d962ffcaa2158f9f197426fe` on 15 August 2026. External projects
+were checked on 12 August. Current-branch links are used where an upstream
+project does not publish stable source snapshots, so their claims should be
+rechecked before implementation.
+
+## Conclusion
+
+There is no obvious broad default-mode technique left to import from a modern
+Deflate encoder. Their largest gains come from finding new matches and
+iteratively changing the LZ77 parse, which would turn Columbo into a
+recompressor.
+
+The remaining useful search space is mostly in coupling decisions that Columbo
+currently optimizes separately:
+
+1. the literal/length and distance data trees;
+2. the data-tree code-length sequence and its RLE spelling;
+3. that RLE spelling and its own nineteen-symbol Huffman tree; and
+4. several locally valid proven-match rewrites whose combined frequency change
+   can cross a dynamic-header discontinuity.
+
+The first output-changing experiment selected was **symmetric distance-tree
+and paired balanced-tree moves**. It is now implemented. Columbo applies its
+bounded pair and quad Kraft-preserving search to both data alphabets, then
+exactly prices a small paired cross-product. The next broader search to
+investigate is **k-best code-length-RLE feedback**, retaining a few alternate
+RLE parses instead of feeding only one cheapest parse into the next tree
+rebuild.
+
+| Priority | Experiment | Likely benefit | Initial runtime policy | Status |
+| ---: | --- | ---: | --- | --- |
+| 1 | Distance-side and paired balanced-tree moves | Tiny–small, broad | Bounded default; wider Max | Implemented |
+| 2 | K-best code-length-RLE feedback | Small, broad | Zero-cost ties in default; bounded Max | Proposed next |
+| 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Proposed |
+| 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Proposed |
+| 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Proposed |
+| 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Proposed |
+| 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Proposed |
+| 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Proposed |
+
+Every experiment must retain the original complete candidate and accept a
+rewrite only when exact byte count, then meaningful Deflate bits, improves.
+
+## Scope inventory
+
+RFC 1951 leaves only a small number of ways to spell an already decoded byte
+stream. Blocks may have arbitrary boundaries, their Huffman trees are
+independent, LZ77 references may cross block boundaries, and a match may
+overlap the bytes it is producing. Dynamic blocks transmit one combined
+literal/length and distance code-length sequence, whose repeat codes may cross
+the alphabet boundary. The relevant rules are in
+[RFC 1951 sections 2 and 3.2.7](https://www.rfc-editor.org/rfc/rfc1951.html#section-3.2.7).
+
+For Columbo, every in-scope improvement belongs to one of these areas:
+
+| Area | Current coverage | Remaining plausible gap |
+| --- | --- | --- |
+| Wrapper and container bytes | PNG/APNG, GZIP, ZIP, and zlib reconstruction, metadata handling, duplicate-frame reuse, exact candidate comparison | Format-specific work only; no general Deflate method found |
+| Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split | A second adaptive basin, one local boundary reseat, and a diagnosed forced-split escape |
+| Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites | Header-aware selection among several near-tie spellings rather than one local winner per match or group |
+| Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | Near-optimal tree frontiers and controlled unused-symbol support |
+| Dynamic header | Eight repeat masks, balanced and zero-continuation packs, DeflOpt/deft4j/Defluff-derived routes, exact shortest RLE for one fixed code-length tree, four feedback passes | Retain several RLE alternatives because the cheapest parse under the current tree need not build the cheapest next tree |
+| Search engineering | Route-local canonical block-plan cache, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Cache fixed-tree header kernels independently of token order; share completed immutable interval kernels across compatible sibling lineages |
+
+This inventory also explains why a new whole-block proven-match lattice is not,
+by itself, a new method. Existing match intervals do not overlap, so under one
+fixed Huffman cost model their local shortest paths factor into the per-match
+graphs Columbo already solves. New value appears only when several alternate
+local paths are retained and their *joint header effect* is priced.
+
+## Representative encoder research
+
+This is not a compression-ratio league table. The projects use different
+corpora, runtime budgets, block policies, and release dates. The purpose is to
+identify techniques, then classify whether they can operate on an existing
+Deflate stream without discovering new matches.
+
+### Google Zopfli and its maintained fork
+
+Google Zopfli repeatedly runs an optimal LZ77 parse, updates symbol statistics,
+and perturbs those statistics after convergence. Its block splitter searches
+candidate positions and repeatedly selects another splittable range. Those
+parse and match-finding routes are outside Columbo's scope
+([`squeeze.c`](https://github.com/google/zopfli/blob/master/src/zopfli/squeeze.c),
+[`blocksplitter.c`](https://github.com/google/zopfli/blob/master/src/zopfli/blocksplitter.c)).
+
+Two Zopfli tree methods are directly relevant:
+
+- it tries all eight enable/disable combinations for RLE symbols 16, 17, and
+  18; Columbo already does this and substantially more; and
+- `OptimizeHuffmanForRle` smooths true symbol counts into RLE-friendly
+  pseudo-counts, builds alternate data trees, then compares complete
+  tree-plus-payload cost against the true-count tree
+  ([`deflate.c`](https://github.com/google/zopfli/blob/master/src/zopfli/deflate.c)).
+
+Columbo's adjacency-aware logarithmic quantizer is a different algorithm. An
+exact Zopfli pseudo-frequency candidate therefore remains a useful differential
+experiment, but it should not be confused with a new Columbo invention.
+
+Google archived its repository in October 2025. The recent
+[QVXLabs fork](https://github.com/QVXLabs/zopfli) describes a fixed-point,
+deterministic cost model, reusable match caches, and size-scaled iteration
+counts. These are valuable encoder speed improvements, but the quality path
+still depends on repeated fresh LZ77 parsing. The fork's performance and ratio
+figures are upstream self-measurements, not independently verified results.
+
+### libdeflate
+
+libdeflate's higher compression levels cache matches, solve a minimum-cost path
+over literal and match edges, build Huffman codes from the selected path, and
+repeat with the new code lengths as costs. It keeps the best exact-cost pass,
+can recover a better non-final path, separately considers all literals, and on
+small blocks optimizes against the fixed tree
+([`deflate_compress.c`](https://github.com/ebiggers/libdeflate/blob/master/lib/deflate_compress.c#L3115-L3318)).
+
+The reusable lesson is not the match graph, which is out of scope. It is to
+retain alternate states across feedback passes and judge them by exact final
+cost. Columbo already follows this principle at route level; the proposed
+k-best header feedback applies it to the remaining small header state space.
+
+### 7-Zip and AdvanceCOMP
+
+7-Zip's Deflate encoder uses priced optimal parsing and a second pass whose
+prices come from the first pass's tables
+([`DeflateEncoder.cpp`](https://github.com/ip7z/7zip/blob/main/CPP/7zip/Compress/DeflateEncoder.cpp#L2765-L3421)).
+AdvanceCOMP is a recompression suite that includes 7-Zip- and Zopfli-derived
+Deflate encoders ([project source](https://github.com/amadvance/advancecomp)).
+
+Both are useful external ceilings for complete recompression. Neither exposes
+a missing post-optimization primitive that can be imported without match
+discovery or raw-byte reparsing.
+
+### ECT
+
+[Efficient Compression Tool](https://github.com/fhanau/Efficient-Compression-Tool)
+is a file optimizer that bundles modified zlib and Zopfli-derived encoder
+sources. Its published size/time table demonstrates the familiar tradeoff
+between more encoder work and a thinner ratio tail, but its Deflate gains come
+from recompressing decoded bytes. Treat it as a comparison encoder, not as an
+existing-token optimizer.
+
+### Turtledeflate
+
+Turtledeflate combines match enumeration, several parse-cost models, repeated
+boundary refinement, and recompression of changed partitions. Columbo already
+implements independent cumulative-histogram and adaptive-boundary concepts,
+while its match discovery and parse diversification remain out of scope. The
+source-pinned audit and exact classifications are in
+[`turtledeflate-methods.md`](./turtledeflate-methods.md).
+
+The remaining boundary ideas from that audit—one second split basin, one
+bounded adjacent-boundary reseat, and a forced split only for a diagnosed
+miss—remain valid lower-priority experiments.
+
+## Ground-truth gaps in the current source
+
+The following distinctions are important when evaluating the proposed work:
+
+| Source | Audited responsibility |
+| --- | --- |
+| [`header.rs`](../../src/deflate/header.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE and finished-tree moves |
+| [`huffman.rs`](../../src/deflate/huffman.rs) | Length-limited tree builders and Columbo's adjacency-aware pseudo-frequencies |
+| [`search.rs`](../../src/deflate/search.rs) | Same-distance, proven-submatch, match-family and feedback searches |
+| [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, global boundary graph and range caches |
+| [`block.rs`](../../src/deflate/block.rs) | Exact representation selection and canonical block-plan cache |
+
+- `tree_candidates` retains up to twenty unique trees per data alphabet and
+  exactly prices the literal/distance cross-product. More ordinary tree
+  builders alone are unlikely to help.
+- The Max pseudo-frequency candidate changes both data alphabets, but uses
+  Columbo's adjacency quantizer rather than Zopfli's run marking and stride
+  averaging.
+- Equal-frequency reassignment and greedy length swaps operate on both data
+  alphabets. They change which symbols receive existing lengths; they do not
+  enumerate new near-optimal length histograms.
+- `plan_columbo_balanced_tree_candidate` now generates pair and quad moves for
+  both data alphabets and exactly prices at most sixteen paired combinations.
+  The compact route still retains its established one-block and token-count
+  work bounds.
+- `shortest_rle` is exact for one fixed nineteen-symbol code-length tree. The
+  enclosing route then retains one feedback tree and repeats for at most four
+  passes. It does not keep several near-tie RLE parses whose different symbol
+  counts may build a better next tree or shorten `HCLEN`.
+- Proven-submatch search solves every selected match under fixed current data
+  costs, also tries a source-length-symbol-free solution, exactly prices
+  individual and combined rewrites, and in Max may repeat to stability. It
+  does not retain several near-tie paths per match for a global
+  frequency/header beam.
+- The canonical block-plan cache verifies complete token state, source-tree
+  seed, and policy. It is already real route-DAG work, not an unimplemented
+  proposal. A narrower header cache can still reuse work between distinct token
+  orders or routes that produce the same frequencies and tree lengths.
+
+## Proposed experiments
+
+### 1. Symmetric distance-tree and paired balanced-tree moves — implemented
+
+Columbo's pair and quad moves preserve the Kraft sum while accepting a small
+payload penalty only when the complete dynamic block becomes smaller. Apply
+the same transformations to the distance tree:
+
+- **pair:** shorten one length-`L` code to `L-1` and lengthen two other
+  length-`L` codes to `L+1`;
+- **quad:** shorten one length-`L` code to `L-1` and lengthen four
+  length-`L+1` codes to `L+2`.
+
+Then price a small cross-product of the best literal-side and distance-side
+moves. This can change the RLE run that crosses from the last transmitted
+literal/length entry to the first distance entry, a legal interaction that
+independent alphabet selection can miss.
+
+Implemented bounds:
+
+- retain the existing candidate caps and payload-delta margin initially;
+- try standalone distance moves, then at most the four lowest-payload-delta
+  moves from each alphabet as paired candidates;
+- validate maximum code length, every used symbol, end-of-block, and complete
+  tree shape before header planning; and
+- keep the existing compact one-dynamic-block route: at most 4,096 tokens and
+  its established source-size gates;
+- in default mode, restrict paired work to non-positive combined payload
+  delta. Max may use the existing positive eighteen-bit margin; and
+- preserve Max's existing omission of standalone literal pair pricing on
+  matched streams while still allowing distance and paired work.
+
+Verbose source-opportunity counters now report dynamic blocks, legal bounded
+literal/length moves, legal bounded distance moves, and the maximum number of
+paired prices. The following outcome counters remain useful for corpus
+diagnosis:
+
+- standalone literal, standalone distance, and paired candidates priced;
+- candidates rejected by payload margin or tree validity;
+- payload bits added, header bits removed, exact net bits saved; and
+- wins unique to the paired search.
+
+This was selected first because it is deterministic, small, and exercised a
+clear source asymmetry. Focused tests cover literal and distance pair/quad
+validity, the paired cross-alphabet case, and opportunity counting.
+
+### 2. K-best code-length-RLE feedback
+
+For fixed literal/length and distance code lengths, the possible RLE streams
+form a small acyclic graph over at most 316 decoded lengths. Columbo currently
+returns one cheapest path under one fixed code-length tree. Replace the scalar
+shortest path in Max with a bounded k-shortest-path variant:
+
+1. retain the best `K` distinct RLE streams under the current code-length
+   costs;
+2. de-duplicate them by both token spelling and nineteen-symbol frequency
+   vector;
+3. build the existing code-length-tree families for each frequency vector;
+4. exactly price `HCLEN`, the transmitted code-length tree, RLE symbols and
+   extra bits; and
+5. retain a small exact-cost beam until its fingerprint stabilizes or the pass
+   cap is reached.
+
+This is not claimed to be a globally exact joint solver. The fully coupled
+objective makes the RLE edge costs depend on the tree built from the completed
+path. A bounded beam is practical; a brute-force oracle can prove optimality
+only for short test sequences.
+
+Recommended initial bounds:
+
+- `K = 2` for exact fixed-cost ties in default mode;
+- `K = 4` and at most four bits of fixed-tree deficit in Max;
+- retain at most eight exact `(RLE, code-length tree)` states per pass; and
+- stop on a repeated state fingerprint, four passes, or the route deadline.
+
+Suggested counters:
+
+- headers with more than one fixed-cost RLE path in the retained window;
+- distinct RLE frequency vectors produced;
+- alternate paths that reduce `HCLEN` or rebuilt-tree cost;
+- exact wins not reached by the current single-feedback route; and
+- states discarded by beam, deficit, duplicate, and deadline gates.
+
+Add exhaustive tests for short code-length sequences whose RLE spellings use a
+small active alphabet. Enumerate every legal spelling and every complete
+length-limited code-length tree for those active symbols. Assert that
+production never reports a cost below the oracle and that the bounded route
+retains its source candidate.
+
+### 3. Exact Zopfli RLE-friendly pseudo-frequencies
+
+Implement Zopfli's published `OptimizeHuffmanForRle` behavior as one additional
+paired literal/distance candidate, then score its payload using the original
+frequencies and run it through Columbo's complete header planner.
+
+This is best treated as a control experiment:
+
+- if it produces unique corpus wins, retain it as a Max candidate;
+- if Columbo's adjacency quantizer always ties or wins, remove the duplicate
+  experiment; and
+- if code is closely translated rather than independently reimplemented,
+  retain Zopfli's Apache-2.0 notice and authorship.
+
+It should not become another cross-product with every existing tree family.
+
+### 4. Header-aware data-tree frontier and unused-symbol grafts
+
+Ordinary Huffman construction minimizes payload for a fixed symbol set. It
+does not minimize payload plus the cost of describing its code-length
+sequence. Columbo samples this larger objective with several builders,
+pseudo-frequencies, assignments, swaps, and literal-side Kraft moves. A Max
+frontier can generalize those samples without enumerating every tree.
+
+Seed the frontier with the best distinct current trees, then generate bounded
+neighbours such as:
+
+- the symmetric pair/quad moves above;
+- one generalized Kraft exchange beyond pair/quad, selected from a
+  precomputed table whose removed and added code-space weights are exactly
+  equal;
+- a near-optimal length histogram produced by forbidding one decision from the
+  winning length-limited construction; and
+- an **unused-symbol graft**: lengthen one rare used leaf from `L` to `L+1`
+  and assign an unused, header-helpful symbol the other `L+1` leaf.
+
+The last move deliberately adds a code that is never emitted. It increases
+payload by the used symbol's frequency but preserves the Kraft sum and can
+create a cheaper code-length run. RFC 1951 requires zero-length symbols not to
+participate; it does not require every participating code to appear in the
+payload. Fixed Deflate trees themselves contain non-emitted symbols. Columbo
+should nevertheless keep this Max-only until strict-decoder corpus testing
+confirms the generated shapes.
+
+For each neighbour, compute the payload delta from frequencies, reject a
+configurable positive margin, then exactly price the complete header. Keep a
+small Pareto frontier over payload bits, header bits, `HLIT`, `HDIST`, and
+`HCLEN` rather than only the current total winner.
+
+Suggested counters:
+
+- unique length histograms and symbol assignments reached;
+- unused-symbol graft opportunities by alphabet and target position;
+- candidates at each payload-deficit band;
+- header-only, payload-only, and combined exact gains; and
+- wins already duplicated by another tree family.
+
+### 5. Header-aware proven-spelling composition
+
+For each targeted original match, retain a small menu rather than one local
+path:
+
+- the exact source match;
+- the fixed-tree payload minimum;
+- the current source-length-symbol-free path;
+- the all-literal spelling; and
+- at most two near-tie paths with distinct length-symbol histograms.
+
+Include alternate minimum-token partitions of a same-distance run when they
+have distinct length-symbol support. Compose the menus with a frequency-delta
+beam. Give priority to states that can:
+
+- remove the highest used literal/length or distance symbol;
+- eliminate a frequency-one or frequency-two symbol;
+- make an RLE run cross the literal/distance boundary;
+- reduce the set of code-length values used; or
+- enable a promising inside-match block cut.
+
+Only the best bounded states receive complete block planning. This route never
+searches the history window: every submatch remains inside one original match
+and retains its original distance. Its novelty is global selection across
+several already-proven alternatives.
+
+Suggested initial Max gates:
+
+- at most 128 source matches and 8,000 total tokens;
+- at most eight targeted matches, with at most four spellings each;
+- beam width 16 and depth eight;
+- retain states within 24 estimated payload bits of the best; and
+- exact-price no more than 32 distinct frequency states.
+
+Suggested counters:
+
+- matches with two or more distinct near-tie symbol histograms;
+- rare/highest length and distance symbols removable;
+- beam states, frequency-state duplicates, and exact plans priced;
+- wins requiring two or more simultaneous rewrites; and
+- wins unreachable by current individual, combined-local-minimum, or match
+  group candidates.
+
+### 6. Boundary polishing not already covered
+
+The global boundary graph already chooses exactly among its known cuts and
+prices starting bit alignment. The missing work is cut *discovery*, not another
+segmentation pass over the same nodes.
+
+Two bounded Max experiments remain justified:
+
+1. retain one well-separated second minimum from the existing adaptive split
+   probe cache and exactly plan it; and
+2. perform one parity pass over adjacent selected blocks, join each pair, find
+   one new adaptive cut across the union, and accept only the exactly smaller
+   complete route.
+
+Do not copy Turtledeflate's repeated recompression loop. Columbo should reuse
+its range index and canonical plan cache, limit the number of new cuts, and
+stop after one pass.
+
+### 7. Header-kernel and wider interval caching
+
+Broader search should be paid for by eliminating duplicated deterministic
+work. Two cache layers are plausible:
+
+- a fixed-tree header cache keyed by trimmed literal and distance length
+  sequences plus header-search policy; and
+- a frequency-planning kernel keyed by literal/length frequencies, distance
+  frequencies, match extra-bit total, strict policy, exhaustive policy, and
+  any source-tree seed that participates in candidate generation.
+
+The emitted token order does not change Huffman payload cost, although it still
+matters to final emission and identity verification. Cache only immutable,
+completed planning kernels; verify the full key after hash lookup; and never
+publish deadline-aborted work.
+
+After measuring route-local hit rates, consider sharing immutable interval
+kernels across compatible sibling lineages. Do not add synchronization to the
+hot path without evidence that cross-lineage hits repay it.
+
+### 8. One forced-split escape
+
+A locally losing split can expose a later winning split, but unrestricted
+lookahead is expensive and usually unproductive. Keep this disabled until a
+specific reproducible miss demonstrates it.
+
+For that miss, try at most one forced cut from the second adaptive basin,
+followed by one adjacent-boundary reseat. Require a hard candidate, decoded
+size, token, probe, and time cap. Exact complete comparison remains the only
+acceptance test.
+
+## Methods that remain excluded
+
+Do not add any of the following under the current product scope:
+
+- hash-chain, binary-tree, suffix-array, or brute-force match discovery;
+- alternative match distances, even if another distance is already used
+  elsewhere in the block;
+- extending a proven match across intervening literals by rechecking decoded
+  bytes against history;
+- Zopfli, libdeflate, 7-Zip, ECT, or Turtledeflate recompression;
+- randomized or perturbed LZ77 parsing;
+- repartitioning raw bytes and then discovering a new parse in each partition;
+- sharing a dynamic tree between separate blocks, because each block must
+  transmit its own tree;
+- reserved-symbol, oversubscribed-tree, or incomplete-tree tricks in strict
+  mode; or
+- empty-block alignment tricks without an exact demonstrated net saving.
+
+More Zopfli iterations, faster match caches, and SIMD match finders may improve
+a comparison encoder, but they cannot improve Columbo without crossing the
+match-discovery boundary.
+
+## Measurement and safety protocol
+
+Instrument opportunities before enabling a new search. Counters must
+distinguish source opportunities, candidates visited, exact plans priced,
+unique winners, and work stopped by each gate. Otherwise a route that merely
+duplicates an existing winner can look productive.
+
+For every experiment:
+
+1. retain the original complete candidate;
+2. compare output bytes first, then meaningful Deflate bits;
+3. reparse the emitted stream and compare decoded size and SHA-256;
+4. test strict and relaxed mode separately;
+5. run default and Max A/B comparisons with identical time budgets;
+6. record route wall time, peak retained candidate memory, cache hits, and
+   deadline completion;
+7. use `--dry-run` for corpus, script, benchmark, and tool invocations whenever
+   an output file is not the subject of the test; and
+8. treat repository fixtures as read-only inputs. If a test needs mutation,
+   use a temporary copy outside `fixtures` and verify that `git status` shows
+   no fixture change afterwards.
+
+Start with the last twenty regression files and every known miss above ten
+percent, then sample the whole corpus. A method should enter default mode only
+after demonstrating broad wins with negligible wall-time regression. Rare
+header or forced-boundary wins belong in Max even when exact comparison makes
+their output safe.
+
+## Recommended implementation order
+
+1. Completed: add source opportunity counters for balanced-tree moves.
+2. Completed: implement symmetric distance-tree moves and a tiny paired
+   cross-product.
+3. Next: add the short-sequence exhaustive RLE oracle, then bounded k-best RLE
+   feedback.
+4. Trial exact Zopfli pseudo-frequencies as one differential candidate.
+5. Add header-kernel caching before widening data-tree or proven-spelling
+   beams.
+6. Trial the data-tree frontier and unused-symbol grafts.
+7. Trial header-aware proven-spelling composition on diagnosed misses.
+8. Add the second adaptive split basin and one adjacent-boundary reseat.
+9. Consider a forced split only if a remaining substantial miss proves the
+   need.
+
+This order resolves the cheapest untested degrees of freedom first and makes
+later searches pay for themselves through measured reuse.

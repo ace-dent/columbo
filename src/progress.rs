@@ -718,6 +718,16 @@ pub(crate) struct SameDistanceProgress {
     pub(crate) tokens_removable: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BalancedTreeProgress {
+    pub(crate) dynamic_blocks: usize,
+    pub(crate) literal_pair_moves: usize,
+    pub(crate) literal_quad_moves: usize,
+    pub(crate) distance_pair_moves: usize,
+    pub(crate) distance_quad_moves: usize,
+    pub(crate) paired_prices: usize,
+}
+
 pub(crate) struct StreamProgress {
     pub(crate) blocks: usize,
     pub(crate) compressed_bytes: usize,
@@ -914,6 +924,41 @@ impl Progress {
             plural(report.repartition_runs, "repartition", "repartitions"),
             report.tokens_removable,
             plural(report.tokens_removable, "token", "tokens"),
+        ));
+    }
+
+    pub(crate) fn balanced_tree_opportunities(self, report: BalancedTreeProgress) {
+        if !self.mode.enabled() {
+            return;
+        }
+        let total_moves = report
+            .literal_pair_moves
+            .saturating_add(report.literal_quad_moves)
+            .saturating_add(report.distance_pair_moves)
+            .saturating_add(report.distance_quad_moves);
+        if self.mode.visual() {
+            visual::activity(
+                self.report_id,
+                &format!(
+                    "Source trees · {total_moves} balanced moves · up to {} paired prices",
+                    report.paired_prices
+                ),
+            );
+        }
+        if !self.mode.verbose() {
+            return;
+        }
+        self.write_verbose(format_args!(
+            "  S{} Trees · {} dynamic {} · literal/length: {} pair + {} quad · distance: {} pair + {} quad · up to {} paired {}",
+            self.stream_id,
+            report.dynamic_blocks,
+            plural(report.dynamic_blocks, "block", "blocks"),
+            report.literal_pair_moves,
+            report.literal_quad_moves,
+            report.distance_pair_moves,
+            report.distance_quad_moves,
+            report.paired_prices,
+            plural(report.paired_prices, "price", "prices"),
         ));
     }
 

@@ -337,154 +337,93 @@ fn pad_lengths<const N: usize>(lengths: &[u8]) -> [u8; N] {
     padded
 }
 
-/// Try the original Columbo C quad-lengthening finished-tree move.
-///
-/// This is Columbo's `consider_quad_lengthen_moves_fast`, not a DeflOpt,
-/// Defluff, or deft4j method. Shortening one length-L literal and lengthening
-/// four length-(L+1) literals preserves the Kraft sum. The five-symbol caps and
-/// eighteen-bit payload margin bound the route to at most 300 exact header
-/// trials. Frequency scoring avoids rescanning the same tokens for every trial.
-pub(crate) fn plan_columbo_quad_lengthen_candidate(
-    tokens: &[Token],
-    literal_frequencies: &[u32; 286],
-    distance_frequencies: &[u32; 30],
-    seed: &DynamicPlan,
-    exhaustive_header: bool,
-) -> Option<DynamicPlan> {
-    const CANDIDATE_CAP: usize = 5;
-    const PAYLOAD_MARGIN_BITS: i64 = 18;
+const BALANCED_TREE_CANDIDATE_CAP: usize = 5;
+const BALANCED_TREE_PAIRED_CAP: usize = 4;
+const BALANCED_TREE_PAYLOAD_MARGIN_BITS: i64 = 18;
 
-    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
-        return None;
-    }
-    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
-    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
-    let extra_bits = token_extra_bits(tokens);
-    let mut best: Option<DynamicPlan> = None;
-    let mut shorten = Vec::<(usize, u32)>::new();
-    let mut lengthen = Vec::<(usize, u32)>::new();
-    if shorten.try_reserve_exact(CANDIDATE_CAP).is_err()
-        || lengthen.try_reserve_exact(CANDIDATE_CAP).is_err()
-    {
-        return None;
-    }
-
-    for length in 2_u8..=13 {
-        shorten.clear();
-        lengthen.clear();
-        for (symbol, &candidate) in seed_literal.iter().enumerate() {
-            if candidate == length {
-                let entry = (symbol, literal_frequencies[symbol]);
-                let insertion = shorten
-                    .iter()
-                    .position(|&(_, frequency)| frequency < entry.1)
-                    .unwrap_or(shorten.len());
-                if insertion < CANDIDATE_CAP {
-                    if shorten.len() == CANDIDATE_CAP {
-                        shorten.pop();
-                    }
-                    shorten.insert(insertion, entry);
-                }
-            } else if candidate == length + 1 {
-                let entry = (symbol, literal_frequencies[symbol]);
-                let insertion = lengthen
-                    .iter()
-                    .position(|&(_, frequency)| frequency > entry.1)
-                    .unwrap_or(lengthen.len());
-                if insertion < CANDIDATE_CAP {
-                    if lengthen.len() == CANDIDATE_CAP {
-                        lengthen.pop();
-                    }
-                    lengthen.insert(insertion, entry);
-                }
-            }
-        }
-        if shorten.is_empty() || lengthen.len() < 4 {
-            continue;
-        }
-
-        // Symbols arrive in ascending order. Inserting only before a strictly
-        // worse frequency keeps ties in that order, matching the old stable
-        // sort while retaining no more than the five entries we can inspect.
-
-        for &(short_symbol, short_frequency) in &shorten {
-            for first in 0..lengthen.len() - 3 {
-                for second in first + 1..lengthen.len() - 2 {
-                    for third in second + 1..lengthen.len() - 1 {
-                        for fourth in third + 1..lengthen.len() {
-                            let long_symbols = [
-                                lengthen[first],
-                                lengthen[second],
-                                lengthen[third],
-                                lengthen[fourth],
-                            ];
-                            let payload_delta = long_symbols
-                                .iter()
-                                .fold(-i64::from(short_frequency), |delta, (_, frequency)| {
-                                    delta + i64::from(*frequency)
-                                });
-                            if payload_delta > PAYLOAD_MARGIN_BITS {
-                                continue;
-                            }
-
-                            let mut literal = seed_literal;
-                            literal[short_symbol] -= 1;
-                            for &(symbol, _) in &long_symbols {
-                                literal[symbol] += 1;
-                            }
-                            let Some(data_bits) = token_bits_from_frequencies(
-                                literal_frequencies,
-                                distance_frequencies,
-                                &literal,
-                                &seed_distance,
-                                extra_bits,
-                            ) else {
-                                continue;
-                            };
-                            if let Some(candidate) = plan_for_explicit_lengths_with_cost(
-                                &literal,
-                                &seed_distance,
-                                data_bits,
-                                exhaustive_header,
-                            ) {
-                                keep_better(&mut best, candidate);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    best
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BalancedTreeOpportunities {
+    pub(crate) dynamic_blocks: usize,
+    pub(crate) literal_pair_moves: usize,
+    pub(crate) literal_quad_moves: usize,
+    pub(crate) distance_pair_moves: usize,
+    pub(crate) distance_quad_moves: usize,
+    pub(crate) paired_prices: usize,
 }
 
-/// Try Columbo's one-shorter/two-longer equal-Kraft tree move.
-///
-/// Shortening one length-L code to L-1 adds the same code-space weight that
-/// lengthening two other length-L codes to L+1 removes. The bounded candidate
-/// lists favor a frequently used short code and rarely used long codes, while
-/// exact header-plus-payload pricing remains the acceptance test.
-pub(crate) fn plan_columbo_pair_lengthen_candidate(
-    tokens: &[Token],
-    literal_frequencies: &[u32; 286],
-    distance_frequencies: &[u32; 30],
-    seed: &DynamicPlan,
-    exhaustive_header: bool,
-) -> Option<DynamicPlan> {
-    const CANDIDATE_CAP: usize = 5;
-    const PAYLOAD_MARGIN_BITS: i64 = 18;
+impl BalancedTreeOpportunities {
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.dynamic_blocks = self.dynamic_blocks.saturating_add(other.dynamic_blocks);
+        self.literal_pair_moves = self
+            .literal_pair_moves
+            .saturating_add(other.literal_pair_moves);
+        self.literal_quad_moves = self
+            .literal_quad_moves
+            .saturating_add(other.literal_quad_moves);
+        self.distance_pair_moves = self
+            .distance_pair_moves
+            .saturating_add(other.distance_pair_moves);
+        self.distance_quad_moves = self
+            .distance_quad_moves
+            .saturating_add(other.distance_quad_moves);
+        self.paired_prices = self.paired_prices.saturating_add(other.paired_prices);
+    }
+}
 
-    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BalancedTreeFamily {
+    Pair,
+    Quad,
+}
+
+#[derive(Clone)]
+struct BalancedTreeMove<const N: usize> {
+    lengths: [u8; N],
+    payload_delta: i64,
+    family: BalancedTreeFamily,
+}
+
+fn insert_frequency_candidate(
+    candidates: &mut Vec<(usize, u32)>,
+    entry: (usize, u32),
+    descending: bool,
+) {
+    let insertion = candidates
+        .iter()
+        .position(|&(_, frequency)| {
+            if descending {
+                frequency < entry.1
+            } else {
+                frequency > entry.1
+            }
+        })
+        .unwrap_or(candidates.len());
+    if insertion < BALANCED_TREE_CANDIDATE_CAP {
+        if candidates.len() == BALANCED_TREE_CANDIDATE_CAP {
+            candidates.pop();
+        }
+        candidates.insert(insertion, entry);
+    }
+}
+
+fn collect_pair_moves<const N: usize>(
+    seed_lengths: &[u8; N],
+    frequencies: &[u32; N],
+) -> Option<Vec<BalancedTreeMove<N>>> {
+    // Fourteen length bands, five shortening choices, and ten pairs from the
+    // five lengthening choices make 700 the exact pre-filter upper bound.
+    let mut moves = Vec::new();
+    if moves.try_reserve_exact(14 * 5 * 10).is_err() {
         return None;
     }
-    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
-    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
-    let extra_bits = token_extra_bits(tokens);
-    let mut best: Option<DynamicPlan> = None;
     let mut shorten = Vec::<(usize, u32)>::new();
     let mut lengthen = Vec::<(usize, u32)>::new();
-    if shorten.try_reserve_exact(CANDIDATE_CAP).is_err()
-        || lengthen.try_reserve_exact(CANDIDATE_CAP).is_err()
+    if shorten
+        .try_reserve_exact(BALANCED_TREE_CANDIDATE_CAP)
+        .is_err()
+        || lengthen
+            .try_reserve_exact(BALANCED_TREE_CANDIDATE_CAP)
+            .is_err()
     {
         return None;
     }
@@ -492,33 +431,13 @@ pub(crate) fn plan_columbo_pair_lengthen_candidate(
     for length in 2_u8..=14 {
         shorten.clear();
         lengthen.clear();
-        for (symbol, &candidate) in seed_literal.iter().enumerate() {
+        for (symbol, &candidate) in seed_lengths.iter().enumerate() {
             if candidate != length {
                 continue;
             }
-            let entry = (symbol, literal_frequencies[symbol]);
-
-            let short_insertion = shorten
-                .iter()
-                .position(|&(_, frequency)| frequency < entry.1)
-                .unwrap_or(shorten.len());
-            if short_insertion < CANDIDATE_CAP {
-                if shorten.len() == CANDIDATE_CAP {
-                    shorten.pop();
-                }
-                shorten.insert(short_insertion, entry);
-            }
-
-            let long_insertion = lengthen
-                .iter()
-                .position(|&(_, frequency)| frequency > entry.1)
-                .unwrap_or(lengthen.len());
-            if long_insertion < CANDIDATE_CAP {
-                if lengthen.len() == CANDIDATE_CAP {
-                    lengthen.pop();
-                }
-                lengthen.insert(long_insertion, entry);
-            }
+            let entry = (symbol, frequencies[symbol]);
+            insert_frequency_candidate(&mut shorten, entry, true);
+            insert_frequency_candidate(&mut lengthen, entry, false);
         }
         if shorten.is_empty() || lengthen.len() < 2 {
             continue;
@@ -539,33 +458,264 @@ pub(crate) fn plan_columbo_pair_lengthen_candidate(
                         .fold(-i64::from(short_frequency), |delta, (_, frequency)| {
                             delta + i64::from(*frequency)
                         });
-                    if payload_delta > PAYLOAD_MARGIN_BITS {
+                    if payload_delta > BALANCED_TREE_PAYLOAD_MARGIN_BITS {
                         continue;
                     }
 
-                    let mut literal = seed_literal;
-                    literal[short_symbol] -= 1;
+                    let mut lengths = *seed_lengths;
+                    lengths[short_symbol] -= 1;
                     for &(symbol, _) in &long_symbols {
-                        literal[symbol] += 1;
+                        lengths[symbol] += 1;
                     }
-                    let Some(data_bits) = token_bits_from_frequencies(
-                        literal_frequencies,
-                        distance_frequencies,
-                        &literal,
-                        &seed_distance,
-                        extra_bits,
-                    ) else {
-                        continue;
-                    };
-                    if let Some(candidate) = plan_for_explicit_lengths_with_cost(
-                        &literal,
-                        &seed_distance,
-                        data_bits,
-                        exhaustive_header,
-                    ) {
-                        keep_better(&mut best, candidate);
+                    moves.push(BalancedTreeMove {
+                        lengths,
+                        payload_delta,
+                        family: BalancedTreeFamily::Pair,
+                    });
+                }
+            }
+        }
+    }
+    Some(moves)
+}
+
+fn collect_quad_moves<const N: usize>(
+    seed_lengths: &[u8; N],
+    frequencies: &[u32; N],
+) -> Option<Vec<BalancedTreeMove<N>>> {
+    // The literal/length form is Columbo C's original
+    // `consider_quad_lengthen_moves_fast`; applying the same equal-Kraft
+    // transformation to distance lengths is the Rust extension.
+    // Twelve length bands, five shortening choices, and five four-of-five
+    // choices make 300 the exact pre-filter upper bound.
+    let mut moves = Vec::new();
+    if moves.try_reserve_exact(12 * 5 * 5).is_err() {
+        return None;
+    }
+    let mut shorten = Vec::<(usize, u32)>::new();
+    let mut lengthen = Vec::<(usize, u32)>::new();
+    if shorten
+        .try_reserve_exact(BALANCED_TREE_CANDIDATE_CAP)
+        .is_err()
+        || lengthen
+            .try_reserve_exact(BALANCED_TREE_CANDIDATE_CAP)
+            .is_err()
+    {
+        return None;
+    }
+
+    for length in 2_u8..=13 {
+        shorten.clear();
+        lengthen.clear();
+        for (symbol, &candidate) in seed_lengths.iter().enumerate() {
+            if candidate == length {
+                insert_frequency_candidate(&mut shorten, (symbol, frequencies[symbol]), true);
+            } else if candidate == length + 1 {
+                insert_frequency_candidate(&mut lengthen, (symbol, frequencies[symbol]), false);
+            }
+        }
+        if shorten.is_empty() || lengthen.len() < 4 {
+            continue;
+        }
+
+        for &(short_symbol, short_frequency) in &shorten {
+            for first in 0..lengthen.len() - 3 {
+                for second in first + 1..lengthen.len() - 2 {
+                    for third in second + 1..lengthen.len() - 1 {
+                        for fourth in third + 1..lengthen.len() {
+                            let long_symbols = [
+                                lengthen[first],
+                                lengthen[second],
+                                lengthen[third],
+                                lengthen[fourth],
+                            ];
+                            let payload_delta = long_symbols
+                                .iter()
+                                .fold(-i64::from(short_frequency), |delta, (_, frequency)| {
+                                    delta + i64::from(*frequency)
+                                });
+                            if payload_delta > BALANCED_TREE_PAYLOAD_MARGIN_BITS {
+                                continue;
+                            }
+
+                            let mut lengths = *seed_lengths;
+                            lengths[short_symbol] -= 1;
+                            for &(symbol, _) in &long_symbols {
+                                lengths[symbol] += 1;
+                            }
+                            moves.push(BalancedTreeMove {
+                                lengths,
+                                payload_delta,
+                                family: BalancedTreeFamily::Quad,
+                            });
+                        }
                     }
                 }
+            }
+        }
+    }
+    Some(moves)
+}
+
+fn retain_best_balanced_moves<const N: usize>(
+    pair: &[BalancedTreeMove<N>],
+    quad: &[BalancedTreeMove<N>],
+) -> Option<Vec<BalancedTreeMove<N>>> {
+    let mut best = Vec::new();
+    if best.try_reserve_exact(BALANCED_TREE_PAIRED_CAP).is_err() {
+        return None;
+    }
+    for candidate in pair.iter().chain(quad) {
+        let insertion = best
+            .iter()
+            .position(|current: &BalancedTreeMove<N>| {
+                (current.payload_delta, current.family, &current.lengths)
+                    > (
+                        candidate.payload_delta,
+                        candidate.family,
+                        &candidate.lengths,
+                    )
+            })
+            .unwrap_or(best.len());
+        if insertion < BALANCED_TREE_PAIRED_CAP {
+            if best.len() == BALANCED_TREE_PAIRED_CAP {
+                best.pop();
+            }
+            best.insert(insertion, candidate.clone());
+        }
+    }
+    Some(best)
+}
+
+pub(crate) fn balanced_tree_opportunities(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    seed: &DynamicPlan,
+) -> Option<BalancedTreeOpportunities> {
+    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
+        return None;
+    }
+    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
+    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
+    let literal_pair = collect_pair_moves(&seed_literal, literal_frequencies)?.len();
+    let literal_quad = collect_quad_moves(&seed_literal, literal_frequencies)?.len();
+    let distance_pair = collect_pair_moves(&seed_distance, distance_frequencies)?.len();
+    let distance_quad = collect_quad_moves(&seed_distance, distance_frequencies)?.len();
+    let paired_prices = literal_pair
+        .saturating_add(literal_quad)
+        .min(BALANCED_TREE_PAIRED_CAP)
+        .saturating_mul(
+            distance_pair
+                .saturating_add(distance_quad)
+                .min(BALANCED_TREE_PAIRED_CAP),
+        );
+    Some(BalancedTreeOpportunities {
+        dynamic_blocks: 1,
+        literal_pair_moves: literal_pair,
+        literal_quad_moves: literal_quad,
+        distance_pair_moves: distance_pair,
+        distance_quad_moves: distance_quad,
+        paired_prices,
+    })
+}
+
+/// Try Columbo's bounded equal-Kraft pair/quad moves on both data alphabets.
+///
+/// Standalone literal/length and distance moves receive exact full-header
+/// pricing. A sixteen-candidate cross-product of the lowest-payload-delta moves
+/// can additionally exploit the RLE run that crosses the alphabet boundary.
+/// The original complete candidate remains outside this helper as an
+/// independent fallback.
+pub(crate) fn plan_columbo_balanced_tree_candidate(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    seed: &DynamicPlan,
+    exhaustive_header: bool,
+    price_literal_pair: bool,
+) -> Option<DynamicPlan> {
+    if seed.literal_lengths.len() > 286 || seed.distance_lengths.len() > 30 {
+        return None;
+    }
+    let seed_literal = pad_lengths::<286>(&seed.literal_lengths);
+    let seed_distance = pad_lengths::<30>(&seed.distance_lengths);
+    let extra_bits = token_extra_bits(tokens);
+    let mut best: Option<DynamicPlan> = None;
+    let literal_pair = collect_pair_moves(&seed_literal, literal_frequencies)?;
+    let literal_quad = collect_quad_moves(&seed_literal, literal_frequencies)?;
+    let distance_pair = collect_pair_moves(&seed_distance, distance_frequencies)?;
+    let distance_quad = collect_quad_moves(&seed_distance, distance_frequencies)?;
+
+    for candidate in literal_pair
+        .iter()
+        .filter(|_| price_literal_pair)
+        .chain(&literal_quad)
+    {
+        let Some(data_bits) = token_bits_from_frequencies(
+            literal_frequencies,
+            distance_frequencies,
+            &candidate.lengths,
+            &seed_distance,
+            extra_bits,
+        ) else {
+            continue;
+        };
+        if let Some(candidate) = plan_for_explicit_lengths_with_cost(
+            &candidate.lengths,
+            &seed_distance,
+            data_bits,
+            exhaustive_header,
+        ) {
+            keep_better(&mut best, candidate);
+        }
+    }
+
+    for candidate in distance_pair.iter().chain(&distance_quad) {
+        let Some(data_bits) = token_bits_from_frequencies(
+            literal_frequencies,
+            distance_frequencies,
+            &seed_literal,
+            &candidate.lengths,
+            extra_bits,
+        ) else {
+            continue;
+        };
+        if let Some(candidate) = plan_for_explicit_lengths_with_cost(
+            &seed_literal,
+            &candidate.lengths,
+            data_bits,
+            exhaustive_header,
+        ) {
+            keep_better(&mut best, candidate);
+        }
+    }
+
+    let literal_best = retain_best_balanced_moves(&literal_pair, &literal_quad)?;
+    let distance_best = retain_best_balanced_moves(&distance_pair, &distance_quad)?;
+    for literal in &literal_best {
+        for distance in &distance_best {
+            let combined_delta = literal.payload_delta.saturating_add(distance.payload_delta);
+            if combined_delta > BALANCED_TREE_PAYLOAD_MARGIN_BITS
+                || (!exhaustive_header && combined_delta > 0)
+            {
+                continue;
+            }
+            let Some(data_bits) = token_bits_from_frequencies(
+                literal_frequencies,
+                distance_frequencies,
+                &literal.lengths,
+                &distance.lengths,
+                extra_bits,
+            ) else {
+                continue;
+            };
+            if let Some(candidate) = plan_for_explicit_lengths_with_cost(
+                &literal.lengths,
+                &distance.lengths,
+                data_bits,
+                exhaustive_header,
+            ) {
+                keep_better(&mut best, candidate);
             }
         }
     }
@@ -2583,12 +2733,13 @@ mod tests {
             bits: 0,
         };
 
-        let candidate = plan_columbo_quad_lengthen_candidate(
+        let candidate = plan_columbo_balanced_tree_candidate(
             &tokens,
             &literal_frequencies,
             &distance_frequencies,
             &seed,
             true,
+            false,
         )
         .expect("the Kraft-preserving quad move is legal");
 
@@ -2629,11 +2780,12 @@ mod tests {
             bits: 0,
         };
 
-        let candidate = plan_columbo_pair_lengthen_candidate(
+        let candidate = plan_columbo_balanced_tree_candidate(
             &tokens,
             &literal_frequencies,
             &distance_frequencies,
             &seed,
+            true,
             true,
         )
         .expect("the Kraft-preserving pair move is legal");
@@ -2642,6 +2794,151 @@ mod tests {
         assert_eq!(candidate.literal_lengths[usize::from(b'b')], 3);
         assert_eq!(candidate.literal_lengths[usize::from(b'c')], 3);
         assert!(Huffman::build(&candidate.literal_lengths).is_some());
+    }
+
+    #[test]
+    fn columbo_pair_move_also_optimizes_the_distance_tree() {
+        let mut tokens = Vec::new();
+        for (symbol, count) in [(0_u8, 100_usize), (1, 1), (2, 1), (3, 1)] {
+            tokens.extend((0..count).map(|_| Token::Match {
+                length: 3,
+                distance: u16::from(symbol) + 1,
+                length_symbol: 257,
+                distance_symbol: symbol,
+                length_extra: 0,
+                distance_extra: 0,
+                length_extra_bits: 0,
+                distance_extra_bits: 0,
+            }));
+        }
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[256] = 1;
+        literal_frequencies[257] = tokens.len() as u32;
+        let mut distance_frequencies = [0_u32; 30];
+        distance_frequencies[0] = 100;
+        distance_frequencies[1..4].fill(1);
+        let mut literal_lengths = vec![0_u8; 258];
+        literal_lengths[256] = 1;
+        literal_lengths[257] = 1;
+        let seed = DynamicPlan {
+            literal_lengths,
+            distance_lengths: vec![2; 4],
+            code_length_lengths: [0; 19],
+            rle: Vec::new(),
+            hlit: 258,
+            hdist: 4,
+            hclen: 4,
+            bits: 0,
+        };
+
+        let candidate = plan_columbo_balanced_tree_candidate(
+            &tokens,
+            &literal_frequencies,
+            &distance_frequencies,
+            &seed,
+            true,
+            false,
+        )
+        .expect("the distance-side pair move is legal");
+
+        assert_eq!(candidate.distance_lengths[0], 1);
+        assert_eq!(
+            candidate
+                .distance_lengths
+                .iter()
+                .filter(|&&length| length == 3)
+                .count(),
+            2
+        );
+        assert!(Huffman::build(&candidate.distance_lengths).is_some());
+    }
+
+    #[test]
+    fn columbo_quad_move_also_optimizes_the_distance_tree() {
+        let tokens = Vec::new();
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[256] = 1;
+        let mut distance_frequencies = [0_u32; 30];
+        distance_frequencies[0] = 100;
+        distance_frequencies[1..6].fill(1);
+        let mut literal_lengths = vec![0_u8; 257];
+        literal_lengths[256] = 1;
+        let seed = DynamicPlan {
+            literal_lengths,
+            distance_lengths: vec![2, 2, 3, 3, 3, 3],
+            code_length_lengths: [0; 19],
+            rle: Vec::new(),
+            hlit: 257,
+            hdist: 6,
+            hclen: 4,
+            bits: 0,
+        };
+
+        let candidate = plan_columbo_balanced_tree_candidate(
+            &tokens,
+            &literal_frequencies,
+            &distance_frequencies,
+            &seed,
+            true,
+            false,
+        )
+        .expect("the distance-side quad move is legal");
+
+        assert_eq!(candidate.distance_lengths[0], 1);
+        assert!(candidate.distance_lengths[2..6]
+            .iter()
+            .all(|&length| length == 4));
+        assert!(Huffman::build(&candidate.distance_lengths).is_some());
+    }
+
+    #[test]
+    fn columbo_balanced_tree_search_prices_paired_alphabet_moves() {
+        let tokens = Vec::new();
+        let mut literal_frequencies = [0_u32; 286];
+        literal_frequencies[usize::from(b'A')] = 100;
+        literal_frequencies[usize::from(b'b')] = 1;
+        literal_frequencies[usize::from(b'c')] = 1;
+        literal_frequencies[256] = 1;
+        let mut distance_frequencies = [0_u32; 30];
+        distance_frequencies[0] = 100;
+        distance_frequencies[1..4].fill(1);
+        let mut literal_lengths = vec![0_u8; 257];
+        for symbol in b"Abc" {
+            literal_lengths[usize::from(*symbol)] = 2;
+        }
+        literal_lengths[256] = 2;
+        let seed = DynamicPlan {
+            literal_lengths,
+            distance_lengths: vec![2; 4],
+            code_length_lengths: [0; 19],
+            rle: Vec::new(),
+            hlit: 257,
+            hdist: 4,
+            hclen: 4,
+            bits: 0,
+        };
+
+        let opportunities =
+            balanced_tree_opportunities(&literal_frequencies, &distance_frequencies, &seed)
+                .expect("opportunity counting should remain bounded");
+        assert!(opportunities.literal_pair_moves > 0);
+        assert!(opportunities.distance_pair_moves > 0);
+        assert_eq!(opportunities.paired_prices, 16);
+
+        let candidate = plan_columbo_balanced_tree_candidate(
+            &tokens,
+            &literal_frequencies,
+            &distance_frequencies,
+            &seed,
+            true,
+            true,
+        )
+        .expect("the paired balanced-tree move is legal");
+
+        assert_eq!(candidate.literal_lengths[usize::from(b'A')], 1);
+        assert_eq!(candidate.distance_lengths[0], 1);
+        assert!(Huffman::build(&candidate.literal_lengths).is_some());
+        assert!(Huffman::build(&candidate.distance_lengths).is_some());
     }
 
     #[test]
