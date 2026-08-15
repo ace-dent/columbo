@@ -22,9 +22,10 @@ use super::model::{
 };
 use super::parse::{parse_stream, parsed_model_bytes};
 use super::search::{
-    compact_proven_submatch_route_eligible, improve_plan_with_integrated_proven_floor,
-    improve_plan_with_short_family_floor, plan_block_with_integrated_proven_search,
-    rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
+    improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
+    plan_block_with_integrated_proven_search, rewrite_258_symbols, same_distance_opportunities,
+    PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
 use super::stream::{
@@ -2975,15 +2976,37 @@ fn build_compact_proven_feedback_candidate(
     let mut route_options = options.clone();
     route_options.exhaustive = false;
     let floor_base = plan_block(block, 0, &route_options, &mut *expired);
-    let floor_plan =
+    let mut floor_plan =
         improve_plan_with_integrated_proven_floor(block, 0, &route_options, true, floor_base);
+    let floor_bits_before_composition = floor_plan.bits;
+    // Max may mix several locally valid match spellings before replay. Keep
+    // this attached to M3's already-complete compact floor: the floor remains
+    // a fallback, while the beam inherits its useful table as the cost seed.
+    if options.exhaustive && !expired.reached() {
+        floor_plan = improve_plan_with_header_aware_proven_composition(
+            block, 0, options, expired, floor_plan,
+        );
+    }
+    let composition_improved = floor_plan.bits < floor_bits_before_composition;
+    let composition_bits = floor_plan.bits;
     let floor_plan = improve_plan_with_short_family_floor(block, &route_options, floor_plan);
+    let floor_route = if composition_improved && floor_plan.bits == composition_bits {
+        "Columbo header-aware proven feedback"
+    } else {
+        "Columbo proven-feedback floor"
+    };
     // Stabilize the cheap floor before starting its heavier full-search
     // sibling. Besides securing an early complete candidate for shared
     // deadlines, this avoids making a later local search consume time needed
     // by the floor's distinct replay fixed point.
-    let mut candidate =
-        build_compact_proven_seed_candidate(source, floor_plan, &route_options, options, expired)?;
+    let mut candidate = build_compact_proven_seed_candidate(
+        source,
+        floor_plan,
+        &route_options,
+        options,
+        floor_route,
+        expired,
+    )?;
     if options.exhaustive || expired.reached() {
         return Ok(Some(candidate));
     }
@@ -2997,6 +3020,7 @@ fn build_compact_proven_feedback_candidate(
         searched_plan,
         &route_options,
         options,
+        "Columbo proven-feedback floor",
         expired,
     )?;
     candidate.replace_if_smaller(searched);
@@ -3013,6 +3037,7 @@ fn build_compact_proven_seed_candidate(
     plan: PlannedBlock,
     route_options: &Options,
     options: &Options,
+    route: &'static str,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
     // The first proven-before-feedback pass exposes two distinct replay fixed
@@ -3027,7 +3052,7 @@ fn build_compact_proven_seed_candidate(
         ReplayPlanner::Full,
         expired,
     )?
-    .named("Columbo proven-feedback floor");
+    .named(route);
     let integrated = build_candidate_from_plans(
         source,
         vec![plan],
@@ -3036,7 +3061,7 @@ fn build_compact_proven_seed_candidate(
         ReplayPlanner::IntegratedProven,
         expired,
     )?
-    .named("Columbo proven-feedback floor");
+    .named(route);
     candidate.replace_if_smaller(integrated);
     // Balanced-tree cleanup follows each seed lineage independently. Comparing
     // the pre-cleanup candidates first can hide a locally dearer seed whose

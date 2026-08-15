@@ -271,7 +271,7 @@ flowchart TD
     GROUP --> POST["Bounded phase rejoined"]
 
     POST --> M3POST{"M3 eligible, not completed, + G0"}
-    M3POST -- "Yes" --> M3RUN["🟡 Proven-feedback sibling"]
+    M3POST -- "Yes" --> M3RUN["🔴 Proven-feedback sibling<br/>+ header-aware spelling beam"]
     M3POST -- "No" --> S0
     M3RUN --> S0{"S0 · proven candidate ties floor bytes<br/>and wins meaningful bits"}
     S0 -- "Yes" --> SINTEGRATED["Later source max uses integrated compact order"]
@@ -334,7 +334,7 @@ comparison order.
 | M0 · bounded-floor prebuild | Max plus `Shared` always prebuilds a bounded floor. Max plus `CompleteThenBounded` prebuilds when nonempty blocks ≤1, decoded bytes ≤768 KiB, decoded bytes >2 MiB, or more than 512 matches belong to source same-distance runs. `Established` directly retains the complete caller-provided floor; `Complete` never prebuilds here. | Otherwise the multi-block single-image PNG floor is built inside the bounded phase. |
 | M1 · deft4j source | Max. With exactly one nonempty block: floor policy must allow a single-block route (`Complete` or `CompleteThenBounded`) and the block must be fixed/dynamic. With 2–128 nonempty blocks: at least two must be fixed/dynamic. Other counts are rejected. | Adds the direct deft4j-derived source candidate. |
 | M2 · no-split source | Max + `CompleteThenBounded`; compressed bytes ≤512 KiB; 2–128 nonempty blocks; every nonempty block fixed/dynamic. | Adds the bounded narrow source route. |
-| M3 · compact proven feedback | Max + `CompleteThenBounded`; exactly one parsed block; at least one match; ≤4,000 tokens; ≤80,000 decoded bytes. | Schedules the proven-first sibling in the initial phase under M8/M9, or tries it after that phase if it has not completed and G0 remains open. |
+| M3 · compact proven feedback | Max + `CompleteThenBounded`; exactly one parsed block; at least one match; ≤4,000 tokens; ≤80,000 decoded bytes. | Schedules the proven-first sibling in the initial phase under M8/M9, or tries it after that phase if it has not completed and G0 remains open. Its completed initial floor also receives the bounded header-aware spelling beam when the rewritten parent has ≤8,000 tokens and 2–128 matches. |
 | M4 · compact balanced tree | The top-level flag requires max + `CompleteThenBounded`, compressed bytes ≤8 KiB, decoded bytes ≤128 KiB, exactly one nonempty dynamic source block, and ≤4,096 tokens in that block. Each rewritten parent must parse as exactly one dynamic block with ≤4,096 tokens and a retained source dynamic-tree seed. | On floor-seeded and source-max parents, admitted balanced-tree and feedback cleanup is deterministic and needs no new G0 start; the final selected-parent trial does require G0. Pair/quad moves are exact-priced independently on the literal/length and distance alphabets. Up to the four lowest-payload-delta moves from each side form at most sixteen paired candidates. Default admits paired work only at non-positive combined payload delta; Max permits the existing positive eighteen-bit margin. Matched Max streams omit only standalone literal pair pricing, while retaining distance and paired work. Every result survives only when complete header-plus-payload pricing wins. |
 | M5 · route-level parallel cap | Max + bounded floor policy (`CompleteThenBounded`, `Shared`, or `Established`); compressed bytes ≤8 MiB; decoded bytes ≤64 MiB; estimated parsed model ≤64 MiB. | Allows broad independent candidate arenas to overlap. Failure selects Standard scheduling: floor, eligible M1/M2 routes, and dependent work remain serial, M8 is disabled, and source max remains eligible later; it does not promise an equivalent deferred floor-max descendant. |
 | M6 · bounded PNG policy | Evaluated only for `CompleteThenBounded` after M5. `GenericParallel` when neither M1 nor M2 is eligible. Otherwise `FloorExpansion` when source has ≥2 nonempty blocks or the completed floor changes nonempty boundaries/token arrays. Otherwise `Standard`. | Chooses which independent source and floor lineages own the initial wall-clock window. |
@@ -469,6 +469,18 @@ endpoint lineage so a locally smaller spelling cannot hide the ordinary replay
 fixed point. Compact default and single-image PNG routes additionally retain
 the proven-before-feedback and integrated-proven state orders described by D1,
 D2, and M3.
+
+Within Max's compact M3 route, 🔴 header-aware proven-spelling composition can
+combine different choices across as many as eight ranked matches. Each menu
+contains the source spelling and at most three frequency-distinct alternatives:
+the current-tree payload minimum, the source-length-symbol-free path, and all
+literals. The beam keeps at most 16 exact frequency/extra-bit states within 24
+estimated payload bits of its best state. Only combinations rewriting at least
+two matches are materialized, with a hard ceiling of 32 complete block prices.
+The initial source has at most 4,000 tokens and 80,000 decoded bytes; the
+rewritten parent has at most 8,000 tokens and 2–128 matches. Every emitted match
+still uses its original proven distance, and the earlier complete M3 floor wins
+every exact tie.
 
 ## Boundary polishing inside proven matches
 
@@ -649,6 +661,7 @@ the internal scheduler described here.
 | Cumulative short-length bands | Ordinary floors price five prefixes from symbol 260 through 260–264. Compact seeds use endpoints 257, 258, 259, 260, 262, and 264. Large no-split work uses endpoints 262, 265, 267, 269, and 270 plus one sparse family containing symbols 260–270 and 280. | 🟡 | **Columbo**, inspired by deft4j least-family pruning |
 | Match-to-literal alternatives | Emits known literals for selected existing matches when complete repricing wins; never finds a new match. | 🔴 | **Columbo**; labelled primitives retain DeflOpt/deft4j attribution |
 | Proven-submatch resegmentation | Searches literal/match paths wholly inside an already-proved match at its original distance. | 🔴 | **Columbo** |
+| Header-aware proven-spelling composition | Max-only within compact M3: combines up to eight match menus in a 16-state frequency beam, deduplicates exact literal/distance frequencies plus match-extra bits, and exact-prices only multi-match combinations. | 🔴 | **Columbo** |
 | Independent proven endpoint | Replays proven resegmentation after the ordinary candidate rather than allowing a local spelling to hide another fixed point. | 🔴 | **Columbo** |
 | Match-preserving and integrated proven feedback | Adds the compact D1/D2/M3 state orders as independent complete candidates. | 🟡 | **Columbo** |
 | Terminal tree tightening | Applies bounded feedback trees and one strictly improving existing-match-to-literal replay to eligible final Huffman blocks. | 🟡 | DeflOpt-inspired primitive; **Columbo** scheduling |

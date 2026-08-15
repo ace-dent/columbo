@@ -30,8 +30,8 @@ use super::huffman::{
     make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    canonical_length_encoding, count_frequencies, try_clone_slice, DynamicPlan, ParsedBlock,
-    PlannedBlock, Representation, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
+    canonical_length_encoding, count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan,
+    ParsedBlock, PlannedBlock, Representation, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -74,6 +74,13 @@ const PROVEN_SUBMATCH_RARE_FREQUENCY: u32 = 2;
 const PROVEN_SUBMATCH_EXPENSIVE_CODE_BITS: u8 = 9;
 const PROVEN_SUBMATCH_TRANSITION_BYTES: u16 = 2;
 const PROVEN_SUBMATCH_BOUNDARY_RADIUS: usize = 8;
+const PROVEN_COMPOSITION_MAX_SOURCE_MATCHES: usize = 128;
+const PROVEN_COMPOSITION_MAX_TOKENS: usize = 8_000;
+const PROVEN_COMPOSITION_MAX_TARGETS: usize = 8;
+const PROVEN_COMPOSITION_MAX_SPELLINGS: usize = 4;
+const PROVEN_COMPOSITION_BEAM_WIDTH: usize = 16;
+const PROVEN_COMPOSITION_PAYLOAD_WINDOW: i64 = 24;
+const PROVEN_COMPOSITION_EXACT_LIMIT: usize = 32;
 // These source-tree probes are part of the deadline-independent compact floor.
 // Keep only a small, ranked set so a many-frame container cannot spend its
 // shared budget rebuilding every nearly identical local candidate.
@@ -706,7 +713,14 @@ fn consider_proven_submatches(
             0
         };
         let mut priced_candidates = Vec::new();
-        let priced_candidate_limit = individual_limit.saturating_mul(2).saturating_add(3);
+        let priced_candidate_limit = individual_limit
+            .saturating_mul(2)
+            .saturating_add(3)
+            .saturating_add(if options.exhaustive {
+                PROVEN_COMPOSITION_EXACT_LIMIT
+            } else {
+                0
+            });
         if priced_candidates
             .try_reserve_exact(priced_candidate_limit)
             .is_err()
@@ -786,6 +800,91 @@ pub(crate) fn improve_plan_with_proven_submatches(
     mut best: PlannedBlock,
 ) -> PlannedBlock {
     consider_proven_submatches(block, alignment, options, stop, &mut best);
+    best
+}
+
+/// Compose a bounded menu of already-proven match spellings under Max's
+/// complete header pricing.
+///
+/// This is an additive compact route: it starts from a completed incumbent,
+/// never searches history, and keeps only frequency-distinct beam states.
+pub(crate) fn improve_plan_with_header_aware_proven_composition(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+    mut best: PlannedBlock,
+) -> PlannedBlock {
+    if !options.exhaustive
+        || best.tokens.len() > PROVEN_COMPOSITION_MAX_TOKENS
+        || block.plain.len() > MAX_PROVEN_SUBMATCH_FULL_PLAIN
+        || stop.reached()
+    {
+        return best;
+    }
+    let source = Arc::clone(&best.tokens);
+    let source_matches = source
+        .iter()
+        .filter(|token| matches!(token, Token::Match { .. }))
+        .count();
+    if !(2..=PROVEN_COMPOSITION_MAX_SOURCE_MATCHES).contains(&source_matches) {
+        return best;
+    }
+    let (literal_lengths, distance_lengths) = proven_submatch_seed_lengths(block, &best);
+    let (literal_frequencies, _) = count_frequencies(&source);
+    let Some(targets) = select_proven_submatch_targets(
+        &source,
+        block.plain.len(),
+        &block.source_splits,
+        &literal_frequencies,
+        &literal_lengths,
+        true,
+        true,
+        stop,
+    ) else {
+        return best;
+    };
+    let Some(payload_rewrites) = build_proven_submatch_rewrites(
+        &targets,
+        &block.plain,
+        &literal_lengths,
+        &distance_lengths,
+        ProvenSubmatchRestriction::None,
+        stop,
+    ) else {
+        return best;
+    };
+    let Some(symbol_free_rewrites) = build_proven_submatch_rewrites(
+        &targets,
+        &block.plain,
+        &literal_lengths,
+        &distance_lengths,
+        ProvenSubmatchRestriction::SourceSymbol,
+        stop,
+    ) else {
+        return best;
+    };
+    let mut priced_candidates = Vec::new();
+    if priced_candidates
+        .try_reserve_exact(PROVEN_COMPOSITION_EXACT_LIMIT)
+        .is_err()
+    {
+        return best;
+    }
+    consider_header_aware_proven_composition(
+        block,
+        &source,
+        alignment,
+        options,
+        &targets,
+        &payload_rewrites,
+        &symbol_free_rewrites,
+        &literal_lengths,
+        &distance_lengths,
+        &mut priced_candidates,
+        stop,
+        &mut best,
+    );
     best
 }
 
@@ -872,6 +971,475 @@ fn same_proven_submatch_rewrites(
         && left.iter().zip(right).all(|(left, right)| {
             left.token_index == right.token_index && left.replacement == right.replacement
         })
+}
+
+struct ProvenCompositionMenu {
+    token_index: usize,
+    source: Token,
+    alternatives: Vec<ProvenSubmatchRewrite>,
+}
+
+#[derive(Clone)]
+struct ProvenCompositionState {
+    literal_frequencies: [u32; 286],
+    distance_frequencies: [u32; 30],
+    extra_bits: u64,
+    estimated_delta: i64,
+    choices: [u8; PROVEN_COMPOSITION_MAX_TARGETS],
+    rewrite_count: u8,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_header_aware_proven_composition(
+    block: &ParsedBlock,
+    source: &[Token],
+    alignment: u8,
+    options: &Options,
+    targets: &[ProvenSubmatchTarget],
+    payload_rewrites: &[ProvenSubmatchRewrite],
+    symbol_free_rewrites: &[ProvenSubmatchRewrite],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    stop: &mut SearchStop<'_>,
+    best: &mut PlannedBlock,
+) {
+    let source_matches = source
+        .iter()
+        .filter(|token| matches!(token, Token::Match { .. }))
+        .count();
+    if source.len() > PROVEN_COMPOSITION_MAX_TOKENS
+        || !(2..=PROVEN_COMPOSITION_MAX_SOURCE_MATCHES).contains(&source_matches)
+    {
+        return;
+    }
+
+    let Some(menus) = build_proven_composition_menus(
+        block,
+        targets,
+        payload_rewrites,
+        symbol_free_rewrites,
+        literal_lengths,
+        distance_lengths,
+    ) else {
+        return;
+    };
+    if menus.len() < 2 {
+        return;
+    }
+
+    let (literal_frequencies, distance_frequencies) = count_frequencies(source);
+    let source_literal_frequencies = literal_frequencies;
+    let source_distance_frequencies = distance_frequencies;
+    let mut states = Vec::new();
+    if states.try_reserve_exact(1).is_err() {
+        return;
+    }
+    states.push(ProvenCompositionState {
+        literal_frequencies,
+        distance_frequencies,
+        extra_bits: token_extra_bits(source),
+        estimated_delta: 0,
+        choices: [0; PROVEN_COMPOSITION_MAX_TARGETS],
+        rewrite_count: 0,
+    });
+    for (depth, menu) in menus.iter().enumerate() {
+        if stop.reached() {
+            return;
+        }
+        let branch_count = menu.alternatives.len().saturating_add(1);
+        let Some(capacity) = states.len().checked_mul(branch_count) else {
+            return;
+        };
+        let mut next = Vec::new();
+        if next.try_reserve_exact(capacity).is_err() {
+            return;
+        }
+        for state in &states {
+            next.push(state.clone());
+            for (alternative_index, alternative) in menu.alternatives.iter().enumerate() {
+                let mut candidate = state.clone();
+                let Some(choice) = alternative_index
+                    .checked_add(1)
+                    .and_then(|choice| u8::try_from(choice).ok())
+                else {
+                    return;
+                };
+                candidate.choices[depth] = choice;
+                candidate.rewrite_count = candidate.rewrite_count.saturating_add(1);
+                let Some(delta) = candidate
+                    .estimated_delta
+                    .checked_sub(alternative.estimated_saving)
+                else {
+                    continue;
+                };
+                candidate.estimated_delta = delta;
+                if !apply_proven_composition_frequency_delta(
+                    &mut candidate,
+                    menu.source,
+                    &alternative.replacement,
+                ) {
+                    continue;
+                }
+                if next
+                    .iter()
+                    .any(|existing| same_proven_composition_frequency_state(existing, &candidate))
+                {
+                    continue;
+                }
+                next.push(candidate);
+            }
+        }
+        let Some(best_delta) = next.iter().map(|state| state.estimated_delta).min() else {
+            return;
+        };
+        let ceiling = best_delta.saturating_add(PROVEN_COMPOSITION_PAYLOAD_WINDOW);
+        next.retain(|state| state.estimated_delta <= ceiling);
+        next.sort_by_key(|state| {
+            proven_composition_state_key(
+                state,
+                &source_literal_frequencies,
+                &source_distance_frequencies,
+            )
+        });
+        next.truncate(PROVEN_COMPOSITION_BEAM_WIDTH);
+        states = next;
+    }
+
+    states.sort_by_key(|state| {
+        proven_composition_state_key(
+            state,
+            &source_literal_frequencies,
+            &source_distance_frequencies,
+        )
+    });
+    for state in states
+        .iter()
+        .filter(|state| state.rewrite_count >= 2)
+        .take(PROVEN_COMPOSITION_EXACT_LIMIT)
+    {
+        if stop.reached() {
+            break;
+        }
+        let Some(tokens) = apply_proven_composition_state(source, block.plain.len(), &menus, state)
+        else {
+            continue;
+        };
+        if priced_candidates
+            .iter()
+            .any(|candidate| candidate.as_slice() == tokens.as_slice())
+        {
+            continue;
+        }
+        consider_unique_proven_submatch_tokens(
+            block,
+            tokens,
+            alignment,
+            options,
+            priced_candidates,
+            stop,
+            best,
+        );
+    }
+}
+
+fn build_proven_composition_menus(
+    block: &ParsedBlock,
+    targets: &[ProvenSubmatchTarget],
+    payload_rewrites: &[ProvenSubmatchRewrite],
+    symbol_free_rewrites: &[ProvenSubmatchRewrite],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> Option<Vec<ProvenCompositionMenu>> {
+    let mut ranked: Vec<&ProvenSubmatchTarget> = Vec::new();
+    ranked.try_reserve_exact(targets.len()).ok()?;
+    ranked.extend(targets.iter());
+    ranked.sort_by_key(|target| target.rank.key());
+
+    let mut menus = Vec::new();
+    menus
+        .try_reserve_exact(PROVEN_COMPOSITION_MAX_TARGETS)
+        .ok()?;
+    for target in ranked {
+        if menus.len() == PROVEN_COMPOSITION_MAX_TARGETS {
+            break;
+        }
+        let mut alternatives = Vec::new();
+        alternatives
+            .try_reserve_exact(PROVEN_COMPOSITION_MAX_SPELLINGS - 1)
+            .ok()?;
+        for family in [payload_rewrites, symbol_free_rewrites] {
+            let Some(rewrite) = family
+                .iter()
+                .find(|rewrite| rewrite.token_index == target.token_index)
+            else {
+                continue;
+            };
+            let rewrite = try_clone_proven_submatch_rewrite(rewrite)?;
+            insert_distinct_proven_composition_alternative(
+                &mut alternatives,
+                target.source,
+                rewrite,
+            );
+        }
+
+        let end = target
+            .plain_offset
+            .checked_add(target.source.decoded_len())?;
+        let decoded = block.plain.get(target.plain_offset..end)?;
+        let mut literals = new_token_candidate(decoded.len(), decoded.len())?;
+        literals.extend(decoded.iter().copied().map(Token::Literal));
+        let source_bits =
+            estimated_match_token_bits(target.source, literal_lengths, distance_lengths)?;
+        let literal_bits = estimated_tokens_bits(&literals, literal_lengths, distance_lengths)?;
+        let literal_rewrite = ProvenSubmatchRewrite {
+            token_index: target.token_index,
+            replacement: literals,
+            estimated_saving: i64::try_from(source_bits)
+                .ok()?
+                .checked_sub(i64::try_from(literal_bits).ok()?)?,
+            rank: target.rank,
+        };
+        insert_distinct_proven_composition_alternative(
+            &mut alternatives,
+            target.source,
+            literal_rewrite,
+        );
+        alternatives.truncate(PROVEN_COMPOSITION_MAX_SPELLINGS - 1);
+        if alternatives.is_empty() {
+            continue;
+        }
+        menus.push(ProvenCompositionMenu {
+            token_index: target.token_index,
+            source: target.source,
+            alternatives,
+        });
+    }
+    menus.sort_by_key(|menu| menu.token_index);
+    Some(menus)
+}
+
+fn try_clone_proven_submatch_rewrite(
+    rewrite: &ProvenSubmatchRewrite,
+) -> Option<ProvenSubmatchRewrite> {
+    Some(ProvenSubmatchRewrite {
+        token_index: rewrite.token_index,
+        replacement: try_clone_slice(&rewrite.replacement)?,
+        estimated_saving: rewrite.estimated_saving,
+        rank: rewrite.rank,
+    })
+}
+
+fn insert_distinct_proven_composition_alternative(
+    alternatives: &mut Vec<ProvenSubmatchRewrite>,
+    source: Token,
+    candidate: ProvenSubmatchRewrite,
+) {
+    if same_proven_composition_spelling_cost(std::slice::from_ref(&source), &candidate.replacement)
+        || alternatives.iter().any(|existing| {
+            same_proven_composition_spelling_cost(&existing.replacement, &candidate.replacement)
+        })
+    {
+        return;
+    }
+    alternatives.push(candidate);
+}
+
+fn same_proven_composition_spelling_cost(left: &[Token], right: &[Token]) -> bool {
+    count_frequencies(left) == count_frequencies(right)
+        && token_extra_bits(left) == token_extra_bits(right)
+}
+
+fn apply_proven_composition_frequency_delta(
+    state: &mut ProvenCompositionState,
+    source: Token,
+    replacement: &[Token],
+) -> bool {
+    if !adjust_proven_composition_token_frequency(
+        &mut state.literal_frequencies,
+        &mut state.distance_frequencies,
+        source,
+        false,
+    ) {
+        return false;
+    }
+    for &token in replacement {
+        if !adjust_proven_composition_token_frequency(
+            &mut state.literal_frequencies,
+            &mut state.distance_frequencies,
+            token,
+            true,
+        ) {
+            return false;
+        }
+    }
+    let source_extra = token_extra_bits(std::slice::from_ref(&source));
+    let replacement_extra = token_extra_bits(replacement);
+    let Some(extra_bits) = state
+        .extra_bits
+        .checked_sub(source_extra)
+        .and_then(|bits| bits.checked_add(replacement_extra))
+    else {
+        return false;
+    };
+    state.extra_bits = extra_bits;
+    true
+}
+
+fn adjust_proven_composition_token_frequency(
+    literal_frequencies: &mut [u32; 286],
+    distance_frequencies: &mut [u32; 30],
+    token: Token,
+    add: bool,
+) -> bool {
+    let (literal_symbol, distance_symbol) = match token {
+        Token::Literal(value) => (usize::from(value), None),
+        Token::Match {
+            length_symbol,
+            distance_symbol,
+            ..
+        } => (
+            usize::from(length_symbol),
+            Some(usize::from(distance_symbol)),
+        ),
+    };
+    let Some(literal) = literal_frequencies.get_mut(literal_symbol) else {
+        return false;
+    };
+    let Some(updated) = (if add {
+        literal.checked_add(1)
+    } else {
+        literal.checked_sub(1)
+    }) else {
+        return false;
+    };
+    *literal = updated;
+    if let Some(distance_symbol) = distance_symbol {
+        let Some(distance) = distance_frequencies.get_mut(distance_symbol) else {
+            return false;
+        };
+        let Some(updated) = (if add {
+            distance.checked_add(1)
+        } else {
+            distance.checked_sub(1)
+        }) else {
+            return false;
+        };
+        *distance = updated;
+    }
+    true
+}
+
+fn same_proven_composition_frequency_state(
+    left: &ProvenCompositionState,
+    right: &ProvenCompositionState,
+) -> bool {
+    left.literal_frequencies == right.literal_frequencies
+        && left.distance_frequencies == right.distance_frequencies
+        && left.extra_bits == right.extra_bits
+}
+
+fn proven_composition_state_key(
+    state: &ProvenCompositionState,
+    source_literal_frequencies: &[u32; 286],
+    source_distance_frequencies: &[u32; 30],
+) -> (i64, i64, usize, usize, [u8; PROVEN_COMPOSITION_MAX_TARGETS]) {
+    let literal_span = state
+        .literal_frequencies
+        .iter()
+        .rposition(|&frequency| frequency != 0)
+        .map_or(257, |symbol| symbol + 1)
+        .max(257);
+    let distance_span = state
+        .distance_frequencies
+        .iter()
+        .rposition(|&frequency| frequency != 0)
+        .map_or(1, |symbol| symbol + 1)
+        .max(1);
+    let source_literal_span = source_literal_frequencies
+        .iter()
+        .rposition(|&frequency| frequency != 0)
+        .map_or(257, |symbol| symbol + 1)
+        .max(257);
+    let source_distance_span = source_distance_frequencies
+        .iter()
+        .rposition(|&frequency| frequency != 0)
+        .map_or(1, |symbol| symbol + 1)
+        .max(1);
+    let span_reduction = source_literal_span
+        .saturating_sub(literal_span)
+        .saturating_add(source_distance_span.saturating_sub(distance_span));
+    let rare_removed = source_literal_frequencies
+        .iter()
+        .zip(&state.literal_frequencies)
+        .chain(
+            source_distance_frequencies
+                .iter()
+                .zip(&state.distance_frequencies),
+        )
+        .filter(|(source, current)| **source != 0 && **source <= 2 && **current == 0)
+        .count();
+    let active_symbols = state
+        .literal_frequencies
+        .iter()
+        .chain(&state.distance_frequencies)
+        .filter(|&&frequency| frequency != 0)
+        .count();
+    let header_credit = span_reduction
+        .saturating_mul(2)
+        .saturating_add(rare_removed.saturating_mul(2));
+    let adjusted = state
+        .estimated_delta
+        .saturating_sub(i64::try_from(header_credit).unwrap_or(i64::MAX));
+    (
+        adjusted,
+        state.estimated_delta,
+        literal_span.saturating_add(distance_span),
+        active_symbols,
+        state.choices,
+    )
+}
+
+fn apply_proven_composition_state(
+    source: &[Token],
+    decoded_bytes: usize,
+    menus: &[ProvenCompositionMenu],
+    state: &ProvenCompositionState,
+) -> Option<Vec<Token>> {
+    let mut output_count = source.len();
+    for (menu_index, menu) in menus.iter().enumerate() {
+        let choice = usize::from(*state.choices.get(menu_index)?);
+        if choice == 0 {
+            continue;
+        }
+        let alternative = menu.alternatives.get(choice - 1)?;
+        output_count = output_count
+            .checked_sub(1)?
+            .checked_add(alternative.replacement.len())?;
+    }
+    let mut output = new_token_candidate(output_count, decoded_bytes)?;
+    let mut menu_index = 0_usize;
+    for (token_index, &token) in source.iter().enumerate() {
+        if menus
+            .get(menu_index)
+            .is_some_and(|menu| menu.token_index == token_index)
+        {
+            let menu = &menus[menu_index];
+            if token != menu.source {
+                return None;
+            }
+            let choice = usize::from(state.choices[menu_index]);
+            if choice == 0 {
+                output.push(token);
+            } else {
+                output.extend_from_slice(&menu.alternatives.get(choice - 1)?.replacement);
+            }
+            menu_index += 1;
+        } else {
+            output.push(token);
+        }
+    }
+    (menu_index == menus.len()).then_some(output)
 }
 
 fn proven_submatch_seed_lengths(block: &ParsedBlock, best: &PlannedBlock) -> (Vec<u8>, Vec<u8>) {
@@ -4249,6 +4817,116 @@ mod tests {
             rank,
         };
         assert!(apply_proven_submatch_rewrites(&tokens, 34, &[wrong_length]).is_none());
+    }
+
+    #[test]
+    fn proven_composition_frequency_state_matches_materialized_tokens() {
+        let source_match = test_match(6, 6, 4, 1, 1);
+        let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        source.extend([source_match, source_match]);
+        let decoded = b"abcdefabcdefabcdef";
+        let rank = ProvenSubmatchRank {
+            highest: true,
+            rare: true,
+            near_boundary: false,
+            transition: true,
+            expensive: false,
+            code_bits: 4,
+            frequency: 2,
+            token_index: 6,
+        };
+        let literal_replacement: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        let menus = vec![
+            ProvenCompositionMenu {
+                token_index: 6,
+                source: source_match,
+                alternatives: vec![ProvenSubmatchRewrite {
+                    token_index: 6,
+                    replacement: literal_replacement.clone(),
+                    estimated_saving: -3,
+                    rank,
+                }],
+            },
+            ProvenCompositionMenu {
+                token_index: 7,
+                source: source_match,
+                alternatives: vec![ProvenSubmatchRewrite {
+                    token_index: 7,
+                    replacement: literal_replacement,
+                    estimated_saving: -3,
+                    rank: ProvenSubmatchRank {
+                        token_index: 7,
+                        ..rank
+                    },
+                }],
+            },
+        ];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&source);
+        let mut state = ProvenCompositionState {
+            literal_frequencies,
+            distance_frequencies,
+            extra_bits: token_extra_bits(&source),
+            estimated_delta: 6,
+            choices: [1, 1, 0, 0, 0, 0, 0, 0],
+            rewrite_count: 2,
+        };
+        for menu in &menus {
+            assert!(apply_proven_composition_frequency_delta(
+                &mut state,
+                menu.source,
+                &menu.alternatives[0].replacement,
+            ));
+        }
+
+        let materialized = apply_proven_composition_state(&source, decoded.len(), &menus, &state)
+            .expect("the two nonoverlapping menu choices materialize");
+        assert_eq!(
+            decode_test_tokens(&materialized).as_deref(),
+            Some(decoded.as_slice())
+        );
+        assert_eq!(
+            count_frequencies(&materialized).0,
+            state.literal_frequencies
+        );
+        assert_eq!(
+            count_frequencies(&materialized).1,
+            state.distance_frequencies
+        );
+        assert_eq!(token_extra_bits(&materialized), state.extra_bits);
+    }
+
+    #[test]
+    fn proven_composition_deduplicates_header_equivalent_spellings() {
+        let left = [Token::Literal(b'a'), Token::Literal(b'b')];
+        let right = [Token::Literal(b'b'), Token::Literal(b'a')];
+        assert_ne!(left, right);
+        assert!(same_proven_composition_spelling_cost(&left, &right));
+
+        let source = test_match(6, 6, 4, 1, 1);
+        let mut alternatives = Vec::new();
+        let rank = ProvenSubmatchRank {
+            highest: true,
+            rare: true,
+            near_boundary: false,
+            transition: false,
+            expensive: false,
+            code_bits: 4,
+            frequency: 1,
+            token_index: 0,
+        };
+        for replacement in [left.to_vec(), right.to_vec()] {
+            insert_distinct_proven_composition_alternative(
+                &mut alternatives,
+                source,
+                ProvenSubmatchRewrite {
+                    token_index: 0,
+                    replacement,
+                    estimated_saving: 0,
+                    rank,
+                },
+            );
+        }
+        assert_eq!(alternatives.len(), 1);
     }
 
     #[test]

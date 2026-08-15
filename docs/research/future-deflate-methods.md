@@ -49,7 +49,7 @@ candidate.
 | 2 | K-best code-length-RLE feedback | Small, broad | Zero-cost ties in default; bounded Max | Explored; not adopted |
 | 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Implemented |
 | 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Graft explored; not adopted |
-| 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Proposed |
+| 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Implemented |
 | 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Proposed |
 | 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Header kernel implemented |
 | 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Proposed |
@@ -73,7 +73,7 @@ For Columbo, every in-scope improvement belongs to one of these areas:
 | --- | --- | --- |
 | Wrapper and container bytes | PNG/APNG, GZIP, ZIP, and zlib reconstruction, metadata handling, duplicate-frame reuse, exact candidate comparison | Format-specific work only; no general Deflate method found |
 | Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split | A second adaptive basin, one local boundary reseat, and a diagnosed forced-split escape |
-| Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites | Header-aware selection among several near-tie spellings rather than one local winner per match or group |
+| Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites, and bounded header-aware composition across several matches | Wider composition only after a diagnosed miss; the implemented compact beam covers the demonstrated gap |
 | Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | A near-optimal tree frontier only after a diagnosed miss; the bounded unused-symbol graft trial found no real-file win |
 | Dynamic header | Eight repeat masks, balanced and zero-continuation packs, DeflOpt/deft4j/Defluff-derived routes, exact shortest RLE for one fixed code-length tree, four feedback passes | Retain several RLE alternatives because the cheapest parse under the current tree need not build the cheapest next tree |
 | Search engineering | Route-local canonical block-plan and exact-length header-kernel caches, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Cache frequency-planning kernels; share completed immutable interval kernels across compatible sibling lineages |
@@ -396,48 +396,59 @@ Suggested counters:
 - header-only, payload-only, and combined exact gains; and
 - wins already duplicated by another tree family.
 
-### 5. Header-aware proven-spelling composition
+### 5. Header-aware proven-spelling composition — implemented
 
-For each targeted original match, retain a small menu rather than one local
-path:
+The retained Max route gives each targeted original match a small menu rather
+than one local path:
 
 - the exact source match;
-- the fixed-tree payload minimum;
+- the current-tree payload minimum;
 - the current source-length-symbol-free path;
-- the all-literal spelling; and
-- at most two near-tie paths with distinct length-symbol histograms.
+- the all-literal spelling.
 
-Include alternate minimum-token partitions of a same-distance run when they
-have distinct length-symbol support. Compose the menus with a frequency-delta
-beam. Give priority to states that can:
+The source spelling is implicit, so each match has at most four spellings.
+Header-equivalent alternatives are removed before the beam. The implementation
+composes the menus with exact literal/length frequencies, distance frequencies,
+and match-extra-bit totals, and gives ranking credit to states that remove a
+high trailing symbol or a source symbol whose frequency is one or two.
 
+The production gates are:
+
+- Max only, inside the compact M3 proven-feedback candidate;
+- the M3 source parent is one block with at most 4,000 tokens and 80,000
+  decoded bytes; the spelling produced by its initial floor may contain at
+  most 8,000 tokens;
+- two to 128 source matches;
+- at most eight targeted matches and four spellings per match;
+- beam width 16 and depth eight;
+- states remain within 24 estimated payload bits of the current best; and
+- only states rewriting at least two matches are exact-priced, under a hard
+  ceiling of 32 plans.
+
+Every beam layer deduplicates complete frequency and extra-bit state. Surviving
+states are materialized with the original match distances, sent through the
+ordinary complete Max block planner, and retained only on a strict exact-bit
+win. The original M3 floor remains the incumbent.
+
+The implementation was retained after a read-only scan of 800 source PNGs:
+3,736 source blocks were inspected, 1,706 met the composition scan's
+8,000-token/128-match ceiling, and 98 blocks improved over the existing
+integrated proven floor. Complete ten-second Max A/B tests produced a unique
+one-byte/six-bit gain on `imageworsener/p8tbg.png` and a same-byte/two-bit gain
+on `PngSuite/f02n2c08.png`. The established eleven-file hard sample was
+unchanged in bytes and meaningful bits.
+
+The beam prioritizes states that can:
+
+- retain the smallest estimated payload delta;
 - remove the highest used literal/length or distance symbol;
 - eliminate a frequency-one or frequency-two symbol;
-- make an RLE run cross the literal/distance boundary;
-- reduce the set of code-length values used; or
-- enable a promising inside-match block cut.
+- reduce the transmitted literal/distance alphabet spans; or
+- reduce the number of active payload symbols.
 
-Only the best bounded states receive complete block planning. This route never
-searches the history window: every submatch remains inside one original match
-and retains its original distance. Its novelty is global selection across
-several already-proven alternatives.
-
-Suggested initial Max gates:
-
-- at most 128 source matches and 8,000 total tokens;
-- at most eight targeted matches, with at most four spellings each;
-- beam width 16 and depth eight;
-- retain states within 24 estimated payload bits of the best; and
-- exact-price no more than 32 distinct frequency states.
-
-Suggested counters:
-
-- matches with two or more distinct near-tie symbol histograms;
-- rare/highest length and distance symbols removable;
-- beam states, frequency-state duplicates, and exact plans priced;
-- wins requiring two or more simultaneous rewrites; and
-- wins unreachable by current individual, combined-local-minimum, or match
-  group candidates.
+This route never searches the history window: every submatch remains inside
+one original match and retains its original distance. Its novelty is global
+selection across several already-proven alternatives.
 
 ### 6. Boundary polishing not already covered
 
@@ -564,8 +575,10 @@ their output safe.
 6. Completed: trial the unused-symbol graft. Its constructed win did not recur
    across 1,278 source dynamic blocks or six full Max routes, so remove it and
    defer the broader data-tree frontier until a diagnosed miss justifies it.
-7. Next: trial header-aware proven-spelling composition on diagnosed misses.
-8. Add the second adaptive split basin and one adjacent-boundary reseat.
+7. Completed: retain bounded header-aware proven-spelling composition after
+   98 local block wins, one unique byte win, one unique same-byte bit win, and
+   no change across the established hard sample.
+8. Next: add the second adaptive split basin and one adjacent-boundary reseat.
 9. Consider a forced split only if a remaining substantial miss proves the
    need.
 
