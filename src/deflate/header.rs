@@ -4,10 +4,12 @@
 
 use super::huffman::{
     code_length_tree_shape_is_valid, make_columbo_rle_pseudofrequencies, make_lengths,
-    make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap,
-    make_lengths_deflopt_heap_into, make_lengths_defluff_exact, make_lengths_deft4j_java_heap,
-    make_lengths_order_heap, payload_tree_shape_is_valid, Huffman, FIXED_DISTANCE_CODE_LENGTHS,
-    FIXED_LITERAL_CODE_LENGTHS,
+    make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
+    make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
+    make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
+    make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
+    make_lengths_order_heap_into, payload_tree_shape_is_valid, Huffman,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -1256,15 +1258,14 @@ fn build_deft4j_header(
 
 fn deft4j_code_length_tree(rle: &[RleToken]) -> Option<[u8; 19]> {
     let frequencies = rle_frequencies(rle);
-    let lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
-    if lengths.len() != 19 || !code_length_tree_shape_is_valid(&lengths) {
+    let mut lengths = [0_u8; 19];
+    make_lengths_deft4j_java_heap_into(&frequencies, &mut lengths, 7);
+    if !code_length_tree_shape_is_valid(&lengths) {
         return None;
     }
-    let mut result = [0_u8; 19];
-    result.copy_from_slice(&lengths);
     rle.iter()
-        .all(|token| result[usize::from(token.symbol)] != 0)
-        .then_some(result)
+        .all(|token| lengths[usize::from(token.symbol)] != 0)
+        .then_some(lengths)
 }
 
 fn deft4j_dynamic_plan(
@@ -1411,7 +1412,7 @@ fn plan_for_trimmed_lengths(
             literal_lengths,
             distance_lengths,
             &decoded_lengths,
-            &rle,
+            rle,
             exhaustive,
             &mut best,
         );
@@ -1683,17 +1684,21 @@ fn consider_rle(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     decoded_lengths: &[u8],
-    initial_rle: &[RleToken],
+    initial_rle: Vec<RleToken>,
     exhaustive: bool,
     best: &mut Option<DynamicPlan>,
 ) {
-    let mut rle = initial_rle.to_vec();
+    // Each seed is consumed by exactly one feedback lineage. Taking ownership
+    // reuses its allocation through all four passes instead of cloning every
+    // candidate immediately after `rle_seed_candidates` built it.
+    let mut rle = initial_rle;
 
     // From each Columbo RLE-mask seed, price a DeflOpt-derived local candidate:
     // build DeflOpt's height-tied code-length tree, replace repeat tokens that
     // are locally dearer than explicit lengths, then rebuild. Every rewrite
     // strictly reduces the finite repeat rank, so this remains bounded. It is
     // not DeflOpt's complete state-feedback route.
+    let mut frequencies = rle_frequencies(&rle);
     let mut prescored_deflopt_trees = [None; 4];
     for (variant, tree) in prescored_deflopt_trees.iter_mut().enumerate() {
         *tree = consider_columbo_deflopt_local_rewrite(
@@ -1701,6 +1706,7 @@ fn consider_rle(
             literal_lengths,
             distance_lengths,
             &rle,
+            &frequencies,
             variant as u32,
             best,
         );
@@ -1711,20 +1717,23 @@ fn consider_rle(
     // its fourth pass and neither stops early nor retains earlier winners.
     let passes = 4;
     for pass in 0..passes {
-        let frequencies = rle_frequencies(&rle);
         let variants = 4;
-        let mut code_length_candidates = Vec::new();
+        // The code-length alphabet is always exactly nineteen symbols. Store
+        // its candidates inline so each builder does not allocate a Vec only
+        // for the result to be copied into DynamicPlan's fixed-size array.
+        let candidate_capacity = if exhaustive { 18 } else { 6 };
+        let mut code_length_candidates = Vec::with_capacity(candidate_capacity);
         for variant in 0..variants {
-            push_unique(
-                &mut code_length_candidates,
-                make_lengths_order_heap(&frequencies, 7, variant),
-            );
+            let mut order_lengths = [0_u8; 19];
+            make_lengths_order_heap_into(&frequencies, &mut order_lengths, 7, variant);
+            push_unique(&mut code_length_candidates, order_lengths);
             // The deft4j tree's PriorityQueue-compatible heap is expensive
             // across the full data alphabets, but the code-length alphabet has
             // only nineteen symbols. Keeping it in Columbo's ordinary header
             // repack closes RLE gaps without broadening token search.
             if variant == 0 {
-                let deft4j_lengths = make_lengths_deft4j_java_heap(&frequencies, 7);
+                let mut deft4j_lengths = [0_u8; 19];
+                make_lengths_deft4j_java_heap_into(&frequencies, &mut deft4j_lengths, 7);
                 consider_deft4j_pruned_header(
                     data_bits,
                     literal_lengths,
@@ -1737,10 +1746,14 @@ fn consider_rle(
                 // This is Columbo's generic code-length tree with Defluff's
                 // limiter, not Defluff's complete tree builder. Pricing the
                 // hybrid once is inexpensive when the data trees are fixed.
-                push_unique(
-                    &mut code_length_candidates,
-                    make_lengths_columbo_defluff_limited(&frequencies, 7, 0),
+                let mut defluff_limited_lengths = [0_u8; 19];
+                make_lengths_columbo_defluff_limited_into(
+                    &frequencies,
+                    &mut defluff_limited_lengths,
+                    7,
+                    0,
                 );
+                push_unique(&mut code_length_candidates, defluff_limited_lengths);
             }
             if exhaustive {
                 // The local DeflOpt feedback route already built and scored
@@ -1748,34 +1761,29 @@ fn consider_rle(
                 // feedback ranking instead of rebuilding and rescoring it.
                 if pass == 0 {
                     if let Some(lengths) = prescored_deflopt_trees[variant as usize] {
-                        push_unique(&mut code_length_candidates, lengths.to_vec());
+                        push_unique(&mut code_length_candidates, lengths);
                     }
                 } else {
-                    push_unique(
-                        &mut code_length_candidates,
-                        make_lengths_deflopt_heap(&frequencies, 7, variant),
-                    );
+                    let mut deflopt_lengths = [0_u8; 19];
+                    make_lengths_deflopt_heap_into(&frequencies, &mut deflopt_lengths, 7, variant);
+                    push_unique(&mut code_length_candidates, deflopt_lengths);
                 }
-                push_unique(
-                    &mut code_length_candidates,
-                    make_lengths(&frequencies, 7, variant),
-                );
-                push_unique(
-                    &mut code_length_candidates,
-                    make_lengths_defluff_exact(&frequencies, 7, variant),
-                );
+                let mut columbo_lengths = [0_u8; 19];
+                make_lengths_into(&frequencies, &mut columbo_lengths, 7, variant);
+                push_unique(&mut code_length_candidates, columbo_lengths);
+
+                let mut defluff_lengths = [0_u8; 19];
+                make_lengths_defluff_exact_into(&frequencies, &mut defluff_lengths, 7, variant);
+                push_unique(&mut code_length_candidates, defluff_lengths);
             }
         }
 
         let mut feedback_tree = None;
         let mut feedback_cost = INF;
-        for candidate_lengths in code_length_candidates {
-            if candidate_lengths.len() != 19 || !code_length_tree_shape_is_valid(&candidate_lengths)
-            {
+        for code_length_lengths in code_length_candidates {
+            if !code_length_tree_shape_is_valid(&code_length_lengths) {
                 continue;
             }
-            let mut code_length_lengths = [0_u8; 19];
-            code_length_lengths.copy_from_slice(&candidate_lengths);
             let was_prescored = pass == 0
                 && prescored_deflopt_trees
                     .iter()
@@ -1843,6 +1851,7 @@ fn consider_rle(
             break;
         }
         rle = rewritten;
+        frequencies = rle_frequencies(&rle);
     }
 }
 
@@ -1877,11 +1886,11 @@ fn consider_deft4j_pruned_header(
         return;
     };
     let frequencies = rle_frequencies(&pruned);
-    let rebuilt = make_lengths_deft4j_java_heap(&frequencies, 7);
-    if rebuilt.len() != 19 || !code_length_tree_shape_is_valid(&rebuilt) {
+    let mut code_length_lengths = [0_u8; 19];
+    make_lengths_deft4j_java_heap_into(&frequencies, &mut code_length_lengths, 7);
+    if !code_length_tree_shape_is_valid(&code_length_lengths) {
         return;
     }
-    code_length_lengths.copy_from_slice(&rebuilt);
     if pruned
         .iter()
         .any(|token| code_length_lengths[usize::from(token.symbol)] == 0)
@@ -1927,27 +1936,31 @@ fn consider_columbo_deflopt_local_rewrite(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     initial_rle: &[RleToken],
+    initial_frequencies: &[u32; 19],
     variant: u32,
     best: &mut Option<DynamicPlan>,
 ) -> Option<[u8; 19]> {
-    let mut rle = initial_rle.to_vec();
-    let mut rank = repeat_rank(&rle);
+    // Score the seed by reference. Allocate only if the local rewrite finds a
+    // genuinely different next state; four variants otherwise cloned this
+    // same RLE before discovering that no rewrite was possible.
+    let mut rewritten_rle: Option<Vec<RleToken>> = None;
+    let mut frequencies = *initial_frequencies;
+    let mut rank = repeat_rank(initial_rle);
     let mut initial_tree = None;
 
     loop {
-        let frequencies = rle_frequencies(&rle);
-        let candidate_lengths = make_lengths_deflopt_heap(&frequencies, 7, variant);
-        if candidate_lengths.len() != 19 || !code_length_tree_shape_is_valid(&candidate_lengths) {
+        let rle = rewritten_rle.as_deref().unwrap_or(initial_rle);
+        let mut code_length_lengths = [0_u8; 19];
+        make_lengths_deflopt_heap_into(&frequencies, &mut code_length_lengths, 7, variant);
+        if !code_length_tree_shape_is_valid(&code_length_lengths) {
             return initial_tree;
         }
 
-        let mut code_length_lengths = [0_u8; 19];
-        code_length_lengths.copy_from_slice(&candidate_lengths);
         let Some(_) = consider_dynamic_header(
             data_bits,
             literal_lengths,
             distance_lengths,
-            &rle,
+            rle,
             &frequencies,
             code_length_lengths,
             best,
@@ -1966,7 +1979,7 @@ fn consider_columbo_deflopt_local_rewrite(
                 data_bits,
                 literal_lengths,
                 distance_lengths,
-                &rle,
+                rle,
                 &frequencies,
                 reordered,
                 best,
@@ -1976,7 +1989,7 @@ fn consider_columbo_deflopt_local_rewrite(
         if rank == 0 {
             break;
         }
-        let Some(rewritten) = rewrite_rle_deflopt_local(&rle, &code_length_lengths) else {
+        let Some(rewritten) = rewrite_rle_deflopt_local(rle, &code_length_lengths) else {
             break;
         };
         let next_rank = repeat_rank(&rewritten);
@@ -1998,7 +2011,8 @@ fn consider_columbo_deflopt_local_rewrite(
             best,
         );
 
-        rle = rewritten;
+        rewritten_rle = Some(rewritten);
+        frequencies = rewritten_frequencies;
         rank = next_rank;
     }
     initial_tree
@@ -3038,7 +3052,7 @@ mod tests {
             &lengths[..286],
             &lengths[286..],
             &lengths,
-            &rle,
+            rle,
             false,
             &mut best,
         );
