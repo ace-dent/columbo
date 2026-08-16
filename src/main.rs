@@ -27,7 +27,7 @@ const PROGRAM_VERSION: &str = concat!(
     ".",
     env!("CARGO_PKG_VERSION_MINOR")
 );
-const PROGRAM_STAGE: &str = "Alpha";
+const PROGRAM_STAGE: &str = "Beta";
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);

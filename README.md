@@ -4,9 +4,9 @@
 
 <hr>
 
-## ⚠️ Alpha software
+## ⚠️ Beta software
 
-This project is alpha software and is relatively untested. Expect bugs, incomplete behavior, and breaking changes. Do not rely on it for production or other critical workloads without independently reviewing and thoroughly testing it first.
+This project is beta software and is relatively untested. Expect bugs, incomplete behavior, and breaking changes. Do not rely on it for production or other critical workloads without independently reviewing and thoroughly testing it first.
 
 Code in this project has been generated with the assistance of OpenAI models. Review and validate the code before use.
 

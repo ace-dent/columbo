@@ -521,6 +521,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     let mut proven_feedback_candidate = bounded_candidates.proven_feedback;
     let mut suppress_later_source_max = bounded_candidates.suppress_later_source_max;
     let suppress_later_optional_routes = bounded_candidates.suppress_later_optional_routes;
+    let completed_compact_split_parent = bounded_candidates.completed_compact_split_parent;
     if let Some(step) = bounded_step {
         step.finish_phase();
         for (name, candidate) in [
@@ -662,19 +663,24 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // duplicates.
     let compact_split_normal_parent = run_compact_split_floor
         .then_some(bounded_floor_candidate.as_ref())
-        .flatten();
+        .flatten()
+        .filter(|candidate| {
+            !compact_split_parent_is_completed(candidate, completed_compact_split_parent.as_deref())
+        });
     let compact_split_seeded_parent = run_compact_split_floor
         .then_some(floor_seeded_candidate.as_ref())
         .flatten()
         .filter(|seeded| {
-            compact_split_normal_parent.map_or(true, |normal| normal.data != seeded.data)
+            !compact_split_parent_is_completed(seeded, completed_compact_split_parent.as_deref())
+                && compact_split_normal_parent.map_or(true, |normal| normal.data != seeded.data)
         });
     let compact_split_deft4j_parent = if run_compact_split_floor {
         deft4j_candidate.as_ref().filter(|deft4j| {
-            [compact_split_normal_parent, compact_split_seeded_parent]
-                .into_iter()
-                .flatten()
-                .all(|seed| seed.data != deft4j.data)
+            !compact_split_parent_is_completed(deft4j, completed_compact_split_parent.as_deref())
+                && [compact_split_normal_parent, compact_split_seeded_parent]
+                    .into_iter()
+                    .flatten()
+                    .all(|seed| seed.data != deft4j.data)
         })
     } else {
         None
@@ -778,7 +784,11 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                                 ]
                                 .into_iter()
                                 .flatten()
-                                .any(|seed| seed.data == deft4j.data);
+                                .any(|seed| seed.data == deft4j.data)
+                                    || compact_split_parent_is_completed(
+                                        deft4j,
+                                        completed_compact_split_parent.as_deref(),
+                                    );
                                 let improves_early_seeds = [
                                     compact_split_normal_seed.as_ref(),
                                     compact_split_seeded_seed.as_ref(),
@@ -883,10 +893,16 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // finish it serially so scheduling cannot discard a bounded saving.
     if run_compact_split_floor && !compact_split_attempted {
         compact_split_candidate = match deft4j_candidate.as_ref() {
-            Some(deft4j) => {
+            Some(deft4j)
+                if !compact_split_parent_is_completed(
+                    deft4j,
+                    completed_compact_split_parent.as_deref(),
+                ) =>
+            {
                 refine_with_compact_source_split_floor(deft4j, options, decoded_limit, identity)?
             }
             None => None,
+            Some(_) => None,
         };
     }
     if let Some(step) = compact_split_step {
@@ -1770,6 +1786,7 @@ struct BoundedPhaseCandidates {
     proven_feedback: Option<Candidate>,
     suppress_later_source_max: bool,
     suppress_later_optional_routes: bool,
+    completed_compact_split_parent: Option<Vec<u8>>,
 }
 
 /// One complete compressed stream together with the facts needed to verify
@@ -1868,6 +1885,7 @@ fn build_bounded_phase_candidates(
     } else {
         None
     };
+    let mut completed_compact_split_parent = None;
     if let Some(deft4j) = &mut prebuilt_deft4j {
         if deadline.can_start_route() {
             let refined = refine_with_default_planner(
@@ -1880,13 +1898,31 @@ fn build_bounded_phase_candidates(
             deft4j.replace_if_smaller(refined);
         }
         if prebuild_compact_split {
-            if let Some(split) = refine_with_compact_source_split_floor(
-                deft4j,
-                options,
-                source.decoded_limit,
-                source.identity,
-            )? {
-                deft4j.replace_if_smaller(split);
+            if let Some(seed) =
+                prepare_compact_source_split_seed(deft4j, source.decoded_limit, source.identity)?
+            {
+                let split = build_prepared_compact_source_split_floor(
+                    &seed,
+                    options,
+                    source.decoded_limit,
+                    source.identity,
+                )?;
+                let preserves_source_blocks = split.as_ref().is_some_and(|candidate| {
+                    compact_split_preserves_source_blocks(&seed.stream.blocks, &candidate.plans)
+                });
+                if let Some(split) = split {
+                    deft4j.replace_if_smaller(split);
+                }
+                // Exact parent identity suppresses the later copy of this
+                // completed deterministic route. If no structural cut won,
+                // its emitted endpoint has the same token/block state and is
+                // already the route's fixed point; otherwise only the input
+                // parent is complete and the split descendant remains useful.
+                completed_compact_split_parent = if preserves_source_blocks {
+                    Some(deft4j.data.clone())
+                } else {
+                    Some(seed.data)
+                };
             }
         }
     }
@@ -1938,12 +1974,13 @@ fn build_bounded_phase_candidates(
             floor: Some(floor),
             floor_seeded,
             deft4j: prebuilt_deft4j,
+            completed_compact_split_parent,
             ..BoundedPhaseCandidates::default()
         });
     }
 
     if !parallel_routes {
-        return build_bounded_phase_candidates_sequential(
+        let mut candidates = build_bounded_phase_candidates_sequential(
             source,
             options,
             run_seeded_max,
@@ -1951,7 +1988,12 @@ fn build_bounded_phase_candidates(
             run_narrow,
             &route_window,
             completed_floor,
-        );
+        )?;
+        if let Some(prebuilt) = prebuilt_deft4j {
+            replace_optional_if_smaller(&mut candidates.deft4j, prebuilt);
+        }
+        candidates.completed_compact_split_parent = completed_compact_split_parent;
+        return Ok(candidates);
     }
 
     thread::scope(|scope| {
@@ -2086,6 +2128,7 @@ fn build_bounded_phase_candidates(
             source_max,
             proven_feedback,
             suppress_later_source_max: run_source_max,
+            completed_compact_split_parent,
             ..BoundedPhaseCandidates::default()
         })
     })
@@ -2733,6 +2776,24 @@ fn ordered_compact_split_seeds(seeds: [Option<&CompactSplitSeed>; 3]) -> Vec<&Co
     let mut seeds: Vec<_> = seeds.into_iter().flatten().collect();
     seeds.sort_by_key(|seed| (seed.data.len(), seed.bits));
     seeds
+}
+
+fn compact_split_parent_is_completed(candidate: &Candidate, completed: Option<&[u8]>) -> bool {
+    completed.is_some_and(|data| data == candidate.data)
+}
+
+fn compact_split_preserves_source_blocks(blocks: &[ParsedBlock], plans: &[PlannedBlock]) -> bool {
+    blocks.len() == plans.len()
+        && blocks.iter().zip(plans).all(|(block, plan)| {
+            std::sync::Arc::ptr_eq(&block.tokens, &plan.tokens)
+                && std::sync::Arc::ptr_eq(&block.plain, &plan.plain)
+                && match &plan.representation {
+                    Representation::Original(original) => original.block_type == block.source_type,
+                    Representation::Stored => block.source_type == SourceBlockType::Stored,
+                    Representation::Fixed => block.source_type == SourceBlockType::Fixed,
+                    Representation::Dynamic(_) => block.source_type == SourceBlockType::Dynamic,
+                }
+        })
 }
 
 fn refine_with_compact_source_split_floor(
@@ -4380,6 +4441,36 @@ mod tests {
             parsed.decoded_size,
             &parsed.blocks
         ));
+        let plans: Vec<_> = parsed
+            .blocks
+            .iter()
+            .map(|block| {
+                let original = block.original.expect("parsed block has source bits");
+                PlannedBlock {
+                    tokens: Arc::clone(&block.tokens),
+                    plain: Arc::clone(&block.plain),
+                    representation: Representation::Original(original),
+                    bits: original.len,
+                    source_type: block.source_type,
+                }
+            })
+            .collect();
+        assert!(compact_split_preserves_source_blocks(
+            &parsed.blocks,
+            &plans
+        ));
+        let mut changed_plans = plans.clone();
+        changed_plans[0].plain = vec![b'a'; 127].into();
+        assert!(!compact_split_preserves_source_blocks(
+            &parsed.blocks,
+            &changed_plans
+        ));
+        let mut changed_type = plans;
+        changed_type[0].representation = Representation::Stored;
+        assert!(!compact_split_preserves_source_blocks(
+            &parsed.blocks,
+            &changed_type
+        ));
         assert!(!compact_source_split_floor_eligible(
             COMPACT_SPLIT_FLOOR_MAX_DECODED + 1,
             &parsed.blocks
@@ -4465,6 +4556,21 @@ mod tests {
             ordered_compact_split_seeds([Some(&tied_first), Some(&tied_second), Some(&largest)]);
         assert!(std::ptr::eq(ordered[0], &tied_first));
         assert!(std::ptr::eq(ordered[1], &tied_second));
+    }
+
+    #[test]
+    fn completed_compact_split_parent_requires_exact_encoded_identity() {
+        let candidate = comparison_candidate(4, 29, 7);
+
+        assert!(compact_split_parent_is_completed(
+            &candidate,
+            Some(&[7, 7, 7, 7])
+        ));
+        assert!(!compact_split_parent_is_completed(
+            &candidate,
+            Some(&[7, 7, 7, 6])
+        ));
+        assert!(!compact_split_parent_is_completed(&candidate, None));
     }
 
     #[test]
