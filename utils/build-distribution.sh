@@ -98,8 +98,27 @@ if [ "$TARGET" = "x86_64-pc-windows-gnu" ] && \
 fi
 
 PINNED_RUSTC=$(rustup which --toolchain "$TOOLCHAIN" rustc)
+RUST_SYSROOT=$(rustup run "$TOOLCHAIN" rustc --print sysroot)
+RUST_SOURCE_ROOT="$RUST_SYSROOT/lib/rustlib/src/rust"
+
+# Remap source names before they can reach an object file. Cargo splits
+# RUSTFLAGS on whitespace, so use its unit-separator encoding to keep checkout
+# and toolchain paths containing spaces intact as single rustc arguments.
+RUSTFLAG_SEPARATOR=$(printf '\037')
+CARGO_ENCODED_RUSTFLAGS="-Zlocation-detail=none"
+append_rustflag() {
+    CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${RUSTFLAG_SEPARATOR}$1"
+}
+append_rustflag "-Zunstable-options"
+append_rustflag "-Cpanic=immediate-abort"
+append_rustflag "--remap-path-prefix=$PROJECT_ROOT=/columbo"
+append_rustflag "--remap-path-prefix=src/=/columbo/src/"
+append_rustflag "--remap-path-prefix=$RUST_SYSROOT=/rust-toolchain"
+append_rustflag "--remap-path-prefix=$RUST_SOURCE_ROOT=/rust-source"
+append_rustflag "--remap-path-scope=object"
+
 RUSTC="$PINNED_RUSTC" \
-RUSTFLAGS="-Zlocation-detail=none -Zunstable-options -Cpanic=immediate-abort" \
+CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS" \
     rustup run "$TOOLCHAIN" cargo build --locked --profile distribution \
         --target "$TARGET" -Z build-std
 
