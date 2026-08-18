@@ -159,6 +159,11 @@ impl<'a> RouteWindow<'a> {
             stop_after: self.stop_after,
         }
     }
+
+    /// Let an admitted dependent refinement finish within the file grace.
+    pub(crate) fn hard_stop(&self) -> SearchStop<'_> {
+        self.deadline.hard_stop()
+    }
 }
 
 /// One concrete stop policy for the complete planner hierarchy.

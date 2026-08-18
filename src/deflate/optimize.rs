@@ -2012,7 +2012,12 @@ fn build_bounded_phase_candidates(
                 .name("columbo-no-split".into())
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
-                        build_narrow_source_candidate(source, options, &mut route_window.stop())
+                        build_narrow_source_candidate(
+                            source,
+                            options,
+                            &mut route_window.stop(),
+                            &mut route_window.hard_stop(),
+                        )
                     })
                 })
                 .ok()
@@ -2071,7 +2076,12 @@ fn build_bounded_phase_candidates(
         let narrow = match narrow_worker.flatten() {
             Some(worker) => worker.join(),
             None if run_narrow => Ok(run_route_with_cancellation(deadline, || {
-                build_narrow_source_candidate(source, options, &mut route_window.stop())
+                build_narrow_source_candidate(
+                    source,
+                    options,
+                    &mut route_window.stop(),
+                    &mut route_window.hard_stop(),
+                )
             })),
             None => Ok(Ok(None)),
         };
@@ -2150,7 +2160,12 @@ fn build_bounded_phase_candidates_sequential(
         None
     };
     let narrow = if run_narrow && route_window.can_start_route() {
-        build_narrow_source_candidate(source, options, &mut route_window.stop())?
+        build_narrow_source_candidate(
+            source,
+            options,
+            &mut route_window.stop(),
+            &mut route_window.hard_stop(),
+        )?
     } else {
         None
     };
@@ -2575,21 +2590,53 @@ fn build_deft4j_source_candidate(
 
 /// Build one direct source-order candidate without the broader split graph.
 ///
-/// This mirrors the useful no-split route family while sharing the caller's
-/// parsed payloads and deadline. It is intentionally not replayed through
-/// `plan_stream`; doing so would immediately repeat the grouping and split
-/// work this sibling exists to bypass.
+/// A winning merge or token rewrite exposes a parent that the original source
+/// planner could not inspect. Reparse that genuinely new state once through
+/// the ordinary planner; header-only rewrites are already fully priced by the
+/// first pass and do not justify repeating the work.
 fn build_narrow_source_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     expired: &mut SearchStop<'_>,
+    refinement_stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
     let Some(plans) = plan_source_no_split_route(source.blocks, 0, options, true, &mut *expired)
     else {
         return Ok(None);
     };
-    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
-        .map(|candidate| Some(candidate.named("No-split source")))
+    let mut candidate =
+        build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)?;
+    if candidate_exposes_new_parent(&candidate, source) && !refinement_stop.reached() {
+        let refined = refine_with_default_planner(
+            &candidate,
+            options,
+            source.decoded_limit,
+            source.identity,
+            refinement_stop,
+        )?;
+        candidate.replace_if_smaller(refined);
+    }
+    Ok(Some(candidate.named("No-split source")))
+}
+
+/// Whether emitting a route changed block boundaries or token spellings.
+///
+/// A different Huffman representation alone cannot improve when immediately
+/// fed to the smaller Default tree search: Max has already priced that same
+/// token state with a superset of header candidates. Boundary or token changes
+/// are different—they expose a new planner input and justify one replay.
+fn candidate_exposes_new_parent(candidate: &Candidate, source: CandidateInput<'_>) -> bool {
+    candidate.data.as_slice() != source.compressed
+        && (candidate.plans.len() != source.blocks.len()
+            || candidate
+                .plans
+                .iter()
+                .zip(source.blocks)
+                .any(|(plan, block)| {
+                    plan.plain.len() != block.plain.len()
+                        || (!std::sync::Arc::ptr_eq(&plan.tokens, &block.tokens)
+                            && plan.tokens.as_ref() != block.tokens.as_ref())
+                }))
 }
 
 /// Apply the source-ordered deft4j route to a genuinely rewritten floor state.
@@ -3761,6 +3808,39 @@ mod tests {
         };
         assert!(comparison_candidate(1, 8, 9).is_strictly_smaller_than_source(source));
         assert!(!comparison_candidate(2, 7, 10).is_strictly_smaller_than_source(source));
+    }
+
+    #[test]
+    fn no_split_replay_requires_a_new_parent_state() {
+        let compressed = [0_u8];
+        let source = CandidateInput {
+            compressed: &compressed,
+            blocks: &[],
+            meaningful_bits: 8,
+            decoded_limit: 0,
+            identity: StreamIdentity {
+                decoded_size: 0,
+                crc32: 0,
+                adler32: 0,
+            },
+        };
+        let mut candidate = comparison_candidate(1, 7, 1);
+
+        // Different output bytes alone can be only a better Huffman header;
+        // Max already priced that token state, so Default must not repeat it.
+        assert!(!candidate_exposes_new_parent(&candidate, source));
+
+        candidate.plans.push(PlannedBlock {
+            tokens: Arc::new(vec![Token::Literal(0)]),
+            plain: Arc::new(vec![0]),
+            representation: Representation::Fixed,
+            bits: 10,
+            source_type: SourceBlockType::Fixed,
+        });
+        assert!(candidate_exposes_new_parent(&candidate, source));
+
+        candidate.data.copy_from_slice(&compressed);
+        assert!(!candidate_exposes_new_parent(&candidate, source));
     }
 
     #[test]
