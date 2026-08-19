@@ -45,7 +45,7 @@ pub(crate) const MAX_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
 /// model. Without a separate count limit, a relatively small hostile stream
 /// could therefore force millions of parser iterations while using almost no
 /// decoded-byte or model budget.
-const MAX_SOURCE_BLOCKS: usize = 1_000_000;
+const MAX_SOURCE_BLOCKS: usize = 262_144;
 const PARSED_BLOCK_MODEL_BYTES: usize = std::mem::size_of::<ParsedBlock>() + 4 * 1024;
 
 /// Estimate the owned model bytes accounted by the parser. Optional search

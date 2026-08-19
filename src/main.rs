@@ -16,7 +16,10 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use columbo::{optimize, Format, Options, MAX_TIMEOUT, MIN_TIMEOUT};
+use columbo::{
+    optimize, Format, Options, MAX_EXPANSION_RATIO, MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES,
+    MIN_TIMEOUT,
+};
 use presentation::{
     countdown_seconds, format_duration as format_elapsed, plural, plural_u64, write_spinner_line,
 };
@@ -920,6 +923,11 @@ fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(
         output,
         "Input and decoded Deflate data are limited to 1 GiB."
+    )?;
+    writeln!(
+        output,
+        "Decoded data is also limited to {MAX_EXPANSION_RATIO}x input size after a {} MiB allowance.",
+        MIN_EXPANSION_LIMIT_BYTES / (1024 * 1024)
     )
 }
 

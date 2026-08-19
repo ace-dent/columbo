@@ -4,7 +4,7 @@
 
 use std::thread;
 
-use columbo::{optimize, Format, Options};
+use columbo::{optimize, Format, Options, MAX_EXPANSION_RATIO};
 
 const EMPTY_RAW: &[u8] = &[0x03, 0x00];
 const EMPTY_ZLIB: &[u8] = &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -37,6 +37,10 @@ fn strict_mode_is_the_default() {
     assert!(Options::default().strict);
     assert!(!Options::default().verbose);
     assert!(!Options::default().visual);
+    assert_eq!(
+        Options::default().max_expansion_ratio,
+        Some(MAX_EXPANSION_RATIO)
+    );
 }
 
 #[test]

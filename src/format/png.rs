@@ -44,9 +44,9 @@ const MAX_APNG_FRAMES: usize = 16_384;
 /// streams from multiplying that mandatory parser setup indefinitely.
 const MAX_COMPRESSED_METADATA_STREAMS: usize = 4_096;
 /// Twelve-byte empty chunks otherwise amplify into several independent Rust
-/// model records. A million chunks is already far beyond practical PNG/APNG
-/// use while keeping parser bookkeeping comfortably bounded.
-const MAX_PNG_CHUNKS: usize = 1_000_000;
+/// model records. This remains far beyond practical PNG/APNG use while
+/// keeping parser bookkeeping and mandatory CRC work comfortably bounded.
+const MAX_PNG_CHUNKS: usize = 65_536;
 
 #[derive(Clone, Copy)]
 struct Chunk<'a> {
@@ -3217,6 +3217,21 @@ mod tests {
             error.message(),
             "PNG contains too many compressed metadata streams"
         );
+    }
+
+    #[test]
+    fn rejects_pathological_chunk_counts_early() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        for _ in 0..MAX_PNG_CHUNKS {
+            input.extend(chunk(*b"aaAa", &[]));
+        }
+
+        let error = match parse(&input, false) {
+            Err(error) => error,
+            Ok(_) => panic!("excess PNG chunks should fail"),
+        };
+        assert_eq!(error.message(), "PNG contains too many chunks");
     }
 
     #[test]

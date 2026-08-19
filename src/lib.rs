@@ -26,7 +26,8 @@ mod terminal;
 
 pub use error::{Error, Result};
 pub use options::{
-    Format, Options, DEFAULT_TIMEOUT, MAX_DECODED_BYTES, MAX_INPUT_BYTES, MAX_TIMEOUT, MIN_TIMEOUT,
+    Format, Options, DEFAULT_TIMEOUT, MAX_DECODED_BYTES, MAX_EXPANSION_RATIO, MAX_INPUT_BYTES,
+    MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES, MIN_TIMEOUT,
 };
 
 /// The result of one optimization run.

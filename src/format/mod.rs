@@ -140,6 +140,9 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         return Err(Error::new("input exceeds configured safety limit"));
     }
 
+    let effective_options = options_with_input_expansion_limit(input.len(), options);
+    let options = &effective_options;
+
     let detected = match requested {
         Format::Auto => detect(input),
         explicit => explicit,
@@ -186,6 +189,8 @@ pub(crate) fn deflate_stream_count(
     if input.len() as u64 > options.max_input_bytes {
         return Err(Error::new("input exceeds configured safety limit"));
     }
+    let effective_options = options_with_input_expansion_limit(input.len(), options);
+    let options = &effective_options;
     let detected = match requested {
         Format::Auto => detect(input),
         explicit => explicit,
@@ -196,6 +201,23 @@ pub(crate) fn deflate_stream_count(
         Format::Gzip => gzip::deflate_stream_count(input, options.max_decoded_bytes),
         Format::Zip => zip::deflate_stream_count(input),
     }
+}
+
+/// Apply the bomb-resistance policy once at the top-level input boundary.
+///
+/// Container children must share this reduced cumulative allowance rather
+/// than each deriving a fresh ratio from its own compressed slice. Otherwise
+/// a many-member archive could multiply the minimum allowance.
+fn options_with_input_expansion_limit(input_bytes: usize, options: &Options) -> Options {
+    let mut effective = options.clone();
+    if let Some(ratio) = options.max_expansion_ratio {
+        let ratio_limit = u64::try_from(input_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(ratio)
+            .max(crate::MIN_EXPANSION_LIMIT_BYTES);
+        effective.max_decoded_bytes = effective.max_decoded_bytes.min(ratio_limit);
+    }
+    effective
 }
 
 fn detect(input: &[u8]) -> Format {
@@ -285,6 +307,45 @@ mod tests {
 
         let error = optimize(&[0x03, 0x00], Format::Raw, &options).unwrap_err();
         assert_eq!(error.message(), "input exceeds configured safety limit");
+    }
+
+    #[test]
+    fn top_level_expansion_limit_combines_ratio_floor_and_absolute_ceiling() {
+        let defaults = Options::default();
+        let small = options_with_input_expansion_limit(1, &defaults);
+        assert_eq!(small.max_decoded_bytes, crate::MIN_EXPANSION_LIMIT_BYTES);
+
+        let larger_input = usize::try_from(crate::MIN_EXPANSION_LIMIT_BYTES).unwrap();
+        let larger = options_with_input_expansion_limit(larger_input, &defaults);
+        assert_eq!(larger.max_decoded_bytes, defaults.max_decoded_bytes);
+
+        let absolute = Options {
+            max_decoded_bytes: 123,
+            ..defaults.clone()
+        };
+        assert_eq!(
+            options_with_input_expansion_limit(1, &absolute).max_decoded_bytes,
+            123
+        );
+
+        let trusted = Options {
+            max_expansion_ratio: None,
+            ..defaults.clone()
+        };
+        assert_eq!(
+            options_with_input_expansion_limit(1, &trusted).max_decoded_bytes,
+            defaults.max_decoded_bytes
+        );
+
+        let saturating = Options {
+            max_decoded_bytes: u64::MAX,
+            max_expansion_ratio: Some(u64::MAX),
+            ..defaults
+        };
+        assert_eq!(
+            options_with_input_expansion_limit(usize::MAX, &saturating).max_decoded_bytes,
+            u64::MAX
+        );
     }
 
     #[test]

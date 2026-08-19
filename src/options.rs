@@ -6,6 +6,10 @@ use std::time::Duration;
 pub const MAX_INPUT_BYTES: u64 = 1 << 30;
 /// Default cumulative decoded-byte ceiling for one top-level call.
 pub const MAX_DECODED_BYTES: u64 = 1 << 30;
+/// Default maximum decoded-to-input expansion ratio.
+pub const MAX_EXPANSION_RATIO: u64 = 512;
+/// Decoded bytes allowed before the expansion-ratio ceiling becomes relevant.
+pub const MIN_EXPANSION_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 /// Smallest timeout accepted by the command-line interface.
 pub const MIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default wall-clock search budget for one top-level call.
@@ -76,6 +80,14 @@ pub struct Options {
     pub max_input_bytes: u64,
     /// Maximum cumulative decoded payload bytes across the supplied file.
     pub max_decoded_bytes: u64,
+    /// Maximum cumulative decoded bytes relative to the top-level input size.
+    ///
+    /// The ratio is applied after a 64 MiB decoded allowance, and is combined
+    /// with `max_decoded_bytes` by taking the smaller limit. This rejects a
+    /// compact Deflate bomb before it can consume the full absolute allowance.
+    /// Set this to `None` only when the caller trusts unusually
+    /// high-compression input and supplies an appropriate absolute limit.
+    pub max_expansion_ratio: Option<u64>,
 }
 
 impl Default for Options {
@@ -89,6 +101,7 @@ impl Default for Options {
             timeout: DEFAULT_TIMEOUT,
             max_input_bytes: MAX_INPUT_BYTES,
             max_decoded_bytes: MAX_DECODED_BYTES,
+            max_expansion_ratio: Some(MAX_EXPANSION_RATIO),
         }
     }
 }
