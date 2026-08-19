@@ -34,10 +34,14 @@ three complete journals.
 
 The complete DeflOpt and like-for-like Defluff refreshes use the current
 distribution binary SHA-256
-`5d8aa667026dbfe7edff9b5917dcaf7352354e54ebaa477cda8e893250e41650`.
-The complete timed-deft4j journal and its miss replays use an earlier binary;
-the accepted candidate results below are kept separate so executable hashes
-are not mixed within a journal.
+`5bac688c214e576cdfb54bc04b463c8e102a7f3f46f545f06205c5daea8db48e`.
+The complete timed-deft4j journal and its miss replays use the earlier binary
+SHA-256
+`ef63e3228ee65b70fd14aa0fea4345af70893e3535928a572ec81003fa5ce44c`;
+the accepted candidate and 40-file guard use
+`9f8262d6cd667295b2863d4835d7b69d777514ba94b31d53a19992568fff839e`.
+These results are kept separate so executable hashes are not mixed within a
+journal.
 The changed-parent no-split candidate is intentionally kept in separate sample
 state while it is validated, so the complete journals do not mix executable
 hashes.
@@ -132,11 +136,11 @@ reason to interrupt a complete benchmark refresh.
 | `css-ig-net/barchart.png` | DeflOpt | Candidate remains two bits above its historical floor. |
 | `css-ig-net/briefcase.png` | both | Candidate remains one byte / five bits above its historical floor. |
 | `css-ig-net/caution.png` | both | Candidate remains one byte / one bit above its historical floor. |
-| `medium/loupe-fs8.png` | DeflOpt | Candidate narrows the difference to one meaningful bit. |
+| `medium/loupe-fs8.png` | DeflOpt | Ten-second candidate is one bit above its floor; 30 seconds improves the floor by 4 bytes / 33 bits. |
 | `oxipng/grayscale_2_should_be_grayscale_1.png` | deft4j | Candidate remains four bits above its historical floor. |
 | `oxipng/grayscale_8_should_be_palette_8.png` | DeflOpt | Fixed: candidate is 39 bytes / 311 bits below its historical floor. |
 | `pkmn-bw/000-Logo-2.png` | both | Candidate remains two bits above its historical floor. |
-| `small/bomb.png` | both | Candidate remains five bits above its historical floor. |
+| `small/bomb.png` | both | Ten-second candidate is five bits above its floor; 30 seconds reaches exact parity. |
 | `small/check.png` | both | Fixed by retaining the ordinary no-split parent before refinement. |
 | `small/news.png` | both | Candidate remains three bits above its historical floor. |
 
@@ -215,6 +219,25 @@ canary 8 bytes / 80 bits above its floor. Direct lineage traces explain the
 trade-off: `sample_59.png` benefits from the earlier, weaker parent, whereas
 `Matrix.png` needs the one-fifth parent before its best descendant becomes
 reachable. No corpus-size threshold was introduced to choose between them.
+
+Historical replay also isolates the remaining Zopfli-sensitive cluster.
+`sample_17-fs8.png` reaches 3,949 bytes / 23,981 bits through `a9e5879`; the
+first loss is `847e0a3`, which introduced the exact Zopfli RLE-friendly tree,
+and later commits retain the 3,953-byte / 24,009-bit basin. Removing Zopfli
+globally restores that and several 1–7-bit floors but loses newer, materially
+stronger lineages. Two additive approximations were therefore tested: retain
+the exact pre-Zopfli tree as another transformation seed, and retain both
+already-built Defluff-derived feedback trees as transformation seeds. Neither
+recovered `sample_17-fs8.png` or `small/bomb.png`; both added work. Longer Max
+trials distinguish deadline pressure from a lost route lineage. At 30 seconds,
+the current engine reaches `bomb.png`'s exact 9,537-bit floor and improves
+`loupe-fs8.png` beyond its historical floor by 4 bytes / 33 bits. The other
+eight differences do not recover: `sample_17-fs8.png` remains in the same
+3,953-byte basin at 24,010 bits in that bounded run, and the seven smaller
+cases retain their 1–7-bit differences. Reproducing the former historical
+lineage requires a complete second no-split state lineage, which is rejected
+here because it duplicates substantial Max work for at most four bytes in the
+known guard set.
 
 The remaining historical-floor differences are retained as priority cases,
 but accepted for this build where the only identified common reversal caused

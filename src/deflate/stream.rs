@@ -391,6 +391,26 @@ pub(crate) fn plan_stream_with_progress(
         }
     }
     progress.checkpoint("Comparison floor", fallback_bits, fallback.len());
+    if options.exhaustive && !stop.reached() {
+        if let Some(candidate) = plan_selected_huffman_boundary_reseat(
+            &fallback,
+            start_alignment,
+            options,
+            &mut plan_cache,
+            stop,
+        ) {
+            let candidate_bits = total_bits(&candidate);
+            progress.checkpoint(
+                "Comparison-floor boundary reseat",
+                candidate_bits,
+                candidate.len(),
+            );
+            if candidate_bits < fallback_bits {
+                fallback = candidate;
+                fallback_bits = candidate_bits;
+            }
+        }
+    }
 
     // Search the most promising pre-grouped list before the original long
     // list can consume the deadline. Columbo's original C block-list route
@@ -890,6 +910,107 @@ fn plan_selected_huffman_merge_floor(
     append_output_plan(&mut output, &mut output_bits, pending_plan, true)?;
 
     (output_bits < total_bits(plans)).then_some(output)
+}
+
+/// Reconsider one boundary between adjacent blocks in a selected Max plan.
+///
+/// The comparison floor has already paid for the token spellings on both sides.
+/// Join each bounded pair only for histogram cut discovery, exact-price its best
+/// new adaptive cut, and retain at most the strongest single reseat. All
+/// surrounding blocks are alignment-independent, so a shorter replacement
+/// cannot invalidate their established prices.
+fn plan_selected_huffman_boundary_reseat(
+    plans: &[PlannedBlock],
+    start_alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    if !options.exhaustive
+        || !(2..=MAX_REGROUP_SOURCE_BLOCKS).contains(&plans.len())
+        || plans
+            .iter()
+            .any(|plan| !plan_is_alignment_independent(plan))
+    {
+        return None;
+    }
+    let token_count = plans
+        .iter()
+        .try_fold(0_usize, |total, plan| total.checked_add(plan.tokens.len()))?;
+    let plain_count = plans
+        .iter()
+        .try_fold(0_usize, |total, plan| total.checked_add(plan.plain.len()))?;
+    if token_count > COLLECTED_RUN_MAX_TOKENS || plain_count > COLLECTED_RUN_MAX_PLAIN {
+        return None;
+    }
+
+    let mut prefix_bits = 0_u64;
+    let mut best_savings = 0_u64;
+    let mut best_reseat = None;
+    for pair_index in 0..plans.len() - 1 {
+        if stop.reached() {
+            break;
+        }
+        let pair = [
+            parsed_from_selected_plan(&plans[pair_index]),
+            parsed_from_selected_plan(&plans[pair_index + 1]),
+        ];
+        let Some(composite) = Composite::new(&pair) else {
+            break;
+        };
+        let start = Cut { token: 0, plain: 0 };
+        let end = Cut {
+            token: composite.tokens.len(),
+            plain: composite.plain.len(),
+        };
+        let existing = Cut {
+            token: pair[0].tokens.len(),
+            plain: pair[0].plain.len(),
+        };
+        let mut cuts = Vec::new();
+        let Some(()) =
+            add_adaptive_split_cut(&mut cuts, &composite, start, end, options.strict, stop)
+        else {
+            break;
+        };
+        let Some(&split) = cuts.first().filter(|&&split| split != existing) else {
+            prefix_bits = prefix_bits.checked_add(plans[pair_index].bits)?;
+            continue;
+        };
+        let alignment = ((u64::from(start_alignment) + prefix_bits) & 7) as u8;
+        let Some(replacement) = plan_structural_ranges(
+            &composite,
+            &[start, split, end],
+            alignment,
+            options,
+            plan_cache,
+            stop,
+        ) else {
+            break;
+        };
+        let old_bits = plans[pair_index]
+            .bits
+            .checked_add(plans[pair_index + 1].bits)?;
+        let replacement_bits = total_bits(&replacement);
+        let savings = old_bits.saturating_sub(replacement_bits);
+        if savings > best_savings {
+            best_savings = savings;
+            best_reseat = Some((pair_index, replacement));
+        }
+        prefix_bits = prefix_bits.checked_add(plans[pair_index].bits)?;
+    }
+
+    let (pair_index, replacement) = best_reseat?;
+    let mut output = Vec::new();
+    output.try_reserve_exact(plans.len()).ok()?;
+    for plan in &plans[..pair_index] {
+        output.push(try_clone_planned_block(plan)?);
+    }
+    output.extend(replacement);
+    for plan in &plans[pair_index + 2..] {
+        output.push(try_clone_planned_block(plan)?);
+    }
+    (total_bits(&output) < total_bits(plans)).then_some(output)
 }
 
 fn parsed_from_selected_plan(plan: &PlannedBlock) -> ParsedBlock {
@@ -5970,6 +6091,56 @@ mod tests {
         assert!(total_bits(&merged) < total_bits(&selected));
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].plain.as_slice(), &[b'a'; 1_600]);
+    }
+
+    #[test]
+    fn selected_plan_boundary_reseat_finds_a_better_transition() {
+        let options = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        let mut left_bytes = vec![b'a'; 733];
+        left_bytes.extend(std::iter::repeat(b'z').take(291));
+        let blocks = [
+            literal_block(&left_bytes, SourceBlockType::Dynamic),
+            literal_block(&vec![b'z'; 1_024], SourceBlockType::Dynamic),
+        ];
+        let mut plan_cache = CanonicalPlanCache::new();
+        let selected = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
+        let reseated = plan_selected_huffman_boundary_reseat(
+            &selected,
+            0,
+            &options,
+            &mut plan_cache,
+            &mut SearchStop::never(),
+        )
+        .expect("the literal transition is a cheaper boundary");
+
+        assert!(total_bits(&reseated) < total_bits(&selected));
+        assert_eq!(reseated.len(), 2);
+        assert_eq!(reseated[0].plain.len(), 733);
+        let decoded: Vec<_> = reseated
+            .iter()
+            .flat_map(|plan| plan.plain.iter().copied())
+            .collect();
+        assert_eq!(decoded, [vec![b'a'; 733], vec![b'z'; 1_315]].concat());
+
+        assert!(plan_selected_huffman_boundary_reseat(
+            &selected,
+            0,
+            &Options::default(),
+            &mut plan_cache,
+            &mut SearchStop::never(),
+        )
+        .is_none());
+        assert!(plan_selected_huffman_boundary_reseat(
+            &selected,
+            0,
+            &options,
+            &mut plan_cache,
+            &mut SearchStop::always(),
+        )
+        .is_none());
     }
 
     #[test]

@@ -50,7 +50,7 @@ candidate.
 | 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Implemented |
 | 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Graft explored; not adopted |
 | 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Implemented |
-| 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Proposed |
+| 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Reseat implemented; second basin not adopted |
 | 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Header kernel implemented |
 | 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Proposed |
 
@@ -72,7 +72,7 @@ For Columbo, every in-scope improvement belongs to one of these areas:
 | Area | Current coverage | Remaining plausible gap |
 | --- | --- | --- |
 | Wrapper and container bytes | PNG/APNG, GZIP, ZIP, and zlib reconstruction, metadata handling, duplicate-frame reuse, exact candidate comparison | Format-specific work only; no general Deflate method found |
-| Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split | A second adaptive basin, one local boundary reseat, and a diagnosed forced-split escape |
+| Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split, one comparison-floor adjacent-boundary reseat | A diagnosed forced-split escape; revisit a second adaptive basin only after a reproducible miss |
 | Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites, and bounded header-aware composition across several matches | Wider composition only after a diagnosed miss; the implemented compact beam covers the demonstrated gap |
 | Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | A near-optimal tree frontier only after a diagnosed miss; the bounded unused-symbol graft trial found no real-file win |
 | Dynamic header | Eight repeat masks, balanced and zero-continuation packs, DeflOpt/deft4j/Defluff-derived routes, exact shortest RLE for one fixed code-length tree, four feedback passes | Retain several RLE alternatives because the cheapest parse under the current tree need not build the cheapest next tree |
@@ -450,13 +450,13 @@ This route never searches the history window: every submatch remains inside
 one original match and retains its original distance. Its novelty is global
 selection across several already-proven alternatives.
 
-### 6. Boundary polishing not already covered
+### 6. Boundary polishing not already covered — one reseat implemented
 
 The global boundary graph already chooses exactly among its known cuts and
 prices starting bit alignment. The missing work is cut *discovery*, not another
 segmentation pass over the same nodes.
 
-Two bounded Max experiments remain justified:
+Two bounded Max experiments were evaluated:
 
 1. retain one well-separated second minimum from the existing adaptive split
    probe cache and exactly plan it; and
@@ -464,9 +464,28 @@ Two bounded Max experiments remain justified:
    one new adaptive cut across the union, and accept only the exactly smaller
    complete route.
 
-Do not copy Turtledeflate's repeated recompression loop. Columbo should reuse
-its range index and canonical plan cache, limit the number of new cuts, and
-stop after one pass.
+The second-basin prototype tied the existing output on all ten selected
+priority-guard files and was removed. The adjacent-boundary reseat is retained:
+before broad source search, Max considers comparison floors of 2–8
+alignment-independent Huffman blocks, capped at 8,192 tokens and 512 KiB
+decoded. It reuses the adaptive histogram probe and canonical plan cache,
+exactly prices each completed adjacent replacement, and keeps at most the
+strongest single strict win. It never repeats recompression or discovers new
+matches.
+
+At an equivalent ten-second Max timeout, repeatable final-file A/B wins were
+10 bytes / 80 meaningful bits on `sample_17-fs8.png`, 1 byte / 8 bits on
+`bomb.png`, and 3 meaningful bits at equal bytes on `loupe-fs8.png`. The direct
+comparison-floor replacements saved 366, 13, and 17 bits respectively; later
+lineage work could improve those completed parents further. A serial 40-case
+historical regression guard exposed no miss attributable to the route: its
+reported misses either tied the clean executable, came from a Max-ineligible
+plan, or were in Default mode. The original complete candidate remains the
+quality floor throughout. `bomb.png` and `loupe-fs8.png` remained effectively
+timing-neutral. On `sample_17-fs8.png`, the better parent admitted more
+downstream lineage work and increased observed wall time from 14.6 to 19.7
+seconds despite the same configured timeout; that measured cost buys the
+byte-first win rather than hiding it.
 
 ### 7. Header-kernel and wider interval caching — header kernel implemented
 
@@ -578,8 +597,10 @@ their output safe.
 7. Completed: retain bounded header-aware proven-spelling composition after
    98 local block wins, one unique byte win, one unique same-byte bit win, and
    no change across the established hard sample.
-8. Next: add the second adaptive split basin and one adjacent-boundary reseat.
-9. Consider a forced split only if a remaining substantial miss proves the
+8. Completed: retain one bounded adjacent-boundary reseat after byte and bit
+   wins at equal timeout. The well-separated second-basin prototype produced
+   no output gain on the selected priority guard and was removed.
+9. Next: consider a forced split only if a remaining substantial miss proves the
    need.
 
 This order resolves the cheapest untested degrees of freedom first and makes
