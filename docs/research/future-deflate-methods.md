@@ -43,6 +43,13 @@ subsequent exact Zopfli RLE-friendly pseudo-frequency control produced distinct
 complete-plan and real-file wins, so it is now retained as one paired Max
 candidate.
 
+Later evidence justified two coupled searches: a compact header-aware beam
+across several proven match spellings, and boundary escape through one forced
+runner-up split followed by one reseat. Both are now implemented behind tight
+Max gates. Wider frequency-kernel caching, an unused-symbol tree graft, and a
+standalone second split basin were measured and removed because they did not
+repay their runtime or complexity.
+
 | Priority | Experiment | Likely benefit | Initial runtime policy | Status |
 | ---: | --- | ---: | --- | --- |
 | 1 | Distance-side and paired balanced-tree moves | Tiny–small, broad | Bounded default; wider Max | Implemented |
@@ -50,9 +57,9 @@ candidate.
 | 3 | Exact Zopfli RLE-friendly pseudo-frequencies | Small, broad | One paired Max candidate | Implemented |
 | 4 | Header-aware data-tree frontier and unused-symbol grafts | Small–medium on difficult headers | Max | Graft explored; not adopted |
 | 5 | Header-aware proven-spelling composition | Medium on selected misses | Targeted Max | Implemented |
-| 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Reseat implemented; second basin not adopted |
-| 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Header kernel implemented |
-| 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Proposed |
+| 6 | Second split basin and one adjacent-boundary reseat | Medium on difficult files | Bounded Max | Reseat implemented; standalone second basin not adopted |
+| 7 | Header-kernel and wider interval caching | Runtime saving | All applicable routes | Header implemented; frequency layer explored, not adopted |
+| 8 | One forced-split escape | Rare but potentially substantial | Heavily gated Max | Implemented |
 
 Every experiment must retain the original complete candidate and accept a
 rewrite only when exact byte count, then meaningful Deflate bits, improves.
@@ -72,11 +79,11 @@ For Columbo, every in-scope improvement belongs to one of these areas:
 | Area | Current coverage | Remaining plausible gap |
 | --- | --- | --- |
 | Wrapper and container bytes | PNG/APNG, GZIP, ZIP, and zlib reconstruction, metadata handling, duplicate-frame reuse, exact candidate comparison | Format-specific work only; no general Deflate method found |
-| Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split, one comparison-floor adjacent-boundary reseat | A diagnosed forced-split escape; revisit a second adaptive basin only after a reproducible miss |
+| Block partition and representation | Stored/fixed/dynamic selection, merge/group/split routes, cuts inside proven matches, global alignment-aware boundary graph, adaptive split, one comparison-floor adjacent-boundary reseat, and one bounded forced-split escape | Revisit wider or repeated forced splitting only after another reproducible miss |
 | Proven token spelling | Length-258 normalization/alias, match-to-literal families, same-distance repacking, per-match proven-submatch graph, combined rewrites, and bounded header-aware composition across several matches | Wider composition only after a diagnosed miss; the implemented compact beam covers the demonstrated gap |
 | Literal/length and distance trees | Multiple DeflOpt, Defluff, deft4j, and Columbo builders; exact source-tree reuse/repack; equal-frequency assignments; greedy swaps; adjacency-aware pseudo-frequencies; symmetric pair/quad moves and a bounded paired cross-product | A near-optimal tree frontier only after a diagnosed miss; the bounded unused-symbol graft trial found no real-file win |
 | Dynamic header | Eight repeat masks, balanced and zero-continuation packs, DeflOpt/deft4j/Defluff-derived routes, exact shortest RLE for one fixed code-length tree, four feedback passes | Retain several RLE alternatives because the cheapest parse under the current tree need not build the cheapest next tree |
-| Search engineering | Route-local canonical block-plan and exact-length header-kernel caches, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Cache frequency-planning kernels; share completed immutable interval kernels across compatible sibling lineages |
+| Search engineering | Route-local canonical block-plan and exact-length header-kernel caches, boundary range index, edge-kernel reuse, fingerprints and work/deadline gates | Share completed immutable interval kernels only after measurements expose enough duplicate cross-lineage work; the frequency-planning cache trial did not meet that threshold |
 
 This inventory also explains why a new whole-block proven-match lattice is not,
 by itself, a new method. Existing match intervals do not overlap, so under one
@@ -164,9 +171,11 @@ while its match discovery and parse diversification remain out of scope. The
 source-pinned audit and exact classifications are in
 [`turtledeflate-methods.md`](./turtledeflate-methods.md).
 
-The remaining boundary ideas from that audit—one second split basin, one
-bounded adjacent-boundary reseat, and a forced split only for a diagnosed
-miss—remain valid lower-priority experiments.
+The bounded adjacent-boundary reseat and, after a diagnosed miss, one
+forced-split escape are now implemented. A standalone second-basin candidate
+did not improve the original guard and remains excluded; the forced escape
+uses its runner-up only as an intermediate before exact replanning and one
+reseat.
 
 ## Ground-truth gaps in the current source
 
@@ -487,7 +496,7 @@ downstream lineage work and increased observed wall time from 14.6 to 19.7
 seconds despite the same configured timeout; that measured cost buys the
 byte-first win rather than hiding it.
 
-### 7. Header-kernel and wider interval caching — header kernel implemented
+### 7. Header-kernel and wider interval caching — frequency layer not adopted
 
 Broader search should be paid for by eliminating duplicated deterministic
 work. The first layer is now implemented:
@@ -505,30 +514,58 @@ the canonical whole-block cache. Runtime instrumentation observed real hits;
 a triplicate short Max control was neutral at 3.99 seconds before and 4.01
 seconds after, with identical output.
 
-The remaining possible layer is a frequency-planning kernel keyed by
+A second prototype cached the complete fixed/dynamic planning kernel by exact
 literal/length frequencies, distance frequencies, match extra-bit total,
-strict policy, exhaustive policy, and any source-tree seed that participates
-in candidate generation.
+strict and exhaustive policy, and source-tree seed. It retained at most 512
+completed immutable kernels, verified the full key after hash lookup, and
+never published deadline-aborted work. Focused tests proved reuse across
+different token orders, policy and source-seed isolation, collision safety,
+and bounded saturation.
 
-The emitted token order does not change Huffman payload cost, although it still
-matters to final emission and identity verification. Cache only immutable,
-completed planning kernels; verify the full key after hash lookup; and never
-publish deadline-aborted work.
+The route-level opportunity rate was too low to retain it. Across five
+targeted Max files, telemetry found only one frequency-equivalent reuse among
+hundreds of route-local cache probes. The five-run Default control on
+`nascar.png` remained about 0.42–0.43 seconds after warm-up with or without the
+prototype. On the one file that produced a hit,
+`sample_17-fs8.png`, both versions selected the same 2,992-byte / 23,929-bit
+Deflate result; the measured Max wall time was 18.4 seconds without the cache
+and 19.0 seconds with it. That single noisy comparison showed no speed benefit
+to offset the added hashing and retained memory, so the prototype was removed.
 
-After measuring route-local hit rates, consider sharing immutable interval
-kernels across compatible sibling lineages. Do not add synchronization to the
-hot path without evidence that cross-lineage hits repay it.
+Immutable interval sharing across sibling lineages remains conceptually safe,
+but the frequency-cache result removes the evidence for implementing it now.
+Do not add synchronization to the hot path unless later instrumentation finds
+a materially denser duplicate-work class.
 
-### 8. One forced-split escape
+### 8. One forced-split escape — implemented
 
-A locally losing split can expose a later winning split, but unrestricted
-lookahead is expensive and usually unproductive. Keep this disabled until a
-specific reproducible miss demonstrates it.
+A locally losing split can expose a later winning boundary arrangement, but
+unrestricted lookahead is expensive and usually unproductive. A reproducible
+miss on `sample_17-fs8.png` demonstrated this case: the ordinary two-block
+comparison floor in one winning lineage cost 24,279 meaningful bits; forcing
+the well-separated runner-up adaptive basin initially worsened it to 24,291
+bits, and one adjacent-boundary reseat then reached 24,059 bits.
+Downstream compact splitting selected a 23,904-bit result. Against the
+pre-change binary at the same ten-second Max timeout, the final PNG improved
+from 3,943 to 3,939 bytes and its Deflate stream from 23,929 to 23,904
+meaningful bits on repeated dry runs.
 
-For that miss, try at most one forced cut from the second adaptive basin,
-followed by one adjacent-boundary reseat. Require a hard candidate, decoded
-size, token, probe, and time cap. Exact complete comparison remains the only
-acceptance test.
+The retained route is deliberately narrower than a repeated pushed-split
+search. It runs only in Max while time remains, starts from 2–7
+alignment-independent Huffman blocks totalling at most 8,192 tokens and 512
+KiB decoded bytes, and selects the largest block having at least 513 tokens
+and 128 decoded bytes. The existing adaptive search keeps one sampled local
+minimum at least the greater of one seventh of the token span or sixteen
+tokens away from its best basin, without exceeding the existing 128-probe
+budget. Columbo forces exactly that one cut, exactly replans the two children,
+then tries exactly one existing adjacent-boundary reseat. The secured complete
+floor remains available throughout, and the new candidate survives only on a
+strict complete-plan meaningful-bit win.
+
+The first wider dry-run sample covered the historical backlog and fifteen
+additional PNG/APNG files. It found no other output difference or route
+displacement, which is appropriate for a rare escape rather than a new broad
+split loop.
 
 ## Methods that remain excluded
 
@@ -600,8 +637,13 @@ their output safe.
 8. Completed: retain one bounded adjacent-boundary reseat after byte and bit
    wins at equal timeout. The well-separated second-basin prototype produced
    no output gain on the selected priority guard and was removed.
-9. Next: consider a forced split only if a remaining substantial miss proves the
-   need.
+9. Completed: trial a bounded frequency-planning kernel cache. One hit across
+   five targeted Max files produced no observed runtime or output benefit, so
+   remove it and leave cross-lineage interval sharing deferred.
+10. Completed: retain one heavily gated forced split after a reproducible
+    four-byte file win and twenty-five-bit Deflate win. The route reuses the
+    existing 128-probe bound, forces only the well-separated second
+    basin, permits one boundary reseat, and exact-prices the complete result.
 
 This order resolves the cheapest untested degrees of freedom first and makes
 later searches pay for themselves through measured reuse.

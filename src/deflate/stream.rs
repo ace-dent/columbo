@@ -99,6 +99,10 @@ const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
 const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
 const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
 const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
+// Forced lookahead may add one block to an already-selected comparison floor.
+// Keeping the parent at seven blocks preserves the existing eight-block
+// structural and boundary-reseat ceiling.
+const FORCED_SPLIT_MAX_PARENT_BLOCKS: usize = MAX_REGROUP_SOURCE_BLOCKS - 1;
 // Seven decoded-eighth probes can each contribute the legacy snapped boundary
 // and one exact inside-match sibling. Compact max mode adds at most fourteen
 // 32-token anchors, so 32 retains the complete bounded set.
@@ -402,6 +406,26 @@ pub(crate) fn plan_stream_with_progress(
             let candidate_bits = total_bits(&candidate);
             progress.checkpoint(
                 "Comparison-floor boundary reseat",
+                candidate_bits,
+                candidate.len(),
+            );
+            if candidate_bits < fallback_bits {
+                fallback = candidate;
+                fallback_bits = candidate_bits;
+            }
+        }
+    }
+    if options.exhaustive && !stop.reached() {
+        if let Some(candidate) = plan_forced_split_boundary_escape(
+            &fallback,
+            start_alignment,
+            options,
+            &mut plan_cache,
+            stop,
+        ) {
+            let candidate_bits = total_bits(&candidate);
+            progress.checkpoint(
+                "Forced-split boundary escape",
                 candidate_bits,
                 candidate.len(),
             );
@@ -1011,6 +1035,100 @@ fn plan_selected_huffman_boundary_reseat(
         output.push(try_clone_planned_block(plan)?);
     }
     (total_bits(&output) < total_bits(plans)).then_some(output)
+}
+
+/// Test one deliberately non-greedy split before one bounded boundary reseat.
+///
+/// Turtledeflate's pushed-split route can cross a locally losing state before
+/// boundary movement finds a better complete partition. Columbo admits only a
+/// much smaller experiment: select the largest eligible block in a compact Max
+/// comparison floor, force the well-separated second basin already observed by
+/// the adaptive histogram probes, then run the existing single-reseat pass.
+/// The original complete floor remains the exact acceptance bound.
+fn plan_forced_split_boundary_escape(
+    plans: &[PlannedBlock],
+    start_alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    if !options.exhaustive
+        || !(2..=FORCED_SPLIT_MAX_PARENT_BLOCKS).contains(&plans.len())
+        || plans
+            .iter()
+            .any(|plan| !plan_is_alignment_independent(plan))
+    {
+        return None;
+    }
+    let token_count = plans
+        .iter()
+        .try_fold(0_usize, |total, plan| total.checked_add(plan.tokens.len()))?;
+    let plain_count = plans
+        .iter()
+        .try_fold(0_usize, |total, plan| total.checked_add(plan.plain.len()))?;
+    if token_count > COLLECTED_RUN_MAX_TOKENS || plain_count > COLLECTED_RUN_MAX_PLAIN {
+        return None;
+    }
+
+    let (block_index, selected) = plans
+        .iter()
+        .enumerate()
+        .filter(|(_, plan)| {
+            (ADAPTIVE_SPLIT_MIN_TOKENS..=MAX_MERGED_TOKENS).contains(&plan.tokens.len())
+                && plan.plain.len() >= 128
+        })
+        .max_by_key(|(index, plan)| (plan.tokens.len(), plan.plain.len(), usize::MAX - index))?;
+    if stop.reached() {
+        return None;
+    }
+
+    let block = parsed_from_selected_plan(selected);
+    let composite = Composite::new(std::slice::from_ref(&block))?;
+    let start = Cut { token: 0, plain: 0 };
+    let end = Cut {
+        token: block.tokens.len(),
+        plain: block.plain.len(),
+    };
+    let split = secondary_adaptive_split_cut(&composite, start, end, options.strict, stop)?;
+    let prefix_bits = plans[..block_index]
+        .iter()
+        .try_fold(0_u64, |bits, plan| bits.checked_add(plan.bits))?;
+    let alignment = ((u64::from(start_alignment) + prefix_bits) & 7) as u8;
+    let replacement = plan_structural_ranges(
+        &composite,
+        &[start, split, end],
+        alignment,
+        options,
+        plan_cache,
+        stop,
+    )?;
+
+    let mut forced = Vec::new();
+    forced.try_reserve_exact(plans.len().checked_add(1)?).ok()?;
+    for plan in &plans[..block_index] {
+        forced.push(try_clone_planned_block(plan)?);
+    }
+    forced.extend(replacement);
+    for plan in &plans[block_index + 1..] {
+        forced.push(try_clone_planned_block(plan)?);
+    }
+
+    let floor_bits = total_bits(plans);
+    let forced_bits = total_bits(&forced);
+    if !stop.reached() {
+        if let Some(reseated) = plan_selected_huffman_boundary_reseat(
+            &forced,
+            start_alignment,
+            options,
+            plan_cache,
+            stop,
+        ) {
+            if total_bits(&reseated) < floor_bits && total_bits(&reseated) < forced_bits {
+                return Some(reseated);
+            }
+        }
+    }
+    (forced_bits < floor_bits).then_some(forced)
 }
 
 fn parsed_from_selected_plan(plan: &PlannedBlock) -> ParsedBlock {
@@ -3871,6 +3989,12 @@ struct AdaptiveSplit {
     bits: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdaptiveSplitSearch {
+    best: AdaptiveSplit,
+    secondary: Option<AdaptiveSplit>,
+}
+
 /// Add one max-only cut using Columbo's independent, bounded implementation of
 /// the coarse-to-fine concept in Turtledeflate's
 /// `turtledeflate_best_block_split` at commit 756f844.
@@ -3889,8 +4013,50 @@ fn add_adaptive_split_cut(
     min_distance_codes: bool,
     stop: &mut SearchStop<'_>,
 ) -> Option<()> {
-    if !composite.cut_is_token_boundary(start) || !composite.cut_is_token_boundary(end) {
+    let Some((unsplit_bits, search)) =
+        adaptive_histogram_split_search(composite, start, end, min_distance_codes, stop)
+    else {
         return Some(());
+    };
+    if search.best.bits < unsplit_bits {
+        add_cut(cuts, composite, search.best.token)?;
+    }
+    Some(())
+}
+
+/// Return one well-separated runner-up from the existing adaptive probes.
+///
+/// This does not spend a second probe budget. It is used only by the bounded
+/// forced-lookahead experiment, whose exact complete-plan comparison decides
+/// whether the deliberately non-greedy boundary is useful.
+fn secondary_adaptive_split_cut(
+    composite: &Composite,
+    start: Cut,
+    end: Cut,
+    min_distance_codes: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<Cut> {
+    let (_, search) =
+        adaptive_histogram_split_search(composite, start, end, min_distance_codes, stop)?;
+    let candidate = search.secondary?;
+    let plain = *composite.token_plain_offsets.get(candidate.token)?;
+    let cut = Cut {
+        token: candidate.token,
+        plain,
+    };
+    (composite.cut_is_token_boundary(cut) && start.plain < plain && plain < end.plain)
+        .then_some(cut)
+}
+
+fn adaptive_histogram_split_search(
+    composite: &Composite,
+    start: Cut,
+    end: Cut,
+    min_distance_codes: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<(u64, AdaptiveSplitSearch)> {
+    if !composite.cut_is_token_boundary(start) || !composite.cut_is_token_boundary(end) {
+        return None;
     }
     let token_count = end.token.checked_sub(start.token)?;
     let plain_count = end.plain.checked_sub(start.plain)?;
@@ -3898,7 +4064,7 @@ fn add_adaptive_split_cut(
         || plain_count < 128
         || composite.frequency_checkpoints.is_none()
     {
-        return Some(());
+        return None;
     }
 
     let whole = composite.range_frequencies(start.token, end.token)?;
@@ -3928,14 +4094,8 @@ fn add_adaptive_split_cut(
         left_bits.checked_add(right_bits)
     };
 
-    let Some(candidate) = coarse_to_fine_split(start.token, end.token, &mut score_split, stop)
-    else {
-        return Some(());
-    };
-    if candidate.bits < unsplit_bits {
-        add_cut(cuts, composite, candidate.token)?;
-    }
-    Some(())
+    let search = coarse_to_fine_split_search(start.token, end.token, &mut score_split, stop)?;
+    Some((unsplit_bits, search))
 }
 
 fn estimate_histogram_range_bits(
@@ -3958,12 +4118,25 @@ fn estimate_histogram_range_bits(
 /// This independent Columbo implementation is substantially different from
 /// Turtledeflate's `turtledeflate_best_block_split`; it is not a translation
 /// or exact recreation.
+#[cfg(test)]
 fn coarse_to_fine_split<S>(
     start: usize,
     end: usize,
     score: &mut S,
     stop: &mut SearchStop<'_>,
 ) -> Option<AdaptiveSplit>
+where
+    S: FnMut(usize) -> Option<u64>,
+{
+    Some(coarse_to_fine_split_search(start, end, score, stop)?.best)
+}
+
+fn coarse_to_fine_split_search<S>(
+    start: usize,
+    end: usize,
+    score: &mut S,
+    stop: &mut SearchStop<'_>,
+) -> Option<AdaptiveSplitSearch>
 where
     S: FnMut(usize) -> Option<u64>,
 {
@@ -4042,13 +4215,35 @@ where
         cached_adaptive_split_score(token, &mut probes, &mut cache, score, stop)?;
     }
 
-    cache.into_iter().min_by_key(|candidate| {
+    let candidate_key = |candidate: &AdaptiveSplit| {
         (
             candidate.bits,
             candidate.token.abs_diff(original_midpoint),
             candidate.token,
         )
-    })
+    };
+    let best = *cache
+        .iter()
+        .min_by_key(|candidate| candidate_key(candidate))?;
+    cache.sort_unstable_by_key(|candidate| candidate.token);
+    let separation = ((end - start) / ADAPTIVE_SPLIT_INTERVALS).max(ADAPTIVE_SPLIT_FINAL_WIDTH);
+    let secondary = cache
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.token.abs_diff(best.token) >= separation)
+        .filter(|(index, candidate)| {
+            let left_is_no_better = index
+                .checked_sub(1)
+                .and_then(|left| cache.get(left))
+                .map_or(true, |left| left.bits >= candidate.bits);
+            let right_is_no_better = cache
+                .get(index + 1)
+                .map_or(true, |right| right.bits >= candidate.bits);
+            left_is_no_better && right_is_no_better
+        })
+        .min_by_key(|(_, candidate)| candidate_key(candidate))
+        .map(|(_, candidate)| *candidate);
+    Some(AdaptiveSplitSearch { best, secondary })
 }
 
 fn cached_adaptive_split_score<S>(
@@ -5358,6 +5553,24 @@ mod tests {
     }
 
     #[test]
+    fn coarse_to_fine_split_retains_one_well_separated_secondary_basin() {
+        let mut score = |token: usize| {
+            let primary = token.abs_diff(420) as u64;
+            let secondary = token.abs_diff(1_600) as u64;
+            Some((primary * primary).min(100 + secondary * secondary))
+        };
+        let search = coarse_to_fine_split_search(0, 2_048, &mut score, &mut SearchStop::never())
+            .expect("two sampled basins");
+
+        assert_eq!(search.best.token, 420);
+        let secondary = search
+            .secondary
+            .expect("the distant local minimum is retained");
+        assert!(secondary.token > 1_000);
+        assert!(secondary.token.abs_diff(search.best.token) >= 2_048 / ADAPTIVE_SPLIT_INTERVALS);
+    }
+
+    #[test]
     fn adaptive_histogram_cut_finds_a_literal_transition() {
         let mut bytes = vec![b'a'; 733];
         bytes.extend(std::iter::repeat(b'z').take(1_315));
@@ -6137,6 +6350,37 @@ mod tests {
             &selected,
             0,
             &options,
+            &mut plan_cache,
+            &mut SearchStop::always(),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn forced_split_escape_is_max_only_and_deadline_bounded() {
+        let blocks = [
+            literal_block(&vec![b'a'; 1_024], SourceBlockType::Dynamic),
+            literal_block(&vec![b'z'; 1_024], SourceBlockType::Dynamic),
+        ];
+        let mut plan_cache = CanonicalPlanCache::new();
+        let selected =
+            direct_structural_plan(&blocks, 0, &Options::default(), &mut plan_cache).unwrap();
+
+        assert!(plan_forced_split_boundary_escape(
+            &selected,
+            0,
+            &Options::default(),
+            &mut plan_cache,
+            &mut SearchStop::never(),
+        )
+        .is_none());
+        assert!(plan_forced_split_boundary_escape(
+            &selected,
+            0,
+            &Options {
+                exhaustive: true,
+                ..Options::default()
+            },
             &mut plan_cache,
             &mut SearchStop::always(),
         )

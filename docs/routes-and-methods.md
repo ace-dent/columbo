@@ -303,7 +303,7 @@ flowchart TD
     M12 -- "Completed" --> M4SRC
     M12 -- "Suppressed" --> M13
     M12 -- "Absent" --> M12G{"G0"}
-    M12G -- "Yes" --> SMAX["🔴 Broad source-max route"]
+    M12G -- "Yes" --> SMAX["🔴 Broad source-max route<br/>+ eligible forced-split escape"]
     M12G -- "No" --> M13
     SMAX --> M4SRC{"M4 · rewritten source-max parent eligible"}
     M4SRC -- "Yes" --> M4SRUN["🟡 Deterministic balanced-tree / feedback cleanup"]
@@ -378,6 +378,7 @@ and boundary methods contribute to an already-started route.
 | Mandatory token floor | At most 128 blocks; the extended compact feedback floor applies only at ≤8 blocks. If same-distance repartition opportunities exist, proven resegmentation is integrated before feedback; otherwise proven search remains an independent endpoint lineage. | 🟡 |
 | Selected-plan merge cleanup | Max; the searched source-order plan strictly replaced the fallback; 2–8 alignment-independent Huffman blocks; ≤8,192 tokens and ≤512 KiB plain. | 🟡 |
 | Comparison-floor boundary reseat | Max + deadline remains; the secured comparison floor has 2–8 alignment-independent Huffman blocks, ≤8,192 tokens, and ≤512 KiB plain. Each adjacent union must satisfy the adaptive probe's histogram, ≥513-token, and ≥128-byte gates, and its discovered cut must differ from the existing boundary. Exactly price every completed replacement, retain only the strongest single reseat, and accept only a strict complete-plan bit win. | 🟡 |
+| Forced-split boundary escape | Max + deadline remains; the secured comparison floor has 2–7 alignment-independent Huffman blocks, ≤8,192 tokens, and ≤512 KiB plain. Select the largest block with ≥513 tokens and ≥128 decoded bytes. Its adaptive histogram search must expose a sampled local minimum separated from the best basin by at least the greater of one seventh of the token span or 16 tokens. Force exactly that runner-up cut, exactly plan both children, and then try one existing adjacent-boundary reseat. Accept only a complete-plan bit win over the secured floor. | 🟡 |
 | Per-source split | Otherwise falls back to whole-block search when tokens <16, decoded bytes <128, or default decoded bytes <32,768. Eligible blocks receive seven decoded-eighth probes. Max blocks ≤512 tokens also receive every interior 32-token anchor, capped with the source cut set at 32. | 🔴 |
 | Exact inside-match siblings | Max always admits them. Default admits them when `token_count × 7 ≤ 32,768`. A source's own exact eighths still need ≥16 tokens, ≥128 decoded bytes, and in default ≥32,768 decoded bytes. With regroup and ≤8 sources, compact default as well as max also adds exact siblings for combined Huffman runs and their 2+-source subgroups; every combined interval still needs ≥16 tokens and ≥128 decoded bytes. | 🔴 |
 | Default nested split | At least two exact-priced split candidates and runner-up cost within 64 bits of the best; refine only the larger child around its midpoint. Retain the snapped midpoint and, when the compact default inside-match gate passes, an exact inside-match sibling, for at most two nested cuts. | 🟡 |
@@ -690,6 +691,7 @@ the internal scheduler described here.
 | Bounded and wide collection | Folds long Huffman runs under bounded or broad token/plain limits before replay. | 🟡 | **Columbo** |
 | Selected-plan merge cleanup | Prices every adjacent pair once on a newly selected compact Huffman plan without reparsing the whole stream. | 🟡 | **Columbo** |
 | Comparison-floor boundary reseat | Before broad source search, joins each adjacent pair in a bounded Max comparison floor only for adaptive cut discovery, exactly prices the replacement, and retains at most the strongest single strict win. | 🟡 | **Columbo** |
+| Forced-split boundary escape | In a compact Max comparison floor, retains one well-separated runner-up from the existing adaptive probes, forces that single cut, and tries one adjacent-boundary reseat. The original complete floor remains the exact acceptance bound. | 🟡 | Turtledeflate-inspired pushed-split concept; **Columbo** bounded implementation |
 | Source split family | Prices seven decoded-eighth cuts, compact max 32-token anchors, child search, and a bounded default runner-up midpoint with an optional exact inside-match sibling. | 🔴 | **Columbo** |
 | Inside-match boundary polishing | Adds exact decoded-boundary siblings inside proven matches and keeps the original distance. | 🔴 | **Columbo** |
 | Adaptive split probe | Samples, smooths, and narrows a bounded histogram search, then requires a 32-bit exact win. | 🟡 | Turtledeflate-inspired search shape; **Columbo** implementation |
