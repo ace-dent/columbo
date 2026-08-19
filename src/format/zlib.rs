@@ -25,7 +25,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         return Err(Error::new("invalid zlib header"));
     }
     if input[1] & 0x20 != 0 {
-        return Err(Error::new("preset zlib dictionaries are not supported"));
+        return Err(Error::unsupported_feature(
+            "preset zlib dictionaries are not supported",
+        ));
     }
 
     let optimized = optimize_embedded(
@@ -70,13 +72,13 @@ pub(super) fn optimize_embedded(
                 timed_out: false,
             });
         }
-        return Err(Error::new(if input.len() < 6 {
-            "zlib stream too small"
+        return Err(if input.len() < 6 {
+            Error::new("zlib stream too small")
         } else if unsupported_dictionary {
-            "preset zlib dictionaries are not supported"
+            Error::unsupported_feature("preset zlib dictionaries are not supported")
         } else {
-            "invalid zlib header"
-        }));
+            Error::new("invalid zlib header")
+        });
     }
 
     // A zlib stream is exactly: two-byte header, raw Deflate data, Adler-32.
@@ -119,7 +121,7 @@ pub(super) fn optimize_embedded(
 
     let stored_adler = u32::from_be_bytes(input[input.len() - 4..].try_into().unwrap());
     if raw.info.adler32 != stored_adler {
-        return Err(Error::new("zlib Adler-32 mismatch"));
+        return Err(Error::integrity_mismatch("zlib Adler-32 mismatch"));
     }
 
     let output_size = raw
@@ -172,15 +174,6 @@ pub(super) fn has_rfc1950_header(input: &[u8]) -> bool {
     let cmf = input[0];
     let flg = input[1];
     (cmf & 0x0f) == 8 && (cmf >> 4) <= 7 && ((u16::from(cmf) << 8) | u16::from(flg)) % 31 == 0
-}
-
-/// Recognize the RFC 1950 compression method and window field before FCHECK
-/// validation. This lets auto mode route a damaged zlib header to the zlib
-/// parser for a specific diagnostic instead of treating it as unknown bytes.
-pub(super) fn has_recognizable_header(input: &[u8]) -> bool {
-    input
-        .first()
-        .is_some_and(|&cmf| (cmf & 0x0f) == 8 && (cmf >> 4) <= 7)
 }
 
 #[cfg(test)]

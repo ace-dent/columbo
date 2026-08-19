@@ -2,7 +2,7 @@
 
 use crate::checksum::crc32_update;
 use crate::deflate::{optimize_raw_prefix_with_floor_and_grace, DefaultFloor};
-use crate::{Error, Optimization, Options, Result};
+use crate::{Error, ErrorKind, Optimization, Options, Result};
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,6 +72,14 @@ struct Entry {
     output_deflate_bits: u64,
 }
 
+pub(super) struct ParsedZip {
+    eocd_offset: usize,
+    central_offset: usize,
+    entries: Vec<Entry>,
+    physical_order: Vec<usize>,
+    expanded_size: u64,
+}
+
 /// Recognize both ordinary archives and ZIP-family inputs that should receive
 /// a specific malformed/unsupported ZIP diagnostic.
 ///
@@ -84,12 +92,73 @@ pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
         Some(LOCAL_FILE_HEADER)
             | Some(CENTRAL_DIRECTORY_HEADER)
             | Some(END_OF_CENTRAL_DIRECTORY)
-            | Some(DATA_DESCRIPTOR)
             | Some(ZIP64_END_OF_CENTRAL_DIRECTORY)
-    ) || find_end_of_central_directory(input).is_some()
+    ) || has_consistent_end_layout(input)
+}
+
+/// Require internally consistent EOCD fields before treating a terminal ZIP
+/// record as strong evidence. Signature-only inputs remain recognizable so
+/// callers can retain targeted diagnostics for truncated archives.
+pub(super) fn has_plausible_end_record(input: &[u8]) -> bool {
+    let Some(offset) = find_end_of_central_directory(input) else {
+        return false;
+    };
+    let Some(eocd) = input.get(offset..offset.saturating_add(22)) else {
+        return false;
+    };
+    let disk_number = le16(eocd, 4);
+    let central_disk = le16(eocd, 6);
+    let entries_on_disk = le16(eocd, 8);
+    let entry_count = le16(eocd, 10);
+    let central_size = le32(eocd, 12);
+    let central_offset = le32(eocd, 16);
+    disk_number == 0
+        && central_disk == 0
+        && entries_on_disk == entry_count
+        && entry_count != u16::MAX
+        && central_size != u32::MAX
+        && central_offset != u32::MAX
+        && (central_offset as usize).checked_add(central_size as usize) == Some(offset)
+        && ((entry_count == 0 && central_size == 0)
+            || read_le32(input, central_offset as usize) == Some(CENTRAL_DIRECTORY_HEADER))
+}
+
+fn has_consistent_end_layout(input: &[u8]) -> bool {
+    let Some(offset) = find_end_of_central_directory(input) else {
+        return false;
+    };
+    let Some(eocd) = input.get(offset..offset.saturating_add(22)) else {
+        return false;
+    };
+    let entry_count = le16(eocd, 10);
+    let central_size = le32(eocd, 12);
+    let central_offset = le32(eocd, 16);
+    if entry_count == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
+        return true;
+    }
+    (central_offset as usize).checked_add(central_size as usize) == Some(offset)
+        && ((entry_count == 0 && central_size == 0)
+            || read_le32(input, central_offset as usize) == Some(CENTRAL_DIRECTORY_HEADER))
 }
 
 pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
+    let parsed = preflight(input, false, u64::MAX)?;
+    Ok(stream_count(&parsed))
+}
+
+pub(super) fn stream_count(parsed: &ParsedZip) -> usize {
+    parsed
+        .entries
+        .iter()
+        .filter(|entry| entry_is_optimizable(entry))
+        .count()
+}
+
+pub(super) fn preflight(
+    input: &[u8],
+    strip_metadata: bool,
+    max_decoded_bytes: u64,
+) -> Result<ParsedZip> {
     let eocd_offset = find_end_of_central_directory(input)
         .ok_or_else(|| Error::new("ZIP end of central directory not found"))?;
     let eocd = input
@@ -102,10 +171,14 @@ pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
     let central_size = le32(eocd, 12);
     let central_offset_u32 = le32(eocd, 16);
     if disk_number != 0 || central_disk != 0 || entries_on_disk != entry_count {
-        return Err(Error::new("spanned ZIP archives are not supported"));
+        return Err(Error::unsupported_feature(
+            "spanned ZIP archives are not supported",
+        ));
     }
     if entry_count == u16::MAX || central_size == u32::MAX || central_offset_u32 == u32::MAX {
-        return Err(Error::new("ZIP64 archives are not supported"));
+        return Err(Error::unsupported_feature(
+            "ZIP64 archives are not supported",
+        ));
     }
     let central_offset = central_offset_u32 as usize;
     if central_offset
@@ -113,16 +186,47 @@ pub(super) fn deflate_stream_count(input: &[u8]) -> Result<usize> {
         .filter(|&end| end == eocd_offset)
         .is_none()
     {
-        return Err(Error::new("unsupported ZIP layout"));
+        return Err(Error::unsupported_feature("unsupported ZIP layout"));
     }
-    let entries = parse_central_entries(input, central_offset, eocd_offset, entry_count, false)?;
-    Ok(entries
-        .iter()
-        .filter(|entry| entry_is_optimizable(entry))
-        .count())
+    let mut entries = parse_central_entries(
+        input,
+        central_offset,
+        eocd_offset,
+        entry_count,
+        strip_metadata,
+    )?;
+    let mut expanded_size = 0_u64;
+    for entry in &entries {
+        if matches!(entry.method, 0 | 8) && entry.flags & FLAG_ENCRYPTED == 0 {
+            expanded_size = expanded_size
+                .checked_add(u64::from(entry.uncompressed_size))
+                .filter(|&size| size <= max_decoded_bytes)
+                .ok_or_else(|| {
+                    Error::resource_limit("ZIP expanded data exceeds configured safety limit")
+                })?;
+        }
+    }
+    let physical_order = preflight_local_entries(input, central_offset, &mut entries)?;
+    Ok(ParsedZip {
+        eocd_offset,
+        central_offset,
+        entries,
+        physical_order,
+        expanded_size,
+    })
 }
 
+#[cfg(test)]
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let parsed = preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
+    optimize_preflight(input, options, &parsed)
+}
+
+pub(super) fn optimize_preflight(
+    input: &[u8],
+    options: &Options,
+    parsed: &ParsedZip,
+) -> Result<Optimization> {
     if !options.exhaustive {
         configure_stream_producers(options, &[ZIP_NORMAL_PRODUCER]);
         return optimize_once(
@@ -131,14 +235,15 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
             DefaultFloor::Complete,
             ParallelMemberPolicy::UniformWorkOnly,
             ZIP_NORMAL_PRODUCER,
+            parsed,
         );
     }
 
-    if parallel_max_archive_is_bounded(input) {
-        return optimize_max_parallel(input, options);
+    if parallel_max_archive_is_bounded(input, parsed) {
+        return optimize_max_parallel(input, options, parsed);
     }
 
-    optimize_max_sequential(input, options)
+    optimize_max_sequential(input, options, parsed)
 }
 
 fn configure_stream_producers(options: &Options, producers: &[u8]) {
@@ -155,7 +260,11 @@ fn configure_stream_producers(options: &Options, producers: &[u8]) {
 /// archive remains useful rather than duplicate work: its rewritten block and
 /// token choices expose a distinct search basin that the source branch cannot
 /// necessarily reach.
-fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization> {
+fn optimize_max_parallel(
+    input: &[u8],
+    options: &Options,
+    parsed: &ParsedZip,
+) -> Result<Optimization> {
     configure_stream_producers(
         options,
         &[
@@ -176,6 +285,7 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
                         DefaultFloor::Established,
                         ParallelMemberPolicy::UniformWorkOnly,
                         ZIP_DIRECT_MAX_PRODUCER,
+                        parsed,
                     )
                 })
             });
@@ -189,6 +299,7 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
                 DefaultFloor::Complete,
                 ParallelMemberPolicy::AnyIndependentWork,
                 ZIP_DEFAULT_FLOOR_PRODUCER,
+                parsed,
             )
         });
 
@@ -220,7 +331,11 @@ fn optimize_max_parallel(input: &[u8], options: &Options) -> Result<Optimization
     })
 }
 
-fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimization> {
+fn optimize_max_sequential(
+    input: &[u8],
+    options: &Options,
+    parsed: &ParsedZip,
+) -> Result<Optimization> {
     configure_stream_producers(
         options,
         &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
@@ -234,6 +349,7 @@ fn optimize_max_sequential(input: &[u8], options: &Options) -> Result<Optimizati
         DefaultFloor::Complete,
         ParallelMemberPolicy::UniformWorkOnly,
         ZIP_DEFAULT_FLOOR_PRODUCER,
+        parsed,
     )?;
     refine_complete_floor(input, options, started, floor)
 }
@@ -261,12 +377,18 @@ fn refine_complete_floor(
 
     let mut max_options = options.clone();
     max_options.timeout = remaining;
+    let refined_parsed = preflight(
+        &floor.data,
+        max_options.strip_metadata,
+        max_options.max_decoded_bytes,
+    )?;
     let mut refined = optimize_once(
         &floor.data,
         &max_options,
         DefaultFloor::Shared,
         ParallelMemberPolicy::UniformWorkOnly,
         ZIP_REFINED_DEFAULT_PRODUCER,
+        &refined_parsed,
     )?;
     let refined_wins = refined.data.len() < floor.data.len()
         || (refined.data.len() == floor.data.len() && refined.bits_saved != 0);
@@ -293,31 +415,11 @@ fn best_complete_optimization(mut floor: Optimization, mut direct: Optimization)
     }
 }
 
-fn parallel_max_archive_is_bounded(input: &[u8]) -> bool {
+fn parallel_max_archive_is_bounded(input: &[u8], parsed: &ParsedZip) -> bool {
     if input.len() > PARALLEL_MAX_ARCHIVE_INPUT {
         return false;
     }
-    let Some(eocd_offset) = find_end_of_central_directory(input) else {
-        return false;
-    };
-    let Some(eocd) = input.get(eocd_offset..eocd_offset.saturating_add(22)) else {
-        return false;
-    };
-    let central_offset = le32(eocd, 16) as usize;
-    let central_size = le32(eocd, 12) as usize;
-    if central_offset
-        .checked_add(central_size)
-        .filter(|&end| end == eocd_offset)
-        .is_none()
-    {
-        return false;
-    }
-    let Ok(entries) =
-        parse_central_entries(input, central_offset, eocd_offset, le16(eocd, 10), false)
-    else {
-        return false;
-    };
-    parallel_max_entry_work_is_bounded(&entries)
+    parallel_max_entry_work_is_bounded(&parsed.entries)
 }
 
 fn parallel_max_entry_work_is_bounded(entries: &[Entry]) -> bool {
@@ -392,44 +494,16 @@ fn optimize_once(
     raw_default_floor: DefaultFloor,
     parallel_member_policy: ParallelMemberPolicy,
     stream_producer: u8,
+    parsed: &ParsedZip,
 ) -> Result<Optimization> {
     let deadline = SearchDeadline::new(options);
-    let eocd_offset = find_end_of_central_directory(input)
-        .ok_or_else(|| Error::new("ZIP end of central directory not found"))?;
+    let eocd_offset = parsed.eocd_offset;
     let eocd = input
         .get(eocd_offset..eocd_offset + 22)
         .ok_or_else(|| Error::new("truncated ZIP end of central directory"))?;
 
-    let disk_number = le16(eocd, 4);
-    let central_disk = le16(eocd, 6);
-    let entries_on_disk = le16(eocd, 8);
-    let entry_count = le16(eocd, 10);
-    let central_size = le32(eocd, 12);
-    let central_offset_u32 = le32(eocd, 16);
-
-    if disk_number != 0 || central_disk != 0 || entries_on_disk != entry_count {
-        return Err(Error::new("spanned ZIP archives are not supported"));
-    }
-    if entry_count == u16::MAX || central_size == u32::MAX || central_offset_u32 == u32::MAX {
-        return Err(Error::new("ZIP64 archives are not supported"));
-    }
-
-    let central_offset = central_offset_u32 as usize;
-    if central_offset
-        .checked_add(central_size as usize)
-        .filter(|&end| end == eocd_offset)
-        .is_none()
-    {
-        return Err(Error::new("unsupported ZIP layout"));
-    }
-
-    let mut entries = parse_central_entries(
-        input,
-        central_offset,
-        eocd_offset,
-        entry_count,
-        options.strip_metadata,
-    )?;
+    let central_offset = parsed.central_offset;
+    let mut entries = parsed.entries.clone();
     let mut next_stream_id = 1_usize;
     let stream_ids: Vec<Option<usize>> = entries
         .iter()
@@ -445,20 +519,11 @@ fn optimize_once(
         .collect();
     // Limit the sum before decoding any member. This avoids doing expensive
     // work on an archive whose declared expansion is already unsafe.
-    let mut expanded_size = 0_u64;
-    for entry in &entries {
-        if matches!(entry.method, 0 | 8) && entry.flags & FLAG_ENCRYPTED == 0 {
-            expanded_size = expanded_size
-                .checked_add(u64::from(entry.uncompressed_size))
-                .filter(|&size| size <= options.max_decoded_bytes)
-                .ok_or_else(|| Error::new("ZIP expanded data exceeds configured safety limit"))?;
-        }
-    }
     // Resolve and validate every physical local range before copying or
     // optimizing any payload. A hostile central directory may otherwise point
     // many entries at the same large local record, multiplying work and owned
     // buffers before the reconstruction loop finally notices the overlap.
-    let physical_order = preflight_local_entries(input, central_offset, &mut entries)?;
+    let physical_order = parsed.physical_order.clone();
 
     // Search order is independent of archive layout. In normal mode the
     // original Columbo C implementation gives the largest Deflate member first
@@ -474,7 +539,7 @@ fn optimize_once(
         .count();
     let parallel_members = should_parallelize_members(
         input.len(),
-        expanded_size,
+        parsed.expanded_size,
         &entries,
         optimizable_members,
         parallel_member_policy,
@@ -1192,11 +1257,15 @@ fn parse_central_entries(
         let uncompressed_size = le32(header, 24);
         let local_offset = le32(header, 42);
         if le16(header, 34) != 0 {
-            return Err(Error::new("spanned ZIP archives are not supported"));
+            return Err(Error::unsupported_feature(
+                "spanned ZIP archives are not supported",
+            ));
         }
         if compressed_size == u32::MAX || uncompressed_size == u32::MAX || local_offset == u32::MAX
         {
-            return Err(Error::new("ZIP64 entries are not supported"));
+            return Err(Error::unsupported_feature(
+                "ZIP64 entries are not supported",
+            ));
         }
 
         let flags = le16(header, 8);
@@ -1273,7 +1342,9 @@ fn build_local_entry(
         if crc32_update(0, source_payload) != entry.crc32
             || source_payload.len() != entry.uncompressed_size as usize
         {
-            return Err(Error::new("ZIP stored member CRC or size mismatch"));
+            return Err(Error::integrity_mismatch(
+                "ZIP stored member CRC or size mismatch",
+            ));
         }
     } else if entry.method == 8 {
         let raw = optimize_raw_prefix_with_floor_and_grace(
@@ -1283,20 +1354,20 @@ fn build_local_entry(
             default_floor,
             grace,
         )
-        .map_err(|error| {
-            if error.message().contains("internal memory safety") {
-                error
-            } else if error.message().contains("limit") || error.message().contains("safety") {
-                Error::new("ZIP member expands beyond its declared size")
-            } else {
-                Error::new("invalid ZIP deflate member")
+        .map_err(|error| match error.kind() {
+            ErrorKind::ResourceLimit => {
+                Error::resource_limit("ZIP member expands beyond its declared size")
             }
+            ErrorKind::ComplexityLimit | ErrorKind::Internal => error,
+            _ => Error::new("invalid ZIP deflate member"),
         })?;
         if raw.consumed != source_payload.len()
             || raw.info.crc32 != entry.crc32
             || raw.info.size as u32 != entry.uncompressed_size
         {
-            return Err(Error::new("ZIP deflate member CRC or size mismatch"));
+            return Err(Error::integrity_mismatch(
+                "ZIP deflate member CRC or size mismatch",
+            ));
         }
         timed_out = raw.timed_out;
         entry.source_deflate_bits = raw.info.source_deflate_bits;
@@ -1379,7 +1450,9 @@ fn local_entry_layout(
                 || le32(header, 18) != entry.compressed_size_before
                 || le32(header, 22) != entry.uncompressed_size))
     {
-        return Err(Error::new("mismatched ZIP local and central headers"));
+        return Err(Error::integrity_mismatch(
+            "mismatched ZIP local and central headers",
+        ));
     }
     let data_end = data_offset
         .checked_add(entry.compressed_size_before as usize)
@@ -1729,7 +1802,8 @@ mod tests {
     #[test]
     fn detailed_reporting_keeps_bounded_default_floor_parallelism_enabled() {
         let input = archive_with_reverse_central_order(&[b"x", b"a longer independent member"]);
-        assert!(parallel_max_archive_is_bounded(&input));
+        let parsed = preflight(&input, false, u64::MAX).unwrap();
+        assert!(parallel_max_archive_is_bounded(&input, &parsed));
 
         let quiet_options = Options {
             exhaustive: true,
@@ -2086,7 +2160,8 @@ mod tests {
     fn parallel_max_archive_requires_bounded_work() {
         let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
         let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, false, false);
-        assert!(parallel_max_archive_is_bounded(&input));
+        let parsed = preflight(&input, false, u64::MAX).unwrap();
+        assert!(parallel_max_archive_is_bounded(&input, &parsed));
 
         let oversized = single_entry_archive(
             8,
@@ -2096,7 +2171,8 @@ mod tests {
             false,
             false,
         );
-        assert!(!parallel_max_archive_is_bounded(&oversized));
+        let parsed = preflight(&oversized, false, u64::MAX).unwrap();
+        assert!(!parallel_max_archive_is_bounded(&oversized, &parsed));
     }
 
     #[test]

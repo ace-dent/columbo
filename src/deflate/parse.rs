@@ -97,7 +97,7 @@ fn parse_stream_with_model_limit(
     let mut saw_content = false;
     loop {
         if source_blocks >= MAX_SOURCE_BLOCKS {
-            return Err(Error::new(
+            return Err(Error::complexity_limit(
                 "Deflate stream exceeds the source-block safety limit",
             ));
         }
@@ -476,7 +476,7 @@ impl Parser<'_> {
 
     fn reserve_decoded(&self, count: u64) -> Result<()> {
         if count > self.decoded_limit.saturating_sub(self.decoded_position) {
-            return Err(Error::new("decoded data exceeds safety limit"));
+            return Err(Error::resource_limit("decoded data exceeds safety limit"));
         }
         Ok(())
     }
@@ -583,7 +583,7 @@ pub(crate) fn raw_stream_decodes_to(input: &[u8], decoded_limit: u64, expected: 
 }
 
 fn model_limit_error() -> Error {
-    Error::new("Deflate structure exceeds internal memory safety limit")
+    Error::complexity_limit("Deflate structure exceeds internal memory safety limit")
 }
 
 #[cfg(test)]

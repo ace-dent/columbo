@@ -4,7 +4,7 @@
 
 use std::thread;
 
-use columbo::{optimize, Format, Options, MAX_EXPANSION_RATIO};
+use columbo::{optimize, ErrorKind, Format, Options, MAX_EXPANSION_RATIO};
 
 const EMPTY_RAW: &[u8] = &[0x03, 0x00];
 const EMPTY_ZLIB: &[u8] = &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -87,4 +87,43 @@ fn reusable_options_are_safe_across_threads() {
     for worker in workers {
         assert_eq!(worker.join().unwrap().data, MAXIMUM_FLEVEL_EMPTY_ZLIB);
     }
+}
+
+#[test]
+fn errors_expose_stable_machine_readable_kinds() {
+    let options = Options::default();
+
+    assert_eq!(
+        optimize(&[0x07], Format::Auto, &options)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnsupportedFormat
+    );
+
+    let mut bad_adler = EMPTY_ZLIB.to_vec();
+    *bad_adler.last_mut().unwrap() ^= 1;
+    assert_eq!(
+        optimize(&bad_adler, Format::Zlib, &options)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::IntegrityMismatch
+    );
+
+    assert_eq!(
+        optimize(&[0x78, 0x20, 0, 0, 0, 0], Format::Zlib, &options)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::UnsupportedFeature
+    );
+
+    let limited = Options {
+        max_input_bytes: 1,
+        ..options
+    };
+    assert_eq!(
+        optimize(EMPTY_RAW, Format::Raw, &limited)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ResourceLimit
+    );
 }

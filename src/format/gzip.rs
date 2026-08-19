@@ -20,7 +20,7 @@ const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate GZIP output";
 const MAX_GZIP_MEMBERS: usize = 16_384;
 
 #[derive(Clone, Copy)]
-struct Member {
+pub(super) struct Member {
     start: usize,
     payload_start: usize,
     trailer_start: usize,
@@ -30,16 +30,29 @@ struct Member {
 }
 
 pub(super) fn deflate_stream_count(input: &[u8], max_decoded_bytes: u64) -> Result<usize> {
-    Ok(parse_members(input, max_decoded_bytes)?.len())
+    Ok(preflight(input, max_decoded_bytes)?.len())
 }
 
+#[cfg(test)]
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let members = preflight(input, options.max_decoded_bytes)?;
+    optimize_preflight(input, options, members)
+}
+
+pub(super) fn preflight(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
+    parse_members(input, max_decoded_bytes)
+}
+
+pub(super) fn optimize_preflight(
+    input: &[u8],
+    options: &Options,
+    members: Vec<Member>,
+) -> Result<Optimization> {
     let deadline = SearchDeadline::new(options);
-    let members = parse_members(input, options.max_decoded_bytes)?;
     let mut order = Vec::new();
     order
         .try_reserve_exact(members.len())
-        .map_err(|_| Error::new("could not allocate GZIP member schedule"))?;
+        .map_err(|_| Error::internal("could not allocate GZIP member schedule"))?;
     order.extend(0..members.len());
     order.sort_unstable_by_key(|&index| {
         let member = members[index];
@@ -48,16 +61,17 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     let total_weight = members.iter().try_fold(0_u64, |total, member| {
         total.checked_add(member.decoded_size.max(1))
     });
-    let total_weight = total_weight.ok_or_else(|| Error::new("GZIP decoded size is too large"))?;
+    let total_weight =
+        total_weight.ok_or_else(|| Error::resource_limit("GZIP decoded size is too large"))?;
     let mut results = Vec::new();
     results
         .try_reserve_exact(members.len())
-        .map_err(|_| Error::new("could not allocate GZIP member results"))?;
+        .map_err(|_| Error::internal("could not allocate GZIP member results"))?;
     results.resize_with(members.len(), || None);
     let mut pending = Vec::new();
     pending
         .try_reserve_exact(members.len())
-        .map_err(|_| Error::new("could not allocate GZIP member schedule"))?;
+        .map_err(|_| Error::internal("could not allocate GZIP member schedule"))?;
 
     for (position, &index) in order.iter().enumerate() {
         let file_remaining = deadline.remaining();
@@ -140,6 +154,18 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     ))
 }
 
+pub(super) fn has_rfc1952_header(input: &[u8]) -> bool {
+    input.len() >= 4
+        && input[0] == 0x1f
+        && input[1] == 0x8b
+        && input[2] == 8
+        && input[3] & RESERVED_FLAGS == 0
+}
+
+pub(super) fn has_signature(input: &[u8]) -> bool {
+    input.starts_with(&[0x1f, 0x8b])
+}
+
 fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     if input.is_empty() {
         return Err(Error::new("invalid GZIP signature"));
@@ -149,7 +175,7 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     let mut decoded_remaining = max_decoded_bytes;
     while member_start < input.len() {
         if members.len() >= MAX_GZIP_MEMBERS {
-            return Err(Error::new("GZIP contains too many members"));
+            return Err(Error::resource_limit("GZIP contains too many members"));
         }
         if input.len() - member_start < 18
             || input[member_start] != 0x1f
@@ -184,15 +210,15 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
             let stored = read_u16(input, payload_start, "truncated GZIP header CRC")?;
             let calculated = crc32_update(0, &input[member_start..payload_start]) as u16;
             if stored != calculated {
-                return Err(Error::new("GZIP header CRC mismatch"));
+                return Err(Error::integrity_mismatch("GZIP header CRC mismatch"));
             }
             payload_start += 2;
         }
 
         let (consumed, info) = inspect_raw_prefix(&input[payload_start..], decoded_remaining)?;
-        decoded_remaining = decoded_remaining
-            .checked_sub(info.size)
-            .ok_or_else(|| Error::new("decoded GZIP data exceeds configured safety limit"))?;
+        decoded_remaining = decoded_remaining.checked_sub(info.size).ok_or_else(|| {
+            Error::resource_limit("decoded GZIP data exceeds configured safety limit")
+        })?;
         let trailer_start = payload_start
             .checked_add(consumed)
             .filter(|&start| consumed != 0 && input.len().saturating_sub(start) >= 8)
@@ -202,11 +228,13 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
             u32::from_le_bytes(input[trailer_start..trailer_start + 4].try_into().unwrap());
         let stored_size = u32::from_le_bytes(input[trailer_start + 4..end].try_into().unwrap());
         if stored_crc != info.crc32 || stored_size != info.size as u32 {
-            return Err(Error::new("GZIP trailer CRC or size mismatch"));
+            return Err(Error::integrity_mismatch(
+                "GZIP trailer CRC or size mismatch",
+            ));
         }
         members
             .try_reserve(1)
-            .map_err(|_| Error::new("could not allocate GZIP member model"))?;
+            .map_err(|_| Error::internal("could not allocate GZIP member model"))?;
         members.push(Member {
             start: member_start,
             payload_start,
@@ -271,12 +299,12 @@ fn reclaim_timed_out_members(
             total.checked_add(members[index].decoded_size.max(1))
         });
         let Some(mut remaining_weight) = remaining_weight.take() else {
-            return Err(Error::new("GZIP decoded size is too large"));
+            return Err(Error::resource_limit("GZIP decoded size is too large"));
         };
         let mut still_pending = Vec::new();
         still_pending
             .try_reserve_exact(pending.len())
-            .map_err(|_| Error::new("could not allocate GZIP member schedule"))?;
+            .map_err(|_| Error::internal("could not allocate GZIP member schedule"))?;
         for (position, &index) in pending.iter().enumerate() {
             let file_remaining = deadline.remaining();
             if file_remaining.is_zero() {

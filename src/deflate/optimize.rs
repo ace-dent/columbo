@@ -302,7 +302,9 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     grace: Duration,
 ) -> Result<RawOptimization> {
     if input.len() as u64 > options.max_input_bytes {
-        return Err(Error::new("input exceeds configured safety limit"));
+        return Err(Error::resource_limit(
+            "input exceeds configured safety limit",
+        ));
     }
 
     let started = Instant::now();
@@ -3594,7 +3596,7 @@ fn validate_replayed_stream(
         || stream.crc32 != identity.crc32
         || stream.adler32 != identity.adler32
     {
-        return Err(Error::new(
+        return Err(Error::internal(
             "internal error: rewritten Deflate stream changed decoded data",
         ));
     }
@@ -3611,7 +3613,7 @@ fn emit_plans(input: &[u8], plans: &[PlannedBlock], strict: bool) -> Result<(Vec
             )
         })
     {
-        return Err(Error::new(
+        return Err(Error::internal(
             "internal strict Deflate plan has an incomplete Huffman code",
         ));
     }

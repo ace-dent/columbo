@@ -29,7 +29,7 @@ pub(super) fn try_vec_with_capacity<T>(capacity: usize, message: &'static str) -
     let mut output = Vec::new();
     output
         .try_reserve_exact(capacity)
-        .map_err(|_| Error::new(message))?;
+        .map_err(|_| Error::internal(message))?;
     Ok(output)
 }
 
@@ -50,7 +50,7 @@ pub(super) fn try_append_bytes(
 ) -> Result<()> {
     output
         .try_reserve(source.len())
-        .map_err(|_| Error::new(message))?;
+        .map_err(|_| Error::internal(message))?;
     output.extend_from_slice(source);
     Ok(())
 }
@@ -137,45 +137,75 @@ impl SearchDeadline {
 
 pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Result<Optimization> {
     if input.len() as u64 > options.max_input_bytes {
-        return Err(Error::new("input exceeds configured safety limit"));
+        return Err(Error::resource_limit(
+            "input exceeds configured safety limit",
+        ));
     }
 
     let effective_options = options_with_input_expansion_limit(input.len(), options);
     let options = &effective_options;
 
-    let detected = match requested {
+    let detection = match requested {
         Format::Auto => detect(input),
-        explicit => explicit,
+        explicit => Detection::Confirmed(explicit),
     };
-    let deflate_streams = if options.verbose || options.visual {
-        Some(deflate_stream_count(input, detected, options)?)
-    } else {
-        None
-    };
-    crate::progress::format_detected(options, detected, deflate_streams);
+    let detected = detection.format();
 
     let result = match detected {
-        Format::Auto | Format::Raw => super::deflate::optimize_raw(input, options)
-            .map(|raw| {
-                Optimization::from_metrics(
-                    input.len(),
-                    raw.data,
-                    raw.info.source_deflate_bits,
-                    raw.info.deflate_bits,
-                    raw.timed_out,
-                )
-            })
-            .map_err(|error| {
-                if requested == Format::Auto {
-                    Error::new("unsupported or invalid input format")
-                } else {
-                    error
-                }
-            }),
-        Format::Png => png::optimize(input, options),
-        Format::Zlib => zlib::optimize(input, options),
-        Format::Gzip => gzip::optimize(input, options),
-        Format::Zip => zip::optimize(input, options),
+        Format::Auto | Format::Raw => {
+            crate::progress::format_detected(
+                options,
+                detected,
+                (options.verbose || options.visual).then_some(1),
+            );
+            super::deflate::optimize_raw(input, options)
+                .map(|raw| {
+                    Optimization::from_metrics(
+                        input.len(),
+                        raw.data,
+                        raw.info.source_deflate_bits,
+                        raw.info.deflate_bits,
+                        raw.timed_out,
+                    )
+                })
+                .map_err(|error| {
+                    if requested == Format::Auto {
+                        Error::unsupported_format("unsupported or invalid input format")
+                    } else {
+                        error
+                    }
+                })
+        }
+        Format::Png => {
+            let parsed = png::preflight(input, options.strip_metadata)?;
+            let count = if options.verbose || options.visual {
+                Some(png::stream_count(&parsed)?)
+            } else {
+                None
+            };
+            crate::progress::format_detected(options, detected, count);
+            png::optimize_preflight(input, options, parsed)
+        }
+        Format::Zlib => {
+            crate::progress::format_detected(
+                options,
+                detected,
+                (options.verbose || options.visual).then_some(1),
+            );
+            zlib::optimize(input, options)
+        }
+        Format::Gzip => {
+            let members = gzip::preflight(input, options.max_decoded_bytes)?;
+            let count = (options.verbose || options.visual).then_some(members.len());
+            crate::progress::format_detected(options, detected, count);
+            gzip::optimize_preflight(input, options, members)
+        }
+        Format::Zip => {
+            let parsed = zip::preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
+            let count = (options.verbose || options.visual).then_some(zip::stream_count(&parsed));
+            crate::progress::format_detected(options, detected, count);
+            zip::optimize_preflight(input, options, &parsed)
+        }
     };
     crate::progress::finish_file(options);
     result
@@ -187,12 +217,14 @@ pub(crate) fn deflate_stream_count(
     options: &Options,
 ) -> Result<usize> {
     if input.len() as u64 > options.max_input_bytes {
-        return Err(Error::new("input exceeds configured safety limit"));
+        return Err(Error::resource_limit(
+            "input exceeds configured safety limit",
+        ));
     }
     let effective_options = options_with_input_expansion_limit(input.len(), options);
     let options = &effective_options;
     let detected = match requested {
-        Format::Auto => detect(input),
+        Format::Auto => detect(input).format(),
         explicit => explicit,
     };
     match detected {
@@ -220,22 +252,42 @@ fn options_with_input_expansion_limit(input_bytes: usize, options: &Options) -> 
     effective
 }
 
-fn detect(input: &[u8]) -> Format {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Detection {
+    Confirmed(Format),
+    Recognized(Format),
+    RawCandidate,
+}
+
+impl Detection {
+    fn format(self) -> Format {
+        match self {
+            Self::Confirmed(format) | Self::Recognized(format) => format,
+            Self::RawCandidate => Format::Raw,
+        }
+    }
+}
+
+fn detect(input: &[u8]) -> Detection {
     if input.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Format::Png
-    } else if input.starts_with(&[0x1f, 0x8b]) {
-        Format::Gzip
-    } else if zip::has_recognizable_structure(input) {
-        Format::Zip
+        Detection::Confirmed(Format::Png)
+    } else if gzip::has_rfc1952_header(input) {
+        Detection::Confirmed(Format::Gzip)
+    } else if zip::has_plausible_end_record(input) {
+        Detection::Confirmed(Format::Zip)
     } else if looks_like_zlib(input) {
-        Format::Zlib
+        Detection::Confirmed(Format::Zlib)
+    } else if gzip::has_signature(input) {
+        Detection::Recognized(Format::Gzip)
+    } else if zip::has_recognizable_structure(input) {
+        Detection::Recognized(Format::Zip)
     } else {
-        Format::Raw
+        Detection::RawCandidate
     }
 }
 
 fn looks_like_zlib(input: &[u8]) -> bool {
-    zlib::has_recognizable_header(input)
+    zlib::has_rfc1950_header(input)
 }
 
 #[cfg(test)]
@@ -404,6 +456,49 @@ mod tests {
     }
 
     #[test]
+    fn invalid_fcheck_bytes_do_not_steal_raw_deflate_streams() {
+        for cinfo in 0..=7 {
+            let cmf = (cinfo << 4) | 8;
+            // The first byte starts a non-final stored block. The next four
+            // bytes encode an empty LEN/NLEN pair, followed by an empty final
+            // fixed block. CMF looks zlib-like, but CMF/FLG fails FCHECK.
+            let input = [cmf, 0x00, 0x00, 0xff, 0xff, 0x03, 0x00];
+            assert!(!zlib::has_rfc1950_header(&input));
+            assert_eq!(detect(&input), Detection::RawCandidate);
+
+            let automatic = optimize(&input, Format::Auto, &Options::default()).unwrap();
+            let explicit = optimize(&input, Format::Raw, &Options::default()).unwrap();
+            assert_eq!(automatic, explicit, "CINFO={cinfo}");
+        }
+    }
+
+    #[test]
+    fn gzip_probe_distinguishes_valid_and_damaged_headers() {
+        assert_eq!(
+            detect(&[0x1f, 0x8b, 8, 0]),
+            Detection::Confirmed(Format::Gzip)
+        );
+        assert_eq!(
+            detect(&[0x1f, 0x8b, 7, 0]),
+            Detection::Recognized(Format::Gzip)
+        );
+        assert_eq!(
+            detect(&[0x1f, 0x8b, 8, 0xe0]),
+            Detection::Recognized(Format::Gzip)
+        );
+    }
+
+    #[test]
+    fn zip_probe_rejects_weak_signature_collisions() {
+        assert_eq!(detect(b"PK\x07\x08"), Detection::RawCandidate);
+
+        let mut fake_end = b"not a zip".to_vec();
+        fake_end.extend_from_slice(b"PK\x05\x06");
+        fake_end.extend_from_slice(&[0; 18]);
+        assert_eq!(detect(&fake_end), Detection::RawCandidate);
+    }
+
+    #[test]
     fn auto_detection_reports_an_unsupported_zlib_dictionary() {
         let mut input = zlib_header(7, 2, true).to_vec();
         input.extend_from_slice(&0_u32.to_be_bytes()); // DICTID.
@@ -433,10 +528,6 @@ mod tests {
             (vec![0x1f, 0x8b], "invalid GZIP signature"),
             (vec![0x78, 0x01], "zlib stream too small"),
             (
-                vec![0x78, 0x00, 0x03, 0x00, 0, 0, 0, 1],
-                "invalid zlib header",
-            ),
-            (
                 b"PK\x03\x04".to_vec(),
                 "ZIP end of central directory not found",
             ),
@@ -456,7 +547,7 @@ mod tests {
     fn auto_detects_a_prefixed_zip_from_its_end_record() {
         let input = prefixed_empty_zip(b"MZ self-extracting prefix");
 
-        assert_eq!(detect(&input), Format::Zip);
+        assert_eq!(detect(&input), Detection::Confirmed(Format::Zip));
         let optimized = optimize(&input, Format::Auto, &Options::default()).unwrap();
         assert_eq!(optimized.data, input);
     }
@@ -466,7 +557,7 @@ mod tests {
         let input = prefixed_empty_zip(&[0x78, 0x01]);
 
         assert!(looks_like_zlib(&input));
-        assert_eq!(detect(&input), Format::Zip);
+        assert_eq!(detect(&input), Detection::Confirmed(Format::Zip));
         let optimized = optimize(&input, Format::Auto, &Options::default()).unwrap();
         assert_eq!(optimized.data, input);
     }

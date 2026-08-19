@@ -8,7 +8,7 @@ use crate::deflate::{
     decoded_bytes_for_comparison, raw_source_benefits_from_early_max_lineage,
     raw_stream_decodes_to, DefaultFloor, RawInfo,
 };
-use crate::{Error, Optimization, Options, Result};
+use crate::{Error, ErrorKind, Optimization, Options, Result};
 
 use super::{scale_duration, zlib, SearchDeadline};
 
@@ -55,7 +55,7 @@ struct Chunk<'a> {
     encoded: &'a [u8],
 }
 
-struct ParsedPng<'a> {
+pub(super) struct ParsedPng<'a> {
     chunks: Vec<Chunk<'a>>,
     idat: Vec<u8>,
     idat_decoded_size: u64,
@@ -133,7 +133,15 @@ fn empty_chunk_replacements(chunk_count: usize) -> Result<Vec<Option<CompressedB
 }
 
 pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result<usize> {
-    let parsed = parse(input, strip_metadata)?;
+    let parsed = preflight(input, strip_metadata)?;
+    stream_count(&parsed)
+}
+
+pub(super) fn preflight(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
+    parse(input, strip_metadata)
+}
+
+pub(super) fn stream_count(parsed: &ParsedPng<'_>) -> Result<usize> {
     let compressed_metadata = parsed
         .chunks
         .iter()
@@ -142,15 +150,24 @@ pub(super) fn deflate_stream_count(input: &[u8], strip_metadata: bool) -> Result
     1_usize
         .checked_add(parsed.fdat_frames.len())
         .and_then(|count| count.checked_add(compressed_metadata))
-        .ok_or_else(|| Error::new("too many PNG Deflate streams"))
+        .ok_or_else(|| Error::resource_limit("too many PNG Deflate streams"))
 }
 
+#[cfg(test)]
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let parsed = preflight(input, options.strip_metadata)?;
+    optimize_preflight(input, options, parsed)
+}
+
+pub(super) fn optimize_preflight(
+    input: &[u8],
+    options: &Options,
+    parsed: ParsedPng<'_>,
+) -> Result<Optimization> {
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
         deadline: SearchDeadline::new(options),
     };
-    let parsed = parse(input, options.strip_metadata)?;
     let metadata_stream_ids = metadata_stream_ids(&parsed)?;
 
     // Small compressed metadata gets a short first pass in the original
@@ -208,7 +225,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         probe_work_remaining = probe_work_remaining.saturating_sub(decoded_work);
         let replacement = match probe {
             Ok(replacement) => replacement,
-            Err(error) if error.message().contains("decoded PNG data exceeds") => {
+            Err(error) if error.kind() == ErrorKind::ResourceLimit => {
                 // The lower-level decoder cannot report partial decoded bytes
                 // on this error. Conservatively spend the rest of the optional
                 // probe allowance so a second tiny high-expansion stream cannot
@@ -259,7 +276,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         let image_decoded_bytes =
             total_image_decoded_bytes(parsed.idat_decoded_size, &parsed.fdat_decoded_sizes)?;
         if image_decoded_bytes > budget.remaining {
-            return Err(Error::new(
+            return Err(Error::resource_limit(
                 "decoded PNG data exceeds configured safety limit",
             ));
         }
@@ -672,7 +689,7 @@ fn metadata_stream_ids(parsed: &ParsedPng<'_>) -> Result<Vec<Option<usize>>> {
         .fdat_frames
         .len()
         .checked_add(2)
-        .ok_or_else(|| Error::new("too many PNG Deflate streams"))?;
+        .ok_or_else(|| Error::resource_limit("too many PNG Deflate streams"))?;
     let mut ids = Vec::new();
     ids.try_reserve_exact(parsed.chunks.len())
         .map_err(|_| Error::new("could not allocate PNG stream identifiers"))?;
@@ -681,7 +698,7 @@ fn metadata_stream_ids(parsed: &ParsedPng<'_>) -> Result<Vec<Option<usize>>> {
             ids.push(Some(next_id));
             next_id = next_id
                 .checked_add(1)
-                .ok_or_else(|| Error::new("too many PNG Deflate streams"))?;
+                .ok_or_else(|| Error::resource_limit("too many PNG Deflate streams"))?;
         } else {
             ids.push(None);
         }
@@ -706,7 +723,7 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
 
     while input.len().saturating_sub(position) >= 12 {
         if chunks.len() >= MAX_PNG_CHUNKS {
-            return Err(Error::new("PNG contains too many chunks"));
+            return Err(Error::resource_limit("PNG contains too many chunks"));
         }
         let length = be32(input, position)?;
         if length > 0x7fff_ffff {
@@ -728,7 +745,7 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
         }
         let calculated_crc = crc32_update(crc32_update(0, &kind), data);
         if calculated_crc != stored_crc {
-            return Err(Error::new("bad PNG chunk CRC"));
+            return Err(Error::integrity_mismatch("bad PNG chunk CRC"));
         }
 
         if position == SIGNATURE.len() {
@@ -775,7 +792,7 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
         if !strip_chunk && compressed_zlib_offset(kind, data).is_some() {
             compressed_metadata_streams += 1;
             if compressed_metadata_streams > MAX_COMPRESSED_METADATA_STREAMS {
-                return Err(Error::new(
+                return Err(Error::resource_limit(
                     "PNG contains too many compressed metadata streams",
                 ));
             }
@@ -844,7 +861,7 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
         return Err(Error::new("IDAT zlib stream too small"));
     }
     if (idat[0] & 0x0f) != 8 || (idat[0] >> 4) > 7 || idat[1] & 0x20 != 0 {
-        return Err(Error::new("unsupported PNG zlib header"));
+        return Err(Error::unsupported_feature("unsupported PNG zlib header"));
     }
     if ((u16::from(idat[0]) << 8) | u16::from(idat[1])) % 31 != 0 {
         return Err(Error::new("invalid PNG zlib header check"));
@@ -926,7 +943,7 @@ fn png_decoded_size(
     let height = u64::from(height);
     if interlace_method == 0 {
         return pass_size(width, height)
-            .ok_or_else(|| Error::new("PNG image dimensions are too large"));
+            .ok_or_else(|| Error::resource_limit("PNG image dimensions are too large"));
     }
 
     // Adam7 pass geometry: (starting x, starting y, x step, y step).
@@ -950,7 +967,7 @@ fn png_decoded_size(
                 .map_or(0, |remaining| remaining.div_ceil(step_y));
             total.checked_add(pass_size(pass_width, pass_height)?)
         })
-        .ok_or_else(|| Error::new("PNG image dimensions are too large"))
+        .ok_or_else(|| Error::resource_limit("PNG image dimensions are too large"))
 }
 
 fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<()> {
@@ -1348,7 +1365,7 @@ fn total_image_decoded_bytes(idat: u64, frames: &[u64]) -> Result<u64> {
     frames
         .iter()
         .try_fold(idat, |total, &size| total.checked_add(size))
-        .ok_or_else(|| Error::new("decoded PNG data exceeds configured safety limit"))
+        .ok_or_else(|| Error::resource_limit("decoded PNG data exceeds configured safety limit"))
 }
 
 /// Optimize the IDAT stream and each unique APNG frame under one file budget.
@@ -1370,7 +1387,7 @@ fn optimize_image_streams(
     }
     let total_decoded_size = total_image_decoded_bytes(idat_decoded_size, frame_decoded_sizes)?;
     if total_decoded_size > budget.remaining {
-        return Err(Error::new(
+        return Err(Error::resource_limit(
             "decoded PNG data exceeds configured safety limit",
         ));
     }
@@ -1391,7 +1408,7 @@ fn optimize_image_streams(
         frames
             .len()
             .checked_add(1)
-            .ok_or_else(|| Error::new("too many PNG frames"))?,
+            .ok_or_else(|| Error::resource_limit("too many PNG frames"))?,
     )
     .map_err(|_| Error::new("could not allocate PNG frame jobs"))?;
     jobs.push(ImageJob::Idat);
@@ -2209,7 +2226,7 @@ fn optimize_single_image_max_parallel(
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
     if expected_decoded_size > budget.remaining {
-        return Err(Error::new(
+        return Err(Error::resource_limit(
             "decoded PNG data exceeds configured safety limit",
         ));
     }
@@ -2264,7 +2281,7 @@ fn optimize_single_image_max_parallel(
         return Err(Error::new("PNG image data size does not match IHDR"));
     }
     if info.size > budget.remaining {
-        return Err(Error::new(
+        return Err(Error::resource_limit(
             "decoded PNG data exceeds configured safety limit",
         ));
     }
@@ -2365,7 +2382,7 @@ fn run_png_image_zlib(
 }
 
 fn map_png_image_zlib_error(error: Error) -> Error {
-    if error.message() == "decoded PNG data exceeds configured safety limit" {
+    if error.kind() == ErrorKind::ResourceLimit {
         Error::new("PNG image data size does not match IHDR")
     } else {
         error
@@ -2373,12 +2390,12 @@ fn map_png_image_zlib_error(error: Error) -> Error {
 }
 
 fn map_png_zlib_error(error: Error) -> Error {
-    if error.message().contains("internal memory safety") {
-        error
-    } else if error.message().contains("limit") || error.message().contains("safety") {
-        Error::new("decoded PNG data exceeds configured safety limit")
-    } else {
-        error
+    match error.kind() {
+        ErrorKind::ResourceLimit => {
+            Error::resource_limit("decoded PNG data exceeds configured safety limit")
+        }
+        ErrorKind::ComplexityLimit | ErrorKind::Internal => error,
+        _ => error,
     }
 }
 
@@ -2401,7 +2418,7 @@ fn optimize_scheduled_png_image_zlib(
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
     if expected_decoded_size > budget.remaining {
-        return Err(Error::new(
+        return Err(Error::resource_limit(
             "decoded PNG data exceeds configured safety limit",
         ));
     }
@@ -2433,7 +2450,7 @@ fn optimize_png_zlib_with_options(
     )?;
     if let Some(info) = &result.info {
         if info.size > budget.remaining {
-            return Err(Error::new(
+            return Err(Error::resource_limit(
                 "decoded PNG data exceeds configured safety limit",
             ));
         }

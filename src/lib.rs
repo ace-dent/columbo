@@ -24,7 +24,7 @@ mod presentation;
 mod progress;
 mod terminal;
 
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};
 pub use options::{
     Format, Options, DEFAULT_TIMEOUT, MAX_DECODED_BYTES, MAX_EXPANSION_RATIO, MAX_INPUT_BYTES,
     MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES, MIN_TIMEOUT,
