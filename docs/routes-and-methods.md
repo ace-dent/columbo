@@ -667,6 +667,7 @@ the internal scheduler described here.
 | Same-distance normalization | Coalesces or cost-repartitions adjacent matches already using one proven distance. | 🟢 | **Columbo** |
 | Cumulative short-length bands | Ordinary floors price five prefixes from symbol 260 through 260–264. Compact seeds use endpoints 257, 258, 259, 260, 262, and 264. Large no-split work uses endpoints 262, 265, 267, 269, and 270 plus one sparse family containing symbols 260–270 and 280. | 🟡 | **Columbo**, inspired by deft4j least-family pruning |
 | Match-to-literal alternatives | Emits known literals for selected existing matches when complete repricing wins; never finds a new match. | 🔴 | **Columbo**; labelled primitives retain DeflOpt/deft4j attribution |
+| Preflighted all-literals endpoint | Ordinary planning explicitly compares replacing every existing match by its known decoded literals. A one-tree estimate rejects distant candidates; dense blocks up to 80,000 decoded bytes and sparse-match blocks up to 1,000,000 bytes receive complete fixed/dynamic pricing. The expanded token vector is allocated only for a strict complete-block win. | 🟡 | all-literals comparison inspired by **libdeflate**; independent **Columbo** bounds, preflight, integration, and exact acceptance |
 | Proven-submatch resegmentation | Searches literal/match paths wholly inside an already-proved match at its original distance. | 🔴 | **Columbo** |
 | Header-aware proven-spelling composition | Max-only within compact M3: combines up to eight match menus in a 16-state frequency beam, deduplicates exact literal/distance frequencies plus match-extra bits, and exact-prices only multi-match combinations. | 🔴 | **Columbo** |
 | Independent proven endpoint | Replays proven resegmentation after the ordinary candidate rather than allowing a local spelling to hide another fixed point. | 🔴 | **Columbo** |
@@ -753,6 +754,12 @@ reconstruction. They do not imply directly copied source code.
   construction, header-aware histogram adjustment, and block splitting. Its
   LZ77 recompression is outside Columbo's scope. See
   [Zopfli](https://github.com/google/zopfli).
+- **libdeflate**, by Eric Biggers — inspiration for retaining an explicit
+  all-literals alternative beside iterative match paths. Columbo applies that
+  idea only to already decoded source literals, with its own bounded
+  frequency-only preflight and complete representation pricing; it does not
+  use libdeflate's match finder or parsing code. See
+  [libdeflate](https://github.com/ebiggers/libdeflate).
 - **RFC 1951**, by L. Peter Deutsch — the normative Deflate format. See
   [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951).
 

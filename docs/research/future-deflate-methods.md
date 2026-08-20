@@ -141,6 +141,18 @@ retain alternate states across feedback passes and judge them by exact final
 cost. Columbo already follows this principle at route level; the proposed
 k-best header feedback applies it to the remaining small header state space.
 
+A later differential experiment applied libdeflate's explicit all-literals
+fallback more directly. Columbo previously tested that endpoint only below a
+12 KiB allocation-first gate. The retained implementation now builds literal
+frequencies from decoded bytes, rejects distant candidates with one cheap legal
+tree, completely prices fixed and dynamic representations, and allocates the
+expanded token vector only after a strict win. Work remains bounded to dense
+blocks through 80,000 decoded bytes or blocks through 1,000,000 bytes with at
+most 256 source matches. In a 34-file size-spaced strict corpus it changed two
+outputs with no regression: one PNG saved another 493,708 bytes and a second
+saved 7 bytes against the preceding Columbo binary. The prescribed Max budget
+improved the larger result by another 11 bytes over the new Default floor.
+
 ### 7-Zip and AdvanceCOMP
 
 7-Zip's Deflate encoder uses priced optimal parsing and a second pass whose

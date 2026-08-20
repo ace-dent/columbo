@@ -23,7 +23,8 @@ use crate::Options;
 
 use super::block::{plan_block, plan_owned_block};
 use super::header::{
-    plan_for_explicit_lengths, plan_for_explicit_lengths_with_cost, token_bits_from_frequencies,
+    best_dynamic_plan_cached, estimate_boundary_block_bits, plan_for_explicit_lengths,
+    plan_for_explicit_lengths_with_cost, token_bits_from_frequencies, HeaderPlanCache,
 };
 use super::huffman::{
     make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap, make_lengths_defluff_exact,
@@ -51,6 +52,9 @@ const COMPACT_SHORT_BAND_MAX_PLAIN: usize = 80_000;
 const COMPACT_SHORT_BAND_ENDS: [u16; 6] = [257, 258, 259, 260, 262, 264];
 const TABLE_REPLAY_MAX_TOKENS: usize = 100_000;
 const TABLE_REPLAY_PASSES: usize = 4;
+const ALL_LITERAL_DENSE_MAX_PLAIN: usize = 80_000;
+const ALL_LITERAL_SPARSE_MAX_PLAIN: usize = 1_000_000;
+const ALL_LITERAL_SPARSE_MAX_MATCHES: u64 = 256;
 // The exhaustive deficit DP can require 257 layers. Default mode keeps the
 // exact cost search for ordinary runs, but uses a legal minimum-token fallback
 // once a run would make this cheap candidate family disproportionate.
@@ -2213,18 +2217,8 @@ fn improve_plan_with_floor_policy(
         }
     }
 
-    let sparse_literal_endpoint = block.tokens.len() <= 20_000 && match_count <= 32;
-    if block.plain.len() <= 12_000 && (block.tokens.len() <= 4_000 || sparse_literal_endpoint) {
-        if let Some(literals) = literal_token_candidate(&block.plain) {
-            consider_tokens(
-                block,
-                literals,
-                alignment,
-                &floor_options,
-                &mut never_expired,
-                &mut best,
-            );
-        }
+    if all_literal_endpoint_is_bounded(block.plain.len(), match_count as u64) {
+        consider_all_literals(block, &floor_options, &mut never_expired, &mut best);
     }
 
     // Columbo reserves its exact-Defluff-tree/hybrid-tree feedback seeds and
@@ -3153,17 +3147,11 @@ fn plan_block_with_search_policy(
         return best;
     }
 
-    // Columbo directly prices the literal-only endpoint. Neither DeflOpt nor
-    // Defluff implements this repeated match-group shortcut: they contribute
-    // narrower strict/two-stage primitives used elsewhere in this planner.
-    let sparse_literal_endpoint = block.tokens.len() <= 20_000 && match_count <= 32;
-    if block.plain.len() <= 12_000
-        && (block.tokens.len() <= 4_000 || sparse_literal_endpoint)
-        && !stop.reached()
-    {
-        if let Some(literals) = literal_token_candidate(&block.plain) {
-            consider_tokens(block, literals, alignment, options, stop, &mut best);
-        }
+    // libdeflate's explicit all-literals alternative motivates retaining this
+    // endpoint. Columbo supplies the bounded frequency preflight and complete
+    // existing-stream pricing; it never searches for a replacement match.
+    if all_literal_endpoint_is_bounded(block.plain.len(), match_count) && !stop.reached() {
+        consider_all_literals(block, options, stop, &mut best);
     }
 
     let mut seeds = Vec::new();
@@ -4023,6 +4011,92 @@ fn literal_token_candidate(plain: &[u8]) -> Option<Vec<Token>> {
     let mut tokens = new_token_candidate(plain.len(), plain.len())?;
     tokens.extend(plain.iter().copied().map(Token::Literal));
     Some(tokens)
+}
+
+fn all_literal_endpoint_is_bounded(plain_len: usize, match_count: u64) -> bool {
+    plain_len <= ALL_LITERAL_DENSE_MAX_PLAIN
+        || (plain_len <= ALL_LITERAL_SPARSE_MAX_PLAIN
+            && match_count <= ALL_LITERAL_SPARSE_MAX_MATCHES)
+}
+
+/// Exact-price the all-literals endpoint before allocating its token vector.
+///
+/// The ordinary dynamic planner depends only on symbol frequencies and match
+/// extra bits. An all-literals stream has no extras, so its fixed and dynamic
+/// representations can be decided from the decoded bytes alone. The much
+/// larger token vector is retained only if that complete block is a strict win.
+fn consider_all_literals(
+    block: &ParsedBlock,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+    best: &mut PlannedBlock,
+) {
+    if block.plain.is_empty() || best.tokens.len() == block.plain.len() || stop.reached() {
+        return;
+    }
+
+    let mut literal_frequencies = [0_u32; 286];
+    for &byte in block.plain.iter() {
+        literal_frequencies[usize::from(byte)] += 1;
+    }
+    literal_frequencies[256] = 1;
+    let distance_frequencies = [0_u32; 30];
+
+    // One tree and one greedy header are enough to reject endpoints that are
+    // nowhere near the incumbent. Leave a small header-sized margin so the
+    // complete planner can still recover rare sub-byte and one-byte wins.
+    let Some(estimated_bits) = estimate_boundary_block_bits(
+        &literal_frequencies,
+        &distance_frequencies,
+        0,
+        options.strict,
+    ) else {
+        return;
+    };
+    if estimated_bits >= best.bits.saturating_add(256) {
+        return;
+    }
+
+    let fixed_bits = token_bits_from_frequencies(
+        &literal_frequencies,
+        &distance_frequencies,
+        &FIXED_LITERAL_CODE_LENGTHS,
+        &FIXED_DISTANCE_CODE_LENGTHS,
+        0,
+    )
+    .and_then(|bits| bits.checked_add(3))
+    .unwrap_or(u64::MAX);
+    let dynamic = best_dynamic_plan_cached(
+        &[],
+        &literal_frequencies,
+        &distance_frequencies,
+        None,
+        options.strict,
+        false,
+        stop,
+        &mut HeaderPlanCache::new(),
+    );
+    let (representation, bits) = match dynamic {
+        Some(dynamic) if dynamic.bits < fixed_bits => {
+            let bits = dynamic.bits;
+            (Representation::Dynamic(dynamic), bits)
+        }
+        _ => (Representation::Fixed, fixed_bits),
+    };
+    if bits >= best.bits {
+        return;
+    }
+
+    let Some(tokens) = literal_token_candidate(&block.plain) else {
+        return;
+    };
+    *best = PlannedBlock {
+        tokens: tokens.into(),
+        plain: Arc::clone(&block.plain),
+        representation,
+        bits,
+        source_type: block.source_type,
+    };
 }
 
 /// Expand exactly the matches selected by `should_expand`.
@@ -5274,6 +5348,33 @@ mod tests {
         assert!(!large_source_bands_eligible(127_999, 1));
         assert!(large_source_bands_eligible(128_000, 80_000));
         assert!(!large_source_bands_eligible(128_000, 80_001));
+    }
+
+    #[test]
+    fn all_literal_endpoint_preflights_large_marginal_matches() {
+        let mut tokens = vec![Token::Literal(b'a'); 39_997];
+        tokens.push(test_match(3, 32_768, 29, 8_191, 13));
+        let block = short_family_test_block(tokens, vec![b'a'; 40_000]);
+        let options = Options::default();
+        let base = plan_block(&block, 0, &options, &mut SearchStop::never());
+        let mut improved = base.clone();
+
+        consider_all_literals(&block, &options, &mut SearchStop::never(), &mut improved);
+
+        assert!(improved.bits < base.bits);
+        assert_eq!(improved.tokens.len(), block.plain.len());
+        assert!(improved
+            .tokens
+            .iter()
+            .all(|token| matches!(token, Token::Literal(b'a'))));
+    }
+
+    #[test]
+    fn all_literal_endpoint_has_explicit_work_bounds() {
+        assert!(all_literal_endpoint_is_bounded(80_000, u64::MAX));
+        assert!(!all_literal_endpoint_is_bounded(80_001, 257));
+        assert!(all_literal_endpoint_is_bounded(1_000_000, 256));
+        assert!(!all_literal_endpoint_is_bounded(1_000_001, 1));
     }
 
     fn assert_same_plan(left: &PlannedBlock, right: &PlannedBlock) {
