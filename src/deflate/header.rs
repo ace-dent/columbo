@@ -4,14 +4,16 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
+use super::huffman::Huffman;
 use super::huffman::{
-    code_length_tree_shape_is_valid, make_columbo_rle_pseudofrequencies, make_lengths,
-    make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
-    make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
-    make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
-    make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
-    make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid,
-    Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
+    make_columbo_rle_pseudofrequencies, make_lengths, make_lengths_columbo_defluff_limited,
+    make_lengths_columbo_defluff_limited_into, make_lengths_deflopt_heap,
+    make_lengths_deflopt_heap_into, make_lengths_defluff_exact, make_lengths_defluff_exact_into,
+    make_lengths_deft4j_java_heap, make_lengths_deft4j_java_heap_into, make_lengths_into,
+    make_lengths_order_heap, make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies,
+    payload_tree_shape_is_valid, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -323,9 +325,9 @@ pub(crate) fn score_existing_dynamic(
         || source.hclen > 19
         || source.literal_lengths.len() != source.hlit
         || source.distance_lengths.len() != source.hdist
-        || Huffman::build(&source.literal_lengths).is_none()
-        || Huffman::build(&source.distance_lengths).is_none()
-        || Huffman::build(&source.code_length_lengths).is_none()
+        || !huffman_code_lengths_are_valid(&source.literal_lengths)
+        || !huffman_code_lengths_are_valid(&source.distance_lengths)
+        || !huffman_code_lengths_are_valid(&source.code_length_lengths)
         || !code_length_tree_shape_is_valid(&source.code_length_lengths)
         || !payload_tree_shape_is_valid(&source.literal_lengths, false)
         || !payload_tree_shape_is_valid(&source.distance_lengths, true)
@@ -1042,7 +1044,7 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
                 .iter()
                 .zip(lengths)
                 .all(|(&frequency, &length)| frequency == 0 || length != 0)
-            && Huffman::build(lengths).is_some()
+            && huffman_code_lengths_are_valid(lengths)
     });
     candidates
 }
@@ -1087,8 +1089,8 @@ fn columbo_rle_tree_candidate(
     {
         return None;
     }
-    Huffman::build(&literal)?;
-    Huffman::build(&distance)?;
+    huffman_code_lengths_are_valid(&literal).then_some(())?;
+    huffman_code_lengths_are_valid(&distance).then_some(())?;
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
         distance_frequencies,
@@ -1137,8 +1139,8 @@ fn zopfli_rle_tree_candidate(
     {
         return None;
     }
-    Huffman::build(&literal)?;
-    Huffman::build(&distance)?;
+    huffman_code_lengths_are_valid(&literal).then_some(())?;
+    huffman_code_lengths_are_valid(&distance).then_some(())?;
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
         distance_frequencies,
@@ -1241,7 +1243,7 @@ fn greedy_dynamic_header_bits(
     let code_length_frequencies = rle_frequencies(&rle);
     let mut code_length_lengths = [0_u8; 19];
     make_lengths_deflopt_heap_into(&code_length_frequencies, &mut code_length_lengths, 7, 0);
-    Huffman::build(&code_length_lengths)?;
+    huffman_code_lengths_are_valid(&code_length_lengths).then_some(())?;
     if !code_length_tree_shape_is_valid(&code_length_lengths) {
         return None;
     }
@@ -1376,8 +1378,8 @@ pub(crate) fn plan_for_deft4j_lengths_with_cost(
     let hdist = trim_distance(&distance_lengths);
     let literal = try_clone_slice(&literal_lengths[..hlit])?;
     let distance = try_clone_slice(&distance_lengths[..hdist])?;
-    if Huffman::build(&literal).is_none()
-        || Huffman::build(&distance).is_none()
+    if !huffman_code_lengths_are_valid(&literal)
+        || !huffman_code_lengths_are_valid(&distance)
         || !payload_tree_shape_is_valid(&literal, false)
         || !payload_tree_shape_is_valid(&distance, true)
     {

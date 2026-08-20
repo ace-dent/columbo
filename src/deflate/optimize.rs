@@ -3618,12 +3618,16 @@ fn emit_plans(input: &[u8], plans: &[PlannedBlock], strict: bool) -> Result<(Vec
         ));
     }
 
-    let mut writer = BitWriter::default();
+    let planned_bits = plans
+        .iter()
+        .try_fold(0_u64, |total, plan| total.checked_add(plan.bits));
+    let planned_bits = planned_bits.ok_or_else(|| Error::new("Deflate output is too large"))?;
+    let mut writer = BitWriter::with_capacity_bits(planned_bits)?;
     for (index, plan) in plans.iter().enumerate() {
         emit_block(&mut writer, input, plan, index + 1 == plans.len())?;
     }
     let bits = writer.bit_position();
-    debug_assert_eq!(bits, plans.iter().map(|plan| plan.bits).sum::<u64>());
+    debug_assert_eq!(bits, planned_bits);
     Ok((writer.into_bytes(), bits))
 }
 

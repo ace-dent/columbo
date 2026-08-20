@@ -7,7 +7,7 @@
 //! stream; `timed_out` can never describe a partially decoded member. The one
 //! deliberate compatibility extension is Defluff's non-RFC length-258 alias.
 
-use crate::checksum::crc32_update;
+use crate::checksum::{adler32_update, crc32_update};
 use crate::{Error, Result};
 
 use super::bitstream::BitReader;
@@ -84,8 +84,7 @@ fn parse_stream_with_model_limit(
         model_tokens: 0,
         retained_blocks: 0,
         crc32: 0,
-        adler_low: 1,
-        adler_high: 0,
+        adler32: 1,
         max_distance: 0,
     };
 
@@ -153,7 +152,7 @@ fn parse_stream_with_model_limit(
         consumed,
         meaningful_bits,
         crc32: parser.crc32,
-        adler32: (parser.adler_high << 16) | parser.adler_low,
+        adler32: parser.adler32,
         decoded_size: parser.decoded_position,
         max_distance: parser.max_distance,
     })
@@ -168,8 +167,7 @@ struct Parser<'a> {
     model_tokens: usize,
     retained_blocks: usize,
     crc32: u32,
-    adler_low: u32,
-    adler_high: u32,
+    adler32: u32,
     max_distance: u16,
 }
 
@@ -292,7 +290,7 @@ impl Parser<'_> {
         for &symbol in &CODE_LENGTH_ORDER[..hclen] {
             code_length_lengths[symbol] = self.reader.read(3)? as u8;
         }
-        let code_length_tree = Huffman::build(&code_length_lengths)
+        let code_length_tree = Huffman::build_decoder(&code_length_lengths)
             .ok_or_else(|| Error::new("invalid code-length Huffman tree"))?;
         // The code-length alphabet has none of the one-symbol exceptions used
         // by payload trees. zlib-compatible decoders require it to be complete.
@@ -355,7 +353,7 @@ impl Parser<'_> {
 
         let literal_lengths = lengths[..hlit].to_vec();
         let distance_lengths = lengths[hlit..].to_vec();
-        let literal = Huffman::build(&literal_lengths)
+        let literal = Huffman::build_decoder(&literal_lengths)
             .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
         if literal.code(256).is_none() {
             return Err(Error::new("dynamic Huffman tree has no end code"));
@@ -363,7 +361,7 @@ impl Parser<'_> {
         if !payload_tree_shape_is_valid(&literal_lengths, false) {
             return Err(Error::new("invalid literal/length Huffman tree"));
         }
-        let distance = Huffman::build(&distance_lengths)
+        let distance = Huffman::build_decoder(&distance_lengths)
             .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
         if !payload_tree_shape_is_valid(&distance_lengths, true) {
             return Err(Error::new("invalid distance Huffman tree"));
@@ -516,18 +514,8 @@ impl Parser<'_> {
     }
 
     fn update_checksums(&mut self, bytes: &[u8]) {
-        const MOD_ADLER: u32 = 65_521;
         self.crc32 = crc32_update(self.crc32, bytes);
-        for &byte in bytes {
-            self.adler_low += u32::from(byte);
-            if self.adler_low >= MOD_ADLER {
-                self.adler_low -= MOD_ADLER;
-            }
-            self.adler_high += self.adler_low;
-            if self.adler_high >= MOD_ADLER {
-                self.adler_high %= MOD_ADLER;
-            }
-        }
+        self.adler32 = adler32_update(self.adler32, bytes);
     }
 }
 

@@ -9,6 +9,7 @@ const MAX_CODE_BITS: usize = 15;
 const MAX_C_CODES: usize = 320;
 const MAX_TRACKED_DEPTH: usize = 63;
 const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
+const DECODE_ROOT_BITS: u8 = 9;
 
 const fn make_fixed_literal_code_lengths() -> [u8; 288] {
     let mut lengths = [0_u8; 288];
@@ -72,6 +73,44 @@ pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> 
     }
 }
 
+/// Validate that lengths can form a canonical Deflate Huffman table without
+/// allocating the emission and decode structures built by `Huffman::build`.
+pub(crate) fn huffman_code_lengths_are_valid(lengths: &[u8]) -> bool {
+    analyze_code_lengths(lengths).is_some()
+}
+
+fn analyze_code_lengths(lengths: &[u8]) -> Option<([u32; MAX_CODE_BITS + 1], u8, usize)> {
+    if lengths.is_empty() {
+        return None;
+    }
+
+    let mut count_by_length = [0_u32; MAX_CODE_BITS + 1];
+    let mut max_bits = 0_u8;
+    let mut populated = 0_usize;
+    for &length in lengths {
+        if usize::from(length) > MAX_CODE_BITS {
+            return None;
+        }
+        if length != 0 {
+            count_by_length[usize::from(length)] += 1;
+            max_bits = max_bits.max(length);
+            populated += 1;
+        }
+    }
+    if populated > MAX_C_CODES {
+        return None;
+    }
+
+    let mut code = 0_u32;
+    for bits in 1..=MAX_CODE_BITS {
+        code = (code + count_by_length[bits - 1]) << 1;
+        if code + count_by_length[bits] > (1_u32 << bits) {
+            return None;
+        }
+    }
+    Some((count_by_length, max_bits, populated))
+}
+
 /// One canonical Huffman code in the bit order used on the Deflate wire.
 ///
 /// Deflate writes bits least-significant bit first, so `code` is the reverse
@@ -86,12 +125,12 @@ pub(crate) struct HuffCode {
 /// A small canonical Huffman table.
 ///
 /// Deflate alphabets contain at most 288 payload symbols. Emission retains a
-/// compact symbol-ordered code list, while decoding uses one canonical range
+/// direct symbol-indexed code table, while decoding uses one canonical range
 /// per possible bit length so malformed input cannot trigger alphabet-wide
 /// scans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Huffman {
-    /// Emission entries remain in symbol order for binary lookup.
+    /// Emission entries are indexed directly by symbol; zero length is unused.
     codes: Vec<HuffCode>,
     /// Canonical-code ranges allow decoding in at most fifteen comparisons,
     /// independent of the alphabet size.
@@ -100,6 +139,21 @@ pub(crate) struct Huffman {
     code_count: [u16; MAX_CODE_BITS + 1],
     decode_symbols: Vec<u16>,
     max_bits: u8,
+    decode_table: Option<DecodeTable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DecodeEntry {
+    symbol: u16,
+    bits: u8,
+    subtable_bits: u8,
+    subtable_start: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DecodeTable {
+    entries: Vec<DecodeEntry>,
+    root_bits: u8,
 }
 
 impl Huffman {
@@ -110,35 +164,12 @@ impl Huffman {
     /// 320-code table limit. Construction can represent an incomplete tree;
     /// callers apply the alphabet-specific complete, empty, or singleton rule.
     pub(crate) fn build(lengths: &[u8]) -> Option<Self> {
-        if lengths.is_empty() {
-            return None;
-        }
-
-        let mut count_by_length = [0_u32; MAX_CODE_BITS + 1];
-        let mut max_bits = 0_u8;
-        let mut populated = 0_usize;
-
-        for &length in lengths {
-            if usize::from(length) > MAX_CODE_BITS {
-                return None;
-            }
-            if length != 0 {
-                count_by_length[usize::from(length)] += 1;
-                max_bits = max_bits.max(length);
-                populated += 1;
-            }
-        }
-        if populated > MAX_C_CODES {
-            return None;
-        }
+        let (count_by_length, max_bits, populated) = analyze_code_lengths(lengths)?;
 
         let mut next_code = [0_u32; MAX_CODE_BITS + 1];
         let mut code = 0_u32;
         for bits in 1..=MAX_CODE_BITS {
             code = (code + count_by_length[bits - 1]) << 1;
-            if code + count_by_length[bits] > (1_u32 << bits) {
-                return None;
-            }
             next_code[bits] = code;
         }
 
@@ -155,7 +186,16 @@ impl Huffman {
 
         let mut decode_symbols = vec![0_u16; populated];
         let mut next_symbol = first_symbol;
-        let mut codes = Vec::with_capacity(populated);
+        let mut codes = Vec::new();
+        codes.try_reserve_exact(lengths.len()).ok()?;
+        codes.resize(
+            lengths.len(),
+            HuffCode {
+                symbol: 0,
+                length: 0,
+                code: 0,
+            },
+        );
         for (symbol, &length) in lengths.iter().enumerate() {
             if length == 0 {
                 continue;
@@ -165,11 +205,11 @@ impl Huffman {
             let decode_index = usize::from(next_symbol[index]);
             decode_symbols[decode_index] = symbol;
             next_symbol[index] += 1;
-            codes.push(HuffCode {
+            codes[usize::from(symbol)] = HuffCode {
                 symbol,
                 length,
                 code: reverse_bits(next_code[index] as u16, length),
-            });
+            };
             next_code[index] += 1;
         }
 
@@ -180,11 +220,61 @@ impl Huffman {
             code_count,
             decode_symbols,
             max_bits,
+            decode_table: None,
         })
+    }
+
+    /// Build the same canonical representation plus the parser's two-level
+    /// decode table. Planner and emitter trees use `build()` so they do not pay
+    /// this allocation cost.
+    pub(crate) fn build_decoder(lengths: &[u8]) -> Option<Self> {
+        let mut tree = Self::build(lengths)?;
+        tree.decode_table = Some(build_decode_table(&tree.codes, tree.max_bits)?);
+        Some(tree)
     }
 
     /// Decode one symbol, consuming no more than the tree's maximum length.
     pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        if let Some(table) = &self.decode_table {
+            return self.decode_table(reader, table);
+        }
+        self.decode_canonical(reader)
+    }
+
+    fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
+        if table.root_bits == 0 {
+            return Err(Error::new("invalid Huffman code in Deflate stream"));
+        }
+        let root_value = match reader.peek(table.root_bits) {
+            Ok(value) => value,
+            Err(_) => return self.decode_canonical(reader),
+        };
+        let root_entry = table.entries[root_value as usize];
+        if root_entry.subtable_bits == 0 {
+            if root_entry.bits == 0 {
+                return Err(Error::new("invalid Huffman code in Deflate stream"));
+            }
+            reader.drop_bits(root_entry.bits)?;
+            return Ok(root_entry.symbol);
+        }
+
+        let lookup_bits = table.root_bits + root_entry.subtable_bits;
+        let value = match reader.peek(lookup_bits) {
+            Ok(value) => value,
+            Err(_) => return self.decode_canonical(reader),
+        };
+        let subtable_mask = (1_u32 << root_entry.subtable_bits) - 1;
+        let subtable_index = usize::from(root_entry.subtable_start)
+            + ((value >> table.root_bits) & subtable_mask) as usize;
+        let entry = table.entries[subtable_index];
+        if entry.bits == 0 {
+            return Err(Error::new("invalid Huffman code in Deflate stream"));
+        }
+        reader.drop_bits(table.root_bits + entry.bits)?;
+        Ok(entry.symbol)
+    }
+
+    fn decode_canonical(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         let mut code = 0_u16;
         for length in 1..=self.max_bits {
             // Huffman bits arrive in canonical most-significant-bit order,
@@ -204,11 +294,8 @@ impl Huffman {
 
     /// Look up a symbol for emission.
     pub(crate) fn code(&self, symbol: usize) -> Option<HuffCode> {
-        let symbol = u16::try_from(symbol).ok()?;
-        self.codes
-            .binary_search_by_key(&symbol, |entry| entry.symbol)
-            .ok()
-            .map(|index| self.codes[index])
+        let code = *self.codes.get(symbol)?;
+        (code.length != 0).then_some(code)
     }
 
     #[cfg(test)]
@@ -217,13 +304,78 @@ impl Huffman {
     }
 }
 
-fn reverse_bits(mut code: u16, length: u8) -> u16 {
-    let mut reversed = 0_u16;
-    for _ in 0..length {
-        reversed = (reversed << 1) | (code & 1);
-        code >>= 1;
+fn build_decode_table(codes: &[HuffCode], max_bits: u8) -> Option<DecodeTable> {
+    if max_bits == 0 {
+        return Some(DecodeTable {
+            entries: Vec::new(),
+            root_bits: 0,
+        });
     }
-    reversed
+    let root_bits = max_bits.min(DECODE_ROOT_BITS);
+    let root_size = 1_usize << root_bits;
+    let root_mask = (root_size - 1) as u16;
+
+    let mut subtable_widths = Vec::new();
+    subtable_widths.try_reserve_exact(root_size).ok()?;
+    subtable_widths.resize(root_size, 0_u8);
+    for code in codes.iter().filter(|code| code.length > root_bits) {
+        let prefix = usize::from(code.code & root_mask);
+        subtable_widths[prefix] = subtable_widths[prefix].max(code.length - root_bits);
+    }
+
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(root_size).ok()?;
+    entries.resize(root_size, DecodeEntry::default());
+    for (prefix, &subtable_bits) in subtable_widths.iter().enumerate() {
+        if subtable_bits == 0 {
+            continue;
+        }
+        let subtable_start = u16::try_from(entries.len()).ok()?;
+        let subtable_size = 1_usize << subtable_bits;
+        entries.try_reserve(subtable_size).ok()?;
+        entries.resize(entries.len() + subtable_size, DecodeEntry::default());
+        entries[prefix] = DecodeEntry {
+            subtable_bits,
+            subtable_start,
+            ..DecodeEntry::default()
+        };
+    }
+
+    for code in codes.iter().filter(|code| code.length != 0) {
+        if code.length <= root_bits {
+            let suffix_count = 1_usize << (root_bits - code.length);
+            for suffix in 0..suffix_count {
+                let index = usize::from(code.code) | (suffix << code.length);
+                entries[index] = DecodeEntry {
+                    symbol: code.symbol,
+                    bits: code.length,
+                    ..DecodeEntry::default()
+                };
+            }
+            continue;
+        }
+
+        let prefix = usize::from(code.code & root_mask);
+        let root_entry = entries[prefix];
+        let remaining_bits = code.length - root_bits;
+        let suffix_count = 1_usize << (root_entry.subtable_bits - remaining_bits);
+        let code_suffix = usize::from(code.code >> root_bits);
+        for suffix in 0..suffix_count {
+            let index =
+                usize::from(root_entry.subtable_start) + code_suffix + (suffix << remaining_bits);
+            entries[index] = DecodeEntry {
+                symbol: code.symbol,
+                bits: remaining_bits,
+                ..DecodeEntry::default()
+            };
+        }
+    }
+
+    Some(DecodeTable { entries, root_bits })
+}
+
+fn reverse_bits(code: u16, length: u8) -> u16 {
+    code.reverse_bits() >> (u16::BITS as u8 - length)
 }
 
 /// Return the RFC 1951 fixed literal/length and distance trees.
@@ -235,8 +387,10 @@ pub(crate) fn fixed_trees() -> (&'static Huffman, &'static Huffman) {
     static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     let (literal_length, distance) = FIXED.get_or_init(|| {
         (
-            Huffman::build(&FIXED_LITERAL_CODE_LENGTHS).expect("fixed literal tree is valid"),
-            Huffman::build(&FIXED_DISTANCE_CODE_LENGTHS).expect("fixed distance tree is valid"),
+            Huffman::build_decoder(&FIXED_LITERAL_CODE_LENGTHS)
+                .expect("fixed literal tree is valid"),
+            Huffman::build_decoder(&FIXED_DISTANCE_CODE_LENGTHS)
+                .expect("fixed distance tree is valid"),
         )
     });
     (literal_length, distance)
@@ -355,6 +509,12 @@ pub(crate) fn make_lengths_into(
     max_bits: u8,
     variant: u32,
 ) {
+    make_lengths_inner(frequencies, lengths, max_bits, variant);
+}
+
+/// Return whether the unconstrained tree exceeded `max_bits` before its
+/// generic repair was applied.
+fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, variant: u32) -> bool {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
@@ -369,10 +529,10 @@ pub(crate) fn make_lengths_into(
     }
 
     match active.len() {
-        0 => return,
+        0 => return false,
         1 => {
             lengths[nodes[active[0]].symbol.expect("leaf has a symbol")] = 1;
-            return;
+            return false;
         }
         _ => {}
     }
@@ -410,9 +570,10 @@ pub(crate) fn make_lengths_into(
 
     let max_depth = assign_depths(&nodes, active[0], 0, lengths);
     if max_depth <= usize::from(max_bits) {
-        return;
+        return false;
     }
     limit_generic_lengths(frequencies, lengths, max_bits);
+    true
 }
 
 fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) {
@@ -480,6 +641,7 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
     }
 }
 
+#[cfg(test)]
 fn unconstrained_huffman_max_depth(frequencies: &[u32]) -> usize {
     let mut scratch = vec![0; frequencies.len()];
     let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
@@ -524,6 +686,7 @@ fn unconstrained_huffman_max_depth(frequencies: &[u32]) -> usize {
     assign_depths(&nodes, active[0], 0, &mut scratch)
 }
 
+#[cfg(test)]
 pub(crate) fn tree_exceeds_limit(frequencies: &[u32], max_bits: u8) -> bool {
     unconstrained_huffman_max_depth(frequencies) > usize::from(max_bits)
 }
@@ -657,8 +820,7 @@ pub(crate) fn make_lengths_columbo_defluff_limited_into(
     max_bits: u8,
     _variant: u32,
 ) {
-    make_lengths_into(frequencies, lengths, max_bits, 0);
-    if !tree_exceeds_limit(frequencies, max_bits) {
+    if !make_lengths_inner(frequencies, lengths, max_bits, 0) {
         return;
     }
     apply_defluff_package_merge(frequencies, lengths, max_bits);
@@ -1378,11 +1540,69 @@ mod tests {
     }
 
     #[test]
+    fn table_decoder_matches_canonical_ranges_and_subtables() {
+        let deep_lengths = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15];
+        for lengths in [&FIXED_LITERAL_CODE_LENGTHS[..], &deep_lengths[..]] {
+            let canonical = Huffman::build(lengths).unwrap();
+            let table = Huffman::build_decoder(lengths).unwrap();
+            let symbols: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .filter_map(|(symbol, &length)| (length != 0).then_some(symbol))
+                .cycle()
+                .take(lengths.len() * 3)
+                .collect();
+            let mut writer = BitWriter::default();
+            for &symbol in &symbols {
+                let code = canonical.code(symbol).unwrap();
+                writer.write(u32::from(code.code), code.length).unwrap();
+            }
+            let encoded = writer.into_bytes();
+            let mut canonical_reader = BitReader::new(&encoded);
+            let mut table_reader = BitReader::new(&encoded);
+            for symbol in symbols {
+                assert_eq!(
+                    canonical.decode(&mut canonical_reader).unwrap(),
+                    symbol as u16
+                );
+                assert_eq!(table.decode(&mut table_reader).unwrap(), symbol as u16);
+                assert_eq!(canonical_reader.bit_position(), table_reader.bit_position());
+            }
+        }
+    }
+
+    #[test]
     fn canonical_builder_rejects_malformed_trees() {
         assert!(Huffman::build(&[]).is_none());
         assert!(Huffman::build(&[16]).is_none());
         assert!(Huffman::build(&[1, 1, 1]).is_none());
         assert!(Huffman::build(&[0, 0]).is_some());
+    }
+
+    #[test]
+    fn allocation_free_validator_matches_canonical_builder() {
+        let mut state = 0x9e37_79b9_u32;
+        for length in 0..=321 {
+            let mut lengths = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                lengths.push((state % 18) as u8);
+            }
+            assert_eq!(
+                huffman_code_lengths_are_valid(&lengths),
+                Huffman::build(&lengths).is_some()
+            );
+        }
+        for lengths in [
+            &FIXED_LITERAL_CODE_LENGTHS[..],
+            &FIXED_DISTANCE_CODE_LENGTHS[..],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 15][..],
+        ] {
+            assert!(huffman_code_lengths_are_valid(lengths));
+            assert!(Huffman::build(lengths).is_some());
+        }
     }
 
     #[test]

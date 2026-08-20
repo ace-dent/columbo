@@ -585,14 +585,15 @@ pub(crate) fn emit_block(
             writer.write(u32::from(final_block), 1)?;
             // BFINAL is the only bit whose meaning depends on the new stream
             // layout. Everything after it can be copied verbatim.
-            for offset in 1..original.len {
-                let position = original.start + offset;
-                let byte = *input
-                    .get((position / 8) as usize)
-                    .ok_or_else(|| Error::new("original Deflate bit range is out of bounds"))?;
-                writer.write(u32::from((byte >> (position & 7)) & 1), 1)?;
-            }
-            Ok(())
+            let copied_start = original
+                .start
+                .checked_add(1)
+                .ok_or_else(|| Error::new("original Deflate bit range is out of bounds"))?;
+            let copied_bits = original
+                .len
+                .checked_sub(1)
+                .ok_or_else(|| Error::new("original Deflate bit range is empty"))?;
+            writer.write_bits_from(input, copied_start, copied_bits)
         }
         Representation::Stored => emit_stored(writer, final_block, &block.plain),
         Representation::Fixed => emit_fixed(writer, final_block, &block.tokens),
