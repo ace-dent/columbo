@@ -14,7 +14,8 @@ area was revalidated and implemented against
 were initially checked on 12 August, and Zopfli's pseudo-frequency source was
 revalidated on 15 August. Current-branch links are used where an upstream
 project does not publish stable source snapshots, so their claims should be
-rechecked before implementation.
+rechecked before implementation. The libdeflate comparison was revalidated at
+commit `b122c8be1d78b19f6d0a6efc5bb79bfcbb30dd51` on 20 August 2026.
 
 ## Conclusion
 
@@ -152,6 +153,34 @@ most 256 source matches. In a 34-file size-spaced strict corpus it changed two
 outputs with no regression: one PNG saved another 493,708 bytes and a second
 saved 7 bytes against the preceding Columbo binary. The prescribed Max budget
 improved the larger result by another 11 bytes over the new Default floor.
+
+A second pass separated ratio ideas from Huffman-construction speed work:
+
+- A merged-block warm start retained one neighbouring source table only when
+  its known match-to-literal payload decisions exposed a positive estimate.
+  Forty-five strict differential comparisons produced no byte or meaningful-
+  bit change; the main 34-file sample was 0.86% slower, so the experiment was
+  removed.
+- A Max-only coarse transition scout used twelve independently selected token
+  classes and adjacent 256-token windows to nominate one exactly priced split.
+  Sixteen prescribed Max comparisons produced no output change and aggregate
+  elapsed time increased by about 0.4%, so the scout was removed. Columbo's
+  existing adaptive exact-histogram search remains the stronger boundary
+  method.
+- The retained speed change targets Columbo's generic Huffman builder rather
+  than importing libdeflate's builder. Generic variants zero and one use one
+  stable total order for both selected children, so a standard binary heap can
+  reproduce their exact merge topology without rescanning every active node.
+  The mixed-tie variants retain the original scan. A 768-case generated oracle
+  matched the old scanning lengths exactly. On a 34-file strict differential,
+  aggregate measured time fell from 97.06 to 95.32 seconds with no regression;
+  one timed route completed an additional one-bit win. Three repeated controls
+  improved from a 51.58-second median total to 49.85 seconds while preserving
+  the same deterministic outputs, including that one-bit gain.
+
+The retained heap code is an independently written Columbo optimization over
+the project's existing tree topology. No libdeflate source expressions,
+identifiers, data layouts, or control flow were reused.
 
 ### 7-Zip and AdvanceCOMP
 

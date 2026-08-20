@@ -447,6 +447,93 @@ fn node_less(nodes: &[Node], a: usize, b: usize, variant: u32) -> bool {
     }
 }
 
+fn generic_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut root: usize, variant: u32) {
+    loop {
+        let mut child = root * 2 + 1;
+        if child >= heap.len() {
+            return;
+        }
+        if child + 1 < heap.len() && node_less(nodes, heap[child + 1], heap[child], variant) {
+            child += 1;
+        }
+        if !node_less(nodes, heap[child], heap[root], variant) {
+            return;
+        }
+        heap.swap(root, child);
+        root = child;
+    }
+}
+
+fn generic_heap_pop(nodes: &[Node], heap: &mut Vec<usize>, variant: u32) -> Option<usize> {
+    let result = *heap.first()?;
+    let last = heap.pop().expect("the heap is non-empty");
+    if !heap.is_empty() {
+        heap[0] = last;
+        generic_heap_sift_down(nodes, heap, 0, variant);
+    }
+    Some(result)
+}
+
+fn generic_heap_push(nodes: &[Node], heap: &mut Vec<usize>, node: usize, variant: u32) {
+    let mut position = heap.len();
+    heap.push(node);
+    while position != 0 {
+        let parent = (position - 1) / 2;
+        if !node_less(nodes, heap[position], heap[parent], variant) {
+            break;
+        }
+        heap.swap(position, parent);
+        position = parent;
+    }
+}
+
+fn merge_generic_nodes_scanning(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+    while active.len() > 1 {
+        let first_position = (1..active.len()).fold(0, |best, position| {
+            if node_less(nodes, active[position], active[best], variant) {
+                position
+            } else {
+                best
+            }
+        });
+        let left = active.swap_remove(first_position);
+
+        // Variant bit 1 reverses only the second equal-frequency choice.
+        let second_variant = if variant & 2 != 0 {
+            variant ^ 1
+        } else {
+            variant
+        };
+        let second_position = (1..active.len()).fold(0, |best, position| {
+            if node_less(nodes, active[position], active[best], second_variant) {
+                position
+            } else {
+                best
+            }
+        });
+        let right = active.swap_remove(second_position);
+
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        active.push(index);
+    }
+}
+
+fn merge_generic_nodes_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+    for start in (0..active.len() / 2).rev() {
+        generic_heap_sift_down(nodes, active, start, variant);
+    }
+    while active.len() > 1 {
+        let left = generic_heap_pop(nodes, active, variant).expect("two nodes remain");
+        let right = generic_heap_pop(nodes, active, variant).expect("one node remains");
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        generic_heap_push(nodes, active, index, variant);
+    }
+}
+
 fn assign_depths(nodes: &[Node], node_index: usize, depth: usize, lengths: &mut [u8]) -> usize {
     let node = nodes[node_index];
     if let Some(symbol) = node.symbol {
@@ -537,35 +624,15 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
         _ => {}
     }
 
-    while active.len() > 1 {
-        let first_position = (1..active.len()).fold(0, |best, position| {
-            if node_less(&nodes, active[position], active[best], variant) {
-                position
-            } else {
-                best
-            }
-        });
-        let left = active.swap_remove(first_position);
-
-        // Variant bit 1 reverses only the second equal-frequency choice.
-        let second_variant = if variant & 2 != 0 {
-            variant ^ 1
-        } else {
-            variant
-        };
-        let second_position = (1..active.len()).fold(0, |best, position| {
-            if node_less(&nodes, active[position], active[best], second_variant) {
-                position
-            } else {
-                best
-            }
-        });
-        let right = active.swap_remove(second_position);
-
-        let index = nodes.len();
-        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
-        nodes.push(Node::branch(frequency, left, right, index));
-        active.push(index);
+    // Variants zero and one use one total order for both children. A binary
+    // heap preserves their exact frequency/symbol tie behavior while avoiding
+    // a full active-node scan for every merge. Variants two and three switch
+    // the tie direction between the two children and retain the original
+    // scanning topology.
+    if variant & 2 == 0 {
+        merge_generic_nodes_heap(&mut nodes, &mut active, variant);
+    } else {
+        merge_generic_nodes_scanning(&mut nodes, &mut active, variant);
     }
 
     let max_depth = assign_depths(&nodes, active[0], 0, lengths);
@@ -1501,6 +1568,33 @@ mod tests {
     use super::*;
     use crate::deflate::bitstream::BitWriter;
 
+    fn make_lengths_scanning_reference(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
+        let mut lengths = vec![0; frequencies.len()];
+        let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
+        let mut active = Vec::with_capacity(frequencies.len());
+        for (symbol, &frequency) in frequencies.iter().enumerate() {
+            if frequency != 0 {
+                active.push(nodes.len());
+                nodes.push(Node::leaf(frequency, symbol, symbol));
+            }
+        }
+        match active.len() {
+            0 => return lengths,
+            1 => {
+                lengths[nodes[active[0]].symbol.expect("leaf has a symbol")] = 1;
+                return lengths;
+            }
+            _ => {}
+        }
+
+        merge_generic_nodes_scanning(&mut nodes, &mut active, variant);
+        let max_depth = assign_depths(&nodes, active[0], 0, &mut lengths);
+        if max_depth > usize::from(max_bits) {
+            limit_generic_lengths(frequencies, &mut lengths, max_bits);
+        }
+        lengths
+    }
+
     fn assert_bounded_lengths(frequencies: &[u32], lengths: &[u8], max_bits: u8) {
         assert_eq!(frequencies.len(), lengths.len());
         assert!(lengths.iter().all(|&length| length <= max_bits));
@@ -1698,6 +1792,35 @@ mod tests {
             make_lengths_order_heap(&frequencies, 4, 2),
             [2, 4, 1, 3, 4, 0]
         );
+    }
+
+    #[test]
+    fn heap_generic_variants_match_the_scanning_topology() {
+        let mut state = 0x7f4a_7c15_u32;
+        for alphabet_len in [19, 30, 286] {
+            for sample in 0..128 {
+                let mut frequencies = Vec::with_capacity(alphabet_len);
+                for symbol in 0..alphabet_len {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let frequency = if (state ^ symbol as u32 ^ sample) % 7 == 0 {
+                        0
+                    } else {
+                        state % 65_521 + 1
+                    };
+                    frequencies.push(frequency);
+                }
+                for variant in 0..2 {
+                    let max_bits = if alphabet_len == 19 { 7 } else { 15 };
+                    assert_eq!(
+                        make_lengths(&frequencies, max_bits, variant),
+                        make_lengths_scanning_reference(&frequencies, max_bits, variant),
+                        "alphabet={alphabet_len} sample={sample} variant={variant}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
