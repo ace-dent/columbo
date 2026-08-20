@@ -53,15 +53,18 @@ struct Chunk<'a> {
     kind: [u8; 4],
     data: &'a [u8],
     encoded: &'a [u8],
+    discard_on_output: bool,
 }
 
 pub(super) struct ParsedPng<'a> {
     chunks: Vec<Chunk<'a>>,
+    datastream_len: usize,
     idat: Vec<u8>,
     idat_decoded_size: u64,
     fdat_frames: Vec<Vec<u8>>,
     fdat_decoded_sizes: Vec<u64>,
     has_rewrite_sensitive_ancillary: bool,
+    has_vestigial_rgba_trns: bool,
 }
 
 #[derive(Default)]
@@ -164,6 +167,7 @@ pub(super) fn optimize_preflight(
     options: &Options,
     parsed: ParsedPng<'_>,
 ) -> Result<Optimization> {
+    let datastream_len = parsed.datastream_len;
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
         deadline: SearchDeadline::new(options),
@@ -389,10 +393,11 @@ pub(super) fn optimize_preflight(
     // A signature, iDOT, or unknown unsafe-to-copy ancillary chunk may depend
     // on the exact critical image representation. Columbo cannot update its
     // contract, so after validating every image stream preserve the complete
-    // source unless --strip explicitly removes that chunk.
+    // PNG datastream unless --strip explicitly removes that chunk. Bytes after
+    // IEND are outside that datastream and are never retained.
     if !options.strip_metadata && parsed.has_rewrite_sensitive_ancillary {
-        let data =
-            try_clone_bytes(input).ok_or_else(|| Error::new("could not allocate PNG output"))?;
+        let data = try_clone_bytes(&input[..datastream_len])
+            .ok_or_else(|| Error::new("could not allocate PNG output"))?;
         return Ok(Optimization::from_metrics(
             input.len(),
             data,
@@ -404,7 +409,7 @@ pub(super) fn optimize_preflight(
 
     let mut output = Vec::new();
     output
-        .try_reserve_exact(input.len())
+        .try_reserve_exact(datastream_len)
         .map_err(|_| Error::new("could not allocate PNG output"))?;
     output.extend_from_slice(SIGNATURE);
     let mut idat_written = false;
@@ -413,7 +418,7 @@ pub(super) fn optimize_preflight(
     let mut animation_sequence = 0_u32;
 
     for (index, chunk) in parsed.chunks.iter().enumerate() {
-        if should_strip(chunk.kind, options) {
+        if chunk.discard_on_output || should_strip(chunk.kind, options) {
             continue;
         }
 
@@ -517,9 +522,21 @@ pub(super) fn optimize_preflight(
         }
     }
 
-    if output.len() > input.len() && !options.strict {
+    if output.len() > datastream_len && !options.strict {
         output.clear();
-        output.extend_from_slice(input);
+        if parsed.has_vestigial_rgba_trns {
+            output.extend_from_slice(SIGNATURE);
+            for chunk in &parsed.chunks {
+                if !chunk.discard_on_output {
+                    output
+                        .try_reserve(chunk.encoded.len())
+                        .map_err(|_| Error::new("could not allocate PNG output"))?;
+                    output.extend_from_slice(chunk.encoded);
+                }
+            }
+        } else {
+            output.extend_from_slice(&input[..datastream_len]);
+        }
         output_deflate_bits = source_deflate_bits;
     }
 
@@ -718,6 +735,7 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
     let mut fdat_decoded_sizes = Vec::new();
     let mut state = ParseState::default();
     let mut has_rewrite_sensitive_ancillary = false;
+    let mut has_vestigial_rgba_trns = false;
     let mut compressed_metadata_streams = 0_usize;
     let mut position = SIGNATURE.len();
 
@@ -768,9 +786,12 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
         // Metadata whose semantics or placement are invalid is useful to no
         // output that explicitly strips it. Still validate chunk boundaries,
         // type bytes, and CRC above: --strip is not a general PNG repair mode.
-        if !strip_chunk {
-            validate_ancillary(kind, data, &mut state)?;
-        }
+        let discard_on_output = if strip_chunk {
+            false
+        } else {
+            validate_ancillary(kind, data, &mut state)?
+        };
+        has_vestigial_rgba_trns |= discard_on_output;
         // fcTL begins the next fdAT zlib stream; IEND closes the final one.
         if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
             fdat_frames
@@ -837,10 +858,14 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
             kind,
             data,
             encoded: &input[position..after],
+            discard_on_output,
         });
         position = after;
         if kind == *b"IEND" {
             state.saw_iend = true;
+            // IEND terminates the PNG datastream. Tolerate an enclosing file's
+            // suffix on input, but leave it outside the chunk model so every
+            // reconstructed output discards it.
             break;
         }
     }
@@ -851,11 +876,16 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
     {
         return Err(Error::new("invalid APNG frame count"));
     }
-    if !state.saw_ihdr || !state.saw_iend || position != input.len() {
+    if !state.saw_ihdr || !state.saw_iend {
         return Err(Error::new("invalid PNG trailer"));
     }
     if !state.saw_idat {
         return Err(Error::new("no IDAT chunk found"));
+    }
+    if has_vestigial_rgba_trns && has_rewrite_sensitive_ancillary && !strip_metadata {
+        return Err(Error::new(
+            "cannot remove invalid PNG tRNS while preserving rewrite-sensitive metadata",
+        ));
     }
     if idat.len() < 6 {
         return Err(Error::new("IDAT zlib stream too small"));
@@ -870,11 +900,13 @@ fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
     let idat_decoded_size = png_image_decoded_size(&state)?;
     Ok(ParsedPng {
         chunks,
+        datastream_len: position,
         idat,
         idat_decoded_size,
         fdat_frames,
         fdat_decoded_sizes,
         has_rewrite_sensitive_ancillary,
+        has_vestigial_rgba_trns,
     })
 }
 
@@ -991,7 +1023,16 @@ fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Resul
     Ok(())
 }
 
-fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<()> {
+/// Validate ancillary semantics and report whether a known-invalid chunk must
+/// be omitted from every successful output.
+///
+/// Some exporters leave an indexed palette's tRNS behind after converting the
+/// image data and IHDR to RGBA. PLTE itself is a valid suggested palette for
+/// color type 6, but tRNS is forbidden because RGBA already carries alpha.
+/// Tolerate only that narrow, structurally consistent signature. The chunk is
+/// never allowed to influence pixel interpretation and is never preserved.
+fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<bool> {
+    let mut discard_on_output = false;
     macro_rules! once_before_image {
         ($kind:literal, $seen:ident, $length:expr, $message:literal) => {
             if kind == *$kind {
@@ -1043,19 +1084,20 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
         state.saw_srgb = true;
     }
     if kind == *b"tRNS" {
-        let expected = match state.color_type {
-            0 => 2,
-            2 => 6,
-            3 => data.len(),
-            _ => 0,
+        let valid_for_color_type = match state.color_type {
+            0 => data.len() == 2,
+            2 => data.len() == 6,
+            3 => state.saw_plte && data.len() <= state.palette_entries as usize,
+            6 => {
+                let vestigial_palette_alpha = state.saw_plte
+                    && !data.is_empty()
+                    && data.len() <= state.palette_entries as usize;
+                discard_on_output = vestigial_palette_alpha;
+                vestigial_palette_alpha
+            }
+            _ => false,
         };
-        if state.saw_trns
-            || state.saw_idat
-            || expected == 0
-            || (state.color_type == 3
-                && (!state.saw_plte || data.len() > state.palette_entries as usize))
-            || (state.color_type != 3 && data.len() != expected)
-        {
+        if state.saw_trns || state.saw_idat || !valid_for_color_type {
             return Err(Error::new("invalid PNG tRNS"));
         }
         state.saw_trns = true;
@@ -1166,7 +1208,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             return Err(Error::new("invalid PNG sPLT"));
         }
     }
-    Ok(())
+    Ok(discard_on_output)
 }
 
 /// Validate the decimal notation registered for PNG extension chunks.
@@ -2758,6 +2800,260 @@ mod tests {
     }
 
     #[test]
+    fn strips_everything_after_iend_in_every_mode() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+        input.extend_from_slice(b"opaque payload after the PNG datastream");
+
+        let modes = [
+            Options::default(),
+            Options {
+                strict: false,
+                ..Options::default()
+            },
+            Options {
+                strip_metadata: true,
+                ..Options::default()
+            },
+            Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        ];
+        let iend = chunk(*b"IEND", &[]);
+        for options in modes {
+            let result = optimize(&input, &options).unwrap();
+            assert!(result.data.ends_with(&iend));
+            let saved_bytes = u64::try_from(input.len() - result.data.len()).unwrap();
+            assert_eq!(result.bits_saved, saved_bytes * 8);
+            let parsed = parse(&result.data, false).unwrap();
+            assert_eq!(parsed.datastream_len, result.data.len());
+        }
+    }
+
+    #[test]
+    fn strips_everything_after_an_apng_iend() {
+        let zlib = black_scanline_zlib();
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        let mut actl = Vec::new();
+        actl.extend_from_slice(&2_u32.to_be_bytes());
+        actl.extend_from_slice(&0_u32.to_be_bytes());
+        input.extend(chunk(*b"acTL", &actl));
+        input.extend(chunk(*b"fcTL", &frame_control(0)));
+        input.extend(chunk(*b"IDAT", &zlib));
+        input.extend(chunk(*b"fcTL", &frame_control(1)));
+        let mut frame_data = 2_u32.to_be_bytes().to_vec();
+        frame_data.extend_from_slice(&zlib);
+        input.extend(chunk(*b"fdAT", &frame_data));
+        input.extend(chunk(*b"IEND", &[]));
+        input.extend_from_slice(b"payload after the APNG datastream");
+
+        let result = optimize(&input, &Options::default()).unwrap();
+        assert!(result.data.ends_with(&chunk(*b"IEND", &[])));
+        let saved_bytes = u64::try_from(input.len() - result.data.len()).unwrap();
+        assert_eq!(result.bits_saved, saved_bytes * 8);
+        let parsed = parse(&result.data, false).unwrap();
+        assert_eq!(parsed.datastream_len, result.data.len());
+        assert_eq!(parsed.fdat_frames.len(), 1);
+    }
+
+    #[test]
+    fn accepts_and_removes_vestigial_rgba_trns_in_every_mode() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let decoded = [0, 10, 20, 30, 40];
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        input.extend(chunk(*b"PLTE", &[0, 0, 0, 255, 255, 255]));
+        input.extend(chunk(*b"tRNS", &[0, 255]));
+        input.extend(chunk(*b"IDAT", &stored_zlib(&decoded)));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let modes = [
+            Options::default(),
+            Options {
+                strict: false,
+                ..Options::default()
+            },
+            Options {
+                strip_metadata: true,
+                ..Options::default()
+            },
+            Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        ];
+        for options in modes {
+            let result = optimize(&input, &options).unwrap();
+            let parsed = parse(&result.data, false).unwrap();
+            assert_eq!(parsed.chunks[0].data[9], 6);
+            assert!(parsed.chunks.iter().any(|chunk| chunk.kind == *b"PLTE"));
+            assert!(parsed.chunks.iter().all(|chunk| chunk.kind != *b"tRNS"));
+            assert!(zlib_decodes_to(&parsed.idat, &decoded));
+            let saved_bytes = u64::try_from(input.len() - result.data.len()).unwrap();
+            assert_eq!(result.bits_saved, saved_bytes * 8);
+        }
+    }
+
+    #[test]
+    fn removes_vestigial_rgba_trns_and_trailing_bytes_from_apng() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let decoded = [0, 10, 20, 30, 40];
+        let zlib = stored_zlib(&decoded);
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        let mut actl = Vec::new();
+        actl.extend_from_slice(&2_u32.to_be_bytes());
+        actl.extend_from_slice(&0_u32.to_be_bytes());
+        input.extend(chunk(*b"acTL", &actl));
+        input.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        input.extend(chunk(*b"tRNS", &[0]));
+        input.extend(chunk(*b"fcTL", &frame_control(0)));
+        input.extend(chunk(*b"IDAT", &zlib));
+        input.extend(chunk(*b"fcTL", &frame_control(1)));
+        let mut frame_data = 2_u32.to_be_bytes().to_vec();
+        frame_data.extend_from_slice(&zlib);
+        input.extend(chunk(*b"fdAT", &frame_data));
+        input.extend(chunk(*b"IEND", &[]));
+        input.extend_from_slice(b"payload after IEND");
+
+        let result = optimize(&input, &Options::default()).unwrap();
+        let parsed = parse(&result.data, false).unwrap();
+        assert_eq!(parsed.datastream_len, result.data.len());
+        assert!(parsed.chunks.iter().all(|chunk| chunk.kind != *b"tRNS"));
+        assert!(zlib_decodes_to(&parsed.idat, &decoded));
+        assert_eq!(parsed.fdat_frames.len(), 1);
+        assert!(zlib_decodes_to(&parsed.fdat_frames[0], &decoded));
+        let saved_bytes = u64::try_from(input.len() - result.data.len()).unwrap();
+        assert_eq!(result.bits_saved, saved_bytes * 8);
+    }
+
+    #[test]
+    fn valid_indexed_trns_remains_pixel_semantics_even_with_strip() {
+        let mut header = ihdr();
+        header[9] = 3;
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        input.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        input.extend(chunk(*b"tRNS", &[0]));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for strip_metadata in [false, true] {
+            let result = optimize(
+                &input,
+                &Options {
+                    strip_metadata,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            let parsed = parse(&result.data, false).unwrap();
+            assert!(parsed.chunks.iter().any(|chunk| chunk.kind == *b"tRNS"));
+        }
+    }
+
+    #[test]
+    fn rejects_rgba_trns_outside_the_vestigial_palette_signature() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let cases: [(&[u8], Option<&[u8]>); 3] = [
+            (&[0], None),
+            (&[], Some(&[0, 0, 0])),
+            (&[0, 255], Some(&[0, 0, 0])),
+        ];
+
+        for (transparency, palette) in cases {
+            let mut input = SIGNATURE.to_vec();
+            input.extend(chunk(*b"IHDR", &header));
+            if let Some(palette) = palette {
+                input.extend(chunk(*b"PLTE", palette));
+            }
+            input.extend(chunk(*b"tRNS", transparency));
+            input.extend(chunk(*b"IDAT", &stored_zlib(&[0, 0, 0, 0, 0])));
+            input.extend(chunk(*b"IEND", &[]));
+
+            for strip_metadata in [false, true] {
+                let error = optimize(
+                    &input,
+                    &Options {
+                        strip_metadata,
+                        ..Options::default()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.message(), "invalid PNG tRNS");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_vestigial_rgba_trns_after_idat_or_when_duplicated() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let idat = chunk(*b"IDAT", &stored_zlib(&[0, 0, 0, 0, 0]));
+        let trns = chunk(*b"tRNS", &[0]);
+
+        let mut after_idat = SIGNATURE.to_vec();
+        after_idat.extend(chunk(*b"IHDR", &header));
+        after_idat.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        after_idat.extend(&idat);
+        after_idat.extend(&trns);
+        after_idat.extend(chunk(*b"IEND", &[]));
+
+        let mut duplicated = SIGNATURE.to_vec();
+        duplicated.extend(chunk(*b"IHDR", &header));
+        duplicated.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        duplicated.extend(&trns);
+        duplicated.extend(&trns);
+        duplicated.extend(&idat);
+        duplicated.extend(chunk(*b"IEND", &[]));
+
+        for input in [&after_idat, &duplicated] {
+            let error = optimize(input, &Options::default()).unwrap_err();
+            assert_eq!(error.message(), "invalid PNG tRNS");
+        }
+    }
+
+    #[test]
+    fn vestigial_rgba_trns_does_not_hide_a_wrong_color_mode() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        input.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        input.extend(chunk(*b"tRNS", &[0]));
+        // This is a two-byte grayscale scanline, not the five bytes required
+        // for a one-pixel, eight-bit RGBA scanline.
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let error = optimize(&input, &Options::default()).unwrap_err();
+        assert_eq!(error.message(), "PNG image data size does not match IHDR");
+    }
+
+    #[test]
+    fn still_rejects_trns_for_grayscale_alpha() {
+        let mut header = ihdr();
+        header[9] = 4;
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        input.extend(chunk(*b"tRNS", &[0]));
+        input.extend(chunk(*b"IDAT", &stored_zlib(&[0, 0, 0])));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let error = optimize(&input, &Options::default()).unwrap_err();
+        assert_eq!(error.message(), "invalid PNG tRNS");
+    }
+
+    #[test]
     fn static_png_has_one_physical_deflate_stream() {
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &ihdr()));
@@ -3460,7 +3756,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_png_with_unknown_unsafe_ancillary_chunk() {
+    fn preserves_png_datastream_with_unknown_unsafe_ancillary_chunk() {
         let zlib = black_scanline_zlib();
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &ihdr()));
@@ -3470,9 +3766,13 @@ mod tests {
         input.extend(chunk(*b"IDAT", &zlib[..5]));
         input.extend(chunk(*b"IDAT", &zlib[5..]));
         input.extend(chunk(*b"IEND", &[]));
+        let datastream = input.clone();
+        let trailing = b"payload after IEND";
+        input.extend_from_slice(trailing);
 
         let result = optimize(&input, &Options::default()).unwrap();
-        assert_eq!(result.data, input);
+        assert_eq!(result.data, datastream);
+        assert_eq!(result.bits_saved, trailing.len() as u64 * 8);
     }
 
     #[test]
@@ -3512,6 +3812,39 @@ mod tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn vestigial_rgba_trns_requires_strip_with_rewrite_sensitive_metadata() {
+        let mut header = ihdr();
+        header[9] = 6;
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &header));
+        input.extend(chunk(*b"vpAG", b"private contract"));
+        input.extend(chunk(*b"PLTE", &[0, 0, 0]));
+        input.extend(chunk(*b"tRNS", &[0]));
+        input.extend(chunk(*b"IDAT", &stored_zlib(&[0, 0, 0, 0, 0])));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let error = optimize(&input, &Options::default()).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "cannot remove invalid PNG tRNS while preserving rewrite-sensitive metadata"
+        );
+
+        let result = optimize(
+            &input,
+            &Options {
+                strip_metadata: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let parsed = parse(&result.data, false).unwrap();
+        assert!(parsed
+            .chunks
+            .iter()
+            .all(|chunk| !matches!(&chunk.kind, b"tRNS" | b"vpAG")));
     }
 
     #[test]
