@@ -249,11 +249,12 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
 }
 
 fn optimize_member(input: &[u8], member: Member, options: &Options) -> Result<RawOptimization> {
+    let default_floor = member_default_floor(options.exhaustive);
     let raw = optimize_raw_prefix_with_floor(
         &input[member.payload_start..],
         options,
         member.decoded_size,
-        DefaultFloor::Shared,
+        default_floor,
     )?;
     if member.payload_start.checked_add(raw.consumed) != Some(member.trailer_start)
         || raw.info.size != member.decoded_size
@@ -261,6 +262,14 @@ fn optimize_member(input: &[u8], member: Member, options: &Options) -> Result<Ra
         return Err(Error::new("invalid GZIP deflate member"));
     }
     Ok(raw)
+}
+
+fn member_default_floor(exhaustive: bool) -> DefaultFloor {
+    if exhaustive {
+        DefaultFloor::SharedExact
+    } else {
+        DefaultFloor::Shared
+    }
 }
 
 fn gzip_member_timeout(
@@ -398,6 +407,33 @@ mod tests {
         member
     }
 
+    fn feedback_member() -> Vec<u8> {
+        let raw = [
+            0x25, 0xc0, 0x01, 0x01, 0xc0, 0x30, 0x0c, 0xc3, 0x30, 0x6c, 0xb5, 0x9b, 0xf0, 0x87,
+            0xf4, 0x7d, 0xd3, 0xcc, 0xcc, 0xcc, 0xcc, 0x01, 0x00, 0x00, 0xc0, 0x71, 0x5d, 0xaa,
+            0xaa, 0xaa, 0xfe, 0x76, 0x77, 0x93, 0x24, 0x49, 0x9e, 0xa7, 0x6d, 0xdb, 0xf6, 0x03,
+        ];
+        let (_, info) = inspect_raw_prefix(&raw, 86).unwrap();
+        let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+        member.extend_from_slice(&raw);
+        member.extend_from_slice(&info.crc32.to_le_bytes());
+        member.extend_from_slice(&(info.size as u32).to_le_bytes());
+        member
+    }
+
+    fn aggregate_deflate_bits(input: &[u8]) -> u64 {
+        parse_members(input, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|member| {
+                inspect_raw_prefix(&input[member.payload_start..], member.decoded_size)
+                    .unwrap()
+                    .1
+                    .source_deflate_bits
+            })
+            .sum()
+    }
+
     #[test]
     fn rejects_reserved_flags_before_decoding() {
         let mut input = vec![0x1f, 0x8b, 8, 0x01 | 0x20];
@@ -428,6 +464,34 @@ mod tests {
         let result = optimize(&input, &Options::default()).unwrap();
         assert_eq!(result.data, input);
         assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn max_members_use_an_exact_shared_default_floor() {
+        assert_eq!(member_default_floor(false), DefaultFloor::Shared);
+        assert_eq!(member_default_floor(true), DefaultFloor::SharedExact);
+    }
+
+    #[test]
+    fn sufficient_time_gzip_max_dominates_default_in_bytes_and_bits() {
+        let input = feedback_member();
+        let default_options = Options {
+            strict: false,
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let default = optimize(&input, &default_options).unwrap();
+        let maximum = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                ..default_options
+            },
+        )
+        .unwrap();
+
+        assert!(maximum.data.len() <= default.data.len());
+        assert!(aggregate_deflate_bits(&maximum.data) <= aggregate_deflate_bits(&default.data));
     }
 
     #[test]

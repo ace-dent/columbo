@@ -147,8 +147,9 @@ enum SourceBlockSearch {
         /// The completed compact proven lineage beat the normal floor.
         integrated_compact_proven: bool,
     },
-    /// One whole-block ladder, leaving split and iterative work to siblings.
-    Narrow { allow_individual_prune: bool },
+    /// One cumulative whole-block ladder, leaving individual pruning, splits,
+    /// and iterative work to sibling routes.
+    Narrow,
     /// Deterministic table floors only, for a selected terminal seed.
     Floor,
 }
@@ -166,6 +167,34 @@ fn search_split_before_whole_block(
     unsplit_floor_bits: u64,
 ) -> bool {
     exhaustive && best_split_bits.is_some_and(|bits| bits < unsplit_floor_bits)
+}
+
+/// Prefer the global boundary graph while a complete incumbent already
+/// protects source-order work and the graph has a compact, useful topology.
+///
+/// One source block, or the two blocks produced by its first split, has a
+/// tightly bounded cut graph. Multiple same-distance repartition runs mean
+/// that distant cut combinations can improve together, whereas the linear
+/// source-order route considers each block independently. Broader block lists
+/// retain the ordinary order because their boundary graph grows much faster.
+fn established_boundary_graph_priority(blocks: &[ParsedBlock]) -> bool {
+    if blocks.is_empty() || blocks.len() > 2 {
+        return false;
+    }
+    let Some(token_count) = blocks.iter().try_fold(0_usize, |total, block| {
+        total.checked_add(block.tokens.len())
+    }) else {
+        return false;
+    };
+    let Some(plain_count) = blocks
+        .iter()
+        .try_fold(0_usize, |total, block| total.checked_add(block.plain.len()))
+    else {
+        return false;
+    };
+    token_count <= COLLECTED_RUN_MAX_TOKENS
+        && plain_count >= WHOLE_STREAM_RECODE_MIN_PLAIN
+        && same_distance_opportunities(blocks).repartition_runs >= 2
 }
 
 /// Identifies the cheap pre-grouped layout selected for the first replay.
@@ -480,10 +509,7 @@ pub(crate) fn plan_stream_with_progress(
     let prioritize_boundary_graph = options.exhaustive
         && comparison_floor_secured
         && allow_regroup
-        && matches!(blocks, [block]
-            if block.tokens.len() <= COLLECTED_RUN_MAX_TOKENS
-                && block.plain.len() >= WHOLE_STREAM_RECODE_MIN_PLAIN)
-        && same_distance_opportunities(blocks).repartition_runs >= 2;
+        && established_boundary_graph_priority(blocks);
     let mut boundary_search_completed = false;
     if prioritize_boundary_graph && !stop.reached() {
         boundary_search_completed = true;
@@ -715,7 +741,6 @@ pub(crate) fn plan_source_no_split_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
-    allow_individual_prune: bool,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let prepared = prepare_blocks(blocks);
@@ -731,9 +756,7 @@ pub(crate) fn plan_source_no_split_route(
         start_alignment,
         options,
         AdjacentMergeSearch::LongRun,
-        SourceBlockSearch::Narrow {
-            allow_individual_prune,
-        },
+        SourceBlockSearch::Narrow,
         &mut plan_cache,
         stop,
         None,
@@ -1718,14 +1741,220 @@ pub(crate) fn plan_compact_source_split_floor_until(
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let mut plan_cache = CanonicalPlanCache::new();
-    plan_compact_source_split_floor_cached(
+    if stop.reached() && stop.permits_bounded_finalization() {
+        return plan_compact_source_split_rescue(blocks, start_alignment, options, &mut plan_cache);
+    }
+    // Coarse to fine: cover every structural cut first with the fast ordinary
+    // Huffman planner, then spend the remaining allowance exhaustively pricing
+    // the same topology. The preliminary result is a complete valid stream,
+    // while sufficient Max time still reaches the exact historical sweep.
+    let mut quick_options = options.clone();
+    quick_options.exhaustive = false;
+    let mut priority = plan_compact_source_split_floor_cached(
+        blocks,
+        start_alignment,
+        &quick_options,
+        &mut plan_cache,
+        true,
+        stop,
+    )?;
+    finalize_compact_split_header_suffix(
+        &mut priority,
+        start_alignment,
+        options,
+        &mut plan_cache,
+        stop,
+    );
+    if stop.reached() {
+        return Some(priority);
+    }
+    let complete = plan_compact_source_split_floor_cached(
         blocks,
         start_alignment,
         options,
         &mut plan_cache,
         true,
         stop,
-    )
+    )?;
+    if total_bits(&complete) < total_bits(&priority) {
+        Some(complete)
+    } else {
+        Some(priority)
+    }
+}
+
+/// Finish one bounded structural probe when an admitted compact route reaches
+/// its hard boundary before evaluating a cut.
+///
+/// The largest eligible block offers the widest opportunity to separate two
+/// Huffman regimes. Price all of its at-most-fourteen eighth cuts with the
+/// ordinary header planner, then exhaustively price only the best topology.
+/// This retains broad structural evidence while replacing the old six-trial
+/// exhaustive rescue with one exact child pair.
+fn plan_compact_source_split_rescue(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+) -> Option<Vec<PlannedBlock>> {
+    let priority_block = blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.tokens.len() >= 16 && block.plain.len() >= 128)
+        .max_by_key(|(_, block)| block.plain.len())
+        .map(|(index, _)| index)?;
+    let mut quick_options = options.clone();
+    quick_options.exhaustive = false;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(blocks.len().saturating_add(1))
+        .ok()?;
+    let mut output_bits = 0_u64;
+
+    for (block_index, block) in blocks.iter().enumerate() {
+        let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
+        let base = reusable_original_bits(block, alignment, options.strict)
+            .map(|original| PlannedBlock {
+                tokens: Arc::clone(&block.tokens),
+                plain: Arc::clone(&block.plain),
+                representation: Representation::Original(original),
+                bits: original.len,
+                source_type: block.source_type,
+            })
+            .unwrap_or_else(|| plan_block_cached(block, alignment, &quick_options, plan_cache));
+        let mut winner = vec![base];
+        let mut winner_bits = total_bits(&winner);
+
+        if block_index == priority_block {
+            let composite = Composite::new(std::slice::from_ref(block))?;
+            let source = composite.sources[0];
+            let mut cuts = Vec::new();
+            add_eighth_cuts(
+                &mut cuts,
+                &composite,
+                source.token_start,
+                source.token_end,
+                source.plain_start,
+                source.plain_end,
+                include_inside_match_cuts(options.exhaustive, block.tokens.len()),
+            )?;
+            cuts.sort_unstable_by_key(|cut| cut.plain);
+            cuts.dedup_by_key(|cut| cut.plain);
+
+            let mut best_probe = None;
+            for split in cuts {
+                let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
+                let left_plan = plan_block_cached(&left, alignment, &quick_options, plan_cache);
+                let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
+                let right = make_range(
+                    &composite,
+                    split,
+                    Cut {
+                        token: block.tokens.len(),
+                        plain: block.plain.len(),
+                    },
+                )?;
+                let right_plan =
+                    plan_block_cached(&right, right_alignment, &quick_options, plan_cache);
+                let bits = left_plan.bits.checked_add(right_plan.bits)?;
+                if best_probe.map_or(true, |(best_bits, _)| bits < best_bits) {
+                    best_probe = Some((bits, split));
+                }
+            }
+
+            if let Some((_, split)) = best_probe {
+                let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
+                let left_plan = plan_block_cached(&left, alignment, options, plan_cache);
+                let right_alignment = ((u64::from(alignment) + left_plan.bits) & 7) as u8;
+                let right = make_range(
+                    &composite,
+                    split,
+                    Cut {
+                        token: block.tokens.len(),
+                        plain: block.plain.len(),
+                    },
+                )?;
+                let right_plan = plan_block_cached(&right, right_alignment, options, plan_cache);
+                let bits = left_plan.bits.checked_add(right_plan.bits)?;
+                if bits < winner_bits {
+                    winner_bits = bits;
+                    winner.clear();
+                    winner.push(left_plan);
+                    winner.push(right_plan);
+                }
+            }
+        }
+
+        if output.len().checked_add(winner.len())? > MAX_FRAGMENTED_REPLAY_BLOCKS {
+            return None;
+        }
+        append_output_plans(&mut output, &mut output_bits, winner)?;
+    }
+    Some(output)
+}
+
+/// Exhaustively finalize only the alignment-independent suffix selected by
+/// the fast structural sweep.
+///
+/// Dynamic and fixed blocks do not depend on their starting bit offset. Once
+/// the last stored or exact-original block is behind us, a shorter header can
+/// therefore be adopted without invalidating any later plan. This prices the
+/// winning topology first instead of exhaustively finalizing every losing cut.
+fn finalize_compact_split_header_suffix(
+    plans: &mut [PlannedBlock],
+    start_alignment: u8,
+    options: &Options,
+    plan_cache: &mut CanonicalPlanCache,
+    stop: &mut SearchStop<'_>,
+) {
+    let first_safe = plans
+        .iter()
+        .rposition(|plan| {
+            matches!(
+                plan.representation,
+                Representation::Original(_) | Representation::Stored
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let mut output_bits = 0_u64;
+    for (index, plan) in plans.iter_mut().enumerate() {
+        let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
+        if index >= first_safe && !stop.reached() {
+            if let Some(block) = parsed_from_generated_huffman_plan(plan) {
+                let refined = plan_block_cached(&block, alignment, options, plan_cache);
+                if refined.bits < plan.bits {
+                    *plan = refined;
+                }
+            }
+        }
+        output_bits = output_bits.saturating_add(plan.bits);
+    }
+}
+
+fn parsed_from_generated_huffman_plan(plan: &PlannedBlock) -> Option<ParsedBlock> {
+    let original_dynamic = match &plan.representation {
+        Representation::Dynamic(dynamic) => Some(dynamic.try_clone()?),
+        Representation::Fixed => None,
+        Representation::Original(_) | Representation::Stored => return None,
+    };
+    let source_type = if original_dynamic.is_some() {
+        SourceBlockType::Dynamic
+    } else {
+        SourceBlockType::Fixed
+    };
+    let (literal_frequencies, distance_frequencies) = count_frequencies(&plan.tokens);
+    Some(ParsedBlock {
+        tokens: Arc::clone(&plan.tokens),
+        plain: Arc::clone(&plan.plain),
+        literal_frequencies,
+        distance_frequencies,
+        original_literal_lengths: None,
+        original_distance_lengths: None,
+        original_dynamic,
+        original: None,
+        source_splits: Vec::new(),
+        source_type,
+    })
 }
 
 fn plan_compact_source_split_floor_cached(
@@ -1739,23 +1968,7 @@ fn plan_compact_source_split_floor_cached(
     let mut output = Vec::new();
     output.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
-    // If the hard boundary is reached just as finalization starts, spend a
-    // tiny bounded rescue on the largest eligible block. Balanced splits have
-    // the greatest chance of separating distinct Huffman regimes, so this
-    // orders central eighths first and caps post-deadline work at six complete
-    // trials. Other blocks retain their exact parent representation.
-    let priority_block = prioritize_inside_match_cuts
-        .then(|| {
-            blocks
-                .iter()
-                .enumerate()
-                .filter(|(_, block)| block.tokens.len() >= 16 && block.plain.len() >= 128)
-                .max_by_key(|(_, block)| block.plain.len())
-                .map(|(index, _)| index)
-        })
-        .flatten();
-
-    for (block_index, block) in blocks.iter().enumerate() {
+    for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
         // Deadline-limited finalization starts from the exact completed
         // parent representation whenever its alignment is unchanged. The
@@ -1783,12 +1996,7 @@ fn plan_compact_source_split_floor_cached(
         winner.push(base);
         let mut winner_bits = total_bits(&winner);
 
-        let rescue_after_deadline =
-            priority_block == Some(block_index) && prioritize_inside_match_cuts && stop.reached();
-        if block.tokens.len() >= 16
-            && block.plain.len() >= 128
-            && (!stop.reached() || rescue_after_deadline)
-        {
+        if block.tokens.len() >= 16 && block.plain.len() >= 128 && !stop.reached() {
             let composite = Composite::new(std::slice::from_ref(block))?;
             let source = composite.sources[0];
             let mut cuts = Vec::new();
@@ -1805,17 +2013,16 @@ fn plan_compact_source_split_floor_cached(
                 let token_boundary = composite.cut_is_token_boundary(cut);
                 if prioritize_inside_match_cuts {
                     (
-                        cut.plain.abs_diff(block.plain.len() / 2),
                         usize::from(!token_boundary),
+                        cut.plain.abs_diff(block.plain.len().saturating_mul(7) / 8),
                     )
                 } else {
                     (usize::from(!token_boundary), cut.plain)
                 }
             });
             cuts.dedup_by_key(|cut| cut.plain);
-            let mut completed_rescue_trials = 0_usize;
             for split in cuts {
-                if stop.reached() && (!rescue_after_deadline || completed_rescue_trials >= 6) {
+                if stop.reached() {
                     break;
                 }
                 let left = make_range(&composite, Cut { token: 0, plain: 0 }, split)?;
@@ -1831,15 +2038,11 @@ fn plan_compact_source_split_floor_cached(
                 )?;
                 let right_plan = plan_block_cached(&right, right_alignment, options, plan_cache);
                 let bits = left_plan.bits.checked_add(right_plan.bits)?;
-                completed_rescue_trials += usize::from(rescue_after_deadline);
                 if bits < winner_bits {
                     winner_bits = bits;
                     winner.clear();
                     winner.push(left_plan);
                     winner.push(right_plan);
-                    if rescue_after_deadline {
-                        break;
-                    }
                 }
             }
         }
@@ -2792,26 +2995,13 @@ fn plan_source_with_search(
             plan_cache,
             stop,
         ),
-        SourceBlockSearch::Narrow {
-            allow_individual_prune,
-        } => {
+        SourceBlockSearch::Narrow => {
             let plan = match plan_source_block(block, alignment, options, stop) {
                 Some(seed) if !stop.reached() => plan_block_with_seeded_narrow_search(
-                    block,
-                    alignment,
-                    options,
-                    allow_individual_prune,
-                    seed,
-                    stop,
+                    block, alignment, options, false, seed, stop,
                 ),
                 Some(seed) => seed,
-                None => plan_block_with_narrow_search(
-                    block,
-                    alignment,
-                    options,
-                    allow_individual_prune,
-                    stop,
-                ),
+                None => plan_block_with_narrow_search(block, alignment, options, false, stop),
             };
             vec![plan]
         }
@@ -6256,9 +6446,8 @@ mod tests {
         ];
         let mut plan_cache = CanonicalPlanCache::new();
         let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
-        let route =
-            plan_source_no_split_route(&blocks, 0, &options, true, &mut SearchStop::never())
-                .expect("the direct route retains a complete fallback");
+        let route = plan_source_no_split_route(&blocks, 0, &options, &mut SearchStop::never())
+            .expect("the direct route retains a complete fallback");
 
         assert!(total_bits(&route) <= total_bits(&fallback));
         let decoded: Vec<_> = route
@@ -6266,6 +6455,60 @@ mod tests {
             .flat_map(|plan| plan.plain.iter().copied())
             .collect();
         assert_eq!(decoded, vec![b'a'; 2_400]);
+    }
+
+    #[test]
+    fn compact_split_coarse_to_fine_never_loses_the_unlimited_exact_route() {
+        let options = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        let mut first = vec![b'a'; 512];
+        first.extend(std::iter::repeat(b'b').take(512));
+        let mut second = vec![b'c'; 512];
+        second.extend(std::iter::repeat(b'd').take(512));
+        let blocks = [
+            literal_block(&first, SourceBlockType::Dynamic),
+            literal_block(&second, SourceBlockType::Dynamic),
+        ];
+
+        let exact = plan_compact_source_split_floor(&blocks, 0, &options).unwrap();
+        let timed =
+            plan_compact_source_split_floor_until(&blocks, 0, &options, &mut SearchStop::never())
+                .unwrap();
+        assert!(total_bits(&timed) <= total_bits(&exact));
+
+        let stopped =
+            plan_compact_source_split_floor_until(&blocks, 0, &options, &mut SearchStop::always())
+                .expect("an expired route still forwards a complete structural parent");
+        let decoded: Vec<_> = stopped
+            .iter()
+            .flat_map(|plan| plan.plain.iter().copied())
+            .collect();
+        assert_eq!(decoded, [first, second].concat());
+    }
+
+    #[test]
+    fn expired_compact_split_rescue_keeps_a_complete_parent_or_better() {
+        let options = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        let mut plain = vec![b'a'; 8_192];
+        plain.extend((0..8_192).map(|index| (index % 251) as u8));
+        let blocks = [literal_block(&plain, SourceBlockType::Dynamic)];
+        let mut plan_cache = CanonicalPlanCache::new();
+        let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
+        let rescued =
+            plan_compact_source_split_floor_until(&blocks, 0, &options, &mut SearchStop::always())
+                .expect("the bounded rescue retains a complete parent");
+
+        assert!(total_bits(&rescued) <= total_bits(&fallback));
+        let decoded: Vec<_> = rescued
+            .iter()
+            .flat_map(|plan| plan.plain.iter().copied())
+            .collect();
+        assert_eq!(decoded, plain);
     }
 
     #[test]
@@ -6460,6 +6703,55 @@ mod tests {
         assert!(include_inside_match_cuts(false, maximum_tokens));
         assert!(!include_inside_match_cuts(false, maximum_tokens + 1));
         assert!(include_inside_match_cuts(true, usize::MAX));
+    }
+
+    fn boundary_priority_block(run_count: usize) -> ParsedBlock {
+        let (length_symbol, length_extra, length_extra_bits) =
+            canonical_length_encoding(257).unwrap();
+        let mut tokens = Vec::new();
+        for _ in 0..run_count {
+            tokens.push(Token::Literal(b'a'));
+            tokens.extend((0..200).map(|_| Token::Match {
+                length: 257,
+                distance: 1,
+                length_symbol,
+                distance_symbol: 0,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            }));
+        }
+        let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![b'a'; plain_len].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    }
+
+    #[test]
+    fn established_boundary_priority_covers_a_first_split_but_stays_bounded() {
+        let one_block = [boundary_priority_block(2)];
+        assert!(established_boundary_graph_priority(&one_block));
+
+        let two_blocks = [boundary_priority_block(1), boundary_priority_block(1)];
+        assert!(established_boundary_graph_priority(&two_blocks));
+
+        let three_blocks = [
+            boundary_priority_block(1),
+            boundary_priority_block(1),
+            literal_block(b"a", SourceBlockType::Dynamic),
+        ];
+        assert!(!established_boundary_graph_priority(&three_blocks));
     }
 
     #[test]

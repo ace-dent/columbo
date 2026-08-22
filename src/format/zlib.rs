@@ -178,7 +178,29 @@ pub(super) fn has_rfc1950_header(input: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn feedback_zlib() -> Vec<u8> {
+        let raw = [
+            0x25, 0xc0, 0x01, 0x01, 0xc0, 0x30, 0x0c, 0xc3, 0x30, 0x6c, 0xb5, 0x9b, 0xf0, 0x87,
+            0xf4, 0x7d, 0xd3, 0xcc, 0xcc, 0xcc, 0xcc, 0x01, 0x00, 0x00, 0xc0, 0x71, 0x5d, 0xaa,
+            0xaa, 0xaa, 0xfe, 0x76, 0x77, 0x93, 0x24, 0x49, 0x9e, 0xa7, 0x6d, 0xdb, 0xf6, 0x03,
+        ];
+        let (_, info) = crate::deflate::inspect_raw_prefix(&raw, 86).unwrap();
+        let mut stream = vec![0x78, 0x01];
+        stream.extend_from_slice(&raw);
+        stream.extend_from_slice(&info.adler32.to_be_bytes());
+        stream
+    }
+
+    fn deflate_bits(input: &[u8]) -> u64 {
+        crate::deflate::inspect_raw_prefix(&input[2..input.len() - 4], u64::MAX)
+            .unwrap()
+            .1
+            .source_deflate_bits
+    }
 
     #[test]
     fn same_byte_deflate_win_reports_bits_saved() {
@@ -187,6 +209,28 @@ mod tests {
 
         assert_eq!(optimized.data.len(), input.len());
         assert_eq!(optimized.bits_saved, 1);
+    }
+
+    #[test]
+    fn sufficient_time_zlib_max_dominates_default_in_bytes_and_bits() {
+        let input = feedback_zlib();
+        let default_options = Options {
+            strict: false,
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let default = optimize(&input, &default_options).unwrap();
+        let maximum = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                ..default_options
+            },
+        )
+        .unwrap();
+
+        assert!(maximum.data.len() <= default.data.len());
+        assert!(deflate_bits(&maximum.data) <= deflate_bits(&default.data));
     }
 
     #[test]

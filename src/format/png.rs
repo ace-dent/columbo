@@ -67,6 +67,44 @@ pub(super) struct ParsedPng<'a> {
     has_vestigial_rgba_trns: bool,
 }
 
+struct PngOptimization {
+    data: Vec<u8>,
+    source_deflate_bits: u64,
+    output_deflate_bits: u64,
+    timed_out: bool,
+}
+
+impl PngOptimization {
+    fn dominates(&self, floor: &Self) -> bool {
+        self.data.len() <= floor.data.len() && self.output_deflate_bits <= floor.output_deflate_bits
+    }
+
+    fn into_public(self, source_bytes: usize) -> Optimization {
+        Optimization::from_metrics(
+            source_bytes,
+            self.data,
+            self.source_deflate_bits,
+            self.output_deflate_bits,
+            self.timed_out,
+        )
+    }
+}
+
+fn retain_dominating_maximum(
+    floor: PngOptimization,
+    maximum: PngOptimization,
+    overall_timed_out: bool,
+) -> PngOptimization {
+    let timed_out = floor.timed_out || maximum.timed_out || overall_timed_out;
+    let mut selected = if maximum.dominates(&floor) {
+        maximum
+    } else {
+        floor
+    };
+    selected.timed_out = timed_out;
+    selected
+}
+
 #[derive(Default)]
 struct ParseState {
     saw_ihdr: bool,
@@ -126,6 +164,22 @@ struct CompressedBodyOptimization {
     decoded_size: Option<u64>,
 }
 
+fn compressed_body_len(candidate: &CompressedBodyOptimization, source_len: usize) -> usize {
+    candidate.replacement.as_ref().map_or(source_len, Vec::len)
+}
+
+fn compressed_body_strictly_dominates(
+    candidate: &CompressedBodyOptimization,
+    floor: &CompressedBodyOptimization,
+    source_len: usize,
+) -> bool {
+    let candidate_len = compressed_body_len(candidate, source_len);
+    let floor_len = compressed_body_len(floor, source_len);
+    candidate_len <= floor_len
+        && candidate.output_deflate_bits <= floor.output_deflate_bits
+        && (candidate_len < floor_len || candidate.output_deflate_bits < floor.output_deflate_bits)
+}
+
 fn empty_chunk_replacements(chunk_count: usize) -> Result<Vec<Option<CompressedBodyOptimization>>> {
     let mut replacements = Vec::new();
     replacements
@@ -167,6 +221,93 @@ pub(super) fn optimize_preflight(
     options: &Options,
     parsed: ParsedPng<'_>,
 ) -> Result<Optimization> {
+    // A multi-image APNG splits Max's wall budget across independent image
+    // streams. Per-stream bounded floors cannot guarantee the same fixed point
+    // as the complete Default file pipeline: a small but complex frame may
+    // exhaust its proportional slice even when Default finishes the whole file
+    // before Max's deadline. Race that complete file result against an
+    // original-source Max pass with the full allowance, then retain Max only
+    // when the complete file is no worse in both bytes and aggregate
+    // meaningful Deflate bits. This keeps the quality floor without deducting
+    // Default's elapsed time from Max's search budget.
+    if options.exhaustive
+        && !parsed.fdat_frames.is_empty()
+        && !options.timeout.is_zero()
+        && (options.strip_metadata || !parsed.has_rewrite_sensitive_ancillary)
+        && parallel_apng_file_floor_is_bounded(&parsed)?
+    {
+        let started = Instant::now();
+        let floor_parsed = parse(input, options.strip_metadata)?;
+        let mut floor_options = options.clone();
+        floor_options.exhaustive = false;
+        floor_options.verbose = false;
+        floor_options.visual = false;
+
+        return thread::scope(|scope| {
+            let floor_worker = thread::Builder::new()
+                .name("columbo-apng-default-floor".into())
+                .spawn_scoped(scope, move || {
+                    optimize_preflight_once(input, &floor_options, floor_parsed)
+                });
+
+            let maximum = optimize_preflight_once(input, options, parsed);
+            let floor = match floor_worker {
+                Ok(worker) => match worker.join() {
+                    Ok(result) => result,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
+                // Thread creation failure is not an optimization failure.
+                // Preserve both quality contracts serially in this exceptional
+                // path; Max still receives its complete configured allowance.
+                Err(_) => {
+                    let floor_parsed = parse(input, options.strip_metadata)?;
+                    let mut floor_options = options.clone();
+                    floor_options.exhaustive = false;
+                    floor_options.verbose = false;
+                    floor_options.visual = false;
+                    optimize_preflight_once(input, &floor_options, floor_parsed)
+                }
+            }?;
+            let maximum = maximum?;
+            let selected =
+                retain_dominating_maximum(floor, maximum, started.elapsed() >= options.timeout);
+            Ok(selected.into_public(input.len()))
+        });
+    }
+
+    optimize_preflight_once(input, options, parsed).map(|result| result.into_public(input.len()))
+}
+
+/// Whether a second complete APNG model may safely overlap Max.
+///
+/// Reuse the image-worker input and decoded-work bounds because the sibling
+/// owns another parsed compressed model and another complete output. A
+/// single-core process keeps the historical Max route instead of forcing two
+/// deadline-sensitive whole-file searches to time-slice one CPU.
+fn parallel_apng_file_floor_is_bounded(parsed: &ParsedPng<'_>) -> Result<bool> {
+    if thread::available_parallelism().map_or(true, |parallelism| parallelism.get() < 2) {
+        return Ok(false);
+    }
+    let total_compressed = parsed
+        .fdat_frames
+        .iter()
+        .try_fold(parsed.idat.len(), |total, frame| {
+            total.checked_add(frame.len())
+        })
+        .ok_or_else(|| Error::resource_limit("PNG frame data is too large"))?;
+    let total_decoded =
+        total_image_decoded_bytes(parsed.idat_decoded_size, &parsed.fdat_decoded_sizes)?;
+    Ok(parallel_multi_image_is_bounded(
+        total_compressed,
+        total_decoded,
+    ))
+}
+
+fn optimize_preflight_once(
+    input: &[u8],
+    options: &Options,
+    parsed: ParsedPng<'_>,
+) -> Result<PngOptimization> {
     let datastream_len = parsed.datastream_len;
     let mut budget = DecodeBudget {
         remaining: options.max_decoded_bytes,
@@ -398,13 +539,12 @@ pub(super) fn optimize_preflight(
     if !options.strip_metadata && parsed.has_rewrite_sensitive_ancillary {
         let data = try_clone_bytes(&input[..datastream_len])
             .ok_or_else(|| Error::new("could not allocate PNG output"))?;
-        return Ok(Optimization::from_metrics(
-            input.len(),
+        return Ok(PngOptimization {
             data,
             source_deflate_bits,
-            source_deflate_bits,
-            budget.deadline.is_expired(),
-        ));
+            output_deflate_bits: source_deflate_bits,
+            timed_out: budget.deadline.is_expired(),
+        });
     }
 
     let mut output = Vec::new();
@@ -480,11 +620,12 @@ pub(super) fn optimize_preflight(
                     }
                 } else {
                     let mut optimize_metadata = || {
+                        let default_floor = metadata_default_floor(options.exhaustive);
                         optimize_compressed_body(
                             chunk.kind,
                             chunk.data,
                             options,
-                            DefaultFloor::Shared,
+                            default_floor,
                             &mut budget,
                         )
                     };
@@ -540,13 +681,12 @@ pub(super) fn optimize_preflight(
         output_deflate_bits = source_deflate_bits;
     }
 
-    Ok(Optimization::from_metrics(
-        input.len(),
-        output,
+    Ok(PngOptimization {
+        data: output,
         source_deflate_bits,
         output_deflate_bits,
-        budget.deadline.is_expired(),
-    ))
+        timed_out: budget.deadline.is_expired(),
+    })
 }
 
 /// Whether image work must leave time for a mandatory metadata pass.
@@ -558,6 +698,14 @@ pub(super) fn optimize_preflight(
 /// so it still reserves time whenever compressed metadata follows.
 fn image_work_needs_metadata_reserve(options: &Options, metadata_bytes: u64) -> bool {
     !options.exhaustive && metadata_bytes != 0
+}
+
+fn metadata_default_floor(exhaustive: bool) -> DefaultFloor {
+    if exhaustive {
+        DefaultFloor::SharedExact
+    } else {
+        DefaultFloor::Shared
+    }
 }
 
 /// Cache the complete Default result for a bounded set of metadata streams.
@@ -652,17 +800,56 @@ fn refine_cached_compressed_body(
     }
 
     let floor_data = floor.replacement.as_deref().unwrap_or(source_data);
-    let zlib_offset = compressed_zlib_offset(kind, floor_data)
+    let remaining = budget.deadline.remaining();
+    let direct_allowance = remaining / 2;
+    let mut best = try_clone_compressed_body(floor)
+        .ok_or_else(|| Error::new("could not allocate PNG metadata result"))?;
+
+    // The cached Default floor may have changed tokens before Max reaches
+    // metadata reconstruction. Preserve deft4j's original-source basin with a
+    // bounded independent slice, then use the actual remainder on the
+    // floor-seeded basin. Both are optional descendants of the retained floor;
+    // a local slice ending is not a file timeout.
+    if !direct_allowance.is_zero() {
+        let mut direct_options = budget.deadline.options_for_call(options);
+        direct_options.timeout = direct_options.timeout.min(direct_allowance);
+        let mut direct =
+            optimize_cached_compressed_parent(kind, source_data, decoded_size, &direct_options)?;
+        direct.source_deflate_bits = floor.source_deflate_bits;
+        if compressed_body_strictly_dominates(&direct, &best, source_data.len()) {
+            best = direct;
+        }
+    }
+
+    if !budget.deadline.remaining().is_zero() {
+        let call_options = budget.deadline.options_for_call(options);
+        let mut refined =
+            optimize_cached_compressed_parent(kind, floor_data, decoded_size, &call_options)?;
+        refined.source_deflate_bits = floor.source_deflate_bits;
+        if compressed_body_strictly_dominates(&refined, &best, source_data.len()) {
+            best = refined;
+        }
+    }
+
+    Ok(best)
+}
+
+fn optimize_cached_compressed_parent(
+    kind: [u8; 4],
+    parent_data: &[u8],
+    decoded_size: u64,
+    options: &Options,
+) -> Result<CompressedBodyOptimization> {
+    let zlib_offset = compressed_zlib_offset(kind, parent_data)
         .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
-    let call_options = budget.deadline.options_for_call(options);
-    let refined = run_png_zlib(
-        &floor_data[zlib_offset..],
-        &call_options,
+    let optimized = run_png_zlib(
+        &parent_data[zlib_offset..],
+        options,
         decoded_size,
         true,
         DefaultFloor::Established,
     )?;
-    let info = refined
+    let info = optimized
         .info
         .as_ref()
         .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
@@ -671,23 +858,17 @@ fn refine_cached_compressed_body(
     }
 
     let body_len = zlib_offset
-        .checked_add(refined.data.len())
+        .checked_add(optimized.data.len())
         .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
-    let refined_wins = body_len < floor_data.len()
-        || (body_len == floor_data.len() && info.deflate_bits < floor.output_deflate_bits);
-    if !refined_wins {
-        return try_clone_compressed_body(floor)
-            .ok_or_else(|| Error::new("could not allocate PNG metadata result"));
-    }
 
     let mut body = Vec::new();
     body.try_reserve_exact(body_len)
         .map_err(|_| Error::new("could not allocate PNG compressed metadata"))?;
-    body.extend_from_slice(&floor_data[..zlib_offset]);
-    body.extend_from_slice(&refined.data);
+    body.extend_from_slice(&parent_data[..zlib_offset]);
+    body.extend_from_slice(&optimized.data);
     Ok(CompressedBodyOptimization {
         replacement: Some(body),
-        source_deflate_bits: floor.source_deflate_bits,
+        source_deflate_bits: info.source_deflate_bits,
         output_deflate_bits: info.deflate_bits,
         decoded_size: Some(decoded_size),
     })
@@ -1410,6 +1591,20 @@ fn total_image_decoded_bytes(idat: u64, frames: &[u64]) -> Result<u64> {
         .ok_or_else(|| Error::resource_limit("decoded PNG data exceeds configured safety limit"))
 }
 
+fn image_default_floor(single_image: bool, exhaustive: bool) -> DefaultFloor {
+    if single_image {
+        // Establish the genuine normal result before spending the remaining
+        // file budget on PNG's bounded max routes. This keeps max output no
+        // larger than default without allowing a slow normal floor to starve
+        // every max-only route.
+        DefaultFloor::CompleteThenBounded
+    } else if exhaustive {
+        DefaultFloor::ApngMax
+    } else {
+        DefaultFloor::ApngDefault
+    }
+}
+
 /// Optimize the IDAT stream and each unique APNG frame under one file budget.
 ///
 /// Small streams run first so a large IDAT cannot consume the whole deadline.
@@ -1494,15 +1689,7 @@ fn optimize_image_streams(
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::new("could not allocate PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
-    let image_floor = if single_image {
-        // Establish the genuine normal result before spending the remaining
-        // file budget on PNG's bounded max routes. This keeps max output no
-        // larger than default without allowing a slow normal floor to starve
-        // every max-only route.
-        DefaultFloor::CompleteThenBounded
-    } else {
-        DefaultFloor::Shared
-    };
+    let image_floor = image_default_floor(single_image, options.exhaustive);
     let parallel_multi_image = options.exhaustive
         && !single_image
         && !budget.deadline.remaining().is_zero()
@@ -1920,7 +2107,7 @@ fn optimize_image_job_slice(
                 stream,
                 &call_options,
                 expected_decoded_size,
-                DefaultFloor::Shared,
+                DefaultFloor::ApngMax,
             )
         };
         let (stream_id, duplicates) = image_job_stream_group(job, representatives);
@@ -2723,6 +2910,25 @@ mod tests {
         stream
     }
 
+    fn feedback_zlib() -> Vec<u8> {
+        let raw = [
+            0x25, 0xc0, 0x01, 0x01, 0xc0, 0x30, 0x0c, 0xc3, 0x30, 0x6c, 0xb5, 0x9b, 0xf0, 0x87,
+            0xf4, 0x7d, 0xd3, 0xcc, 0xcc, 0xcc, 0xcc, 0x01, 0x00, 0x00, 0xc0, 0x71, 0x5d, 0xaa,
+            0xaa, 0xaa, 0xfe, 0x76, 0x77, 0x93, 0x24, 0x49, 0x9e, 0xa7, 0x6d, 0xdb, 0xf6, 0x03,
+        ];
+        let (_, info) = crate::deflate::inspect_raw_prefix(&raw, 86).unwrap();
+        let mut stream = vec![0x78, 0x01];
+        stream.extend_from_slice(&raw);
+        stream.extend_from_slice(&info.adler32.to_be_bytes());
+        stream
+    }
+
+    fn feedback_ihdr() -> [u8; 13] {
+        let mut data = ihdr();
+        data[..4].copy_from_slice(&85_u32.to_be_bytes());
+        data
+    }
+
     fn assert_maximum_flevel(stream: &[u8]) {
         assert!(zlib::has_rfc1950_header(stream));
         assert_eq!(stream[1] >> 6, 3);
@@ -2797,6 +3003,77 @@ mod tests {
         assert!(result.data.len() <= input.len());
         let parsed = parse(&result.data, false).unwrap();
         assert_maximum_flevel(&parsed.idat);
+    }
+
+    #[test]
+    fn sufficient_time_static_png_max_dominates_default_in_bytes_and_bits() {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &feedback_ihdr()));
+        input.extend(chunk(*b"IDAT", &feedback_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+        let default_options = Options {
+            strict: false,
+            timeout: Duration::from_secs(1),
+            ..Options::default()
+        };
+        let default =
+            optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
+                .unwrap();
+        let maximum = optimize_preflight_once(
+            &input,
+            &Options {
+                exhaustive: true,
+                ..default_options
+            },
+            parse(&input, false).unwrap(),
+        )
+        .unwrap();
+
+        assert!(maximum.data.len() <= default.data.len());
+        assert!(maximum.output_deflate_bits <= default.output_deflate_bits);
+    }
+
+    #[test]
+    fn sufficient_time_unraced_apng_max_dominates_default_in_bytes_and_bits() {
+        let zlib = feedback_zlib();
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(*b"IHDR", &feedback_ihdr()));
+        let mut actl = Vec::new();
+        actl.extend_from_slice(&2_u32.to_be_bytes());
+        actl.extend_from_slice(&0_u32.to_be_bytes());
+        input.extend(chunk(*b"acTL", &actl));
+        let mut first_control = frame_control(0);
+        first_control[4..8].copy_from_slice(&85_u32.to_be_bytes());
+        input.extend(chunk(*b"fcTL", &first_control));
+        input.extend(chunk(*b"IDAT", &zlib));
+        let mut second_control = frame_control(1);
+        second_control[4..8].copy_from_slice(&85_u32.to_be_bytes());
+        input.extend(chunk(*b"fcTL", &second_control));
+        let mut frame_data = 2_u32.to_be_bytes().to_vec();
+        frame_data.extend_from_slice(&zlib);
+        input.extend(chunk(*b"fdAT", &frame_data));
+        input.extend(chunk(*b"IEND", &[]));
+
+        let default_options = Options {
+            strict: false,
+            timeout: Duration::from_secs(2),
+            ..Options::default()
+        };
+        let default =
+            optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
+                .unwrap();
+        let maximum = optimize_preflight_once(
+            &input,
+            &Options {
+                exhaustive: true,
+                ..default_options
+            },
+            parse(&input, false).unwrap(),
+        )
+        .unwrap();
+
+        assert!(maximum.data.len() <= default.data.len());
+        assert!(maximum.output_deflate_bits <= default.output_deflate_bits);
     }
 
     #[test]
@@ -3205,6 +3482,48 @@ mod tests {
     }
 
     #[test]
+    fn multi_image_apng_uses_mode_specific_raw_floor_policies() {
+        assert_eq!(
+            image_default_floor(true, false),
+            DefaultFloor::CompleteThenBounded
+        );
+        assert_eq!(
+            image_default_floor(true, true),
+            DefaultFloor::CompleteThenBounded
+        );
+        assert_eq!(image_default_floor(false, false), DefaultFloor::ApngDefault);
+        assert_eq!(image_default_floor(false, true), DefaultFloor::ApngMax);
+    }
+
+    #[test]
+    fn uncached_metadata_max_uses_an_exact_shared_default_floor() {
+        assert_eq!(metadata_default_floor(false), DefaultFloor::Shared);
+        assert_eq!(metadata_default_floor(true), DefaultFloor::SharedExact);
+    }
+
+    #[test]
+    fn cached_metadata_max_requires_byte_and_bit_dominance() {
+        let candidate = |length, bits| CompressedBodyOptimization {
+            replacement: Some(vec![0; length]),
+            source_deflate_bits: 120,
+            output_deflate_bits: bits,
+            decoded_size: Some(1),
+        };
+        let floor = candidate(9, 100);
+
+        assert!(!compressed_body_strictly_dominates(
+            &candidate(8, 101),
+            &floor,
+            10
+        ));
+        assert!(compressed_body_strictly_dominates(
+            &candidate(8, 99),
+            &floor,
+            10
+        ));
+    }
+
+    #[test]
     fn parallel_image_timeout_accounts_for_each_child_grace() {
         let timeout = parallel_image_job_timeout(Duration::from_secs(10), 2, 1, 2);
         assert!(timeout >= Duration::from_millis(4_540));
@@ -3233,6 +3552,34 @@ mod tests {
         let selected = best_zlib_optimization(stream(10, 90, true), stream(9, 100, false));
         assert_eq!(selected.data.len(), 9);
         assert!(selected.timed_out);
+    }
+
+    #[test]
+    fn apng_max_file_floor_requires_no_worse_bytes_and_bits() {
+        let result = |tag, length, bits, timed_out| PngOptimization {
+            data: vec![tag; length],
+            source_deflate_bits: 120,
+            output_deflate_bits: bits,
+            timed_out,
+        };
+
+        let selected =
+            retain_dominating_maximum(result(1, 10, 100, false), result(2, 9, 101, false), false);
+        assert_eq!(selected.data[0], 1, "a Deflate-bit regression loses");
+
+        let selected =
+            retain_dominating_maximum(result(1, 10, 100, false), result(2, 11, 90, false), false);
+        assert_eq!(selected.data[0], 1, "a byte regression loses");
+
+        let selected =
+            retain_dominating_maximum(result(1, 10, 100, false), result(2, 10, 99, false), true);
+        assert_eq!(selected.data[0], 2, "a same-byte bit win is retained");
+        assert!(selected.timed_out, "the overall Max deadline is retained");
+
+        let selected =
+            retain_dominating_maximum(result(1, 10, 100, true), result(2, 9, 99, false), false);
+        assert_eq!(selected.data[0], 2, "a win in both metrics is retained");
+        assert!(selected.timed_out, "the Default floor timeout is retained");
     }
 
     #[test]

@@ -2,330 +2,326 @@
 
 # Benchmark miss and regression audit
 
-This audit combines the DeflOpt, Defluff, and timed deft4j benchmark journals.
-It keeps three different questions separate:
+This audit keeps reference misses, historical Columbo-floor regressions, and
+deadline-limited results separate. A positive reference delta means Columbo is
+larger than the comparison program. A guard failure means only that the current
+build did not reproduce an older Columbo result; it can still be substantially
+smaller than DeflOpt, Defluff, or deft4j.
 
-1. Is a reference smaller because it emits a relaxed Deflate spelling that
-   strict Columbo intentionally rejects?
-2. Is a reference using a container rewrite that Columbo cannot safely copy?
-3. Did a newer Columbo search schedule lose a result that an older Columbo
-   build had already found?
+Private machine-readable states live under `work/`, which remains ignored by
+Git. Public Markdown reports never relabel rows from an older executable as
+current results.
 
-The detailed row data remains in `docs/deflopt-benchmark.md`,
-`docs/defluff-benchmark.md`, and `docs/deft4j-timed-benchmark.md`. The private
-machine-readable sources are `work/deflopt-benchmark.json`,
-`work/defluff-benchmark.json`, `work/deft4j-timed-benchmark.json`, and
-`work/regression-guard.json`. Final-build broad samples and complete miss
-replays are retained under `work/*-final-broad-sample.json` and
-`work/*-final-miss-audit.json`; `/work/` remains ignored by Git.
+## Evidence sets
 
-## Snapshot summary
+| Evidence | Coverage | Executable SHA-256 | Current finding |
+| --- | ---: | --- | --- |
+| DeflOpt full journal | 1,914 rows / 957 pairs | `c09b1fc3…` | 14 strict-policy rows; no errors |
+| DeflOpt current family sample | 36 rows / 18 pairs | `9779c011…` | no miss, no error, Max never worse than Default |
+| Defluff relaxed journal | all 66 pairs | `db1556f4…` | no miss, error, or prior-result regression |
+| timed deft4j full journal | 1,621 rows | `ef63e322…` | 17 strict-policy rows and one safe PNG-preservation row; no errors |
+| timed deft4j current family sample | 25 rows | `9779c011…` | one known strict-policy miss; no errors |
+| timed deft4j current PngSuite group | all 161 paired files | `9779c011…` | three strict-policy rows; no errors; 38 bytes / 298 bits smaller than the old journal |
+| Steam APNG stopped full journal | 2,431 rows | `f287245e…` | historical evidence only: 12 misses and 54 errors |
+| Steam APNG current scoped replay | 12 former misses in Max and Default | `fa9b3559…` | no reference miss, Default/Max gate failure, or format error |
+| Priority guard | 100 unique files | `fa9b3559…` | 79 floors pass; 21 older floors remain; no new failure |
 
-| Benchmark | Completed rows | Recorded miss rows | Unique recorded miss files | Current disposition | Prior-result regression files | Errors |
-| --- | ---: | ---: | ---: | --- | ---: | ---: |
-| DeflOpt | 1,914 | 14 | 9 | 14 strict-policy rows | 11 | 0 |
-| Defluff (`--strict 0`) | 66 | 0 | 0 | — | 0 | 0 |
-| timed deft4j | 1,621 | 18 | 18 | 17 strict-policy rows; 1 PNG preservation-policy row | 9 | 0 |
-| Combined | 3,601 | 32 | 25 | 31 strict-policy rows; 1 PNG preservation-policy row; no unclassified row | 12 unique | 0 |
+The current candidate is `target/release/columbo`, SHA-256
+`9779c0115ff8bb08fd3fd852faa2c425520c62e26fd1c227aee3b20ff2ad01f3`.
+The complete guard and scoped APNG evidence use the immediately preceding
+`fa9b3559…` build. The only intervening source change replaces an anonymous
+worker-result tuple with named fields. On the current build, all 61 DeflOpt and
+deft4j family-sample outputs reproduce the earlier byte and bit counts exactly,
+and the four guards repaired by the accepted routing changes pass directly.
 
-Every recorded reference difference has a confirmed strict or safe-preservation
-policy explanation. There is no unclassified optimization-engine miss in the
-three complete journals.
+## Reference misses
 
-The complete DeflOpt and like-for-like Defluff refreshes use the current
-distribution binary SHA-256
-`5bac688c214e576cdfb54bc04b463c8e102a7f3f46f545f06205c5daea8db48e`.
-The complete timed-deft4j journal and its miss replays use the earlier binary
-SHA-256
-`ef63e3228ee65b70fd14aa0fea4345af70893e3535928a572ec81003fa5ce44c`;
-the accepted candidate and 40-file guard use
-`9f8262d6cd667295b2863d4835d7b69d777514ba94b31d53a19992568fff839e`.
-These results are kept separate so executable hashes are not mixed within a
-journal.
-The changed-parent no-split candidate is intentionally kept in separate sample
-state while it is validated, so the complete journals do not mix executable
-hashes.
+### DeflOpt
 
-## DeflOpt misses
+The complete DeflOpt journal has 14 miss rows representing nine files. Every
+one reached parity or better in the earlier `--strict 0` audit. They use compact
+empty/singleton Huffman alphabets or the non-standard symbol-284 spelling of
+length 258. Default Columbo intentionally remains strict, so these are output
+policy differences rather than missing optimization routes.
 
-Every DeflOpt miss reached parity or better in the earlier `--strict 0`
-classification audit. Default mode must remain strictly compliant by default,
-so these are documented policy differences rather than search failures. The
-latest complete run records the same 14 strict deltas for later investigation
-without rerunning relaxed audits. Deltas below are the largest strict delta
-recorded for the file; positive means Columbo is larger.
+The current size-spaced family sample covers PNG, ZIP, and GZIP families in
+both Default and Max. All 36 rows meet DeflOpt parity, Max is never worse than
+its completed Default result, and no row errors. Against the preceding sample,
+aggregate movement is -46 bytes / -367 meaningful bits. Two Max rows improve;
+one equal-byte ZIP row is one bit longer on two isolated confirmations. The
+full historical and current hashes remain explicitly distinct until a complete
+refresh finishes.
 
-| File | Affected modes | Bytes | Bits | Relaxed audit |
+### Defluff
+
+Defluff uses the compatibility-sensitive spellings exposed by
+`--strict 0`; the comparison is therefore relaxed on both sides. All 66 cases
+complete. Columbo is equal on 15, strictly better on 51, and smaller by 32
+bytes / 318 meaningful bits in aggregate. Strictness is never relaxed in
+ordinary Default use.
+
+### Timed deft4j
+
+The old complete journal's 18 reference misses are fully classified: 17 are
+strict-output-policy differences, while `oxipng/c2pa-signed.png` preserves an
+unknown unsafe-to-copy `caBX` chunk. Columbo will not rewrite signed critical
+content around that chunk unless the user explicitly requests stripping.
+
+The current 25-case sample covers every wrapper and top-level family. Its only
+reference miss is `8x8-png/waves.png` at +1 byte / +4 bits, the same known
+strict-policy case; relaxed Max reaches equal bytes and two fewer bits. Against
+the preceding sample it is smaller by 211 bytes / 1,701 meaningful bits in
+aggregate. At their normal allowances, `Animated.png` and `bored.png` were one
+and 28 bytes above the preceding sample. Longer isolated runs prove these are
+timing-basin losses rather than removed endpoints: at 30 and 60 seconds they
+reach 5,945 bytes / 41,923 bits and 246,079 bytes / 1,949,516 bits, improving
+the preceding floors by 6 bytes / 35 bits and 13 bytes / 141 bits respectively.
+
+Because ten retained guard differences form one PngSuite cluster, the exact
+current binary was also run over all 161 paired files in that group. Columbo is
+strictly better than timed deft4j on 114, equal on 44, and smaller by 3,332
+bytes / 26,603 meaningful bits in aggregate. The other three rows differ only
+under strict output: `basi0g01.png` by three bits and `cs5n3p08.png` plus
+`cs8n3p08.png` by two bits each; all reach parity or better with `--strict 0`.
+There are no errors. Against the older complete journal, 157 outputs are
+identical, three improve, and only `g10n3p04.png` is four bits longer at equal
+file size, yielding a net 38-byte / 298-bit improvement.
+
+### Steam Stickers APNG
+
+The old full APNG state is retained only as historical diagnosis. The
+benchmarked optimizer candidate was replayed on all twelve old misses; every
+one beats the same timed deft4j reference. The aggregate advantage is 12,335
+bytes / 98,686 bits.
+
+Those twelve files also pass the Default/Max policy gates: every Default run is
+faster, and every Max artifact is no worse in both file bytes and aggregate
+meaningful bits. Default saves 14,700 bytes / 117,532 bits from the sources in
+aggregate; Max retains a strict quality lead for every row.
+
+All 54 former error fixtures now complete in Default with identical decoded
+image/frame streams. Fifty-two contain the same invalid exporter vestige: an
+RGBA PNG with a palette-sized `tRNS` after a valid suggested `PLTE`. Columbo
+removes only that specification-forbidden shape. Two have bytes after `IEND`,
+which are outside the PNG datastream and are discarded. The private comparator
+normalizes only the exact RGBA/PLTE/`tRNS` signature; its unit tests prove that
+missing palettes and oversized transparency data remain errors. One Max file
+from each of fourteen structural families also completes and beats deft4j,
+by 20,169 bytes / 151,865 bits in aggregate.
+
+## Hundred-file priority guard
+
+`work/regression-guard.json` remains authoritative. It contains the latest 100
+unique `(format, source)` identities; insertion deduplicates a recurring file.
+The expanded guard currently covers 71 deft4j cases and 29 DeflOpt cases across
+96 PNG and four ZIP inputs. The complete `fa9b3559…` guard run performed 142
+serial trials, including confirmation reruns: 79 historical floors pass and 21
+remain. No previously passing guard became a failure. The exact current build
+also passes the four floors directly repaired by the last accepted changes.
+
+| File | Mode | Byte loss | Bit loss | Disposition |
 | --- | --- | ---: | ---: | --- |
-| `css-ig-net/sample_40.png` | Default | 0 | 2 | parity |
-| `medium/global.png` | Default | 0 | 2 | parity |
-| `medium/tiger.png` | Default, Max | 0 | 2 | parity |
-| `pkmn-bw/023-Ekans-2.png` | Default, Max | 1 | 5 | parity or better |
-| `pkmn-bw/060-Poliwag-2.png` | Default, Max | 1 | 4 | better |
-| `pkmn-bw/132-Ditto-2.png` | Default, Max | 0 | 5 | parity or better |
-| `samplelib-png/sample-green-400x300.png` | Default, Max | 1 | 2 | parity |
-| `small/T_Grass.png` | Default, Max | 2 | 15 | parity or better |
-| `small/profle.png` | Default | 1 | 1 | parity |
+| `css-ig-net/sample_69.png` | Max+5s | 3 | 25 | isolated older search basin |
+| `medium/LevelLoading.png` | Max+5s | 50 | 397 | accepted broad-route trade-off; not recovered at 30 s |
+| `css-ig-net/videocameraclassic.png` | Default | 1 | 2 | small lost historical basin |
+| `small/document.png` | Max+5s | 1 | 6 | small lost historical basin |
+| `css-ig-net/briefcase.png` | Max+5s | 1 | 5 | small lost historical basin |
+| `small/news.png` | Max+5s | 1 | 4 | small lost historical basin |
+| `medium/keyboard.png` | Max+5s | 1 | 6 | small lost historical basin |
+| `css-ig-net/barchart.png` | Default | 0 | 2 | equal bytes; historical bit floor |
+| `oxipng/grayscale_2_should_be_grayscale_1.png` | Max | 0 | 4 | equal bytes; historical bit floor |
+| `pkmn-bw/000-Logo-2.png` | Max | 0 | 2 | equal bytes; historical bit floor |
+| `css-ig-net/bad-paletted.png` | Max | 6 | 45 | isolated older search basin |
+| `PngSuite/ctzn0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
+| `PngSuite/ct1n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
+| `PngSuite/ct0n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
+| `PngSuite/cm9n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
+| `PngSuite/cm0n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
+| `PngSuite/cdhn2c08.png` | Max | 2 | 18 | PngSuite structural cluster |
+| `PngSuite/bgyn6a16.png` | Max | 22 | 171 | identical raw stream/floor with `basn` and `bgan` |
+| `PngSuite/bgan6a16.png` | Max | 22 | 171 | identical raw stream/floor with `basn` and `bgyn` |
+| `PngSuite/basn6a16.png` | Max | 22 | 171 | identical raw stream/floor with `bgan` and `bgyn` |
+| `PngSuite/PngSuite.png` | Max | 5 | 35 | PngSuite structural cluster |
 
-The complete current-binary refresh covers all 15 rows above, and Max was never
-worse than its completed Default result. The prior relaxed audit remains the
-classification evidence; it is not represented as current-hash row metadata.
+The accepted narrow-continuation changes newly recover four substantial guards
+without a filename or timing gate:
 
-## Defluff comparison
+- `medium/BNDT_on_X____stack__https___t_co_3VRfGVC7bX____X.png` reaches its
+  large-model historical floor after raising the narrow route's paired
+  compressed-size ceiling from 512 KiB to 1 MiB;
+- `css-ig-net/file04.png` reaches its floor after keeping the independent
+  deft4j refinement live beside a long floor-seeded continuation;
+- `css-ig-net/Mango512.png` reaches 140,112 bytes / 1,097,291 bits, improving
+  its floor by 6 bytes / 49 bits;
+- `css-ig-net/Sock.png` reaches 85,956 bytes / 686,617 bits, improving its
+  floor by 32 bytes / 258 bits.
 
-Defluff permits compatibility-sensitive empty or singleton Huffman alphabets,
-so its benchmark now invokes Columbo with `--strict 0` for a like-for-like
-comparison. Default Columbo remains strict and continues to emit complete
-Huffman codes for compatibility with old Windows Explorer decoders.
+Earlier accepted changes also retain these important guards at their normal
+allowance:
 
-The complete relaxed run has 66 rows, no errors, no prior-result regressions,
-and no misses. The two former strict-policy differences are now resolved in
-the benchmark: `pkmn-bw-hard/023-Ekans-2.png` is equal in file bytes and one
-Deflate bit better, while `pkmn-bw-hard/060-Poliwag-2.png` is one byte and
-seven bits better than Defluff.
+- `oxipng/rgba_16_should_be_palette_2.png`: 3,751 bytes / 29,500 bits;
+- `css-ig-net/sample_71-fs8.png`: 11,013 bytes / 80,136 bits in three repeated
+  runs;
+- `css-ig-net/dossier-green-normal-fs8.png`: 16,384 bytes / 121,888 bits;
+- `small/check.png`: at or below its 1,586-byte / 9,008-bit guard floor;
+- `css-ig-net/sample_38-fs8.png`: at or below its 6,220-byte / 42,190-bit guard
+  floor;
+- `medium/Death.png`: 21,099 bytes / 165,113 bits at ten seconds, improving the
+  historical 21,101-byte / 165,133-bit floor;
+- `css-ig-net/motorcycle.png`: 5,716 bytes / 44,923 bits at ten seconds,
+  reproducing its historical compact-split floor inside the critical envelope.
 
-Across all 66 files, relaxed Columbo is 32 bytes and 318 meaningful Deflate
-bits smaller than Defluff in aggregate.
+Longer trials distinguish deadline pressure from route removal. Besides the
+ZIP case above, historical `small/bomb.png` and `medium/loupe-fs8.png` floors
+recover or improve with 30 seconds. `LevelLoading.png` does not, so its
+residual is not described as time-limited. The three `basn`/`bgan`/`bgyn`
+fixtures contain the same raw Deflate stream and therefore represent one
+structural miss, not three independent optimizer failures. Ten- and 30-second
+runs produce the same 3,425-byte / 26,762-bit result; a second Columbo pass
+reaches 3,424 bytes / 26,759 bits and then stops, still above the 3,403-byte /
+26,591-bit recorded floor. Strictness does not change that result.
 
-## Timed deft4j misses
+The PngSuite floors came from an unretained experimental executable. Rebuilding
+every unique reachable v0.4 source snapshot did not reproduce them; retained
+versions range from 3,432 bytes / 26,818 bits to the current 3,425 bytes /
+26,762 bits for `bgan6a16.png`. The guard remains useful evidence that a search
+basin may have been lost, but more time, relaxed output, repeated current
+passes, and every reconstructable historical source have not recovered it.
 
-The recorded journal contains 18 misses. Seventeen reach parity or better with
-`--strict 0`. The remaining file,
-`oxipng/c2pa-signed.png`, contains the unknown unsafe-to-copy ancillary chunk
-`caBX`. Columbo preserves the complete source unless stripping is explicitly
-requested; copying that chunk after changing critical image data would not be a
-safe optimization target.
+## Accepted general changes
 
-| File | Timeout | Bytes | Bits | Classification |
-| --- | ---: | ---: | ---: | --- |
-| `8x8-png/symbols.png` | 10 | 0 | 3 | strict policy |
-| `8x8-png/waves.png` | 10 | 1 | 4 | strict policy |
-| `PngSuite/basi0g01.png` | 10 | 0 | 3 | strict policy |
-| `PngSuite/cs5n3p08.png` | 10 | 0 | 2 | strict policy |
-| `PngSuite/cs8n3p08.png` | 10 | 0 | 2 | strict policy |
-| `oxipng/c2pa-signed.png` | 10 | 0 | 2 | safe preservation policy |
-| `pkmn-bw-hard/029-Nidoran♀-2.png` | 10 | 0 | 3 | strict policy |
-| `pkmn-bw-hard/066-Machop-0.png` | 10 | 0 | 3 | strict policy |
-| `pkmn-bw-hard/149-Dragonite-0.png` | 10 | 0 | 3 | strict policy |
-| `pkmn-col-hard/066-Machop-2.png` | 10 | 1 | 3 | strict policy |
-| `pkmn-col/022-Fearow-2.png` | 10 | 0 | 3 | strict policy |
-| `samplelib-png/sample-blue-200x200.png` | 10 | 0 | 2 | strict policy |
-| `samplelib-png/sample-green-200x200.png` | 10 | 0 | 2 | strict policy |
-| `samplelib-png/sample-green-400x300.png` | 10 | 1 | 2 | strict policy |
-| `samplelib-png/sample-red-200x200.png` | 10 | 0 | 2 | strict policy |
-| `small/T_Grass.png` | 10 | 1 | 12 | strict policy |
-| `small/text.png` | 10 | 0 | 3 | strict policy |
-| `samplelib-zip/sample-simple.zip` | 10 | 1 | 5 | strict policy |
+The accepted rules contain no filename, directory, reference score, or
+measured ten-second special case.
 
-The final-build replay covers every row in this table under its recorded
-timeout. All 17 strict-policy rows reach parity or better in the relaxed audit.
+### Priority boundary graph
 
-## Prior-result regressions
+Once a complete incumbent protects source-order work, a compact one-block
+source or its first two-block replay can price the independent global boundary
+graph first when it has at most 8,192 tokens, at least 100,000 decoded bytes,
+and at least two same-distance repartition runs. The graph is the only route
+that combines distant cut anchors; larger block lists keep source order first
+because their graph grows much faster. Sufficient-time route coverage is
+unchanged. This restores the RGBA palette case at ten seconds without changing
+its interlaced sibling or creating a new priority-guard regression.
 
-The benchmark journals contain 11 DeflOpt and 9 deft4j files whose advantage
-over the same reference fell by more than 10%. Defluff has none. Eight files
-occur in both larger journals, leaving 12 unique files. These annotations
-compare Columbo with an older Columbo result; they are not reference misses
-unless the file also appears above. They are an investigation backlog, not a
-reason to interrupt a complete benchmark refresh.
+### Best-first floor-seeded continuation
 
-| File | Journal | Current disposition |
-| --- | --- | --- |
-| `PngSuite/g25n2c08.png` | both | Candidate remains one byte / seven bits above its historical floor. |
-| `css-ig-net/Orange512.png` | both | Fixed: candidate is 732 bytes / 5,851 bits below its historical floor. |
-| `css-ig-net/barchart.png` | DeflOpt | Candidate remains two bits above its historical floor. |
-| `css-ig-net/briefcase.png` | both | Candidate remains one byte / five bits above its historical floor. |
-| `css-ig-net/caution.png` | both | Candidate remains one byte / one bit above its historical floor. |
-| `medium/loupe-fs8.png` | DeflOpt | Ten-second candidate is one bit above its floor; 30 seconds improves the floor by 4 bytes / 33 bits. |
-| `oxipng/grayscale_2_should_be_grayscale_1.png` | deft4j | Candidate remains four bits above its historical floor. |
-| `oxipng/grayscale_8_should_be_palette_8.png` | DeflOpt | Fixed: candidate is 39 bytes / 311 bits below its historical floor. |
-| `pkmn-bw/000-Logo-2.png` | both | Candidate remains two bits above its historical floor. |
-| `small/bomb.png` | both | Ten-second candidate is five bits above its floor; 30 seconds reaches exact parity. |
-| `small/check.png` | both | Fixed by retaining the ordinary no-split parent before refinement. |
-| `small/news.png` | both | Candidate remains three bits above its historical floor. |
+At a bounded-route rejoin, an unfinished floor-seeded endpoint continues before
+weaker complete parents only when it strictly beats the ordinary floor and no
+deft4j, narrow, or source-Max sibling beats it. This is dependency ordering,
+not pruning: the incumbent remains complete and sufficient time still admits
+every sibling. It restores `sample_71-fs8.png` at ten seconds and improves two
+DeflOpt-family rows plus several deft4j/APNG rows.
 
-Earlier guard generations failed 19 and then 13 of 40 files. The current
-changed-parent result reduces the backlog to 10 while retaining the repaired
-compact-split, ZIP, APNG, and large-image canaries.
+### Graceful coarse-to-fine compact split
 
-## Accepted general fixes
+The compact-split route no longer performs an untimed complete sweep after the
+critical file deadline. It first covers every structural cut with the fast
+ordinary Huffman planner, exhaustively finalizes only the winning
+alignment-independent suffix, and then spends remaining hard time on the exact
+Max sweep. Every stage forwards a complete parent or descendant. Unlimited
+tests prove that the exact route is never lost; at ten seconds this keeps
+`sample_24-fs8.png` at 36,097 bits while reducing its elapsed optimization from
+about 17.1 to 11.8 seconds and restores `dossier-green-normal-fs8.png` exactly.
+If the hard boundary is already reached before the first cut, the one stream
+owning file-level grace ordinary-prices at most fourteen eighth cuts on the
+largest eligible block and exact-prices only the strongest child pair. This
+recovers `motorcycle.png` from 5,720 bytes / 44,953 bits to its historical
+5,716-byte / 44,923-bit floor in about 11.8 seconds; the former six-exact-trial
+rescue needed about 13 seconds. Zero-grace container children and route-window
+yields cannot run the rescue, so APNG/ZIP stream counts cannot multiply grace.
 
-The current source changes avoid filenames, corpus identities, and measured
-elapsed-time gates:
+### No-split route ownership
 
-- **Changed-parent no-split refinement:** the bounded M2 route keeps its
-  complete ordinary Zopfli-enabled result. When emitting that result changes a
-  block boundary or token spelling, Columbo reparses it once through the
-  Default planner inside the existing file-wide hard grace. Header-only
-  rewrites skip the replay, Arc-identical token arrays are recognized without
-  scanning, and no alternate pre-Zopfli topology search is duplicated. This
-  recovers `Orange512.png` by 1,072 bytes / 8,571 bits relative to the current
-  journal result and `grayscale_8_should_be_palette_8.png` by 123 bytes / 978
-  bits. Two-run wall-clock checks were unchanged on the grayscale and control
-  cases; Orange completed in about 10.53 seconds instead of 11.89 seconds.
-  The rule is based on exposing a genuinely new planner state rather than a
-  corpus identity or elapsed-time threshold.
-- **PNG metadata floor preservation:** bounded Max runs complete affordable
-  non-Max metadata floors before image routes can consume the shared deadline.
-  This restores `small/text.png` Max to Default parity. When time remains,
-  cached floors continue through `Established` Max routes without rebuilding
-  Default or charging their decoded data twice, so exhaustive opportunities
-  remain available. Once those mandatory floors are complete, the dominant
-  image search receives the full remaining allowance; optional metadata Max
-  refinement uses only time genuinely left afterward. This recovered 189
-  bytes and 1,515 meaningful bits on `medium/Matrix.png` without changing the
-  supported metadata, APNG, or large-image guard floors.
-- **Observational reporting:** Default, verbose, and visual modes share route
-  gates, deadlines, candidate order, memory policy, and worker parallelism.
-  Detailed modes cache stream-labelled reports and emit them as the ordered
-  physical-stream prefix becomes final; they do not serialize ZIP/APNG workers
-  or replace a route with a cheaper schedule.
-- **Compact-split parent priority:** distinct complete parents are ordered by
-  their actual byte count and meaningful bits. Every parent remains eligible
-  when Max has sufficient time, because split gains are not assumed monotone.
-- **Uniform ZIP member scheduling:** archives with at least eight similarly
-  distributed Deflate members use balanced, independent worker slices and a
-  single outer archive lineage. The tested 14-file `8x8-zip` group improved by
-  103 bytes and 910 bits in aggregate relative to the recorded report, with no
-  deft4j miss.
-- **Non-duplicating ZIP lineages:** for bounded nonuniform archives, the caller
-  owns complete Default while the parallel original-source Max branch starts
-  from `Established` and does not rebuild an ordinary floor. Uniform member
-  sets use their balanced member workers instead, and stored-only archives
-  skip the second lineage.
-- **Bounded ZIP Default-floor concurrency:** when that nonuniform archive race
-  contains at least two independent Deflate members, its mandatory Default
-  sibling uses up to eight bounded member lanes. This leaves more of the same
-  file deadline for refinement; the direct Max sibling is unchanged. The
-  workers share one wall-clock deadline and grace boundary, so this does not
-  restore the older accidental behavior in which every serial child received
-  a fresh global grace period. The exact candidate is 11 bytes / 89 bits
-  smaller than timed deft4j on `skinsrc.zip`. Its eight-row DeflOpt ZIP sample
-  has no miss or prior-result regression and is 2 bytes / 14 bits smaller in
-  aggregate than the older broad-sample floor.
+The no-split route retains its deft4j-derived per-block seed, Columbo cumulative
+length-family states, and adjacent source-order merges. Source max now owns the
+individual one-match pruning family exclusively. Removing that duplicated
+walk lets no-split reach later blocks: `Death.png` reaches 165,113 bits at ten
+seconds and 165,101 bits at thirty seconds, versus the 165,133-bit historical
+floor. More time therefore recovers the remaining short-budget bits without a
+file-specific rule.
 
-An experiment that replaced the PNG transformed lineage with only the direct
-Default lineage was rejected: although it recovered several small historical
-floors, it lost 8,149 bytes on `large/nerd.png` and 524 bytes on
-`css-ig-net/Apple512.png`. This is the kind of broad net loss the guard and
-family samples are intended to prevent.
+### Bounded narrow-route model
 
-Shortening the transformed lineage's ordinary-parent share from one fifth to
-one tenth was also rejected. It beat the transient `sample_59.png` historical
-floor by 4 bytes and 31 bits, confirming that a deliberately weaker parent can
-open a distinct Max basin. The same general schedule repeatedly lost the full
-189-byte / 1,515-bit `medium/Matrix.png` repair and put the APNG `Biker.png`
-canary 8 bytes / 80 bits above its floor. Direct lineage traces explain the
-trade-off: `sample_59.png` benefits from the earlier, weaker parent, whereas
-`Matrix.png` needs the one-fifth parent before its best descendant becomes
-reachable. No corpus-size threshold was introduced to choose between them.
+The narrow source route now accepts up to 1 MiB of compressed input while
+retaining its 128-nonempty-block ceiling. The route is linear in the source
+block list, and its per-block candidate storage remains below the existing
+64 MiB parallel-model class under those paired bounds. This is a resource-model
+extension rather than a corpus threshold; it restores the large `BNDT` guard
+without admitting unbounded state growth.
 
-Historical replay also isolates the remaining Zopfli-sensitive cluster.
-`sample_17-fs8.png` reaches 3,949 bytes / 23,981 bits through `a9e5879`; the
-first loss is `847e0a3`, which introduced the exact Zopfli RLE-friendly tree,
-and later commits retain the 3,953-byte / 24,009-bit basin. Removing Zopfli
-globally restores that and several 1–7-bit floors but loses newer, materially
-stronger lineages. Two additive approximations were therefore tested: retain
-the exact pre-Zopfli tree as another transformation seed, and retain both
-already-built Defluff-derived feedback trees as transformation seeds. Neither
-recovered `sample_17-fs8.png` or `small/bomb.png`; both added work. Longer Max
-trials distinguish deadline pressure from a lost route lineage. At 30 seconds,
-the current engine reaches `bomb.png`'s exact 9,537-bit floor and improves
-`loupe-fs8.png` beyond its historical floor by 4 bytes / 33 bits. The other
-eight differences do not recover: `sample_17-fs8.png` remains in the same
-3,953-byte basin at 24,010 bits in that bounded run, and the seven smaller
-cases retain their 1–7-bit differences. Reproducing the former historical
-lineage requires a complete second no-split state lineage, which is rejected
-here because it duplicates substantial Max work for at most four bytes in the
-known guard set.
+### Independent deft4j refinement overlap
 
-The remaining historical-floor differences are retained as priority cases,
-but accepted for this build where the only identified common reversal caused
-far larger losses elsewhere. No filename, corpus identity, or measured
-ten-second timing gate was added to recover them.
+A strong floor-seeded endpoint does not dominate an independent deft4j-derived
+topology merely because its current encoded score is smaller. When the bounded
+parallel work class is available, Columbo therefore keeps the deft4j refinement
+live beside the floor-seeded continuation. It reuses the historical
+at-most-three-worker envelope and one file deadline rather than adding time or
+memory. A transformed direct-deft parent may receive one no-split refinement
+and one Max continuation; header-only changes do not trigger either. This
+restores `file04.png` without delaying the winning floor lineage.
 
-## Forty-file priority guard
+### Non-dominated changed-parent continuation
 
-`work/regression-guard.json` is authoritative. It contains exactly 40 unique
-names; insertion deduplicates each physical source by format and name, so a
-recurring file does not consume more than one slot. The current set is:
+When the narrow source route emits a strict score improvement with genuinely
+different tokens or block boundaries, Columbo may run the distinct no-split
+transformation once more. It does so only while no completed floor,
+floor-seeded, deft4j, source-Max, or exact-Default sibling strictly beats that
+parent. The dependency takes the source-Max worker slot, preserving the prior
+worker and model limits; source Max remains eligible later if time remains.
+This score/topology rule improves `Mango512.png` and `Sock.png`, and longer APNG
+checks show that it has delayed rather than removed the older `Animated.png`
+and `bored.png` endpoints.
 
-- **css-ig-net:** `Orange512.png`, `barchart.png`, `briefcase.png`,
-  `caution.png`, `sample_17-fs8.png`, `sample_21-fs8.png`,
-  `sample_33-fs8.png`, `test-convertir-truecoloralpha-trns.png`,
-  `compose.png`, `sample_14.png`, and `sample_59.png`.
-- **oxipng:** `palette_8_should_be_palette_8.png`,
-  `rgba_16_should_be_palette_2.png`,
-  `grayscale_8_should_be_palette_8.png`,
-  `grayscale_8_should_be_grayscale_1.png`,
-  `grayscale_2_should_be_grayscale_1.png`, and
-  `profile_gray_disallow_color.png`.
-- **PNG/APNG size families:** `large/nerd.png`, `medium/loupe-fs8.png`,
-  `medium/Gingerman.png`, `medium/menu.png`, `medium/te_syntax.png`,
-  `medium/Matrix.png`, `medium/284.png`, `medium/Mittens.png`,
-  `small/bomb.png`, `small/carwheel.png`, `small/check.png`, `small/news.png`,
-  `small/present.png`, `PngSuite/g25n2c08.png`,
-  `pkmn-bw/000-Logo-2.png`, `apng-medium/Lotus-buddha-APNG-animation.png`,
-  and `apng-medium/Biker.png`.
-- **ZIP:** `small-zip/Alleyway (EMU).zophar.zip`,
-  `small-zip/wp-hide-dashboard.2.2.zip`,
-  `small-zip/WindowsBatchFileMarkup.tmbundle.zip`,
-  `8x8-zip/Grid.playdate-pulp.zip`,
-  `8x8-zip/Symbols.playdate-pulp.zip`, and `medium-zip/samples.zip`.
+### Narrow PNG invalid-exporter repair
 
-The changed-parent candidate checked all 40 files in 60 serial trials,
-including confirmation reruns. Thirty floors passed and the following ten
-differences remained. `Orange512.png`, `small/check.png`, and
-`grayscale_8_should_be_palette_8.png` now pass. A zero byte loss denotes a
-meaningful-bit difference within the same file size.
+The runtime accepts and removes only a structurally consistent palette-shaped
+`tRNS` vestige from RGBA, and ignores bytes after the terminating `IEND`.
+Decoded streams remain mandatory validation evidence. Other invalid `tRNS`
+forms and rewrite-sensitive unknown ancillary combinations remain rejected.
 
-| File | Byte loss | Bit loss |
-| --- | ---: | ---: |
-| `small/bomb.png` | 0 | 5 |
-| `medium/loupe-fs8.png` | 0 | 1 |
-| `css-ig-net/caution.png` | 1 | 1 |
-| `PngSuite/g25n2c08.png` | 1 | 7 |
-| `small/news.png` | 0 | 3 |
-| `css-ig-net/briefcase.png` | 1 | 5 |
-| `oxipng/grayscale_2_should_be_grayscale_1.png` | 0 | 4 |
-| `pkmn-bw/000-Logo-2.png` | 0 | 2 |
-| `css-ig-net/sample_17-fs8.png` | 4 | 28 |
-| `css-ig-net/barchart.png` | 0 | 2 |
+## Rejected or accepted trade-offs
 
-## Validation status
+Separating the all-literal endpoint into another full lineage recovers the
+50-byte `LevelLoading.png` floor, but broad controls lose roughly 9.5 KiB on a
+floor-pattern case and 3.6 KiB on `Partnership.png`, or nearly double runtime
+under the less damaging ordering. That experiment was rejected. The current
+50-byte / 397-bit local loss is accepted because the integrated endpoint opens
+much larger, general gains elsewhere.
 
-- All 380 Rust tests pass, including changed-parent admission and no-split
-  decoded-byte preservation. `cargo fmt --check`, strict all-target Clippy,
-  the 40-case guard structure check, and `git diff --check` also pass.
-- All 164 private benchmark-tool tests pass. Dynamic discovery confirms 957
-  eligible DeflOpt pairs and 1,621 timed-deft4j pairs.
-- The complete 66-file Defluff rerun has no error or prior-result regression.
-  Aggregate relaxed results are 32 bytes / 318 bits smaller than Defluff.
-- The complete current-build DeflOpt refresh contains exactly 1,914 current-hash
-  rows for all 957 eligible pairs in Default and Max: no duplicate, missing,
-  orphan, error, stale-hash, or Max-below-Default row. Default totals 385,419
-  bytes / 3,056,660 bits smaller than DeflOpt; Max totals 587,128 bytes /
-  4,670,417 bits smaller. All 14 strict-policy miss rows and all 11 confirmed
-  prior-result regressions are retained in the public report for later
-  investigation; earlier relaxed audits provide their policy classification.
-- The changed-parent broad samples cover 36 DeflOpt rows (18 source pairs) and
-  25 timed-deft4j rows across PNG, ZIP, GZIP, and zlib families. Neither sample
-  records a prior-result regression; every DeflOpt row meets parity. The sole
-  deft4j miss is `8x8-png/waves.png`, which reaches parity under `--strict 0`.
-- The exact current-binary ZIP replays cover eight DeflOpt rows and five timed
-  deft4j rows without an error or unclassified reference miss. Against the
-  pre-fix candidate, the timed-deft4j ZIP set saves another 9 bytes / 78 bits;
-  its sole miss is the unchanged 3-byte / 21-bit strict-policy case. The
-  32-row DeflOpt and 22-row deft4j broad samples, combining these ZIP results
-  with the accepted PNG repair, are respectively 2 bytes / 14 bits and 7
-  bytes / 57 bits smaller than the older candidate samples in aggregate.
-- `medium-zip/skinsrc.zip`, which exposed duplicate floor work in an interim
-  schedule, is now 11 bytes / 89 bits smaller than timed deft4j under one
-  correctly shared grace boundary. `kensilverman-zip/kzipmix-20230322-mac.zip`
-  Max improves its completed Default floor by 13 bytes / 100 bits.
-- All six ZIP cases in the 40-file priority guard pass with the exact current
-  distribution binary in six serial runs.
-- The current priority guard performed 60 serial trials including
-  confirmations: 30 of its 40 historical floors passed, and its 10 differences
-  are enumerated above. The guard remains structurally valid at 40 unique
-  files with no duplicate physical source.
+The remaining isolated differences range from equal-byte bit floors through a
+6-byte / 45-bit `bad-paletted.png` loss. Reintroducing a second unconditional
+complete no-split lineage can recover some older Zopfli-sensitive basins, but
+duplicates substantial Max work and reverses much larger wins. The three
+22-byte PngSuite rows are one identical-stream structural cluster whose
+historical executable cannot be reconstructed; neither extra time nor repeated
+current passes recover its floor. These cases remain priority guards rather
+than being hidden by file-specific scheduling.
+
+## Verification
+
+- `cargo test --release --all-targets`: 429 tests passed (379 library, 43 CLI,
+  7 public API).
+- `cargo fmt --all -- --check`: passed.
+- `cargo clippy --release --all-targets -- -D warnings`: passed.
+- Private benchmark-tool discovery: 175 tests passed, including the narrowed
+  APNG comparator and 100-entry guard checks. The guard's structural preflight
+  validates all 100 unique cases.
+- Full current Defluff replay: 66/66 pass.
+- Current DeflOpt family sample: 36/36 reference gates pass; Max never worse.
+- Current deft4j family sample: only the known strict-policy `waves.png` row.
+- Current PngSuite group: all 161 paired cases complete; three strict-policy
+  rows reach relaxed parity, and no row errors.
+- The exact current build reproduces all 61 outputs in those two samples and
+  passes the `BNDT`, `file04`, `Mango512`, and `Sock` guard floors in four
+  serial runs.
+- Current APNG scoped checks: 12/12 former misses pass; 54/54 former errors
+  validate; 14/14 Max family representatives beat deft4j.
+- `git diff --check`: passed.
+- Tracked source and `Cargo.toml` contain no user, repository, or temporary
+  absolute path. The distribution-path auditor passes both retained platform
+  executables; ordinary developer builds are not distribution artifacts and
+  may retain toolchain paths until the release sanitizer runs.
+
+Accepted routing and provenance are maintained in
+`docs/routes-and-methods.md`.

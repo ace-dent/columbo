@@ -43,7 +43,6 @@ type StateId = usize;
 /// payload under one ceiling so many blocks cannot multiply memory use.
 const MAX_DEFT4J_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
 const MAX_DEFT4J_ARENA_BYTES: usize = MAX_DEFT4J_ROUTE_BYTES;
-const MAX_DEFT4J_STATES: usize = 4_096;
 
 fn token_payload_bytes(token_count: usize) -> Option<usize> {
     token_count.checked_mul(size_of::<Token>())
@@ -262,15 +261,18 @@ impl Deft4jQueue {
             }
         }
 
-        if self.states.len() >= MAX_DEFT4J_STATES {
-            self.saturated = true;
-            return None;
-        }
         let payload_bytes = match token_payload_charge {
             TokenPayloadCharge::Shared => 0,
             TokenPayloadCharge::NewlyAllocated => tokens.len().checked_mul(size_of::<Token>())?,
         };
-        let added = size_of::<Deft4jState>().checked_add(payload_bytes)?;
+        // Bound the queue by its actual arena bytes rather than an arbitrary
+        // state count. This permits long pruned fixed points when Max has time,
+        // while retaining an explicit peak-memory ceiling. Charge hash-table
+        // overhead conservatively along with each inline state and payload.
+        let index_bytes = size_of::<(u64, StateId)>().checked_mul(4)?;
+        let added = size_of::<Deft4jState>()
+            .checked_add(index_bytes)?
+            .checked_add(payload_bytes)?;
         let new_total = self.accounted_bytes.checked_add(added)?;
         if new_total > self.limit_bytes {
             self.saturated = true;
@@ -1549,11 +1551,16 @@ fn plan_source_blocks_with_budget(
     budget_bytes: usize,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
+    let mut budget = Deft4jRouteBudget::new(budget_bytes.min(MAX_DEFT4J_ROUTE_BYTES));
+    // Once source-list admission is no longer capped at an arbitrary block
+    // count, charge the shallow working copies themselves. Their shared token
+    // and plain payloads remain owned by the parser; inline block metadata and
+    // the small cloned dynamic/split vectors are route-local.
+    budget.reserve(prepared_source_blocks_bytes(source)?)?;
     let mut blocks = prepare_source_blocks(source)?;
     if blocks.is_empty() {
         return None;
     }
-    let mut budget = Deft4jRouteBudget::new(budget_bytes.min(MAX_DEFT4J_ROUTE_BYTES));
 
     // deft4j first optimizes every list member in source order. Columbo
     // deliberately recomputes the true alignment after every chosen block,
@@ -1655,6 +1662,41 @@ fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<WorkingBlock>> {
         output.push(WorkingBlock::new(block.try_clone_shared()?));
     }
     Some(output)
+}
+
+fn working_block_clone_bytes(block: &ParsedBlock) -> Option<usize> {
+    let split_bytes = block.source_splits.len().checked_mul(size_of::<usize>())?;
+    let dynamic_bytes = block.original_dynamic.as_ref().map_or(Some(0), |dynamic| {
+        dynamic
+            .literal_lengths
+            .len()
+            .checked_add(dynamic.distance_lengths.len())?
+            .checked_add(
+                dynamic
+                    .rle
+                    .len()
+                    .checked_mul(size_of::<super::model::RleToken>())?,
+            )
+    })?;
+    size_of::<WorkingBlock>()
+        .checked_add(split_bytes)?
+        .checked_add(dynamic_bytes)
+}
+
+fn prepared_source_blocks_bytes(source: &[ParsedBlock]) -> Option<usize> {
+    let nonempty = source
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    if nonempty == 0 {
+        return source.last().map_or(Some(0), working_block_clone_bytes);
+    }
+    source
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .try_fold(0_usize, |total, block| {
+            total.checked_add(working_block_clone_bytes(block)?)
+        })
 }
 
 fn is_huffman(block_type: SourceBlockType) -> bool {
@@ -1859,6 +1901,18 @@ mod tests {
     }
 
     #[test]
+    fn source_route_runs_past_the_historical_128_block_threshold() {
+        let blocks = (0..129)
+            .map(|_| literal_block(b"a", SourceBlockType::Stored))
+            .collect::<Vec<_>>();
+        let mut never = SearchStop::never();
+        let plans = plan_source_blocks(&blocks, 0, &Options::default(), &mut never).unwrap();
+
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].plain.len(), 129);
+    }
+
+    #[test]
     fn stored_merge_limit_is_asymmetric_and_hard() {
         let left = literal_block(&vec![1; 40_000], SourceBlockType::Stored);
         let right = literal_block(&vec![2; 30_000], SourceBlockType::Fixed);
@@ -1907,10 +1961,12 @@ mod tests {
     #[test]
     fn cumulative_budget_limits_retained_expansions_across_blocks() {
         let blocks = [costly_match_block(), costly_match_block()];
+        let working_bytes = prepared_source_blocks_bytes(&blocks).unwrap();
         // One three-token expansion plus its temporary one-byte mark fits. Once
         // retained, only that mark byte remains and the second block cannot
-        // allocate another expanded token vector.
-        let budget_bytes = token_payload_bytes(3).unwrap() + 1;
+        // allocate another expanded token vector. The route-local working-block
+        // metadata is now charged independently of transformed payloads.
+        let budget_bytes = working_bytes + token_payload_bytes(3).unwrap() + 1;
         let mut never = SearchStop::never();
         let plans = plan_source_blocks_with_budget(
             &blocks,
@@ -1985,6 +2041,39 @@ mod tests {
             })
             .unwrap();
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn queue_state_count_is_limited_by_arena_bytes_not_an_iteration_cap() {
+        let tokens = Arc::new(vec![Token::Literal(b'a')]);
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let (_, distance_lengths) = fixed_lengths();
+        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+
+        for index in 0_u32..=4_096 {
+            let mut literal_lengths = [0_u8; 286];
+            literal_lengths[0] = index as u8;
+            literal_lengths[1] = (index >> 8) as u8;
+            literal_lengths[2] = (index >> 16) as u8;
+            assert!(
+                queue
+                    .push(PendingState {
+                        tokens: Arc::clone(&tokens),
+                        token_hash: token_hash(&tokens),
+                        literal_lengths,
+                        distance_lengths,
+                        literal_frequencies,
+                        distance_frequencies,
+                        extra_bits: 0,
+                        depth: usize::try_from(index).unwrap(),
+                        token_payload_charge: TokenPayloadCharge::Shared,
+                    })
+                    .is_some(),
+                "state {index} should fit the configured byte arena"
+            );
+        }
+        assert_eq!(queue.states.len(), 4_097);
+        assert!(!queue.saturated);
     }
 
     #[test]

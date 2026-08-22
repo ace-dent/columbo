@@ -199,6 +199,27 @@ impl<'a> SearchStop<'a> {
         Self::Callback(callback)
     }
 
+    /// Whether an already-admitted route owns file-level grace for one small
+    /// deterministic finalization.
+    ///
+    /// Container schedulers give grace only to the child that owns the actual
+    /// file remainder. A route-window boundary and an earlier zero-grace child
+    /// must forward their incumbent immediately, otherwise many streams could
+    /// multiply what is intended to be one file-wide allowance.
+    pub(crate) fn permits_bounded_finalization(&self) -> bool {
+        match self {
+            Self::Deadline {
+                deadline,
+                stop_at_soft_deadline: false,
+            } => {
+                !deadline.grace.is_zero()
+                    && deadline.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED == 0
+            }
+            Self::Always => true,
+            Self::Deadline { .. } | Self::Window { .. } | Self::Never | Self::Callback(_) => false,
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn reached(&mut self) -> bool {
         match self {
@@ -223,5 +244,31 @@ impl<'a> SearchStop<'a> {
             Self::Always => true,
             Self::Callback(callback) => callback(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_finalization_belongs_to_one_graced_hard_deadline() {
+        let graced = Deadline::with_grace(
+            Instant::now(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        );
+        assert!(graced.hard_stop().permits_bounded_finalization());
+        assert!(!graced.bounded_stop(true).permits_bounded_finalization());
+        assert!(!RouteWindow::full(&graced)
+            .stop()
+            .permits_bounded_finalization());
+
+        let ungraced = Deadline::with_grace(Instant::now(), Duration::from_secs(1), Duration::ZERO);
+        assert!(!ungraced.hard_stop().permits_bounded_finalization());
+
+        graced.cancel_routes();
+        assert!(!graced.hard_stop().permits_bounded_finalization());
+        assert!(SearchStop::always().permits_bounded_finalization());
     }
 }

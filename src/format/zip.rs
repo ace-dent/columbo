@@ -38,6 +38,32 @@ const ZIP_DEFAULT_FLOOR_PRODUCER: u8 = 1;
 const ZIP_DIRECT_MAX_PRODUCER: u8 = 2;
 const ZIP_REFINED_DEFAULT_PRODUCER: u8 = 3;
 
+struct ZipOptimization {
+    data: Vec<u8>,
+    source_deflate_bits: u64,
+    output_deflate_bits: u64,
+    timed_out: bool,
+}
+
+impl ZipOptimization {
+    fn strictly_dominates(&self, floor: &Self) -> bool {
+        self.data.len() <= floor.data.len()
+            && self.output_deflate_bits <= floor.output_deflate_bits
+            && (self.data.len() < floor.data.len()
+                || self.output_deflate_bits < floor.output_deflate_bits)
+    }
+
+    fn into_public(self, source_bytes: usize) -> Optimization {
+        Optimization::from_metrics(
+            source_bytes,
+            self.data,
+            self.source_deflate_bits,
+            self.output_deflate_bits,
+            self.timed_out,
+        )
+    }
+}
+
 /// Which structurally bounded member sets may use the parallel entry builder.
 ///
 /// Ordinary archive work parallelizes only a broad, evenly distributed set,
@@ -227,23 +253,22 @@ pub(super) fn optimize_preflight(
     options: &Options,
     parsed: &ParsedZip,
 ) -> Result<Optimization> {
-    if !options.exhaustive {
+    let optimized = if !options.exhaustive {
         configure_stream_producers(options, &[ZIP_NORMAL_PRODUCER]);
-        return optimize_once(
+        optimize_once(
             input,
             options,
             DefaultFloor::Complete,
             ParallelMemberPolicy::UniformWorkOnly,
             ZIP_NORMAL_PRODUCER,
             parsed,
-        );
-    }
-
-    if parallel_max_archive_is_bounded(input, parsed) {
-        return optimize_max_parallel(input, options, parsed);
-    }
-
-    optimize_max_sequential(input, options, parsed)
+        )
+    } else if parallel_max_archive_is_bounded(input, parsed) {
+        optimize_max_parallel(input, options, parsed)
+    } else {
+        optimize_max_sequential(input, options, parsed)
+    }?;
+    Ok(optimized.into_public(input.len()))
 }
 
 fn configure_stream_producers(options: &Options, producers: &[u8]) {
@@ -264,7 +289,7 @@ fn optimize_max_parallel(
     input: &[u8],
     options: &Options,
     parsed: &ParsedZip,
-) -> Result<Optimization> {
+) -> Result<ZipOptimization> {
     configure_stream_producers(
         options,
         &[
@@ -314,13 +339,13 @@ fn optimize_max_parallel(
                     &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
                 );
                 return crate::progress::with_route_lineage("refined default", || {
-                    refine_complete_floor(input, options, started, floor?)
+                    refine_complete_floor(options, started, floor?)
                 });
             }
         };
         let refined_floor = floor.and_then(|floor| {
             crate::progress::with_route_lineage("refined default", || {
-                refine_complete_floor(input, options, started, floor)
+                refine_complete_floor(options, started, floor)
             })
         });
         let direct = match max_worker.join() {
@@ -335,10 +360,14 @@ fn optimize_max_sequential(
     input: &[u8],
     options: &Options,
     parsed: &ParsedZip,
-) -> Result<Optimization> {
+) -> Result<ZipOptimization> {
     configure_stream_producers(
         options,
-        &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
+        &[
+            ZIP_DEFAULT_FLOOR_PRODUCER,
+            ZIP_DIRECT_MAX_PRODUCER,
+            ZIP_REFINED_DEFAULT_PRODUCER,
+        ],
     );
     let started = Instant::now();
     let mut floor_options = options.clone();
@@ -351,15 +380,44 @@ fn optimize_max_sequential(
         ZIP_DEFAULT_FLOOR_PRODUCER,
         parsed,
     )?;
-    refine_complete_floor(input, options, started, floor)
+    let remaining = options.timeout.saturating_sub(started.elapsed());
+    let direct_allowance = remaining / 2;
+    if direct_allowance.is_zero() {
+        if options.verbose || options.visual {
+            crate::progress::complete_all_stream_producers(ZIP_DIRECT_MAX_PRODUCER);
+        }
+        return refine_complete_floor(options, started, floor);
+    }
+
+    // Large or nonuniform archives cannot retain two complete working copies
+    // concurrently, but sufficient time must still expose the original-source
+    // deft4j graph. Give that independent lineage half of the actual remainder,
+    // then refine the already-complete Default archive with whatever wall time
+    // is genuinely left. A local slice ending is not a file timeout.
+    let mut direct_options = options.clone();
+    direct_options.timeout = direct_allowance;
+    let mut direct = crate::progress::with_route_lineage("direct max", || {
+        optimize_once(
+            input,
+            &direct_options,
+            DefaultFloor::Established,
+            ParallelMemberPolicy::UniformWorkOnly,
+            ZIP_DIRECT_MAX_PRODUCER,
+            parsed,
+        )
+    })?;
+    direct.timed_out = started.elapsed() >= options.timeout;
+    let refined = crate::progress::with_route_lineage("refined default", || {
+        refine_complete_floor(options, started, floor)
+    })?;
+    Ok(best_complete_optimization(refined, direct))
 }
 
 fn refine_complete_floor(
-    input: &[u8],
     options: &Options,
     started: Instant,
-    mut floor: Optimization,
-) -> Result<Optimization> {
+    mut floor: ZipOptimization,
+) -> Result<ZipOptimization> {
     // Max benchmarks and interactive runs allocate one file-wide allowance,
     // normally measured default time plus an extra search budget. Preserve
     // that contract explicitly: establish the complete default archive once,
@@ -390,23 +448,22 @@ fn refine_complete_floor(
         ZIP_REFINED_DEFAULT_PRODUCER,
         &refined_parsed,
     )?;
-    let refined_wins = refined.data.len() < floor.data.len()
-        || (refined.data.len() == floor.data.len() && refined.bits_saved != 0);
-    if !refined_wins {
+    if !refined.strictly_dominates(&floor) {
         floor.timed_out |= refined.timed_out;
         return Ok(floor);
     }
 
-    refined.bits_saved = combined_savings(input.len(), &floor, &refined);
+    refined.source_deflate_bits = floor.source_deflate_bits;
     refined.timed_out |= floor.timed_out;
     Ok(refined)
 }
 
-fn best_complete_optimization(mut floor: Optimization, mut direct: Optimization) -> Optimization {
+fn best_complete_optimization(
+    mut floor: ZipOptimization,
+    mut direct: ZipOptimization,
+) -> ZipOptimization {
     let timed_out = floor.timed_out || direct.timed_out;
-    let direct_wins = direct.data.len() < floor.data.len()
-        || (direct.data.len() == floor.data.len() && direct.bits_saved > floor.bits_saved);
-    if direct_wins {
+    if direct.strictly_dominates(&floor) {
         direct.timed_out = timed_out;
         direct
     } else {
@@ -475,19 +532,6 @@ fn should_parallelize_members(
         || (policy == ParallelMemberPolicy::AnyIndependentWork && optimizable_members >= 2)
 }
 
-fn combined_savings(original_bytes: usize, floor: &Optimization, refined: &Optimization) -> u64 {
-    match original_bytes.cmp(&refined.data.len()) {
-        std::cmp::Ordering::Greater => u64::try_from(original_bytes - refined.data.len())
-            .map_or(u64::MAX, |bytes| bytes.saturating_mul(8)),
-        // When both phases retain the original byte length, each public
-        // metric is a meaningful Deflate-bit improvement over its own input.
-        std::cmp::Ordering::Equal if floor.data.len() == original_bytes => {
-            floor.bits_saved.saturating_add(refined.bits_saved)
-        }
-        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => 0,
-    }
-}
-
 fn optimize_once(
     input: &[u8],
     options: &Options,
@@ -495,7 +539,7 @@ fn optimize_once(
     parallel_member_policy: ParallelMemberPolicy,
     stream_producer: u8,
     parsed: &ParsedZip,
-) -> Result<Optimization> {
+) -> Result<ZipOptimization> {
     let deadline = SearchDeadline::new(options);
     let eocd_offset = parsed.eocd_offset;
     let eocd = input
@@ -694,13 +738,12 @@ fn optimize_once(
         output_deflate_bits = source_deflate_bits;
     }
 
-    Ok(Optimization::from_metrics(
-        input.len(),
-        output,
+    Ok(ZipOptimization {
+        data: output,
         source_deflate_bits,
         output_deflate_bits,
         timed_out,
-    ))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -2114,45 +2157,82 @@ mod tests {
     fn max_retains_the_complete_default_archive() {
         let deflate = [0x01, 0x02, 0x00, 0xfd, 0xff, b'x', b'y'];
         let input = single_entry_archive(8, &deflate, crc32_update(0, b"xy"), 2, false, false);
-        let default = optimize(&input, &Options::default()).unwrap();
-        let max = optimize(
+        let parsed = preflight(&input, false, u64::MAX).unwrap();
+        let default = optimize_once(
+            &input,
+            &Options {
+                timeout: Duration::from_secs(1),
+                ..Options::default()
+            },
+            DefaultFloor::Complete,
+            ParallelMemberPolicy::UniformWorkOnly,
+            ZIP_NORMAL_PRODUCER,
+            &parsed,
+        )
+        .unwrap();
+        let max = optimize_max_parallel(
             &input,
             &Options {
                 exhaustive: true,
                 timeout: Duration::from_secs(1),
                 ..Options::default()
             },
+            &parsed,
         )
         .unwrap();
 
         assert!(max.data.len() <= default.data.len());
-        if max.data.len() == default.data.len() {
-            assert!(max.bits_saved >= default.bits_saved);
-        }
+        assert!(max.output_deflate_bits <= default.output_deflate_bits);
     }
 
     #[test]
-    fn parallel_max_selection_is_byte_first_then_bit_first() {
-        let floor = Optimization {
+    fn parallel_max_selection_requires_byte_and_bit_dominance() {
+        let floor = ZipOptimization {
             data: vec![0; 10],
-            bits_saved: 3,
+            source_deflate_bits: 120,
+            output_deflate_bits: 100,
             timed_out: false,
         };
-        let bit_winner = Optimization {
+        let bit_winner = ZipOptimization {
             data: vec![1; 10],
-            bits_saved: 4,
+            source_deflate_bits: 120,
+            output_deflate_bits: 99,
             timed_out: true,
         };
-        let selected = best_complete_optimization(floor.clone(), bit_winner);
+        let selected = best_complete_optimization(
+            ZipOptimization {
+                data: floor.data.clone(),
+                source_deflate_bits: floor.source_deflate_bits,
+                output_deflate_bits: floor.output_deflate_bits,
+                timed_out: floor.timed_out,
+            },
+            bit_winner,
+        );
         assert_eq!(selected.data, vec![1; 10]);
         assert!(selected.timed_out);
 
-        let byte_winner = Optimization {
+        let byte_only_winner = ZipOptimization {
             data: vec![2; 9],
-            bits_saved: 8,
+            source_deflate_bits: 120,
+            output_deflate_bits: 101,
             timed_out: false,
         };
-        let selected = best_complete_optimization(floor, byte_winner);
+        let selected = best_complete_optimization(floor, byte_only_winner);
+        assert_eq!(selected.data, vec![0; 10]);
+
+        let floor = ZipOptimization {
+            data: vec![0; 10],
+            source_deflate_bits: 120,
+            output_deflate_bits: 100,
+            timed_out: false,
+        };
+        let dominating = ZipOptimization {
+            data: vec![2; 9],
+            source_deflate_bits: 120,
+            output_deflate_bits: 90,
+            timed_out: false,
+        };
+        let selected = best_complete_optimization(floor, dominating);
         assert_eq!(selected.data, vec![2; 9]);
     }
 
@@ -2238,30 +2318,22 @@ mod tests {
     }
 
     #[test]
-    fn two_phase_savings_are_relative_to_the_original_archive() {
-        let floor = Optimization {
-            data: vec![0; 9],
-            bits_saved: 8,
-            timed_out: false,
-        };
-        let refined = Optimization {
+    fn internal_zip_metrics_convert_relative_to_the_original_archive() {
+        let shorter = ZipOptimization {
             data: vec![0; 8],
-            bits_saved: 8,
+            source_deflate_bits: 100,
+            output_deflate_bits: 90,
             timed_out: false,
         };
-        assert_eq!(combined_savings(10, &floor, &refined), 16);
+        assert_eq!(shorter.into_public(10).bits_saved, 16);
 
-        let equal_floor = Optimization {
+        let equal = ZipOptimization {
             data: vec![0; 10],
-            bits_saved: 3,
+            source_deflate_bits: 100,
+            output_deflate_bits: 92,
             timed_out: false,
         };
-        let equal_refined = Optimization {
-            data: vec![0; 10],
-            bits_saved: 5,
-            timed_out: false,
-        };
-        assert_eq!(combined_savings(10, &equal_floor, &equal_refined), 8);
+        assert_eq!(equal.into_public(10).bits_saved, 8);
     }
 
     #[test]
