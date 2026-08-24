@@ -9,10 +9,12 @@
 
 use crate::checksum::{adler32_update, crc32_update};
 use crate::{Error, Result};
+use std::sync::OnceLock;
 
 use super::bitstream::BitReader;
 use super::huffman::{
-    code_length_tree_shape_is_valid, fixed_trees, payload_tree_shape_is_valid, Huffman,
+    code_length_tree_shape_is_valid, payload_tree_shape_is_valid, Huffman,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, RleToken, SourceBlockType, Token,
@@ -47,6 +49,66 @@ pub(crate) const MAX_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
 /// decoded-byte or model budget.
 const MAX_SOURCE_BLOCKS: usize = 262_144;
 const PARSED_BLOCK_MODEL_BYTES: usize = std::mem::size_of::<ParsedBlock>() + 4 * 1024;
+const WINDOW_SIZE: usize = 32_768;
+const WINDOW_MASK: u64 = (WINDOW_SIZE - 1) as u64;
+const MAX_MATCH_LENGTH: usize = 258;
+
+/// Materialize one already-validated match without repeatedly updating the
+/// parser's ring buffer. The first period comes from prior history; doubling
+/// that period in the scratch buffer exactly reproduces Deflate's overlapping
+/// copy semantics for every distance, including distance one.
+fn expand_match<'a>(
+    window: &[u8; WINDOW_SIZE],
+    decoded_position: u64,
+    distance: u16,
+    length: u16,
+    scratch: &'a mut [u8; MAX_MATCH_LENGTH],
+) -> &'a [u8] {
+    let distance = usize::from(distance);
+    let length = usize::from(length);
+    debug_assert!((1..=WINDOW_SIZE).contains(&distance));
+    debug_assert!((3..=MAX_MATCH_LENGTH).contains(&length));
+    debug_assert!(decoded_position >= distance as u64);
+
+    let period = distance.min(length);
+    let source = ((decoded_position - distance as u64) & WINDOW_MASK) as usize;
+    let first = period.min(WINDOW_SIZE - source);
+    scratch[..first].copy_from_slice(&window[source..source + first]);
+    if first != period {
+        scratch[first..period].copy_from_slice(&window[..period - first]);
+    }
+
+    let mut filled = period;
+    while filled < length {
+        let copied = filled.min(length - filled);
+        scratch.copy_within(..copied, filled);
+        filled += copied;
+    }
+    &scratch[..length]
+}
+
+fn fixed_payload_trees() -> (&'static Huffman, &'static Huffman) {
+    static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
+    let (literal, distance) = FIXED.get_or_init(|| {
+        (
+            Huffman::build_value_decoder(
+                &FIXED_LITERAL_CODE_LENGTHS,
+                257,
+                &LENGTH_BASE,
+                &LENGTH_EXTRA_BITS,
+            )
+            .expect("fixed literal tree is valid"),
+            Huffman::build_value_decoder(
+                &FIXED_DISTANCE_CODE_LENGTHS,
+                0,
+                &DISTANCE_BASE,
+                &DISTANCE_EXTRA_BITS,
+            )
+            .expect("fixed distance tree is valid"),
+        )
+    });
+    (literal, distance)
+}
 
 /// Estimate the owned model bytes accounted by the parser. Optional search
 /// candidates use the same formula so their expanded tokens plus decoded
@@ -77,7 +139,7 @@ fn parse_stream_with_model_limit(
 ) -> Result<ParsedStream> {
     let mut parser = Parser {
         reader: BitReader::new(input),
-        window: [0; 32_768],
+        window: [0; WINDOW_SIZE],
         decoded_position: 0,
         decoded_limit,
         model_limit,
@@ -160,7 +222,7 @@ fn parse_stream_with_model_limit(
 
 struct Parser<'a> {
     reader: BitReader<'a>,
-    window: [u8; 32_768],
+    window: [u8; WINDOW_SIZE],
     decoded_position: u64,
     decoded_limit: u64,
     model_limit: usize,
@@ -185,7 +247,7 @@ impl Parser<'_> {
         let payload = match block_type {
             SourceBlockType::Stored => self.parse_stored_block()?,
             SourceBlockType::Fixed => {
-                let (literal, distance) = fixed_trees();
+                let (literal, distance) = fixed_payload_trees();
                 self.parse_huffman_payload(literal, distance)?
             }
             SourceBlockType::Dynamic => {
@@ -353,16 +415,22 @@ impl Parser<'_> {
 
         let literal_lengths = lengths[..hlit].to_vec();
         let distance_lengths = lengths[hlit..].to_vec();
-        let literal = Huffman::build_decoder(&literal_lengths)
-            .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
+        let literal =
+            Huffman::build_value_decoder(&literal_lengths, 257, &LENGTH_BASE, &LENGTH_EXTRA_BITS)
+                .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
         if literal.code(256).is_none() {
             return Err(Error::new("dynamic Huffman tree has no end code"));
         }
         if !payload_tree_shape_is_valid(&literal_lengths, false) {
             return Err(Error::new("invalid literal/length Huffman tree"));
         }
-        let distance = Huffman::build_decoder(&distance_lengths)
-            .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
+        let distance = Huffman::build_value_decoder(
+            &distance_lengths,
+            0,
+            &DISTANCE_BASE,
+            &DISTANCE_EXTRA_BITS,
+        )
+        .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
         if !payload_tree_shape_is_valid(&distance_lengths, true) {
             return Err(Error::new("invalid distance Huffman tree"));
         }
@@ -394,7 +462,8 @@ impl Parser<'_> {
         let mut distance_frequencies = [0_u32; 30];
 
         loop {
-            let symbol = literal_tree.decode(&mut self.reader)?;
+            let decoded = literal_tree.decode_value(&mut self.reader)?;
+            let symbol = decoded.symbol;
             if symbol > 285 {
                 return Err(Error::new("invalid literal/length code"));
             }
@@ -412,19 +481,15 @@ impl Parser<'_> {
                 }
                 256 => break,
                 257..=285 => {
-                    let length_index = usize::from(symbol - 257);
-                    let length_extra_bits = LENGTH_EXTRA_BITS[length_index];
-                    let length_extra = self.reader.read(length_extra_bits)? as u16;
-                    let length = LENGTH_BASE[length_index] + length_extra;
+                    let length = decoded.value;
 
-                    let distance_symbol = distance_tree.decode(&mut self.reader)?;
+                    let decoded_distance = distance_tree.decode_value(&mut self.reader)?;
+                    let distance_symbol = decoded_distance.symbol;
                     if distance_symbol > 29 {
                         return Err(Error::new("invalid distance code"));
                     }
                     let distance_index = usize::from(distance_symbol);
-                    let distance_extra_bits = DISTANCE_EXTRA_BITS[distance_index];
-                    let distance_extra = self.reader.read(distance_extra_bits)? as u16;
-                    let distance = DISTANCE_BASE[distance_index] + distance_extra;
+                    let distance = decoded_distance.value;
                     if distance == 0
                         || distance > 32_768
                         || u64::from(distance) > self.decoded_position
@@ -444,20 +509,22 @@ impl Parser<'_> {
                         distance,
                         length_symbol: symbol,
                         distance_symbol: distance_symbol as u8,
-                        length_extra,
-                        distance_extra,
-                        length_extra_bits,
-                        distance_extra_bits,
+                        length_extra: decoded.extra,
+                        distance_extra: decoded_distance.extra,
+                        length_extra_bits: decoded.extra_bits,
+                        distance_extra_bits: decoded_distance.extra_bits,
                     });
 
-                    // Deflate copies overlap like `memmove`: each newly
-                    // produced byte is immediately visible to the next one.
-                    for _ in 0..length {
-                        let source = (self.decoded_position - u64::from(distance)) & 32_767;
-                        let byte = self.window[source as usize];
-                        plain.push(byte);
-                        self.push_history(byte);
-                    }
+                    let mut scratch = [0_u8; MAX_MATCH_LENGTH];
+                    let expanded = expand_match(
+                        &self.window,
+                        self.decoded_position,
+                        distance,
+                        length,
+                        &mut scratch,
+                    );
+                    plain.extend_from_slice(expanded);
+                    self.append_history(expanded);
                 }
                 _ => unreachable!(),
             }
@@ -503,14 +570,32 @@ impl Parser<'_> {
     }
 
     fn push_history(&mut self, byte: u8) {
-        self.window[(self.decoded_position & 32_767) as usize] = byte;
+        self.window[(self.decoded_position & WINDOW_MASK) as usize] = byte;
         self.decoded_position += 1;
     }
 
     fn append_history(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.push_history(byte);
+        if bytes.is_empty() {
+            return;
         }
+
+        let next_position = self.decoded_position + bytes.len() as u64;
+        // When the input is larger than the ring, only its final window can
+        // affect a later match. Locate that suffix at its absolute position so
+        // the circular layout remains identical to byte-at-a-time insertion.
+        let retained = if bytes.len() > WINDOW_SIZE {
+            &bytes[bytes.len() - WINDOW_SIZE..]
+        } else {
+            bytes
+        };
+        let retained_position = next_position - retained.len() as u64;
+        let destination = (retained_position & WINDOW_MASK) as usize;
+        let first = retained.len().min(WINDOW_SIZE - destination);
+        self.window[destination..destination + first].copy_from_slice(&retained[..first]);
+        if first != retained.len() {
+            self.window[..retained.len() - first].copy_from_slice(&retained[first..]);
+        }
+        self.decoded_position = next_position;
     }
 
     fn update_checksums(&mut self, bytes: &[u8]) {
@@ -578,6 +663,81 @@ fn model_limit_error() -> Error {
 mod tests {
     use super::*;
     use crate::deflate::bitstream::BitWriter;
+
+    #[test]
+    fn bulk_match_expansion_matches_bytewise_overlap_semantics() {
+        let distances = (1..=WINDOW_SIZE)
+            .step_by(127)
+            .chain([1, 2, 3, 255, 256, 257, 32_767, 32_768]);
+        for decoded_position in [32_768_u64, 32_769, 65_535, 65_536, 100_003] {
+            let mut window = [0_u8; WINDOW_SIZE];
+            for absolute in decoded_position - WINDOW_SIZE as u64..decoded_position {
+                window[(absolute & WINDOW_MASK) as usize] = (absolute as u8)
+                    .wrapping_mul(157)
+                    .wrapping_add((absolute >> 11) as u8);
+            }
+
+            for distance in distances.clone() {
+                for length in 3..=MAX_MATCH_LENGTH {
+                    let mut expected = Vec::with_capacity(length);
+                    for offset in 0..length {
+                        let byte = if offset >= distance {
+                            expected[offset - distance]
+                        } else {
+                            let absolute = decoded_position - distance as u64 + offset as u64;
+                            window[(absolute & WINDOW_MASK) as usize]
+                        };
+                        expected.push(byte);
+                    }
+
+                    let mut scratch = [0_u8; MAX_MATCH_LENGTH];
+                    assert_eq!(
+                        expand_match(
+                            &window,
+                            decoded_position,
+                            distance as u16,
+                            length as u16,
+                            &mut scratch,
+                        ),
+                        expected,
+                        "position={decoded_position} distance={distance} length={length}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_history_update_feeds_a_wrapped_cross_block_match() {
+        let stored: Vec<u8> = (0..65_535)
+            .map(|index| (index as u8).wrapping_mul(193).wrapping_add(17))
+            .collect();
+        let mut writer = BitWriter::default();
+        writer.write(0, 1).unwrap();
+        writer.write(0, 2).unwrap();
+        writer.align_to_byte().unwrap();
+        writer.write(65_535, 16).unwrap();
+        writer.write(0, 16).unwrap();
+        writer.write_aligned_bytes(&stored).unwrap();
+
+        writer.write(1, 1).unwrap();
+        writer.write(1, 2).unwrap();
+        let (literal, distance) = crate::deflate::huffman::fixed_trees();
+        let length = literal.code(285).unwrap();
+        writer.write(u32::from(length.code), length.length).unwrap();
+        let offset = distance.code(29).unwrap();
+        writer.write(u32::from(offset.code), offset.length).unwrap();
+        writer.write(8_191, 13).unwrap();
+        let end = literal.code(256).unwrap();
+        writer.write(u32::from(end.code), end.length).unwrap();
+
+        let parsed = parse_stream(&writer.into_bytes(), 65_535 + 258).unwrap();
+        assert_eq!(parsed.blocks.len(), 2);
+        assert_eq!(
+            parsed.blocks[1].plain.as_slice(),
+            &stored[65_535 - 32_768..65_535 - 32_768 + 258]
+        );
+    }
 
     fn write_dynamic_prefix(
         writer: &mut BitWriter,
@@ -891,7 +1051,7 @@ mod tests {
 
     #[test]
     fn bounds_many_nonempty_source_blocks() {
-        let (literal, _) = fixed_trees();
+        let (literal, _) = crate::deflate::huffman::fixed_trees();
         let byte = literal.code(usize::from(b'x')).unwrap();
         let end = literal.code(256).unwrap();
         let mut writer = BitWriter::default();

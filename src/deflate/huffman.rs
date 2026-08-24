@@ -140,14 +140,32 @@ pub(crate) struct Huffman {
     decode_symbols: Vec<u16>,
     max_bits: u8,
     decode_table: Option<DecodeTable>,
+    decode_profile: Option<DecodeProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct DecodeEntry {
     symbol: u16,
+    value_base: u16,
     bits: u8,
+    extra_bits: u8,
     subtable_bits: u8,
     subtable_start: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodeProfile {
+    first_value_symbol: u16,
+    bases: &'static [u16],
+    extra_bits: &'static [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DecodedValue {
+    pub(crate) symbol: u16,
+    pub(crate) value: u16,
+    pub(crate) extra: u16,
+    pub(crate) extra_bits: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +239,7 @@ impl Huffman {
             decode_symbols,
             max_bits,
             decode_table: None,
+            decode_profile: None,
         })
     }
 
@@ -233,6 +252,38 @@ impl Huffman {
         Some(tree)
     }
 
+    /// Build a payload decoder whose table entries also carry the base value
+    /// and extra-bit width associated with each symbol. This lets parsing
+    /// consume a codeword and its extra field as one logical operation.
+    pub(crate) fn build_value_decoder(
+        lengths: &[u8],
+        first_value_symbol: u16,
+        bases: &'static [u16],
+        extra_bits: &'static [u8],
+    ) -> Option<Self> {
+        if bases.len() != extra_bits.len() {
+            return None;
+        }
+        let profile = DecodeProfile {
+            first_value_symbol,
+            bases,
+            extra_bits,
+        };
+        let mut tree = Self::build(lengths)?;
+        let mut table = build_decode_table(&tree.codes, tree.max_bits)?;
+        for entry in &mut table.entries {
+            if entry.bits == 0 {
+                continue;
+            }
+            let (base, width) = decode_metadata(profile, entry.symbol);
+            entry.value_base = base;
+            entry.extra_bits = width;
+        }
+        tree.decode_table = Some(table);
+        tree.decode_profile = Some(profile);
+        Some(tree)
+    }
+
     /// Decode one symbol, consuming no more than the tree's maximum length.
     pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         if let Some(table) = &self.decode_table {
@@ -241,27 +292,81 @@ impl Huffman {
         self.decode_canonical(reader)
     }
 
+    /// Decode a profiled symbol together with its following extra-bit field.
+    pub(crate) fn decode_value(&self, reader: &mut BitReader<'_>) -> Result<DecodedValue> {
+        let profile = self
+            .decode_profile
+            .ok_or_else(|| Error::new("internal Huffman decoder has no value profile"))?;
+        if let Some(table) = &self.decode_table {
+            if let Some((entry, code_bits)) = self.peek_decode_table(reader, table)? {
+                let total_bits = code_bits + entry.extra_bits;
+                let packed = reader.peek(total_bits)?;
+                let extra = if entry.extra_bits == 0 {
+                    0
+                } else {
+                    let mask = (1_u32 << entry.extra_bits) - 1;
+                    ((packed >> code_bits) & mask) as u16
+                };
+                reader.drop_bits(total_bits)?;
+                return Ok(DecodedValue {
+                    symbol: entry.symbol,
+                    value: entry.value_base + extra,
+                    extra,
+                    extra_bits: entry.extra_bits,
+                });
+            }
+        }
+
+        // Near the end of a stream there may be enough input for the actual
+        // codeword but not for the table's wider root lookup. Preserve the
+        // canonical fallback and consume its extra field separately.
+        let symbol = self.decode_canonical(reader)?;
+        let (base, extra_bits) = decode_metadata(profile, symbol);
+        let extra = if extra_bits == 0 {
+            0
+        } else {
+            reader.read(extra_bits)? as u16
+        };
+        Ok(DecodedValue {
+            symbol,
+            value: base + extra,
+            extra,
+            extra_bits,
+        })
+    }
+
     fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
+        if let Some((entry, bits)) = self.peek_decode_table(reader, table)? {
+            reader.drop_bits(bits)?;
+            return Ok(entry.symbol);
+        }
+        self.decode_canonical(reader)
+    }
+
+    fn peek_decode_table(
+        &self,
+        reader: &mut BitReader<'_>,
+        table: &DecodeTable,
+    ) -> Result<Option<(DecodeEntry, u8)>> {
         if table.root_bits == 0 {
             return Err(Error::new("invalid Huffman code in Deflate stream"));
         }
         let root_value = match reader.peek(table.root_bits) {
             Ok(value) => value,
-            Err(_) => return self.decode_canonical(reader),
+            Err(_) => return Ok(None),
         };
         let root_entry = table.entries[root_value as usize];
         if root_entry.subtable_bits == 0 {
             if root_entry.bits == 0 {
                 return Err(Error::new("invalid Huffman code in Deflate stream"));
             }
-            reader.drop_bits(root_entry.bits)?;
-            return Ok(root_entry.symbol);
+            return Ok(Some((root_entry, root_entry.bits)));
         }
 
         let lookup_bits = table.root_bits + root_entry.subtable_bits;
         let value = match reader.peek(lookup_bits) {
             Ok(value) => value,
-            Err(_) => return self.decode_canonical(reader),
+            Err(_) => return Ok(None),
         };
         let subtable_mask = (1_u32 << root_entry.subtable_bits) - 1;
         let subtable_index = usize::from(root_entry.subtable_start)
@@ -270,8 +375,7 @@ impl Huffman {
         if entry.bits == 0 {
             return Err(Error::new("invalid Huffman code in Deflate stream"));
         }
-        reader.drop_bits(table.root_bits + entry.bits)?;
-        Ok(entry.symbol)
+        Ok(Some((entry, table.root_bits + entry.bits)))
     }
 
     fn decode_canonical(&self, reader: &mut BitReader<'_>) -> Result<u16> {
@@ -301,6 +405,17 @@ impl Huffman {
     #[cfg(test)]
     pub(crate) fn max_bits(&self) -> u8 {
         self.max_bits
+    }
+}
+
+fn decode_metadata(profile: DecodeProfile, symbol: u16) -> (u16, u8) {
+    let Some(index) = symbol.checked_sub(profile.first_value_symbol) else {
+        return (symbol, 0);
+    };
+    let index = usize::from(index);
+    match (profile.bases.get(index), profile.extra_bits.get(index)) {
+        (Some(&base), Some(&extra_bits)) => (base, extra_bits),
+        _ => (symbol, 0),
     }
 }
 
@@ -348,6 +463,7 @@ fn build_decode_table(codes: &[HuffCode], max_bits: u8) -> Option<DecodeTable> {
                 let index = usize::from(code.code) | (suffix << code.length);
                 entries[index] = DecodeEntry {
                     symbol: code.symbol,
+                    value_base: code.symbol,
                     bits: code.length,
                     ..DecodeEntry::default()
                 };
@@ -365,6 +481,7 @@ fn build_decode_table(codes: &[HuffCode], max_bits: u8) -> Option<DecodeTable> {
                 usize::from(root_entry.subtable_start) + code_suffix + (suffix << remaining_bits);
             entries[index] = DecodeEntry {
                 symbol: code.symbol,
+                value_base: code.symbol,
                 bits: remaining_bits,
                 ..DecodeEntry::default()
             };
@@ -534,6 +651,62 @@ fn merge_generic_nodes_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, vari
     }
 }
 
+fn take_generic_front(
+    nodes: &[Node],
+    active: &[usize],
+    leaf_end: usize,
+    leaf: &mut usize,
+    branch: &mut usize,
+    variant: u32,
+) -> usize {
+    let take_leaf = *leaf < leaf_end
+        && (*branch >= active.len() || node_less(nodes, active[*leaf], active[*branch], variant));
+    if take_leaf {
+        let result = active[*leaf];
+        *leaf += 1;
+        result
+    } else {
+        let result = active[*branch];
+        *branch += 1;
+        result
+    }
+}
+
+fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+    active.sort_unstable_by(|&left, &right| {
+        if node_less(nodes, left, right, variant) {
+            std::cmp::Ordering::Less
+        } else if node_less(nodes, right, left, variant) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    // The sorted leaves occupy the original prefix. Newly formed branches
+    // have nondecreasing frequencies and increasing creation order, so variant
+    // zero can consume each front exactly once without maintaining a heap.
+    let leaf_end = active.len();
+    active.reserve(leaf_end.saturating_sub(1));
+    let mut leaf = 0;
+    let mut branch = leaf_end;
+    let mut remaining = leaf_end;
+
+    while remaining > 1 {
+        let left = take_generic_front(nodes, active, leaf_end, &mut leaf, &mut branch, variant);
+        let right = take_generic_front(nodes, active, leaf_end, &mut leaf, &mut branch, variant);
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        active.push(index);
+        remaining -= 1;
+    }
+
+    let root = take_generic_front(nodes, active, leaf_end, &mut leaf, &mut branch, variant);
+    active.clear();
+    active.push(root);
+}
+
 fn assign_depths(nodes: &[Node], node_index: usize, depth: usize, lengths: &mut [u8]) -> usize {
     let node = nodes[node_index];
     if let Some(symbol) = node.symbol {
@@ -624,12 +797,18 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
         _ => {}
     }
 
-    // Variants zero and one use one total order for both children. A binary
-    // heap preserves their exact frequency/symbol tie behavior while avoiding
-    // a full active-node scan for every merge. Variants two and three switch
-    // the tie direction between the two children and retain the original
-    // scanning topology.
-    if variant & 2 == 0 {
+    // Variant zero's increasing tie order makes both its leaf and newly formed
+    // branch fronts monotonic. Use a sorted two-front merge when no wrapped
+    // frequency sum can invalidate that property. Variant one retains the
+    // exact-order heap; variants two and three switch tie direction between
+    // their children and retain the original scanning topology.
+    let total_frequency: u64 = frequencies
+        .iter()
+        .map(|&frequency| u64::from(frequency))
+        .sum();
+    if variant == 0 && total_frequency <= u64::from(u32::MAX) {
+        merge_generic_nodes_two_front(&mut nodes, &mut active, variant);
+    } else if variant & 2 == 0 {
         merge_generic_nodes_heap(&mut nodes, &mut active, variant);
     } else {
         merge_generic_nodes_scanning(&mut nodes, &mut active, variant);
@@ -1666,6 +1845,53 @@ mod tests {
     }
 
     #[test]
+    fn profiled_decoder_combines_codewords_with_extra_fields() {
+        static BASES: [u16; 2] = [10, 20];
+        static EXTRA_BITS: [u8; 2] = [1, 2];
+
+        let lengths = [2, 2, 2, 2];
+        let encoder = Huffman::build(&lengths).unwrap();
+        let decoder = Huffman::build_value_decoder(&lengths, 2, &BASES, &EXTRA_BITS).unwrap();
+        let mut writer = BitWriter::default();
+        for (symbol, extra, width) in [(0, 0, 0), (2, 1, 1), (3, 3, 2)] {
+            let code = encoder.code(symbol).unwrap();
+            writer.write(u32::from(code.code), code.length).unwrap();
+            writer.write(extra, width).unwrap();
+        }
+
+        let encoded = writer.into_bytes();
+        let mut reader = BitReader::new(&encoded);
+        assert_eq!(
+            decoder.decode_value(&mut reader).unwrap(),
+            DecodedValue {
+                symbol: 0,
+                value: 0,
+                extra: 0,
+                extra_bits: 0,
+            }
+        );
+        assert_eq!(
+            decoder.decode_value(&mut reader).unwrap(),
+            DecodedValue {
+                symbol: 2,
+                value: 11,
+                extra: 1,
+                extra_bits: 1,
+            }
+        );
+        assert_eq!(
+            decoder.decode_value(&mut reader).unwrap(),
+            DecodedValue {
+                symbol: 3,
+                value: 23,
+                extra: 3,
+                extra_bits: 2,
+            }
+        );
+        assert_eq!(reader.bit_position(), 9);
+    }
+
+    #[test]
     fn canonical_builder_rejects_malformed_trees() {
         assert!(Huffman::build(&[]).is_none());
         assert!(Huffman::build(&[16]).is_none());
@@ -1795,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn heap_generic_variants_match_the_scanning_topology() {
+    fn optimized_generic_variants_match_the_scanning_topology() {
         let mut state = 0x7f4a_7c15_u32;
         for alphabet_len in [19, 30, 286] {
             for sample in 0..128 {
@@ -1819,6 +2045,19 @@ mod tests {
                         "alphabet={alphabet_len} sample={sample} variant={variant}",
                     );
                 }
+            }
+        }
+
+        for frequencies in [
+            vec![u32::MAX, u32::MAX - 1, 7, 5, 3, 1],
+            vec![u32::MAX / 2 + 1; 19],
+        ] {
+            for variant in 0..2 {
+                assert_eq!(
+                    make_lengths(&frequencies, 15, variant),
+                    make_lengths_scanning_reference(&frequencies, 15, variant),
+                    "wrapped-frequency fallback variant={variant}",
+                );
             }
         }
     }

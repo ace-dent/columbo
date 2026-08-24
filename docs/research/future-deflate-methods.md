@@ -15,7 +15,10 @@ were initially checked on 12 August, and Zopfli's pseudo-frequency source was
 revalidated on 15 August. Current-branch links are used where an upstream
 project does not publish stable source snapshots, so their claims should be
 rechecked before implementation. The libdeflate comparison was revalidated at
-commit `b122c8be1d78b19f6d0a6efc5bb79bfcbb30dd51` on 20 August 2026.
+commit `b122c8be1d78b19f6d0a6efc5bb79bfcbb30dd51` on 20 August 2026. Its v1.26
+head, commit `92e6a0db9fa848d742f9eb286c92afc60f2c3dda`, was checked on 22 August;
+the intervening release and CI changes did not modify the Deflate compressor
+or decompressor sources used by this review.
 
 ## Conclusion
 
@@ -181,6 +184,32 @@ A second pass separated ratio ideas from Huffman-construction speed work:
 The retained heap code is an independently written Columbo optimization over
 the project's existing tree topology. No libdeflate source expressions,
 identifiers, data layouts, or control flow were reused.
+
+A third pass evaluated the remaining execution-speed concepts one at a time:
+
+- Safe scratch-buffer match expansion plus sliced ring updates reduced the
+  median match-heavy parse microbenchmark from 26.44 to 10.30 milliseconds,
+  about 61%. A bytewise oracle covered overlap periods, ring wraparound, every
+  match length, and sampled distances through 32,768.
+- A guarded word-at-a-time bit-buffer refill passed its aligned stored-block
+  tests but was about 1% slower on the same parser control, so it was removed.
+- Profiled payload decode entries now carry base values and extra-bit widths,
+  consuming a match codeword and its extra field together. The 60-round parser
+  median improved from 10.88 to 10.18 milliseconds, about 6.4%.
+- Generic variant zero now sorts its leaves once and merges the leaf and branch
+  fronts directly. Variant one retains the heap, and wrapped totals fall back
+  to that heap. Mixed variant-zero/one construction improved from 16.27 to
+  10.66 microseconds per tree, about 34.5%, while the scanning oracle and
+  explicit wrapped-frequency cases remained identical.
+- Final match emission combines each Huffman codeword and extra field in one
+  buffered write. The 100,000-match emission median improved from 1.68 to 1.16
+  milliseconds, about 31%.
+
+These are isolated hot-path measurements and do not add linearly to complete
+optimization time. GZIP, PNG, and zlib whole-file differentials produced
+identical output at every retained step. The implementations were designed
+from Columbo's model and behavioral requirements; they do not translate
+libdeflate source expressions, identifiers, layouts, or control flow.
 
 ### 7-Zip and AdvanceCOMP
 

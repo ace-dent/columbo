@@ -682,10 +682,20 @@ fn emit_tokens(
                 distance_extra_bits,
                 ..
             } => {
-                emit_symbol(writer, literal, usize::from(length_symbol))?;
-                writer.write(u32::from(length_extra), length_extra_bits)?;
-                emit_symbol(writer, distance, usize::from(distance_symbol))?;
-                writer.write(u32::from(distance_extra), distance_extra_bits)?;
+                emit_symbol_with_extra(
+                    writer,
+                    literal,
+                    usize::from(length_symbol),
+                    length_extra,
+                    length_extra_bits,
+                )?;
+                emit_symbol_with_extra(
+                    writer,
+                    distance,
+                    usize::from(distance_symbol),
+                    distance_extra,
+                    distance_extra_bits,
+                )?;
             }
         }
     }
@@ -697,6 +707,22 @@ fn emit_symbol(writer: &mut BitWriter, tree: &Huffman, symbol: usize) -> Result<
         .code(symbol)
         .ok_or_else(|| Error::new("internal Huffman plan does not cover token"))?;
     writer.write(u32::from(code.code), code.length)
+}
+
+fn emit_symbol_with_extra(
+    writer: &mut BitWriter,
+    tree: &Huffman,
+    symbol: usize,
+    extra: u16,
+    extra_bits: u8,
+) -> Result<()> {
+    let code = tree
+        .code(symbol)
+        .ok_or_else(|| Error::new("internal Huffman plan does not cover token"))?;
+    let bits = code.length + extra_bits;
+    debug_assert!(bits <= 32);
+    let packed = u32::from(code.code) | (u32::from(extra) << code.length);
+    writer.write(packed, bits)
 }
 
 #[cfg(test)]
