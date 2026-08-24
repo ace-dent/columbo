@@ -18,7 +18,8 @@ rechecked before implementation. The libdeflate comparison was revalidated at
 commit `b122c8be1d78b19f6d0a6efc5bb79bfcbb30dd51` on 20 August 2026. Its v1.26
 head, commit `92e6a0db9fa848d742f9eb286c92afc60f2c3dda`, was checked on 22 August;
 the intervening release and CI changes did not modify the Deflate compressor
-or decompressor sources used by this review.
+or decompressor sources used by this review. The same upstream head was checked
+again on 24 August before the fourth speed pass.
 
 ## Conclusion
 
@@ -210,6 +211,53 @@ optimization time. GZIP, PNG, and zlib whole-file differentials produced
 identical output at every retained step. The implementations were designed
 from Columbo's model and behavioral requirements; they do not translate
 libdeflate source expressions, identifiers, layouts, or control flow.
+
+A fourth pass completed the remaining portable execution-speed experiments:
+
+- Payload decode tables now use alphabet-specific root widths: ten bits for
+  literal/length codes and eight for distance codes. Code-length codes already
+  fall naturally to their seven-bit maximum. Against the previous nine/nine
+  configuration, the combined setting improved the repeated real-stream parser
+  median by about 2.3%. An eleven-bit literal/length root decoded a synthetic
+  deep tree faster but tripled its table-build time and slowed complete parsing,
+  so it was rejected.
+- Root-table construction now enumerates Columbo's existing canonical
+  length ranges once and expands completed prefixes with contiguous copies.
+  The isolated deep-table build improved from 24.01 to 18.67 milliseconds for
+  20,000 builds, about 22%, and the repeated real-stream parser control improved
+  by about 0.3%. A first version that rescanned the full symbol array at every
+  length was neutral to slower and was replaced.
+- Two literal-run decoders were rejected. A direct-root probe repeated the next
+  lookup when a literal preceded a match and slowed parsing about 5.6%; retaining
+  a prefetched nonliteral still slowed parsing about 5%. Columbo's persistent
+  token and frequency model does not benefit from libdeflate's output-only
+  literal fast-loop shape.
+- Planned emission now records its exact bit limit. Its preallocated writer
+  enforces that limit and skips redundant capacity reservations, while ordinary
+  growable writers retain fallible reservation. The 100,000-match control
+  improved by about 3%.
+- A distance-one fill reduced that isolated copy by roughly 40%, but only 2,015
+  of 514,233 matches in the representative stream used distance one. Its extra
+  branch slowed complete parsing about 1.4%, so the specialization was removed.
+- Generic variant one now merges a sorted leaf front with reverse-ordered
+  equal-frequency branch runs, improving its control from 417.82 to 227.93
+  milliseconds for 20,000 trees, about 45%. Mixed-tie variants two and three
+  maintain both exact total orders in paired heaps with lazy removal, reducing
+  their combined 2,000-round control from 1.65 seconds to 141.57 milliseconds,
+  about 91%. The scanning oracle now covers all four variants across 19-, 30-,
+  and 286-symbol alphabets plus wrapped-frequency inputs.
+
+The final 21-pair representative PNG workload took 13.246 seconds both before
+and after these changes; CPU totals differed by about 0.2%, within run noise.
+All eleven unique candidate outputs were byte-identical to the preceding
+binary. Formatting, warning-free Clippy, and all 433 Rust tests passed. No
+architecture-specific path was added.
+
+This pass again uses libdeflate only to identify general optimization themes.
+The retained Rust algorithms, state layouts, names, and control flow were
+designed from Columbo's existing canonical tables, tie-order semantics, safety
+rules, and exact planned-bit invariant. No libdeflate implementation text was
+copied or translated.
 
 ### 7-Zip and AdvanceCOMP
 

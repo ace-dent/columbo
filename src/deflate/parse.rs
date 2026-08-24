@@ -14,7 +14,8 @@ use std::sync::OnceLock;
 use super::bitstream::BitReader;
 use super::huffman::{
     code_length_tree_shape_is_valid, payload_tree_shape_is_valid, Huffman,
-    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    DISTANCE_DECODE_ROOT_BITS, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    LITERAL_LENGTH_DECODE_ROOT_BITS,
 };
 use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, RleToken, SourceBlockType, Token,
@@ -91,18 +92,20 @@ fn fixed_payload_trees() -> (&'static Huffman, &'static Huffman) {
     static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     let (literal, distance) = FIXED.get_or_init(|| {
         (
-            Huffman::build_value_decoder(
+            Huffman::build_value_decoder_with_root_bits(
                 &FIXED_LITERAL_CODE_LENGTHS,
                 257,
                 &LENGTH_BASE,
                 &LENGTH_EXTRA_BITS,
+                LITERAL_LENGTH_DECODE_ROOT_BITS,
             )
             .expect("fixed literal tree is valid"),
-            Huffman::build_value_decoder(
+            Huffman::build_value_decoder_with_root_bits(
                 &FIXED_DISTANCE_CODE_LENGTHS,
                 0,
                 &DISTANCE_BASE,
                 &DISTANCE_EXTRA_BITS,
+                DISTANCE_DECODE_ROOT_BITS,
             )
             .expect("fixed distance tree is valid"),
         )
@@ -415,20 +418,26 @@ impl Parser<'_> {
 
         let literal_lengths = lengths[..hlit].to_vec();
         let distance_lengths = lengths[hlit..].to_vec();
-        let literal =
-            Huffman::build_value_decoder(&literal_lengths, 257, &LENGTH_BASE, &LENGTH_EXTRA_BITS)
-                .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
+        let literal = Huffman::build_value_decoder_with_root_bits(
+            &literal_lengths,
+            257,
+            &LENGTH_BASE,
+            &LENGTH_EXTRA_BITS,
+            LITERAL_LENGTH_DECODE_ROOT_BITS,
+        )
+        .ok_or_else(|| Error::new("invalid literal/length Huffman tree"))?;
         if literal.code(256).is_none() {
             return Err(Error::new("dynamic Huffman tree has no end code"));
         }
         if !payload_tree_shape_is_valid(&literal_lengths, false) {
             return Err(Error::new("invalid literal/length Huffman tree"));
         }
-        let distance = Huffman::build_value_decoder(
+        let distance = Huffman::build_value_decoder_with_root_bits(
             &distance_lengths,
             0,
             &DISTANCE_BASE,
             &DISTANCE_EXTRA_BITS,
+            DISTANCE_DECODE_ROOT_BITS,
         )
         .ok_or_else(|| Error::new("invalid distance Huffman tree"))?;
         if !payload_tree_shape_is_valid(&distance_lengths, true) {

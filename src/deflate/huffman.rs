@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 
 use super::bitstream::BitReader;
@@ -9,7 +10,11 @@ const MAX_CODE_BITS: usize = 15;
 const MAX_C_CODES: usize = 320;
 const MAX_TRACKED_DEPTH: usize = 63;
 const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
-const DECODE_ROOT_BITS: u8 = 9;
+const DEFAULT_DECODE_ROOT_BITS: u8 = 9;
+// Payload alphabets use independently measured lookup/build/cache tradeoffs.
+// Code-length trees use the default but naturally cap at their seven-bit max.
+pub(crate) const LITERAL_LENGTH_DECODE_ROOT_BITS: u8 = 10;
+pub(crate) const DISTANCE_DECODE_ROOT_BITS: u8 = 8;
 
 const fn make_fixed_literal_code_lengths() -> [u8; 288] {
     let mut lengths = [0_u8; 288];
@@ -247,19 +252,24 @@ impl Huffman {
     /// decode table. Planner and emitter trees use `build()` so they do not pay
     /// this allocation cost.
     pub(crate) fn build_decoder(lengths: &[u8]) -> Option<Self> {
+        Self::build_decoder_with_root_bits(lengths, DEFAULT_DECODE_ROOT_BITS)
+    }
+
+    pub(crate) fn build_decoder_with_root_bits(lengths: &[u8], root_bits: u8) -> Option<Self> {
         let mut tree = Self::build(lengths)?;
-        tree.decode_table = Some(build_decode_table(&tree.codes, tree.max_bits)?);
+        tree.decode_table = Some(build_decode_table(&tree, root_bits)?);
         Some(tree)
     }
 
     /// Build a payload decoder whose table entries also carry the base value
     /// and extra-bit width associated with each symbol. This lets parsing
     /// consume a codeword and its extra field as one logical operation.
-    pub(crate) fn build_value_decoder(
+    pub(crate) fn build_value_decoder_with_root_bits(
         lengths: &[u8],
         first_value_symbol: u16,
         bases: &'static [u16],
         extra_bits: &'static [u8],
+        root_bits: u8,
     ) -> Option<Self> {
         if bases.len() != extra_bits.len() {
             return None;
@@ -270,7 +280,7 @@ impl Huffman {
             extra_bits,
         };
         let mut tree = Self::build(lengths)?;
-        let mut table = build_decode_table(&tree.codes, tree.max_bits)?;
+        let mut table = build_decode_table(&tree, root_bits)?;
         for entry in &mut table.entries {
             if entry.bits == 0 {
                 continue;
@@ -419,21 +429,21 @@ fn decode_metadata(profile: DecodeProfile, symbol: u16) -> (u16, u8) {
     }
 }
 
-fn build_decode_table(codes: &[HuffCode], max_bits: u8) -> Option<DecodeTable> {
-    if max_bits == 0 {
+fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
+    if tree.max_bits == 0 {
         return Some(DecodeTable {
             entries: Vec::new(),
             root_bits: 0,
         });
     }
-    let root_bits = max_bits.min(DECODE_ROOT_BITS);
+    let root_bits = tree.max_bits.min(root_bits);
     let root_size = 1_usize << root_bits;
     let root_mask = (root_size - 1) as u16;
 
     let mut subtable_widths = Vec::new();
     subtable_widths.try_reserve_exact(root_size).ok()?;
     subtable_widths.resize(root_size, 0_u8);
-    for code in codes.iter().filter(|code| code.length > root_bits) {
+    for code in tree.codes.iter().filter(|code| code.length > root_bits) {
         let prefix = usize::from(code.code & root_mask);
         subtable_widths[prefix] = subtable_widths[prefix].max(code.length - root_bits);
     }
@@ -441,36 +451,48 @@ fn build_decode_table(codes: &[HuffCode], max_bits: u8) -> Option<DecodeTable> {
     let mut entries = Vec::new();
     entries.try_reserve_exact(root_size).ok()?;
     entries.resize(root_size, DecodeEntry::default());
-    for (prefix, &subtable_bits) in subtable_widths.iter().enumerate() {
-        if subtable_bits == 0 {
-            continue;
+
+    // Grow the direct root table one address bit at a time. Duplicating the
+    // already populated prefix keeps the inherited shorter codes contiguous
+    // in memory; codes introduced at this width then replace their one exact
+    // slot. The resulting bit-reversed lookup layout is identical to filling
+    // every symbol's widely spaced suffixes independently.
+    for length in 1..=root_bits {
+        if length > 1 {
+            let previous_size = 1_usize << (length - 1);
+            entries.copy_within(..previous_size, previous_size);
         }
-        let subtable_start = u16::try_from(entries.len()).ok()?;
-        let subtable_size = 1_usize << subtable_bits;
-        entries.try_reserve(subtable_size).ok()?;
-        entries.resize(entries.len() + subtable_size, DecodeEntry::default());
-        entries[prefix] = DecodeEntry {
-            subtable_bits,
-            subtable_start,
-            ..DecodeEntry::default()
-        };
+        let length_index = usize::from(length);
+        let first = usize::from(tree.first_symbol[length_index]);
+        let end = first + usize::from(tree.code_count[length_index]);
+        for &symbol in &tree.decode_symbols[first..end] {
+            let code = tree.codes[usize::from(symbol)];
+            entries[usize::from(code.code)] = DecodeEntry {
+                symbol: code.symbol,
+                value_base: code.symbol,
+                bits: code.length,
+                ..DecodeEntry::default()
+            };
+        }
     }
 
-    for code in codes.iter().filter(|code| code.length != 0) {
-        if code.length <= root_bits {
-            let suffix_count = 1_usize << (root_bits - code.length);
-            for suffix in 0..suffix_count {
-                let index = usize::from(code.code) | (suffix << code.length);
-                entries[index] = DecodeEntry {
-                    symbol: code.symbol,
-                    value_base: code.symbol,
-                    bits: code.length,
-                    ..DecodeEntry::default()
-                };
-            }
-            continue;
+    // Install subtable pointers only after the root has been expanded so the
+    // contiguous copies above cannot replicate a pointer into another prefix.
+    for (prefix, &subtable_bits) in subtable_widths.iter().enumerate() {
+        if subtable_bits != 0 {
+            let subtable_start = u16::try_from(entries.len()).ok()?;
+            let subtable_size = 1_usize << subtable_bits;
+            entries.try_reserve(subtable_size).ok()?;
+            entries.resize(entries.len() + subtable_size, DecodeEntry::default());
+            entries[prefix] = DecodeEntry {
+                subtable_bits,
+                subtable_start,
+                ..DecodeEntry::default()
+            };
         }
+    }
 
+    for code in tree.codes.iter().filter(|code| code.length > root_bits) {
         let prefix = usize::from(code.code & root_mask);
         let root_entry = entries[prefix];
         let remaining_bits = code.length - root_bits;
@@ -604,6 +626,7 @@ fn generic_heap_push(nodes: &[Node], heap: &mut Vec<usize>, node: usize, variant
     }
 }
 
+#[cfg(test)]
 fn merge_generic_nodes_scanning(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
     while active.len() > 1 {
         let first_position = (1..active.len()).fold(0, |best, position| {
@@ -649,6 +672,71 @@ fn merge_generic_nodes_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, vari
         nodes.push(Node::branch(frequency, left, right, index));
         generic_heap_push(nodes, active, index, variant);
     }
+}
+
+fn generic_heap_pop_active(
+    nodes: &[Node],
+    heap: &mut Vec<usize>,
+    active: &[bool],
+    variant: u32,
+) -> Option<usize> {
+    loop {
+        let node = generic_heap_pop(nodes, heap, variant)?;
+        if active[node] {
+            return Some(node);
+        }
+    }
+}
+
+/// Merge variants whose first and second child reverse their equal-frequency
+/// preference. Each node enters both total-order heaps; removing it only marks
+/// the shared active bit, and the other heap discards that stale entry when it
+/// reaches its front. This preserves the two distinct choices without an
+/// active-set scan or deletion from the middle of a heap.
+fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+    debug_assert_ne!(variant & 2, 0);
+    let mut increasing_order = active.clone();
+    let mut decreasing_order = active.clone();
+    for start in (0..increasing_order.len() / 2).rev() {
+        generic_heap_sift_down(nodes, &mut increasing_order, start, 0);
+        generic_heap_sift_down(nodes, &mut decreasing_order, start, 1);
+    }
+
+    let leaf_count = active.len();
+    let mut is_active = Vec::with_capacity(leaf_count.saturating_mul(2));
+    is_active.resize(nodes.len(), true);
+    let mut remaining = leaf_count;
+    while remaining > 1 {
+        let reverse_first = variant & 1 != 0;
+        let left = if reverse_first {
+            generic_heap_pop_active(nodes, &mut decreasing_order, &is_active, 1)
+        } else {
+            generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+        }
+        .expect("two nodes remain");
+        is_active[left] = false;
+
+        let right = if reverse_first {
+            generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+        } else {
+            generic_heap_pop_active(nodes, &mut decreasing_order, &is_active, 1)
+        }
+        .expect("one node remains");
+        is_active[right] = false;
+
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        is_active.push(true);
+        generic_heap_push(nodes, &mut increasing_order, index, 0);
+        generic_heap_push(nodes, &mut decreasing_order, index, 1);
+        remaining -= 1;
+    }
+
+    let root = generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+        .expect("one root remains");
+    active.clear();
+    active.push(root);
 }
 
 fn take_generic_front(
@@ -703,6 +791,102 @@ fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
     }
 
     let root = take_generic_front(nodes, active, leaf_end, &mut leaf, &mut branch, variant);
+    active.clear();
+    active.push(root);
+}
+
+#[derive(Clone, Copy)]
+struct ReverseBranchRun {
+    frequency: u32,
+    newest: usize,
+}
+
+fn push_reverse_branch(
+    runs: &mut VecDeque<ReverseBranchRun>,
+    previous: &mut Vec<Option<usize>>,
+    node: usize,
+    frequency: u32,
+) {
+    debug_assert_eq!(previous.len(), node);
+    let predecessor = runs
+        .back()
+        .filter(|run| run.frequency == frequency)
+        .map(|run| run.newest);
+    previous.push(predecessor);
+    if let Some(run) = runs.back_mut().filter(|run| run.frequency == frequency) {
+        run.newest = node;
+    } else {
+        debug_assert!(runs.back().map_or(true, |run| run.frequency < frequency));
+        runs.push_back(ReverseBranchRun {
+            frequency,
+            newest: node,
+        });
+    }
+}
+
+fn pop_reverse_branch(
+    runs: &mut VecDeque<ReverseBranchRun>,
+    previous: &[Option<usize>],
+) -> Option<usize> {
+    let run = runs.front_mut()?;
+    let node = run.newest;
+    if let Some(predecessor) = previous[node] {
+        run.newest = predecessor;
+    } else {
+        runs.pop_front();
+    }
+    Some(node)
+}
+
+fn take_reverse_front(
+    nodes: &[Node],
+    leaves: &[usize],
+    leaf: &mut usize,
+    runs: &mut VecDeque<ReverseBranchRun>,
+    previous: &[Option<usize>],
+) -> usize {
+    let branch = runs.front().map(|run| run.newest);
+    let take_leaf = *leaf < leaves.len()
+        && branch.map_or(true, |branch| node_less(nodes, leaves[*leaf], branch, 1));
+    if take_leaf {
+        let node = leaves[*leaf];
+        *leaf += 1;
+        node
+    } else {
+        pop_reverse_branch(runs, previous).expect("one branch remains")
+    }
+}
+
+/// Variant one prefers the newest node within an equal-frequency group. The
+/// leaves are sorted once; generated branch frequencies are monotonic, so one
+/// linked stack per frequency run exposes that newest branch in constant time.
+fn merge_generic_nodes_reverse_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>) {
+    active.sort_unstable_by(|&left, &right| {
+        if node_less(nodes, left, right, 1) {
+            std::cmp::Ordering::Less
+        } else if node_less(nodes, right, left, 1) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+
+    let leaves = active.clone();
+    let mut leaf = 0;
+    let mut runs = VecDeque::with_capacity(leaves.len());
+    let mut previous = vec![None; nodes.len()];
+    let mut remaining = leaves.len();
+    while remaining > 1 {
+        let left = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
+        let right = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        push_reverse_branch(&mut runs, &mut previous, index, frequency);
+        remaining -= 1;
+    }
+
+    let root = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
     active.clear();
     active.push(root);
 }
@@ -798,20 +982,23 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
     }
 
     // Variant zero's increasing tie order makes both its leaf and newly formed
-    // branch fronts monotonic. Use a sorted two-front merge when no wrapped
-    // frequency sum can invalidate that property. Variant one retains the
-    // exact-order heap; variants two and three switch tie direction between
-    // their children and retain the original scanning topology.
+    // branch fronts monotonic. Use ordered fronts for variants zero and one
+    // when no wrapped frequency sum can invalidate that property. Variants two
+    // and three use one heap for each of their opposing child tie orders.
     let total_frequency: u64 = frequencies
         .iter()
         .map(|&frequency| u64::from(frequency))
         .sum();
-    if variant == 0 && total_frequency <= u64::from(u32::MAX) {
-        merge_generic_nodes_two_front(&mut nodes, &mut active, variant);
+    if variant <= 1 && total_frequency <= u64::from(u32::MAX) {
+        if variant == 0 {
+            merge_generic_nodes_two_front(&mut nodes, &mut active, variant);
+        } else {
+            merge_generic_nodes_reverse_front(&mut nodes, &mut active);
+        }
     } else if variant & 2 == 0 {
         merge_generic_nodes_heap(&mut nodes, &mut active, variant);
     } else {
-        merge_generic_nodes_scanning(&mut nodes, &mut active, variant);
+        merge_generic_nodes_dual_heap(&mut nodes, &mut active, variant);
     }
 
     let max_depth = assign_depths(&nodes, active[0], 0, lengths);
@@ -1845,13 +2032,61 @@ mod tests {
     }
 
     #[test]
+    fn table_widths_match_canonical_decoding_on_generated_trees() {
+        let mut state = 0x34c7_91ed_u32;
+        for sample in 0..64 {
+            let mut frequencies = [0_u32; 286];
+            for frequency in &mut frequencies {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *frequency = if state % 9 == 0 {
+                    0
+                } else {
+                    state % 65_521 + 1
+                };
+            }
+            let lengths = make_lengths(&frequencies, 15, sample % 4);
+            let canonical = Huffman::build(&lengths).unwrap();
+            let symbols: Vec<_> = lengths
+                .iter()
+                .enumerate()
+                .filter_map(|(symbol, &length)| (length != 0).then_some(symbol))
+                .cycle()
+                .take(1_024)
+                .collect();
+            let mut writer = BitWriter::default();
+            for &symbol in &symbols {
+                let code = canonical.code(symbol).unwrap();
+                writer.write(u32::from(code.code), code.length).unwrap();
+            }
+            let encoded = writer.into_bytes();
+
+            for root_bits in 7..=11 {
+                let decoder = Huffman::build_decoder_with_root_bits(&lengths, root_bits).unwrap();
+                let mut reader = BitReader::new(&encoded);
+                for &symbol in &symbols {
+                    assert_eq!(decoder.decode(&mut reader).unwrap(), symbol as u16);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn profiled_decoder_combines_codewords_with_extra_fields() {
         static BASES: [u16; 2] = [10, 20];
         static EXTRA_BITS: [u8; 2] = [1, 2];
 
         let lengths = [2, 2, 2, 2];
         let encoder = Huffman::build(&lengths).unwrap();
-        let decoder = Huffman::build_value_decoder(&lengths, 2, &BASES, &EXTRA_BITS).unwrap();
+        let decoder = Huffman::build_value_decoder_with_root_bits(
+            &lengths,
+            2,
+            &BASES,
+            &EXTRA_BITS,
+            DEFAULT_DECODE_ROOT_BITS,
+        )
+        .unwrap();
         let mut writer = BitWriter::default();
         for (symbol, extra, width) in [(0, 0, 0), (2, 1, 1), (3, 3, 2)] {
             let code = encoder.code(symbol).unwrap();
@@ -2037,7 +2272,7 @@ mod tests {
                     };
                     frequencies.push(frequency);
                 }
-                for variant in 0..2 {
+                for variant in 0..4 {
                     let max_bits = if alphabet_len == 19 { 7 } else { 15 };
                     assert_eq!(
                         make_lengths(&frequencies, max_bits, variant),
@@ -2052,7 +2287,7 @@ mod tests {
             vec![u32::MAX, u32::MAX - 1, 7, 5, 3, 1],
             vec![u32::MAX / 2 + 1; 19],
         ] {
-            for variant in 0..2 {
+            for variant in 0..4 {
                 assert_eq!(
                     make_lengths(&frequencies, 15, variant),
                     make_lengths_scanning_reference(&frequencies, 15, variant),

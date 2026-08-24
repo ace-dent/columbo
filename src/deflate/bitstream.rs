@@ -112,6 +112,7 @@ pub(crate) struct BitWriter {
     buffer: u64,
     buffered_bits: u8,
     bit_pos: u64,
+    bit_limit: Option<u64>,
 }
 
 impl BitWriter {
@@ -127,6 +128,7 @@ impl BitWriter {
             buffer: 0,
             buffered_bits: 0,
             bit_pos: 0,
+            bit_limit: Some(bits),
         })
     }
 
@@ -139,11 +141,18 @@ impl BitWriter {
             .checked_add(u64::from(bits))
             .ok_or_else(|| Error::new("Deflate output is too large"))?;
         let pending_bits = self.buffered_bits + bits;
-        let pending_bytes = usize::from(pending_bits.div_ceil(8));
-        self.bytes
-            .try_reserve(pending_bytes)
-            .map_err(|_| Error::new("could not allocate Deflate output"))?;
-
+        if let Some(bit_limit) = self.bit_limit {
+            if end > bit_limit {
+                return Err(Error::internal(
+                    "internal Deflate emission exceeded its planned size",
+                ));
+            }
+        } else {
+            let pending_bytes = usize::from(pending_bits.div_ceil(8));
+            self.bytes
+                .try_reserve(pending_bytes)
+                .map_err(|_| Error::new("could not allocate Deflate output"))?;
+        }
         let mask = if bits == 32 {
             u64::from(u32::MAX)
         } else {
@@ -212,9 +221,17 @@ impl BitWriter {
             .bit_pos
             .checked_add(added_bits)
             .ok_or_else(|| Error::new("Deflate output is too large"))?;
-        self.bytes
-            .try_reserve(bytes.len())
-            .map_err(|_| Error::new("could not allocate Deflate output"))?;
+        if let Some(bit_limit) = self.bit_limit {
+            if bit_position > bit_limit {
+                return Err(Error::internal(
+                    "internal Deflate emission exceeded its planned size",
+                ));
+            }
+        } else {
+            self.bytes
+                .try_reserve(bytes.len())
+                .map_err(|_| Error::new("could not allocate Deflate output"))?;
+        }
         self.bytes.extend_from_slice(bytes);
         self.bit_pos = bit_position;
         Ok(())
@@ -283,5 +300,21 @@ mod tests {
                 assert_eq!(chunked.into_bytes(), reference.into_bytes());
             }
         }
+    }
+
+    #[test]
+    fn preallocated_writer_enforces_its_planned_bit_limit() {
+        let mut writer = BitWriter::with_capacity_bits(7).unwrap();
+        writer.write(0x55, 7).unwrap();
+        assert_eq!(
+            writer.write(1, 1).unwrap_err().message(),
+            "internal Deflate emission exceeded its planned size"
+        );
+        assert_eq!(writer.into_bytes(), [0x55]);
+
+        let mut aligned = BitWriter::with_capacity_bits(8).unwrap();
+        aligned.write_aligned_bytes(&[0xaa]).unwrap();
+        assert!(aligned.write_aligned_bytes(&[0xbb]).is_err());
+        assert_eq!(aligned.into_bytes(), [0xaa]);
     }
 }
