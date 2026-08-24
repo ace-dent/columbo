@@ -142,8 +142,12 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         ));
     }
 
-    let effective_options = options_with_input_expansion_limit(input.len(), options);
+    let mut effective_options = options_with_input_expansion_limit(input.len(), options);
+    if effective_options.visual && !crate::progress::reports_enabled(&effective_options) {
+        effective_options.visual = false;
+    }
     let options = &effective_options;
+    let reporting = options.verbose || options.visual;
 
     let detection = match requested {
         Format::Auto => detect(input),
@@ -153,11 +157,7 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
 
     let result = match detected {
         Format::Auto | Format::Raw => {
-            crate::progress::format_detected(
-                options,
-                detected,
-                (options.verbose || options.visual).then_some(1),
-            );
+            crate::progress::format_detected(options, detected, reporting.then_some(1));
             super::deflate::optimize_raw(input, options)
                 .map(|raw| {
                     Optimization::from_metrics(
@@ -178,7 +178,7 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         }
         Format::Png => {
             let parsed = png::preflight(input, options.strip_metadata)?;
-            let count = if options.verbose || options.visual {
+            let count = if reporting {
                 Some(png::stream_count(&parsed)?)
             } else {
                 None
@@ -187,22 +187,18 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
             png::optimize_preflight(input, options, parsed)
         }
         Format::Zlib => {
-            crate::progress::format_detected(
-                options,
-                detected,
-                (options.verbose || options.visual).then_some(1),
-            );
+            crate::progress::format_detected(options, detected, reporting.then_some(1));
             zlib::optimize(input, options)
         }
         Format::Gzip => {
             let members = gzip::preflight(input, options.max_decoded_bytes)?;
-            let count = (options.verbose || options.visual).then_some(members.len());
+            let count = reporting.then_some(members.len());
             crate::progress::format_detected(options, detected, count);
             gzip::optimize_preflight(input, options, members)
         }
         Format::Zip => {
             let parsed = zip::preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
-            let count = (options.verbose || options.visual).then_some(zip::stream_count(&parsed));
+            let count = reporting.then_some(zip::stream_count(&parsed));
             crate::progress::format_detected(options, detected, count);
             zip::optimize_preflight(input, options, &parsed)
         }

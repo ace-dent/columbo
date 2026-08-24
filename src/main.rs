@@ -3,26 +3,24 @@
 #![forbid(unsafe_code)]
 
 mod presentation;
+mod spinner;
 mod terminal;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use columbo::{
     optimize, Format, Options, MAX_EXPANSION_RATIO, MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES,
     MIN_TIMEOUT,
 };
-use presentation::{
-    countdown_seconds, format_duration as format_elapsed, plural, plural_u64, write_spinner_line,
-};
+use presentation::{format_duration as format_elapsed, plural, plural_u64};
+use spinner::Spinner;
 
 const PROGRAM_NAME: &str = "columbo";
 const PROGRAM_VERSION: &str = concat!(
@@ -221,7 +219,7 @@ fn run() -> std::result::Result<(), u8> {
 
 fn execute(command: Command) -> std::result::Result<(), u8> {
     let report_mode = ReportMode::for_options(&command.options);
-    if command.options.visual && !visual_terminal_available() {
+    if command.options.visual && !terminal::stderr_interactive() {
         eprintln!("visual mode needs an interactive terminal; continuing without stream maps");
     }
 
@@ -304,7 +302,11 @@ fn execute_file(
     }
 
     let optimize_started = detailed.then(Instant::now);
-    let mut spinner = Spinner::start(report_mode == ReportMode::Default, command.options.timeout);
+    // Detailed reporters start the same spinner after their output state is ready.
+    let spinner_deadline = Instant::now()
+        .checked_add(command.options.timeout)
+        .unwrap_or_else(Instant::now);
+    let mut spinner = Spinner::start(report_mode == ReportMode::Default, spinner_deadline);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
     let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -1225,78 +1227,6 @@ impl Drop for TemporaryOutput {
         if !self.committed {
             let _ = fs::remove_file(&self.path);
         }
-    }
-}
-
-struct Spinner {
-    running: Option<Arc<AtomicBool>>,
-    worker: Option<JoinHandle<()>>,
-}
-
-fn visual_terminal_available() -> bool {
-    io::stderr().is_terminal() && env::var_os("TERM").map_or(true, |term| term != "dumb")
-}
-
-impl Spinner {
-    fn start(enabled: bool, timeout: Duration) -> Self {
-        if !enabled || !visual_terminal_available() {
-            return Self {
-                running: None,
-                worker: None,
-            };
-        }
-
-        let running = Arc::new(AtomicBool::new(true));
-        let worker_running = Arc::clone(&running);
-        let color = terminal::stderr_color_enabled();
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
-        let worker = thread::spawn(move || {
-            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let mut frame = 0;
-            let mut drawn = false;
-            // Avoid flashing a spinner for work that completes quickly.
-            thread::park_timeout(Duration::from_millis(300));
-            while worker_running.load(Ordering::Relaxed) {
-                let seconds = countdown_seconds(deadline.saturating_duration_since(Instant::now()));
-                {
-                    let stderr = io::stderr();
-                    let mut output = stderr.lock();
-                    let _ = write_spinner_line(&mut output, FRAMES[frame], seconds, None, color);
-                    let _ = output.flush();
-                }
-                drawn = true;
-                frame = (frame + 1) % FRAMES.len();
-                thread::park_timeout(Duration::from_millis(500));
-            }
-            if drawn {
-                eprint!("\r\x1b[K");
-                let _ = io::stderr().flush();
-            }
-        });
-        Self {
-            running: Some(running),
-            worker: Some(worker),
-        }
-    }
-
-    fn stop(&mut self) {
-        if let Some(running) = self.running.take() {
-            running.store(false, Ordering::Relaxed);
-        }
-        if let Some(worker) = self.worker.take() {
-            // Wake an initial-delay or between-frame park so stopping never
-            // adds up to 300 ms to the measured command time.
-            worker.thread().unpark();
-            let _ = worker.join();
-        }
-    }
-}
-
-impl Drop for Spinner {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 

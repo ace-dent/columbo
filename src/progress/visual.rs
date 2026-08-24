@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::env;
 #[cfg(unix)]
 use std::fs::File;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -34,9 +34,7 @@ const DYNAMIC_COLOR: &str = "\x1b[96m";
 static RENDERER: OnceLock<Mutex<Renderer>> = OnceLock::new();
 
 pub(super) fn enabled(options: &Options) -> bool {
-    options.visual
-        && io::stderr().is_terminal()
-        && env::var_os("TERM").map_or(true, |term| term != "dumb")
+    options.visual && terminal::stderr_interactive()
 }
 
 pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usize>) {

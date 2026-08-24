@@ -861,7 +861,9 @@ fn build_entries_parallel(
     let worker_count = optimizable.len().min(PARALLEL_ARCHIVE_MEMBER_WORKERS);
     let jobs_per_worker = optimizable.len() / worker_count;
     let workers_with_extra_job = optimizable.len() % worker_count;
-    let route_lineage = crate::progress::current_route_lineage();
+    let route_lineage = (options.verbose || options.visual)
+        .then(crate::progress::current_route_lineage)
+        .flatten();
 
     let completed = thread::scope(|scope| -> Result<_> {
         let mut workers = Vec::new();

@@ -67,7 +67,6 @@ pub(crate) fn write_spinner_line(
     output: &mut dyn Write,
     frame: &str,
     seconds: u64,
-    checked: Option<(usize, usize)>,
     styled: bool,
 ) -> io::Result<()> {
     write!(output, "\r\x1b[K")?;
@@ -75,9 +74,6 @@ pub(crate) fn write_spinner_line(
         write!(output, "\x1b[1m\x1b[36m{frame}\x1b[39m optimizing")?;
     } else {
         write!(output, "{frame} optimizing")?;
-    }
-    if let Some((done, total)) = checked {
-        write!(output, " · {done}/{total} checked")?;
     }
     write!(output, " · (timeout in ")?;
     if styled && seconds <= 3 {
@@ -107,14 +103,14 @@ mod tests {
     #[test]
     fn spinner_line_is_bold_and_warns_during_the_final_three_seconds() {
         let mut ordinary = Vec::new();
-        write_spinner_line(&mut ordinary, "⠋", 4, Some((2, 5)), true).unwrap();
+        write_spinner_line(&mut ordinary, "⠋", 4, true).unwrap();
         assert_eq!(
             String::from_utf8(ordinary).unwrap(),
-            "\r\x1b[K\x1b[1m\x1b[36m⠋\x1b[39m optimizing · 2/5 checked · (timeout in 4 s)\x1b[0m"
+            "\r\x1b[K\x1b[1m\x1b[36m⠋\x1b[39m optimizing · (timeout in 4 s)\x1b[0m"
         );
 
         let mut warning = Vec::new();
-        write_spinner_line(&mut warning, "⠙", 3, None, true).unwrap();
+        write_spinner_line(&mut warning, "⠙", 3, true).unwrap();
         assert_eq!(
             String::from_utf8(warning).unwrap(),
             "\r\x1b[K\x1b[1m\x1b[36m⠙\x1b[39m optimizing · (timeout in \x1b[31m3 s\x1b[39m)\x1b[0m"
@@ -124,7 +120,7 @@ mod tests {
     #[test]
     fn spinner_line_has_no_style_when_colour_is_disabled() {
         let mut line = Vec::new();
-        write_spinner_line(&mut line, "⠋", 2, None, false).unwrap();
+        write_spinner_line(&mut line, "⠋", 2, false).unwrap();
         assert_eq!(
             String::from_utf8(line).unwrap(),
             "\r\x1b[K⠋ optimizing · (timeout in 2 s)"

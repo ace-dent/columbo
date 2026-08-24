@@ -8,18 +8,18 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fmt::{self, Write as _};
-use std::io::{self, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(crate) use crate::presentation::format_duration;
-use crate::presentation::{countdown_seconds, plural, plural_u64, write_spinner_line};
+use crate::presentation::{plural, plural_u64};
+use crate::spinner::Spinner;
 use crate::{Format, Options};
 
+mod verbose;
 mod visual;
 
 pub(crate) const MAX_REPORTED_BLOCKS: usize = 64;
@@ -30,84 +30,19 @@ static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
 // identity separate from the human-facing stream number so their concurrent
 // updates never overwrite each other.
 static NEXT_REPORT_ID: AtomicUsize = AtomicUsize::new(1);
-static VERBOSE_REPORTS: OnceLock<Mutex<VerboseReports>> = OnceLock::new();
-static REPORT_SPINNER: OnceLock<Mutex<Option<ReportSpinner>>> = OnceLock::new();
+static REPORT_SPINNER: OnceLock<Mutex<Option<Spinner>>> = OnceLock::new();
 static REPORT_COORDINATOR: OnceLock<Mutex<ReportCoordinator>> = OnceLock::new();
 static REPORT_EMITTER: OnceLock<Mutex<()>> = OnceLock::new();
-static SPINNER_PROGRESS_DONE: AtomicUsize = AtomicUsize::new(0);
-static SPINNER_PROGRESS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const PRIMARY_STREAM_PRODUCER: u8 = 0;
-const MAX_CACHED_VERBOSE_BYTES: usize = 64 * 1_024 * 1_024;
 const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
-const SPINNER_DELAY: Duration = Duration::from_millis(300);
-const SPINNER_INTERVAL: Duration = Duration::from_millis(500);
-
-struct ReportSpinner {
-    running: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
-}
-
-impl ReportSpinner {
-    fn start(deadline: Instant) -> Option<Self> {
-        if !io::stderr().is_terminal() || env::var_os("TERM").is_some_and(|term| term == "dumb") {
-            return None;
-        }
-
-        let running = Arc::new(AtomicBool::new(true));
-        let worker_running = Arc::clone(&running);
-        let color = crate::terminal::stderr_color_enabled();
-        let worker = thread::Builder::new()
-            .name("columbo-report-spinner".into())
-            .spawn(move || {
-                const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-                let mut frame = 0;
-                let mut drawn = false;
-                thread::park_timeout(SPINNER_DELAY);
-                while worker_running.load(Ordering::Relaxed) {
-                    let done = SPINNER_PROGRESS_DONE.load(Ordering::Relaxed);
-                    let total = SPINNER_PROGRESS_TOTAL.load(Ordering::Relaxed);
-                    let seconds =
-                        countdown_seconds(deadline.saturating_duration_since(Instant::now()));
-                    {
-                        let stderr = io::stderr();
-                        let mut output = stderr.lock();
-                        let checked = (total != 0).then_some((done, total));
-                        let _ =
-                            write_spinner_line(&mut output, FRAMES[frame], seconds, checked, color);
-                        let _ = output.flush();
-                    }
-                    drawn = true;
-                    frame = (frame + 1) % FRAMES.len();
-                    thread::park_timeout(SPINNER_INTERVAL);
-                }
-                if drawn {
-                    eprint!("\r\x1b[K");
-                    let _ = io::stderr().flush();
-                }
-            })
-            .ok()?;
-        Some(Self {
-            running,
-            worker: Some(worker),
-        })
-    }
-
-    fn stop(mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(worker) = self.worker.take() {
-            worker.thread().unpark();
-            let _ = worker.join();
-        }
-    }
-}
 
 fn start_report_spinner(deadline: Instant) {
     stop_report_spinner();
-    let spinner = ReportSpinner::start(deadline);
+    let spinner = Spinner::start(true, deadline);
     let slot = REPORT_SPINNER.get_or_init(|| Mutex::new(None));
-    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = spinner;
+    *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(spinner);
 }
 
 fn stop_report_spinner() {
@@ -118,162 +53,9 @@ fn stop_report_spinner() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
-    if let Some(spinner) = spinner {
+    if let Some(mut spinner) = spinner {
         spinner.stop();
     }
-}
-
-#[derive(Default)]
-struct VerboseReports {
-    cached_bytes: usize,
-    reports: BTreeMap<usize, VerboseReport>,
-}
-
-struct VerboseReport {
-    finished: bool,
-    order: u8,
-    stream_id: usize,
-    text: String,
-    truncated: bool,
-}
-
-impl VerboseReports {
-    fn reset(&mut self) {
-        self.cached_bytes = 0;
-        self.reports.clear();
-    }
-
-    fn insert(&mut self, report_id: usize, stream_id: usize, order: u8, mut text: String) {
-        let truncated = self.cached_bytes.saturating_add(text.len()) > MAX_CACHED_VERBOSE_BYTES;
-        if truncated {
-            text.clear();
-        } else {
-            self.cached_bytes += text.len();
-        }
-        self.reports.insert(
-            report_id,
-            VerboseReport {
-                finished: false,
-                order,
-                stream_id,
-                text,
-                truncated,
-            },
-        );
-    }
-
-    fn append(&mut self, report_id: usize, arguments: fmt::Arguments<'_>) {
-        let Some(report) = self.reports.get_mut(&report_id) else {
-            return;
-        };
-        if report.truncated {
-            return;
-        }
-        let mut line = String::new();
-        let _ = line.write_fmt(arguments);
-        line.push('\n');
-        if self.cached_bytes.saturating_add(line.len()) > MAX_CACHED_VERBOSE_BYTES {
-            report.truncated = true;
-            return;
-        }
-        self.cached_bytes += line.len();
-        report.text.push_str(&line);
-    }
-
-    fn finish(&mut self, report_id: usize) {
-        if let Some(report) = self.reports.get_mut(&report_id) {
-            report.finished = true;
-        }
-    }
-
-    fn take_finished_stream(&mut self, stream_id: usize) -> Option<Vec<VerboseReport>> {
-        if self
-            .reports
-            .values()
-            .any(|report| report.stream_id == stream_id && !report.finished)
-        {
-            return None;
-        }
-        let mut report_ids: Vec<_> = self
-            .reports
-            .iter()
-            .filter_map(|(&report_id, report)| (report.stream_id == stream_id).then_some(report_id))
-            .collect();
-        report_ids.sort_unstable_by_key(|report_id| {
-            let report = &self.reports[report_id];
-            (report.order, *report_id)
-        });
-        let mut finished = Vec::with_capacity(report_ids.len());
-        for report_id in report_ids {
-            let report = self
-                .reports
-                .remove(&report_id)
-                .expect("a collected verbose report remains cached");
-            self.cached_bytes = self.cached_bytes.saturating_sub(report.text.len());
-            finished.push(report);
-        }
-        Some(finished)
-    }
-
-    fn take_finished_in_stream_order(&mut self) -> Vec<VerboseReport> {
-        let mut reports: Vec<_> = std::mem::take(&mut self.reports)
-            .into_iter()
-            .filter_map(|(report_id, report)| report.finished.then_some((report_id, report)))
-            .collect();
-        reports.sort_unstable_by_key(|(report_id, report)| {
-            (report.stream_id, report.order, *report_id)
-        });
-        self.cached_bytes = 0;
-        reports.into_iter().map(|(_, report)| report).collect()
-    }
-}
-
-fn with_verbose_reports<T>(operation: impl FnOnce(&mut VerboseReports) -> T) -> T {
-    let reports = VERBOSE_REPORTS.get_or_init(|| Mutex::new(VerboseReports::default()));
-    let mut reports = reports
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    operation(&mut reports)
-}
-
-fn reset_verbose_reports() {
-    with_verbose_reports(VerboseReports::reset);
-}
-
-fn begin_verbose_report(report_id: usize, stream_id: usize, order: u8, text: String) {
-    with_verbose_reports(|reports| reports.insert(report_id, stream_id, order, text));
-}
-
-fn append_verbose_report(report_id: usize, arguments: fmt::Arguments<'_>) {
-    with_verbose_reports(|reports| reports.append(report_id, arguments));
-}
-
-fn finish_verbose_report(report_id: usize) {
-    with_verbose_reports(|reports| reports.finish(report_id));
-}
-
-fn write_verbose_reports(reports: Vec<VerboseReport>) {
-    if reports.is_empty() {
-        return;
-    }
-    let mut output = io::stdout().lock();
-    for report in reports {
-        let _ = output.write_all(report.text.as_bytes());
-        if report.truncated {
-            let _ = writeln!(
-                output,
-                "  S{} … remaining verbose details omitted; 64 MiB report cache reached",
-                report.stream_id
-            );
-        }
-    }
-    let _ = output.flush();
-}
-
-fn flush_verbose_reports() {
-    write_verbose_reports(with_verbose_reports(
-        VerboseReports::take_finished_in_stream_order,
-    ));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -285,35 +67,24 @@ enum ProgressMode {
 
 struct ReportCoordinator {
     active: bool,
-    checked_count: usize,
-    checked_streams: Vec<bool>,
     completed_producers: BTreeMap<usize, BTreeSet<u8>>,
     deadline: Option<Instant>,
     expected_producers: BTreeSet<u8>,
     mode: ProgressMode,
     next_stream_id: usize,
-    report_streams: BTreeMap<usize, ReportStreams>,
     sealed_streams: BTreeSet<usize>,
     total_streams: usize,
-}
-
-struct ReportStreams {
-    duplicates: Vec<usize>,
-    primary: usize,
 }
 
 impl Default for ReportCoordinator {
     fn default() -> Self {
         Self {
             active: false,
-            checked_count: 0,
-            checked_streams: Vec::new(),
             completed_producers: BTreeMap::new(),
             deadline: None,
             expected_producers: BTreeSet::new(),
             mode: ProgressMode::Disabled,
             next_stream_id: 1,
-            report_streams: BTreeMap::new(),
             sealed_streams: BTreeSet::new(),
             total_streams: 0,
         }
@@ -323,20 +94,14 @@ impl Default for ReportCoordinator {
 impl ReportCoordinator {
     fn reset(&mut self, mode: ProgressMode, total_streams: usize, timeout: Duration) {
         self.active = mode.enabled();
-        self.checked_count = 0;
-        self.checked_streams.clear();
-        self.checked_streams
-            .resize(total_streams.saturating_add(1), false);
         self.completed_producers.clear();
         self.deadline = Instant::now().checked_add(timeout);
         self.expected_producers.clear();
         self.expected_producers.insert(PRIMARY_STREAM_PRODUCER);
         self.mode = mode;
         self.next_stream_id = 1;
-        self.report_streams.clear();
         self.sealed_streams.clear();
         self.total_streams = total_streams;
-        self.publish_spinner_progress();
     }
 
     fn set_expected_producers(&mut self, producers: &[u8]) {
@@ -345,32 +110,6 @@ impl ReportCoordinator {
         for stream_id in self.next_stream_id..=self.total_streams {
             self.update_sealed(stream_id);
         }
-    }
-
-    fn register_report(&mut self, report_id: usize, stream_id: usize, duplicates: &[usize]) {
-        self.report_streams.insert(
-            report_id,
-            ReportStreams {
-                duplicates: duplicates.to_vec(),
-                primary: stream_id,
-            },
-        );
-    }
-
-    fn finish_report(&mut self, report_id: usize) {
-        let Some(streams) = self.report_streams.remove(&report_id) else {
-            return;
-        };
-        for stream_id in std::iter::once(streams.primary).chain(streams.duplicates) {
-            let Some(checked) = self.checked_streams.get_mut(stream_id) else {
-                continue;
-            };
-            if !*checked {
-                *checked = true;
-                self.checked_count = self.checked_count.saturating_add(1);
-            }
-        }
-        self.publish_spinner_progress();
     }
 
     fn complete(&mut self, stream_id: usize, duplicates: &[usize], producer: u8) {
@@ -431,11 +170,6 @@ impl ReportCoordinator {
             self.sealed_streams.insert(stream_id);
         }
     }
-
-    fn publish_spinner_progress(&self) {
-        SPINNER_PROGRESS_DONE.store(self.checked_count, Ordering::Relaxed);
-        SPINNER_PROGRESS_TOTAL.store(self.total_streams, Ordering::Relaxed);
-    }
 }
 
 fn with_report_coordinator<T>(operation: impl FnOnce(&mut ReportCoordinator) -> T) -> T {
@@ -475,7 +209,7 @@ fn emit_ready_streams() {
     let _emitter = emitter
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut verbose = Vec::new();
+    let mut verbose_reports = Vec::new();
     let mut visual_cards = Vec::new();
 
     while let Some((mode, stream_id)) = with_report_coordinator(|coordinator| {
@@ -485,10 +219,9 @@ fn emit_ready_streams() {
     }) {
         let ready = match mode {
             ProgressMode::Verbose => {
-                let reports =
-                    with_verbose_reports(|reports| reports.take_finished_stream(stream_id));
+                let reports = verbose::take_finished_stream(stream_id);
                 reports.map(|reports| {
-                    verbose.extend(reports);
+                    verbose_reports.extend(reports);
                 })
             }
             ProgressMode::Visual => visual::take_finished_stream(stream_id).map(|cards| {
@@ -502,11 +235,11 @@ fn emit_ready_streams() {
         with_report_coordinator(|coordinator| coordinator.advance(stream_id));
     }
 
-    if verbose.is_empty() && visual_cards.is_empty() {
+    if verbose_reports.is_empty() && visual_cards.is_empty() {
         return;
     }
     stop_report_spinner();
-    write_verbose_reports(verbose);
+    verbose::write(verbose_reports);
     visual::emit_cards(visual_cards);
     let restart = with_report_coordinator(|coordinator| {
         coordinator.active.then_some(coordinator.deadline).flatten()
@@ -826,23 +559,13 @@ impl Progress {
                 stream.decoded_bytes,
                 plural_u64(stream.decoded_bytes, "byte", "bytes"),
             );
-            begin_verbose_report(
+            verbose::begin(
                 report_id,
                 stream_id,
                 report_order(group.as_ref().and_then(|group| group.note)),
                 report,
             );
         }
-        with_report_coordinator(|coordinator| {
-            coordinator.register_report(
-                report_id,
-                stream_id,
-                group
-                    .as_ref()
-                    .map_or(&[][..], |group| group.duplicates.as_slice()),
-            )
-        });
-
         Self {
             color,
             mode,
@@ -858,7 +581,7 @@ impl Progress {
     }
 
     fn write_verbose(self, arguments: fmt::Arguments<'_>) {
-        append_verbose_report(self.report_id, arguments);
+        verbose::append(self.report_id, arguments);
     }
 
     pub(crate) fn normalization(self, blocks: usize, elapsed: Duration) {
@@ -1166,9 +889,8 @@ impl Progress {
                     ""
                 }
             ));
-            finish_verbose_report(self.report_id);
+            verbose::finish(self.report_id);
         }
-        with_report_coordinator(|coordinator| coordinator.finish_report(self.report_id));
         // A scheduler may already have sealed this stream while the final
         // report update was racing to the cache. Recheck the ordered head.
         emit_ready_streams();
@@ -1234,7 +956,7 @@ impl RouteProgress {
     }
 
     fn write_verbose(&self, arguments: fmt::Arguments<'_>) {
-        append_verbose_report(self.report_id, arguments);
+        verbose::append(self.report_id, arguments);
     }
 
     pub(crate) fn deadline_reached(&self) {
@@ -1686,6 +1408,10 @@ fn route_heartbeat_interval(budget: Duration) -> Duration {
 }
 
 pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams: Option<usize>) {
+    let mode = ProgressMode::for_options(options);
+    if !mode.enabled() {
+        return;
+    }
     let label = match format {
         Format::Auto => "raw Deflate",
         Format::Raw => "raw Deflate",
@@ -1694,7 +1420,6 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         Format::Gzip => "GZIP",
         Format::Zip => "ZIP",
     };
-    let mode = ProgressMode::for_options(options);
     match mode {
         ProgressMode::Visual => {
             NEXT_STREAM_ID.store(1, Ordering::Relaxed);
@@ -1702,7 +1427,7 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         }
         ProgressMode::Verbose => {
             NEXT_STREAM_ID.store(1, Ordering::Relaxed);
-            reset_verbose_reports();
+            verbose::reset();
             let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
         }
         ProgressMode::Disabled => {}
@@ -1711,10 +1436,8 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         coordinator.reset(mode, deflate_streams.unwrap_or(0), options.timeout);
         coordinator.deadline
     });
-    if mode.enabled() {
-        if let Some(deadline) = deadline {
-            start_report_spinner(deadline);
-        }
+    if let Some(deadline) = deadline {
+        start_report_spinner(deadline);
     }
 }
 
@@ -1724,12 +1447,16 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
 /// Force-sealing here retains error-path reports when a container returned
 /// before it could publish all of its normal scheduler completion events.
 pub(crate) fn finish_file(options: &Options) {
+    let mode = ProgressMode::for_options(options);
+    if !mode.enabled() {
+        return;
+    }
     with_report_coordinator(ReportCoordinator::finish);
     stop_report_spinner();
     emit_ready_streams();
-    match ProgressMode::for_options(options) {
+    match mode {
         ProgressMode::Visual => visual::finish_file(),
-        ProgressMode::Verbose => flush_verbose_reports(),
+        ProgressMode::Verbose => verbose::flush(),
         ProgressMode::Disabled => {}
     }
 }
@@ -1876,33 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_verbose_reports_flush_in_physical_stream_order() {
-        let mut reports = VerboseReports::default();
-        reports.insert(30, 1, 0, "stream one\n".to_owned());
-        reports.insert(10, 3, 0, "stream three\n".to_owned());
-        reports.insert(20, 2, 0, "stream two\n".to_owned());
-
-        // Completion order deliberately differs from source order.
-        reports.finish(10);
-        reports.finish(20);
-        reports.finish(30);
-        let ordered: Vec<_> = reports
-            .take_finished_in_stream_order()
-            .into_iter()
-            .map(|report| (report.stream_id, report.text))
-            .collect();
-
-        assert_eq!(
-            ordered,
-            [
-                (1, "stream one\n".to_owned()),
-                (2, "stream two\n".to_owned()),
-                (3, "stream three\n".to_owned()),
-            ]
-        );
-    }
-
-    #[test]
     fn completed_streams_release_only_the_contiguous_physical_prefix() {
         let mut coordinator = ReportCoordinator::default();
         coordinator.reset(ProgressMode::Verbose, 4, Duration::from_secs(30));
@@ -1922,24 +1622,6 @@ mod tests {
     }
 
     #[test]
-    fn checked_progress_counts_each_physical_stream_once() {
-        let mut coordinator = ReportCoordinator::default();
-        coordinator.reset(ProgressMode::Verbose, 4, Duration::from_secs(30));
-
-        coordinator.register_report(10, 3, &[]);
-        coordinator.finish_report(10);
-        assert_eq!(coordinator.checked_count, 1);
-
-        coordinator.register_report(11, 1, &[2]);
-        coordinator.finish_report(11);
-        assert_eq!(coordinator.checked_count, 3);
-
-        coordinator.register_report(12, 1, &[]);
-        coordinator.finish_report(12);
-        assert_eq!(coordinator.checked_count, 3);
-    }
-
-    #[test]
     fn every_registered_lineage_must_finish_before_a_stream_is_sealed() {
         let mut coordinator = ReportCoordinator::default();
         coordinator.reset(ProgressMode::Visual, 2, Duration::from_secs(30));
@@ -1954,68 +1636,6 @@ mod tests {
         assert_eq!(coordinator.next_sealed(), None);
         coordinator.complete(1, &[], 3);
         assert_eq!(coordinator.next_sealed(), Some(1));
-    }
-
-    #[test]
-    fn one_finished_stream_can_be_removed_without_draining_later_reports() {
-        let mut reports = VerboseReports::default();
-        reports.insert(1, 2, 0, "stream two\n".to_owned());
-        reports.insert(2, 1, 1, "stream one second\n".to_owned());
-        reports.insert(3, 1, 0, "stream one first\n".to_owned());
-        reports.finish(1);
-        reports.finish(2);
-        reports.finish(3);
-
-        let first: Vec<_> = reports
-            .take_finished_stream(1)
-            .unwrap()
-            .into_iter()
-            .map(|report| report.text)
-            .collect();
-        assert_eq!(first, ["stream one first\n", "stream one second\n"]);
-        assert_eq!(reports.reports.len(), 1);
-        assert_eq!(reports.reports[&1].stream_id, 2);
-    }
-
-    #[test]
-    fn incomplete_verbose_reports_are_not_emitted() {
-        let mut reports = VerboseReports::default();
-        reports.insert(1, 1, 0, "complete\n".to_owned());
-        reports.insert(2, 2, 0, "partial\n".to_owned());
-        reports.finish(1);
-
-        let ordered = reports.take_finished_in_stream_order();
-        assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].stream_id, 1);
-        assert_eq!(ordered[0].text, "complete\n");
-    }
-
-    #[test]
-    fn cached_lineages_have_a_stable_order_within_one_stream() {
-        let mut reports = VerboseReports::default();
-        reports.insert(
-            1,
-            4,
-            report_order(Some("refined default")),
-            "refined".to_owned(),
-        );
-        reports.insert(2, 4, report_order(Some("direct max")), "direct".to_owned());
-        reports.insert(
-            3,
-            4,
-            report_order(Some("default floor")),
-            "floor".to_owned(),
-        );
-        reports.finish(1);
-        reports.finish(2);
-        reports.finish(3);
-
-        let ordered: Vec<_> = reports
-            .take_finished_in_stream_order()
-            .into_iter()
-            .map(|report| report.text)
-            .collect();
-        assert_eq!(ordered, ["floor", "direct", "refined"]);
     }
 
     #[test]

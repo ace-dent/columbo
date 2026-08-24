@@ -22,6 +22,7 @@ mod format;
 mod options;
 mod presentation;
 mod progress;
+mod spinner;
 mod terminal;
 
 pub use error::{Error, ErrorKind, Result};
