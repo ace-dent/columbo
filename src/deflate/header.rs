@@ -13,8 +13,9 @@ use super::huffman::{
     make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
     make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
-    make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid,
-    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    make_lengths_order_heap_into, make_lengths_zopfli_package_from,
+    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, FIXED_DISTANCE_CODE_LENGTHS,
+    FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -1071,13 +1072,15 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
             &mut candidates,
             make_lengths_columbo_defluff_limited(frequencies, max_bits, 0),
         );
-        push_unique(
-            &mut candidates,
-            make_lengths_defluff_exact(frequencies, max_bits, 0),
-        );
+        let defluff_exact = make_lengths_defluff_exact(frequencies, max_bits, 0);
+        push_unique(&mut candidates, defluff_exact.clone());
         push_unique(
             &mut candidates,
             make_lengths_deft4j_java_heap(frequencies, max_bits),
+        );
+        push_unique(
+            &mut candidates,
+            make_lengths_zopfli_package_from(frequencies, &defluff_exact, max_bits),
         );
     }
     candidates.retain(|lengths| {
@@ -1158,12 +1161,13 @@ fn explicit_exact_tree_candidate(
 /// The minimum comes from the prefix-code capacity bound `2^depth >= leaves`;
 /// the frontier then covers every ceiling below Deflate's unrestricted
 /// fifteen-bit maximum. This avoids using corpus-trained token-count bands to
-/// choose one ceiling. The ordinary frontier pairs equal ceilings. A caller
-/// with a separate structural work bound may instead request the complete
-/// cross-product of the unique feasible trees for each alphabet; this is a
-/// finite tree-shape dimension, not a corpus gate. Both forms remain additive
-/// at stream level: callers retain their completed parent and accept a sibling
-/// only after exact emission.
+/// choose one ceiling. At each ordinary frontier depth, the leaf-first and
+/// package-first equal-payload shapes form a deduplicated two-by-two alphabet
+/// product. A caller with a separate structural work bound may instead request
+/// the complete cross-product of every unique depth-and-tie tree for each
+/// alphabet; this is a finite tree-shape dimension, not a corpus gate. Both
+/// forms remain additive at stream level: callers retain their completed
+/// parent and accept a sibling only after exact emission.
 pub(crate) fn plan_bounded_depth_tree_candidate(
     tokens: &[Token],
     literal_frequencies: &[u32; 286],
@@ -1185,19 +1189,21 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
         for max_bits in minimum_complete_tree_depth(&build_literal_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            push_unique(
-                &mut literal_candidates,
-                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0),
-            );
+            let defluff = make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0);
+            let package_first =
+                make_lengths_zopfli_package_from(&build_literal_frequencies, &defluff, max_bits);
+            push_unique(&mut literal_candidates, defluff);
+            push_unique(&mut literal_candidates, package_first);
         }
         let mut distance_candidates = Vec::new();
         for max_bits in minimum_complete_tree_depth(&build_distance_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            push_unique(
-                &mut distance_candidates,
-                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0),
-            );
+            let defluff = make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0);
+            let package_first =
+                make_lengths_zopfli_package_from(&build_distance_frequencies, &defluff, max_bits);
+            push_unique(&mut distance_candidates, defluff);
+            push_unique(&mut distance_candidates, package_first);
         }
         for literal_lengths in &literal_candidates {
             for distance_lengths in &distance_candidates {
@@ -1217,18 +1223,43 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
     } else {
         let minimum_depth = minimum_complete_tree_depth(&build_literal_frequencies)
             .max(minimum_complete_tree_depth(&build_distance_frequencies));
+        let mut literal_candidates = Vec::with_capacity(2);
+        let mut distance_candidates = Vec::with_capacity(2);
         for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
-            if let Some(candidate) = exact_tree_candidate(
-                literal_frequencies,
-                distance_frequencies,
+            literal_candidates.clear();
+            let literal_defluff =
+                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0);
+            let literal_package_first = make_lengths_zopfli_package_from(
                 &build_literal_frequencies,
-                &build_distance_frequencies,
-                extra_bits,
+                &literal_defluff,
                 max_bits,
-                exhaustive_header,
-                &mut header_cache,
-            ) {
-                keep_better(&mut best, candidate);
+            );
+            push_unique(&mut literal_candidates, literal_defluff);
+            push_unique(&mut literal_candidates, literal_package_first);
+            distance_candidates.clear();
+            let distance_defluff =
+                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0);
+            let distance_package_first = make_lengths_zopfli_package_from(
+                &build_distance_frequencies,
+                &distance_defluff,
+                max_bits,
+            );
+            push_unique(&mut distance_candidates, distance_defluff);
+            push_unique(&mut distance_candidates, distance_package_first);
+            for literal_lengths in &literal_candidates {
+                for distance_lengths in &distance_candidates {
+                    if let Some(candidate) = explicit_exact_tree_candidate(
+                        literal_frequencies,
+                        distance_frequencies,
+                        literal_lengths,
+                        distance_lengths,
+                        extra_bits,
+                        exhaustive_header,
+                        &mut header_cache,
+                    ) {
+                        keep_better(&mut best, candidate);
+                    }
+                }
             }
         }
     }
@@ -3157,17 +3188,34 @@ mod tests {
         let mut cache = HeaderPlanCache::new();
         let mut expected = None;
         for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
-            if let Some(candidate) = exact_tree_candidate(
-                &literal_frequencies,
-                &distance_frequencies,
-                &literal_frequencies,
-                &distance_frequencies,
-                0,
-                max_bits,
-                false,
-                &mut cache,
-            ) {
-                keep_better(&mut expected, candidate);
+            let literal_defluff = make_lengths_defluff_exact(&literal_frequencies, max_bits, 0);
+            let distance_defluff = make_lengths_defluff_exact(&distance_frequencies, max_bits, 0);
+            let literal_candidates = [
+                literal_defluff.clone(),
+                make_lengths_zopfli_package_from(&literal_frequencies, &literal_defluff, max_bits),
+            ];
+            let distance_candidates = [
+                distance_defluff.clone(),
+                make_lengths_zopfli_package_from(
+                    &distance_frequencies,
+                    &distance_defluff,
+                    max_bits,
+                ),
+            ];
+            for literal_lengths in &literal_candidates {
+                for distance_lengths in &distance_candidates {
+                    if let Some(candidate) = explicit_exact_tree_candidate(
+                        &literal_frequencies,
+                        &distance_frequencies,
+                        literal_lengths,
+                        distance_lengths,
+                        0,
+                        false,
+                        &mut cache,
+                    ) {
+                        keep_better(&mut expected, candidate);
+                    }
+                }
             }
         }
         assert_eq!(actual, expected.unwrap());
@@ -3194,19 +3242,21 @@ mod tests {
         for max_bits in minimum_complete_tree_depth(&build_literal_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            push_unique(
-                &mut literal_candidates,
-                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0),
-            );
+            let defluff = make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0);
+            let package_first =
+                make_lengths_zopfli_package_from(&build_literal_frequencies, &defluff, max_bits);
+            push_unique(&mut literal_candidates, defluff);
+            push_unique(&mut literal_candidates, package_first);
         }
         let mut distance_candidates = Vec::new();
         for max_bits in minimum_complete_tree_depth(&build_distance_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            push_unique(
-                &mut distance_candidates,
-                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0),
-            );
+            let defluff = make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0);
+            let package_first =
+                make_lengths_zopfli_package_from(&build_distance_frequencies, &defluff, max_bits);
+            push_unique(&mut distance_candidates, defluff);
+            push_unique(&mut distance_candidates, package_first);
         }
 
         let mut cache = HeaderPlanCache::new();

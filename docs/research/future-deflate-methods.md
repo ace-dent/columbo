@@ -10,9 +10,12 @@ without finding new LZ77 matches. Detailed production behavior is catalogued in
 
 ## Decision
 
-No reviewed encoder exposes an untested, broadly useful method that satisfies
-Columbo's scope and measured runtime policy. Reopen this audit only when one of
-the following exists:
+The Zopfli fork-network review produced one retained method: independently
+re-run Columbo's exact package-list builder with package-before-leaf equality,
+then exact-price that equal-payload tree at full and restricted depths. No
+other reviewed encoder exposes an untested, broadly useful method that
+satisfies Columbo's scope and measured runtime policy. Reopen this audit only
+when one of the following exists:
 
 - a new portable upstream method that operates on existing tokens;
 - a reproducible output miss that identifies a specific absent tree, header,
@@ -26,7 +29,30 @@ the following exists:
   12 August 2026.
 - Priority-one implementation baseline:
   `6045adefe671da49d962ffcaa2158f9f197426fe`, 15 August 2026.
-- Zopfli pseudo-frequency source revalidated 15 August 2026.
+- Google Zopfli
+  [`ccf9f05`](https://github.com/google/zopfli/commit/ccf9f0588d4a4509cb1040310ec122243e670ee6)
+  and its public direct-fork index were verified 25 August 2026. The audit
+  classified all 337 direct forks in newest order, cross-checked the first 100
+  by stars, then inspected distinct compressor lineages rather than counting
+  unchanged mirrors as separate implementations.
+- Pinned distinct Zopfli lineages were KrzYmod
+  [`11bd7f8`](https://github.com/MrKrzYch00/zopfli/commit/11bd7f84a6774c52d6b0f969c5c82ac67c9c52b9),
+  FrKay
+  [`9501b29`](https://github.com/frkay/zopfli/commit/9501b29d0dacc8b8efb18ae01733b2768dd40b62),
+  QVXLabs
+  [`d3ac16a`](https://github.com/QVXLabs/zopfli/commit/d3ac16a9013dd036f0dd3cb5220b54e94bde4fc9),
+  fhanau
+  [`3315c43`](https://github.com/fhanau/zopfli/commit/3315c43be52e189d947a645a5ecc790e320c35e3),
+  Snesnopic
+  [`11c3738`](https://github.com/Snesnopic/zopfli/commit/11c37384825e593bb1f6fc03b8f72b65c7029d0f),
+  fonttools
+  [`400a507`](https://github.com/fonttools/zopfli/commit/400a50779d7272b044f0ae339c5576c0e842d79e),
+  MegaByte
+  [`f72f44c`](https://github.com/MegaByte/zopfli/commit/f72f44ce0ed354cc7d00d00571c1664a1447d005),
+  ImageOptim
+  [`fe6d762`](https://github.com/ImageOptim/zopfli/commit/fe6d7627992573820152124e4af49453862f33af),
+  and maintained Rust reimplementation zopfli-rs
+  [`3b560cb`](https://github.com/zopfli-rs/zopfli/commit/3b560cb81539b9a1fbc05439a63624ecb3a01702).
 - ECT [`ab3f68b`](https://github.com/fhanau/Efficient-Compression-Tool/commit/ab3f68bf4f0b1fdfb1646c6c70aa54a59d2515bb)
   verified 25 August 2026.
 - libdeflate [`92e6a0d`](https://github.com/ebiggers/libdeflate/commit/92e6a0db9fa848d742f9eb286c92afc60f2c3dda)
@@ -69,7 +95,7 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison | A format-specific diagnosed miss |
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
-| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product in the structurally bounded compact Max route; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
+| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product in the structurally bounded compact Max route; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
 | Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback | A real header requiring a retained alternate RLE histogram |
 | Runtime | Canonical plan and header caches; range and edge reuse; bounded fingerprints; parser/decode/emission hot paths | Measured duplicate work or a new profile hotspot |
 
@@ -85,8 +111,9 @@ which the bounded composition route supplies.
 | All-literals endpoint | Complete fixed/dynamic pricing for dense blocks through 80,000 decoded bytes, or blocks through 1,000,000 bytes with at most 256 matches; token allocation occurs only after a strict win | In a 34-file strict corpus, two outputs improved: 493,708 bytes and 7 bytes; Max found another 11 bytes on the larger result |
 | Symmetric and paired balanced-tree moves | Pair/quad Kraft-preserving moves on both alphabets; retain at most four moves per side and price at most sixteen pairs; Default requires non-positive combined payload delta; Max permits +18 bits | Removes the former literal-only asymmetry while preserving exact complete-header acceptance; focused literal, distance, paired, and opportunity tests pass |
 | Zopfli RLE-friendly pseudo-frequencies | One independently implemented paired Max candidate; no tree-family cross-product | Three of eleven Max files improved by 2, 13, and 9 bytes; other files tied; short no-gain cost was about 0.26 s/file |
+| Package-first exact package merge | Re-run Columbo's existing package-list reconstruction with package-before-leaf equality. The full-depth shape is added only to the exhaustive tree family. Every restricted depth compares leaf-first and package-first shapes; the ordinary frontier prices all four paired-alphabet combinations, while the compact structurally bounded route deduplicates both families before its independent alphabet cross-product. The completed incumbent and exact header price remain authoritative | A deterministic oracle found distinct trees with identical weighted payload cost. Across 31 files and 62 Default/Max records, 18 records covering 12 files improved, saving 33 file bytes / 285 meaningful bits in aggregate with no growth. Default saved 24 bytes / 197 bits; Max saved 9 bytes / 88 bits. Total wall time was 377.75 → 378.76 s (+0.27%); Max was 346.38 → 347.03 s (+0.19%). The isolated full-depth addition uniquely saved another 4 Max bits |
 | Reduced-depth payload trees | Max only; build exact Defluff literal/distance pairs at maximum depths 10 and 9; no cross-product; poll the route deadline; accept only an exactly priced complete payload and dynamic header | Focused depth-10 and depth-9 cases beat every ordinary depth-15 tree-family pairing by 26 and 11 bits. Max A/B improved three of six PNGs by 5, 1, and 3 bytes and a 48.8 KiB GZIP by 2 bytes; aggregate PNG wall time was 88.132 → 88.250 s |
-| Bounded-depth terminal tree frontier | For every completed dynamic block, derive the minimum feasible maximum depth from `2^depth >= populated symbols`, then exact-price one paired raw-count Defluff tree at every ceiling through 14. Max uses its exhaustive header planner for these terminal candidates. Inside the existing compact work bound, Max also deduplicates the feasible trees for each alphabet and exact-prices their complete cross-product, allowing the literal/length and distance ceilings to differ. The unrestricted 15-bit completed parent remains an independent fallback. The general linear pass starts only while route time remains and polls the hard deadline between blocks. There is no corpus-trained file-size or token-count admission band | Against the pre-frontier binary, 55 of 176 PngSuite files became byte-smaller and eight more changed only by meaningful bits, saving 139 aggregate bytes with no growth; wall time was 27.70 → 27.82 s. Three unrelated medium GZIPs gained 3, 75, and 68 bytes (146 total). A timed deft4j Max sample reproduced three new wins totaling 5 file bytes / 19 meaningful bits; the 13-case final run had no loss and changed aggregate wall time from 176.36 to 176.81 s |
+| Bounded-depth terminal tree frontier | For every completed dynamic block, derive the minimum feasible maximum depth from `2^depth >= populated symbols`, then exact-price the deduplicated leaf-first and package-first raw-count trees for both alphabets and all four same-depth pairings at every ceiling through 14. Max uses its exhaustive header planner for these terminal candidates. Inside the existing compact work bound, Max also deduplicates both tie families across feasible depths for each alphabet and exact-prices their complete cross-product, allowing the literal/length and distance ceilings to differ. The unrestricted 15-bit completed parent remains an independent fallback. The general linear pass starts only while route time remains and polls the hard deadline between blocks. There is no corpus-trained file-size or token-count admission band | Against the pre-frontier binary, 55 of 176 PngSuite files became byte-smaller and eight more changed only by meaningful bits, saving 139 aggregate bytes with no growth; wall time was 27.70 → 27.82 s. Three unrelated medium GZIPs gained 3, 75, and 68 bytes (146 total). A timed deft4j Max sample reproduced three new wins totaling 5 file bytes / 19 meaningful bits; the 13-case final run had no loss and changed aggregate wall time from 176.36 to 176.81 s. The later fork audit added the package-first family with the separate 31-file evidence above |
 | Compact payload-tree terminal floor | Terminal floor for completed compact Huffman streams: compare the raw bounded-depth frontier with independent Brotli fixed-point and classic Zopfli nearby-count seed families, the latter exact-priced at paired maximum depths 15 through 9. One bounded pair/quad tree-only closure prices shapes exposed by a winner and repeats the compact price once. At most eight blocks/4,096 tokens, 8 KiB compressed, and 128 KiB decoded; no token search or lineage displacement | Before the raw frontier was added, Default A/B across 176 PngSuite files selected smoothing in 36 of 166 Deflate streams and saved 300 aggregate bytes / 2,428 meaningful bits, with a 26-byte largest win. The classic Zopfli seeds uniquely added 4 bytes / 32 bits across four streams; the one-round balanced closure won 28 of 36 smoothed streams and added 19 bytes / 217 bits. Smoothing cost 51.633 ms across 165 eligible streams; closure cost 610.470 ms across its 36 inputs. Sample ZIP wins were 2 bytes and 9 bytes at complete-file level |
 | Header-aware proven-spelling composition | Max compact M3 only; source parent ≤4,000 tokens/80,000 bytes; generated spelling ≤8,000 tokens; 2–128 matches; target ≤8 matches; ≤4 spellings/match; beam 16; ≤32 exact plans | 98 of 1,706 eligible scanned blocks improved locally; final A/B wins were 1 byte/6 bits and 2 bits at equal bytes |
 | Adjacent-boundary reseat | Max comparison floors of 2–8 Huffman blocks; ≤8,192 tokens/512 KiB; keep one strongest strict replacement | Repeatable final wins: 10 bytes/80 bits, 1 byte/8 bits, and 3 bits at equal bytes |
@@ -174,6 +201,32 @@ bulk history update. Columbo must still materialize one literal token and its
 frequency per byte; an output-only stored/literal shortcut is incompatible
 with its persistent model.
 
+## Zopfli fork-network pinned-source audit
+
+The 25 August 2026 review began at Google Zopfli `ccf9f05`, classified all 337
+entries in GitHub's public direct-fork index in newest order, cross-checked the
+first 100 by stars, and inspected every distinct compressor lineage found
+there. Recent zero-star forks were cloned separately so star ordering could not
+hide a new implementation. Unchanged mirrors, packaging-only changes, and
+CI-only changes are one classification, not independent algorithm audits.
+
+| Lineage | Distinct work | Columbo disposition |
+| --- | --- | --- |
+| Google Zopfli | Repeat-code masks, RLE-friendly nearby-count smoothing, length-limited package merge, repeated optimal LZ parsing, and block splitting | Masks and independently written smoothing were already retained. The audit found one missing existing-token dimension: package merge selects the package on an equal weight where Columbo's Defluff family selected the leaf. Columbo now prices both equal-payload outcomes at full and restricted depths. Fresh matches and repeated optimal parsing remain out of scope |
+| KrzYmod and FrKay | Special header spellings, Brotli-like count smoothing, reversed equal-count ordering, repeated split/recompression passes, slow fixed-tree trials, and compressor hot-path work | Exact shortest header RLE covers the special spellings; both smoothing families and ascending/descending equal-frequency assignments are retained; stored/fixed/dynamic blocks are exactly priced. The remaining ratio and speed changes operate inside fresh LZ parsing. Existing-token split work is already broader through cumulative histograms, exact boundary pricing, reseat, and forced-split escape |
+| QVXLabs | Deterministic fixed-point parse costs, reusable longest-match caches, packed DP state, shared tree-encoding preprocessing, histogram-repeat shortcuts, and allocation reductions | Longest-match and DP changes require fresh parsing. Columbo already keeps one persistent token model, lazily materialized histograms, exact canonical/header caches, duplicate-tree removal, and shared route scratch. The source exposed no absent existing-token method after those mappings |
+| fhanau and descendant JayXon | Non-recursive Boundary Package Merge, faster LZ cost models, greedy-stat reuse, and match-finder cleanup | The equal-weight package choice was tested and retained through Columbo's existing list builder. Its only remaining recursive walk is bounded by Deflate's maximum tree depth of 15 and was not a profile hotspot; replacing it with more indexing has no measured execution case. The other changes are fresh-LZ hot paths |
+| Snesnopic and fonttools | Strict-alignment-safe wide loads in `GetMatch` | Fixes C undefined behavior and portability inside the fresh match finder. Columbo forbids unsafe Rust and uses checked byte slices; it neither has the unaligned-load defect nor performs fresh match discovery |
+| MegaByte and ImageOptim | PNG filtering, palette/genetic transforms, iteration stagnation, per-block time scaling, deterministic sorting, and smaller estimation windows | Pixel/palette work is outside the Deflate-stream contract. Columbo already owns one file deadline, proportional per-stream slices, reclaim passes, and deterministic candidate ordering. Iteration and window changes are coupled to fresh match discovery |
+| zopfli-rs and the earlier rjpower port | Rust translation, streaming writers, arenas/caches, fuzz parity, and container APIs | Useful engineering validation but no different existing-token compression algorithm. Columbo's safe parser/writer, persistent model, memory accounting, and wrapper support already cover the applicable dimensions |
+| enh-google, XhmikosR, brk, mayhemheroes, skn123, ryantig, and other sampled mirrors | Upstream snapshots, build portability, CI, fuzzing workflows, or no unique compressor commit | No compression or execution candidate to test in Columbo |
+
+All lineages were read for concepts and observable invariants only. The retained
+implementation reuses Columbo's own package-list data structure and exact
+header selector, with a new explicit equality policy and independent tests. No
+fork source code, control flow, constants, or helper names were copied or
+translated.
+
 ## 7-Zip pinned-source audit
 
 The 25 August 2026 audit used 7-Zip 26.02 commit
@@ -219,8 +272,8 @@ recompression and container transforms that would change Columbo's scope.
 
 | Project | Relevant method | Columbo disposition |
 | --- | --- | --- |
-| [Google Zopfli](https://github.com/google/zopfli) | All repeat-code masks; RLE-friendly pseudo-frequencies | Masks were already covered; pseudo-frequencies retained independently as one Max candidate. Optimal parsing, match discovery, and repeated block splitting are out of scope |
-| [QVXLabs Zopfli](https://github.com/QVXLabs/zopfli) | Fixed-point costs, reusable match caches, scaled iterations | Depends on fresh LZ77 parsing; comparison-encoder work only |
+| [Google Zopfli](https://github.com/google/zopfli) and fork network | Repeat-code masks; RLE-friendly pseudo-frequencies; equal-weight package-merge choice; alternate header/count/split policies and hot paths in KrzYmod, FrKay, fhanau/JayXon, MegaByte, ImageOptim, and maintained ports | Masks and smoothing were already covered. Package-before-leaf equality is newly retained through Columbo's independent package-list builder and exact full/restricted-depth pricing. Exact header RLE, equal-frequency assignments, stored/fixed/dynamic selection, deadlines, and boundary routes cover the other existing-token dimensions. Optimal parsing, match discovery, PNG pixel transforms, and repeated recompression remain out of scope |
+| [QVXLabs Zopfli](https://github.com/QVXLabs/zopfli) | Fixed-point costs, reusable match caches, packed DP state, tree-preprocessing reuse, histogram shortcuts, and scaled iterations | Parsing work depends on fresh LZ77 matches. Applicable reuse is already covered by Columbo's persistent tokens, cached exact header kernels, canonical plan cache, deduplicated tree families, and scratch ownership |
 | [libdeflate](https://github.com/ebiggers/libdeflate) | Match cache and minimum-cost parse, feedback passes, all-literals fallback, fixed-tree small-block pricing, fast tables/copies/bit I/O | All-literals and useful portable execution themes are implemented; remaining ratio methods require new matches; remaining hardware checksum/CPU dispatch work lacks a significant Columbo hotspot |
 | [7-Zip](https://github.com/ip7z/7zip) | Token-count-selected payload-tree depth; compact code-length decoder; 10/6-bit payload decode roots; recursive splitting; priced optimal parsing and match finding | Restricted depths are generalized into a complete feasible terminal frontier; the compact decoder and 10/6 roots are retained independently. Existing Columbo boundaries cover the in-scope split dimension. Fresh match discovery and optimal LZ parsing remain outside scope |
 | [AdvanceCOMP](https://github.com/amadvance/advancecomp) | Recompression | Outside existing-token scope |
@@ -258,7 +311,7 @@ header or boundary wins remain Max-only.
 
 Latest retained execution pass:
 
-- 450 Rust tests and formatting passed on Apple Silicon;
+- 451 Rust tests and formatting passed on Apple Silicon;
 - warning-free all-target Clippy passed after the retained change;
 - focused oracles cover canonical equivalence and physical-end fallback for
   the compact code-length decoder, generated payload decode tables, the
@@ -269,6 +322,9 @@ Latest retained execution pass:
   GZIPs, 804 KiB and 2.38 MiB GZIP controls, six Max PNGs, zlib controls, and
   compact ZIP samples, plus a thirteen-case timed deft4j cross-format Max A/B.
   The bounded-depth frontier produced no byte regression;
+- the Zopfli fork-network candidate used frozen baseline and candidate release
+  binaries across 31 files from PNG, ZIP, and GZIP families. Its 62 paired
+  Default/Max records contained 18 improvements and no output growth; and
   every emitted contender remains subject to Columbo's wrapper reparse and
   decoded-identity checks.
 
@@ -279,6 +335,12 @@ from Columbo's data model, invariants, and exact-cost behavior.
 
 - Zopfli-derived source attribution and Apache-2.0 provenance remain beside
   the independently written pseudo-frequency transform.
+- The package-before-leaf equality policy was identified in the Zopfli audit,
+  but no upstream package-merge implementation was copied or translated.
+  Columbo refactors its pre-existing Defluff package list behind an explicit
+  tie policy, starts from an independently produced valid fallback, deduplicates
+  the result, and accepts it only through Columbo's exact complete-header and
+  complete-stream comparisons.
 - ECT source was not copied or translated. Its search exposed the general
   reduced-maximum-depth dimension and the value of comparing Zopfli's classic
   nearby-count smoother with Brotli's newer fixed-point smoother for Deflate.

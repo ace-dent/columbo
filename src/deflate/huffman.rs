@@ -1472,7 +1472,7 @@ pub(crate) fn make_lengths_columbo_defluff_limited_into(
     if !make_lengths_inner(frequencies, lengths, max_bits, 0) {
         return;
     }
-    apply_defluff_package_merge(frequencies, lengths, max_bits);
+    apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
 }
 
 /// Build the exact Defluff tree, including its leaf-before-branch tie rule.
@@ -1501,7 +1501,31 @@ pub(crate) fn make_lengths_defluff_exact_into(
     // Defluff enters its allocating package-list path only for an over-depth
     // ordinary tree. Keep a valid bounded tree if reconstruction cannot win.
     make_lengths_into(frequencies, lengths, max_bits, 0);
-    apply_defluff_package_merge(frequencies, lengths, max_bits);
+    apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
+}
+
+/// Re-run package merge with package-first ties, retaining an already valid
+/// tree if the bounded reconstruction cannot complete.
+///
+/// Package merge can have several equal-payload solutions. Defluff retains a
+/// leaf when its weight ties the next package, while Zopfli retains the
+/// package. This independently extends Columbo's existing package-list
+/// builder by changing only that equality decision; no upstream implementation
+/// structure is reproduced.
+pub(crate) fn make_lengths_zopfli_package_from(
+    frequencies: &[u32],
+    fallback: &[u8],
+    max_bits: u8,
+) -> Vec<u8> {
+    assert_eq!(frequencies.len(), fallback.len());
+    let mut lengths = fallback.to_vec();
+    apply_package_merge(
+        frequencies,
+        &mut lengths,
+        max_bits,
+        PackageMergeTie::PackageFirst,
+    );
+    lengths
 }
 
 fn make_lengths_defluff_unconstrained(frequencies: &[u32], lengths: &mut [u8]) -> usize {
@@ -1568,7 +1592,18 @@ struct PackageNode {
     right: Option<usize>,
 }
 
-fn apply_defluff_package_merge(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) {
+#[derive(Debug, Clone, Copy)]
+enum PackageMergeTie {
+    LeafFirst,
+    PackageFirst,
+}
+
+fn apply_package_merge(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    tie: PackageMergeTie,
+) {
     let leaf_count = frequencies
         .iter()
         .filter(|&&frequency| frequency != 0)
@@ -1623,8 +1658,16 @@ fn apply_defluff_package_merge(frequencies: &[u32], lengths: &mut [u8], max_bits
         {
             let take_leaf = package_position >= package_count
                 || (leaf_position < leaf_count
-                    && nodes[leaves[leaf_position]].weight
-                        <= nodes[package_start + package_position].weight);
+                    && match tie {
+                        PackageMergeTie::LeafFirst => {
+                            nodes[leaves[leaf_position]].weight
+                                <= nodes[package_start + package_position].weight
+                        }
+                        PackageMergeTie::PackageFirst => {
+                            nodes[leaves[leaf_position]].weight
+                                < nodes[package_start + package_position].weight
+                        }
+                    });
             if take_leaf {
                 current.push(leaves[leaf_position]);
                 leaf_position += 1;
@@ -2469,17 +2512,59 @@ mod tests {
         let frequencies = [1, 1, 2, 3, 5, 8, 13, 0];
         assert!(tree_exceeds_limit(&frequencies, 4));
 
+        let defluff = make_lengths_defluff_exact(&frequencies, 4, 0);
         let candidates = [
             make_lengths(&frequencies, 4, 0),
             make_lengths_columbo_defluff_limited(&frequencies, 4, 0),
-            make_lengths_defluff_exact(&frequencies, 4, 0),
+            defluff.clone(),
             make_lengths_deflopt_heap(&frequencies, 4, 0),
             make_lengths_order_heap(&frequencies, 4, 0),
             make_lengths_deft4j_java_heap(&frequencies, 4),
+            make_lengths_zopfli_package_from(&frequencies, &defluff, 4),
         ];
         for lengths in candidates {
             assert_bounded_lengths(&frequencies, &lengths, 4);
         }
+    }
+
+    #[test]
+    fn zopfli_package_tie_is_distinct_without_changing_payload_cost() {
+        let mut state = 0x6d2b_79f5_u32;
+        for _ in 0..4096 {
+            let mut frequencies = [0_u32; 19];
+            for frequency in &mut frequencies {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                *frequency = state % 17;
+            }
+            if frequencies
+                .iter()
+                .filter(|&&frequency| frequency != 0)
+                .count()
+                < 2
+            {
+                continue;
+            }
+
+            let defluff = make_lengths_defluff_exact(&frequencies, 7, 0);
+            let zopfli = make_lengths_zopfli_package_from(&frequencies, &defluff, 7);
+            assert_bounded_lengths(&frequencies, &zopfli, 7);
+            if defluff == zopfli {
+                continue;
+            }
+
+            let payload_cost = |lengths: &[u8]| {
+                frequencies
+                    .iter()
+                    .zip(lengths)
+                    .map(|(&frequency, &length)| u64::from(frequency) * u64::from(length))
+                    .sum::<u64>()
+            };
+            assert_eq!(payload_cost(&zopfli), payload_cost(&defluff));
+            return;
+        }
+        panic!("deterministic tie corpus did not expose a distinct package tree");
     }
 
     #[test]
