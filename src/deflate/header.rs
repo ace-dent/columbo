@@ -8,12 +8,13 @@ use std::collections::HashMap;
 use super::huffman::Huffman;
 use super::huffman::{
     code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
-    make_columbo_rle_pseudofrequencies, make_lengths, make_lengths_columbo_defluff_limited,
-    make_lengths_columbo_defluff_limited_into, make_lengths_deflopt_heap,
-    make_lengths_deflopt_heap_into, make_lengths_defluff_exact, make_lengths_defluff_exact_into,
-    make_lengths_deft4j_java_heap, make_lengths_deft4j_java_heap_into, make_lengths_into,
-    make_lengths_order_heap, make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies,
-    payload_tree_shape_is_valid, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    make_brotli_rle_pseudofrequencies, make_columbo_rle_pseudofrequencies, make_lengths,
+    make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
+    make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
+    make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
+    make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
+    make_lengths_order_heap_into, make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -23,6 +24,7 @@ use super::stop::SearchStop;
 
 const INF: u64 = u64::MAX / 4;
 const MAX_HEADER_PLAN_CACHE_ENTRIES: usize = 512;
+const REDUCED_PAYLOAD_TREE_DEPTHS: [u8; 2] = [10, 9];
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HeaderPlanCacheStats {
@@ -449,6 +451,32 @@ pub(crate) fn best_dynamic_plan_cached(
                 ) {
                     keep_better(&mut best, candidate);
                 }
+            }
+        }
+    }
+
+    // A payload-optimal tree may use very deep codes for rare symbols even
+    // when a shallower length-limited tree makes the transmitted code-length
+    // sequence substantially cheaper. ECT exercises the general reduced-depth
+    // idea while recompressing; Columbo independently applies it to the
+    // existing token frequencies and accepts only an exactly priced complete
+    // header. Keep this as two paired Max candidates instead of widening the
+    // literal/distance family cross-product.
+    if exhaustive {
+        for max_bits in REDUCED_PAYLOAD_TREE_DEPTHS {
+            if stop.reached() {
+                break;
+            }
+            if let Some(candidate) = exact_tree_candidate(
+                literal_frequencies,
+                distance_frequencies,
+                &build_literal_frequencies,
+                &build_distance_frequencies,
+                extra_bits,
+                max_bits,
+                header_cache,
+            ) {
+                keep_better(&mut best, candidate);
             }
         }
     }
@@ -1047,6 +1075,98 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
             && huffman_code_lengths_are_valid(lengths)
     });
     candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_tree_candidate(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    build_literal_frequencies: &[u32; 286],
+    build_distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    max_bits: u8,
+    header_cache: &mut HeaderPlanCache,
+) -> Option<DynamicPlan> {
+    let literal_lengths = make_lengths_defluff_exact(build_literal_frequencies, max_bits, 0);
+    let distance_lengths = make_lengths_defluff_exact(build_distance_frequencies, max_bits, 0);
+
+    if literal_lengths.get(256).copied().unwrap_or(0) == 0
+        || !payload_tree_shape_is_valid(&literal_lengths, false)
+        || !payload_tree_shape_is_valid(&distance_lengths, true)
+        || distance_frequencies
+            .iter()
+            .enumerate()
+            .any(|(symbol, &frequency)| frequency != 0 && distance_lengths[symbol] == 0)
+    {
+        return None;
+    }
+
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        &literal_lengths,
+        &distance_lengths,
+        extra_bits,
+    )?;
+    plan_for_explicit_lengths_with_cost_cached(
+        &literal_lengths,
+        &distance_lengths,
+        data_bits,
+        true,
+        header_cache,
+    )
+}
+
+/// Price a compact RLE-smoothed payload-tree frontier.
+///
+/// This is intentionally separate from the ordinary block planner. A locally
+/// cheaper tree can redirect later token feedback into a worse fixed point;
+/// callers use this as an additive completed-stream floor, retaining the
+/// original lineage unless the fully emitted stream is strictly smaller. The
+/// paired literal/distance candidates use every maximum depth from 15 through
+/// 9 without multiplying either alphabet through the ordinary family
+/// cross-product. The two seed families are Brotli's fixed-point smoother and
+/// Zopfli's classic nearby-count smoother.
+pub(crate) fn plan_rle_smoothed_tree_candidate(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    strict: bool,
+) -> Option<DynamicPlan> {
+    let mut families = [
+        (*literal_frequencies, *distance_frequencies),
+        (*literal_frequencies, *distance_frequencies),
+    ];
+    make_brotli_rle_pseudofrequencies(&mut families[0].0);
+    make_brotli_rle_pseudofrequencies(&mut families[0].1);
+    make_zopfli_rle_pseudofrequencies(&mut families[1].0);
+    make_zopfli_rle_pseudofrequencies(&mut families[1].1);
+    let extra_bits = token_extra_bits(tokens);
+    let mut cache = HeaderPlanCache::new();
+    let mut best = None;
+    for (build_literal_frequencies, build_distance_frequencies) in &mut families {
+        if *build_literal_frequencies == *literal_frequencies
+            && *build_distance_frequencies == *distance_frequencies
+        {
+            continue;
+        }
+        ensure_code_symbols(build_literal_frequencies, strict);
+        ensure_distance_symbols(build_distance_frequencies, strict);
+        for max_bits in [15, 14, 13, 12, 11, 10, 9] {
+            if let Some(candidate) = exact_tree_candidate(
+                literal_frequencies,
+                distance_frequencies,
+                build_literal_frequencies,
+                build_distance_frequencies,
+                extra_bits,
+                max_bits,
+                &mut cache,
+            ) {
+                keep_better(&mut best, candidate);
+            }
+        }
+    }
+    best
 }
 
 /// Build Columbo's adjacency-quantized RLE-friendly tree candidate.
@@ -2864,6 +2984,88 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Produce a dense, irregular frequency table without carrying a large
+    /// opaque array literal in the regression test below.
+    fn reduced_depth_fixture(mut state: u32) -> ([u32; 286], [u32; 30]) {
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        let mut literal_frequencies = [0_u32; 286];
+        for frequency in &mut literal_frequencies[..256] {
+            let sample = next();
+            *frequency = if sample % 13 == 0 { 0 } else { 1 + sample % 32 };
+        }
+        literal_frequencies[0] = 100 + next() % 4_000;
+        literal_frequencies[256] = 1;
+        for frequency in &mut literal_frequencies[257..283] {
+            let sample = next();
+            *frequency = if sample % 5 != 0 { 1 + sample % 128 } else { 0 };
+        }
+        let mut distance_frequencies = [0_u32; 30];
+        for frequency in &mut distance_frequencies[..25] {
+            let sample = next();
+            *frequency = if sample % 6 != 0 { 1 + sample % 64 } else { 0 };
+        }
+        (literal_frequencies, distance_frequencies)
+    }
+
+    #[test]
+    fn reduced_depth_candidates_beat_full_depth_tree_families() {
+        for (seed, max_bits, expected_bits) in [
+            (0x9e37_79b9_u32, 10_u8, (48_667, 48_693)),
+            (0xee81_ca19, 9, (46_568, 46_579)),
+        ] {
+            let (literal_frequencies, distance_frequencies) = reduced_depth_fixture(seed);
+            let mut cache = HeaderPlanCache::new();
+            let reduced = exact_tree_candidate(
+                &literal_frequencies,
+                &distance_frequencies,
+                &literal_frequencies,
+                &distance_frequencies,
+                0,
+                max_bits,
+                &mut cache,
+            )
+            .unwrap();
+
+            let mut ordinary = None;
+            let literal_candidates = tree_candidates(&literal_frequencies, 15, true);
+            let distance_candidates = tree_candidates(&distance_frequencies, 15, true);
+            for literal in &literal_candidates {
+                for distance in &distance_candidates {
+                    let Some(data_bits) = token_bits_from_frequencies(
+                        &literal_frequencies,
+                        &distance_frequencies,
+                        literal,
+                        distance,
+                        0,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(candidate) = plan_for_explicit_lengths_with_cost_cached(
+                        literal, distance, data_bits, true, &mut cache,
+                    ) {
+                        keep_better(&mut ordinary, candidate);
+                    }
+                }
+            }
+            let ordinary = ordinary.unwrap();
+            assert_eq!((reduced.bits, ordinary.bits), expected_bits);
+            assert!(reduced.bits < ordinary.bits);
+            assert!(reduced
+                .literal_lengths
+                .iter()
+                .all(|&length| length <= max_bits));
+            assert!(reduced
+                .distance_lengths
+                .iter()
+                .all(|&length| length <= max_bits));
+            assert!(payload_tree_shape_is_valid(&reduced.literal_lengths, false));
+            assert!(payload_tree_shape_is_valid(&reduced.distance_lengths, true));
+        }
+    }
 
     #[test]
     fn header_plan_cache_reuses_only_the_header_kernel() {

@@ -12,6 +12,9 @@ const MAXIMUM_FLEVEL_EMPTY_ZLIB: &[u8] = &[0x78, 0xda, 0x03, 0x00, 0x00, 0x00, 0
 // One stored byte followed by an empty final fixed block. Its 0x78, 0x01
 // prefix is also a valid RFC 1950 header, making byte-only detection ambiguous.
 const ZLIB_LIKE_RAW: &[u8] = &[0x78, 0x01, 0x00, 0xfe, 0xff, b'x', 0x03, 0x00];
+const RLE_SMOOTHING_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/tbbn2c16.png");
+const RLE_SMOOTHING_DEPTH_11_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/bgyn6a16.png");
+const CLASSIC_RLE_SMOOTHING_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/tbrn2c08.png");
 
 #[test]
 fn auto_detection_and_explicit_modes_agree() {
@@ -126,4 +129,34 @@ fn errors_expose_stable_machine_readable_kinds() {
             .kind(),
         ErrorKind::ResourceLimit
     );
+}
+
+#[test]
+fn compact_png_uses_the_rle_smoothed_reduced_depth_tree_floor() {
+    let optimized = optimize(RLE_SMOOTHING_PNG, Format::Png, &Options::default()).unwrap();
+
+    // The pre-floor endpoint is 2,039 bytes; smoothing at depth 15 reaches
+    // 2,037, and the reduced-depth frontier reaches 2,032. Keep this monotone
+    // so a future improvement can make the fixture smaller.
+    assert!(optimized.data.len() <= 2_032);
+    assert!(optimized.bits_saved >= 9 * 8);
+}
+
+#[test]
+fn rle_smoothed_tree_frontier_retains_the_depth_11_win() {
+    let optimized = optimize(RLE_SMOOTHING_DEPTH_11_PNG, Format::Png, &Options::default()).unwrap();
+
+    // Depths 15/10/9 stop at 3,443 bytes; depth 11 saves the next byte.
+    assert!(optimized.data.len() <= 3_442);
+    assert!(optimized.bits_saved >= 11 * 8);
+}
+
+#[test]
+fn rle_smoothed_tree_frontier_retains_the_classic_zopfli_win() {
+    let optimized = optimize(CLASSIC_RLE_SMOOTHING_PNG, Format::Png, &Options::default()).unwrap();
+
+    // The fixed-point family stops at 1,610 bytes; the classic nearby-count
+    // family reaches 1,608.
+    assert!(optimized.data.len() <= 1_608);
+    assert!(optimized.bits_saved >= 25 * 8);
 }

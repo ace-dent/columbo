@@ -1277,6 +1277,97 @@ pub(crate) fn make_zopfli_rle_pseudofrequencies<const N: usize>(frequencies: &mu
     }
 }
 
+/// Construct Brotli-style RLE-friendly Huffman pseudofrequencies.
+///
+/// ECT evaluates both Zopfli's original nearby-count smoother and Brotli's
+/// later fixed-point streak model before emitting a Deflate tree. This is an
+/// independent implementation of that published search dimension: existing
+/// useful runs are protected, while long unprotected runs that remain close
+/// to a moving 24.8 fixed-point mean are collapsed. Trailing zero symbols are
+/// never introduced. Callers must score the resulting tree against the
+/// original frequencies.
+///
+/// Algorithm source and authorship: Google Brotli, Copyright 2010 Google Inc.,
+/// MIT License. ECT identified its usefulness for Deflate tree construction.
+pub(crate) fn make_brotli_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
+    let Some(last_nonzero) = frequencies.iter().rposition(|&frequency| frequency != 0) else {
+        return;
+    };
+    let length = last_nonzero + 1;
+    let mut protected = [false; N];
+
+    let mut run_start = 0;
+    while run_start < length {
+        let count = frequencies[run_start];
+        let mut run_end = run_start + 1;
+        while run_end < length && frequencies[run_end] == count {
+            run_end += 1;
+        }
+        let run_length = run_end - run_start;
+        if (count == 0 && run_length >= 5) || (count != 0 && run_length >= 7) {
+            protected[run_start..run_end].fill(true);
+        }
+        run_start = run_end;
+    }
+
+    const STREAK_LIMIT: u64 = 1_240;
+    let initial_count = frequencies[..length.min(3)]
+        .iter()
+        .map(|&frequency| u64::from(frequency))
+        .sum::<u64>();
+    let mut limit = 256 * initial_count / length.min(3) as u64 + 420;
+    let mut stride = 0_usize;
+    let mut sum = 0_u64;
+
+    for symbol in 0..=length {
+        let scaled = if symbol == length {
+            0
+        } else {
+            256 * u64::from(frequencies[symbol])
+        };
+        let ends_stride = symbol == length
+            || protected[symbol]
+            || (symbol != 0 && protected[symbol - 1])
+            || scaled.abs_diff(limit) >= STREAK_LIMIT;
+        if ends_stride {
+            if stride >= 4 {
+                let average = if sum == 0 {
+                    0
+                } else {
+                    ((sum + stride as u64 / 2) / stride as u64).max(1)
+                };
+                frequencies[symbol - stride..symbol].fill(average as u32);
+            }
+
+            stride = 0;
+            sum = 0;
+            limit = if symbol + 2 < length {
+                256 * frequencies[symbol..symbol + 3]
+                    .iter()
+                    .map(|&frequency| u64::from(frequency))
+                    .sum::<u64>()
+                    / 3
+                    + 420
+            } else if symbol < length {
+                256 * u64::from(frequencies[symbol])
+            } else {
+                0
+            };
+        }
+
+        stride += 1;
+        if symbol != length {
+            sum += u64::from(frequencies[symbol]);
+            if stride >= 4 {
+                limit = (256 * sum + stride as u64 / 2) / stride as u64;
+            }
+            if stride == 4 {
+                limit += 120;
+            }
+        }
+    }
+}
+
 /// Build Columbo's generic tree with Defluff's package-list depth limiter.
 ///
 /// This is a Columbo hybrid, not Defluff's complete tree builder: it keeps
@@ -2418,6 +2509,40 @@ mod tests {
             maximum,
             [u32::MAX - 1, u32::MAX - 1, u32::MAX - 1, u32::MAX - 1, 0,]
         );
+    }
+
+    #[test]
+    fn brotli_rle_pseudofrequencies_follow_a_moving_fixed_point_mean() {
+        let mut frequencies = [10, 14, 13, 12, 11, 50, 0, 0];
+
+        make_brotli_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(frequencies, [12, 12, 12, 12, 12, 50, 0, 0]);
+    }
+
+    #[test]
+    fn brotli_rle_pseudofrequencies_preserve_runs_and_extreme_counts() {
+        let mut frequencies = [
+            u32::MAX,
+            u32::MAX - 1,
+            u32::MAX - 2,
+            u32::MAX - 3,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            7,
+            0,
+            0,
+        ];
+
+        make_brotli_rle_pseudofrequencies(&mut frequencies);
+
+        assert_eq!(&frequencies[..4], &[u32::MAX - 1; 4]);
+        assert_eq!(&frequencies[4..11], &[7; 7]);
+        assert_eq!(&frequencies[11..], &[0; 2]);
     }
 
     #[test]
