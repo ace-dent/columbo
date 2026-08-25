@@ -146,7 +146,8 @@ fn parse_stream_with_model_limit(
         decoded_position: 0,
         decoded_limit,
         model_limit,
-        model_tokens: 0,
+        model_payload_bytes: 0,
+        current_model_payload_limit: None,
         retained_blocks: 0,
         crc32: 0,
         adler32: 1,
@@ -229,7 +230,8 @@ struct Parser<'a> {
     decoded_position: u64,
     decoded_limit: u64,
     model_limit: usize,
-    model_tokens: usize,
+    model_payload_bytes: usize,
+    current_model_payload_limit: Option<usize>,
     retained_blocks: usize,
     crc32: u32,
     adler32: u32,
@@ -238,6 +240,11 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn parse_block(&mut self) -> Result<(ParsedBlock, bool)> {
+        self.current_model_payload_limit = self
+            .retained_blocks
+            .checked_add(1)
+            .and_then(|blocks| blocks.checked_mul(PARSED_BLOCK_MODEL_BYTES))
+            .and_then(|block_bytes| self.model_limit.checked_sub(block_bytes));
         let start = self.reader.bit_position();
         let final_block = self.reader.read(1)? != 0;
         let block_type = match self.reader.read(2)? {
@@ -315,8 +322,7 @@ impl Parser<'_> {
             return Err(Error::new("bad stored block length"));
         }
 
-        self.reserve_decoded(u64::from(length))?;
-        self.reserve_model(u64::from(length), usize::from(length))?;
+        self.reserve_payload(u64::from(length), usize::from(length))?;
         let source = self.reader.read_aligned_bytes(usize::from(length))?;
         let mut plain = Vec::new();
         plain
@@ -415,7 +421,6 @@ impl Parser<'_> {
                 _ => return Err(Error::new("invalid dynamic length symbol")),
             }
         }
-
         let literal_lengths = lengths[..hlit].to_vec();
         let distance_lengths = lengths[hlit..].to_vec();
         let literal = Huffman::build_value_decoder_with_root_bits(
@@ -479,8 +484,7 @@ impl Parser<'_> {
             literal_frequencies[usize::from(symbol)] += 1;
             match symbol {
                 0..=255 => {
-                    self.reserve_decoded(1)?;
-                    self.reserve_model(1, 1)?;
+                    self.reserve_payload(1, 1)?;
                     tokens.try_reserve(1).map_err(|_| model_limit_error())?;
                     plain.try_reserve(1).map_err(|_| model_limit_error())?;
                     let byte = symbol as u8;
@@ -506,8 +510,7 @@ impl Parser<'_> {
                         return Err(Error::new("distance points before beginning of stream"));
                     }
                     self.max_distance = self.max_distance.max(distance);
-                    self.reserve_decoded(u64::from(length))?;
-                    self.reserve_model(u64::from(length), 1)?;
+                    self.reserve_payload(u64::from(length), 1)?;
                     tokens.try_reserve(1).map_err(|_| model_limit_error())?;
                     plain
                         .try_reserve(usize::from(length))
@@ -548,33 +551,30 @@ impl Parser<'_> {
         })
     }
 
-    fn reserve_decoded(&self, count: u64) -> Result<()> {
-        if count > self.decoded_limit.saturating_sub(self.decoded_position) {
+    fn reserve_payload(&mut self, decoded_count: u64, token_count: usize) -> Result<()> {
+        if decoded_count > self.decoded_limit.saturating_sub(self.decoded_position) {
             return Err(Error::resource_limit("decoded data exceeds safety limit"));
         }
-        Ok(())
-    }
 
-    fn reserve_model(&mut self, decoded_count: u64, token_count: usize) -> Result<()> {
-        let decoded = self
-            .decoded_position
-            .checked_add(decoded_count)
-            .and_then(|bytes| usize::try_from(bytes).ok())
+        let added_model_bytes = usize::try_from(decoded_count)
+            .ok()
+            .and_then(|decoded| {
+                token_count
+                    .checked_mul(std::mem::size_of::<Token>())
+                    .and_then(|tokens| decoded.checked_add(tokens))
+            })
             .ok_or_else(model_limit_error)?;
-        let tokens = self
-            .model_tokens
-            .checked_add(token_count)
+        let model_payload_bytes = self
+            .model_payload_bytes
+            .checked_add(added_model_bytes)
             .ok_or_else(model_limit_error)?;
-        let blocks = self
-            .retained_blocks
-            .checked_add(1)
-            .ok_or_else(model_limit_error)?;
-        let estimated =
-            parsed_model_bytes(decoded, tokens, blocks).ok_or_else(model_limit_error)?;
-        if estimated > self.model_limit {
+        if self
+            .current_model_payload_limit
+            .map_or(true, |limit| model_payload_bytes > limit)
+        {
             return Err(model_limit_error());
         }
-        self.model_tokens = tokens;
+        self.model_payload_bytes = model_payload_bytes;
         Ok(())
     }
 
@@ -1055,6 +1055,25 @@ mod tests {
         let input = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
         let error =
             parse_stream_with_model_limit(&input, 1024, PARSED_BLOCK_MODEL_BYTES).unwrap_err();
+        assert!(error.message().contains("memory safety limit"));
+    }
+
+    #[test]
+    fn incremental_model_accounting_preserves_the_exact_limit() {
+        let (literal, _) = crate::deflate::huffman::fixed_trees();
+        let byte = literal.code(usize::from(b'x')).unwrap();
+        let end = literal.code(256).unwrap();
+        let mut writer = BitWriter::default();
+        writer.write(1, 1).unwrap();
+        writer.write(1, 2).unwrap();
+        writer.write(u32::from(byte.code), byte.length).unwrap();
+        writer.write(u32::from(end.code), end.length).unwrap();
+        let input = writer.into_bytes();
+
+        let exact_limit = parsed_model_bytes(1, 1, 1).unwrap();
+        let parsed = parse_stream_with_model_limit(&input, 1, exact_limit).unwrap();
+        assert_eq!(parsed.decoded_size, 1);
+        let error = parse_stream_with_model_limit(&input, 1, exact_limit - 1).unwrap_err();
         assert!(error.message().contains("memory safety limit"));
     }
 

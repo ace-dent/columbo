@@ -149,13 +149,67 @@ pub(crate) struct Huffman {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct DecodeEntry {
-    symbol: u16,
-    value_base: u16,
-    bits: u8,
-    extra_bits: u8,
-    subtable_bits: u8,
-    subtable_start: u16,
+struct DecodeEntry(u64);
+
+impl DecodeEntry {
+    const SYMBOL_SHIFT: u32 = 0;
+    const VALUE_SHIFT: u32 = 9;
+    const BITS_SHIFT: u32 = 25;
+    const EXTRA_BITS_SHIFT: u32 = 29;
+    const SUBTABLE_BITS_SHIFT: u32 = 33;
+    const SUBTABLE_START_SHIFT: u32 = 37;
+
+    fn direct(symbol: u16, value_base: u16, bits: u8) -> Self {
+        debug_assert!(symbol < 1 << 9);
+        debug_assert!(bits < 1 << 4);
+        Self(
+            (u64::from(symbol) << Self::SYMBOL_SHIFT)
+                | (u64::from(value_base) << Self::VALUE_SHIFT)
+                | (u64::from(bits) << Self::BITS_SHIFT),
+        )
+    }
+
+    fn subtable(bits: u8, start: u16) -> Self {
+        debug_assert!(bits < 1 << 4);
+        Self(
+            (u64::from(bits) << Self::SUBTABLE_BITS_SHIFT)
+                | (u64::from(start) << Self::SUBTABLE_START_SHIFT),
+        )
+    }
+
+    fn with_metadata(mut self, value_base: u16, extra_bits: u8) -> Self {
+        debug_assert!(extra_bits < 1 << 4);
+        const VALUE_MASK: u64 = u16::MAX as u64;
+        const WIDTH_MASK: u64 = 0xf;
+        self.0 &= !((VALUE_MASK << Self::VALUE_SHIFT) | (WIDTH_MASK << Self::EXTRA_BITS_SHIFT));
+        self.0 |= (u64::from(value_base) << Self::VALUE_SHIFT)
+            | (u64::from(extra_bits) << Self::EXTRA_BITS_SHIFT);
+        self
+    }
+
+    fn symbol(self) -> u16 {
+        ((self.0 >> Self::SYMBOL_SHIFT) & 0x1ff) as u16
+    }
+
+    fn value_base(self) -> u16 {
+        ((self.0 >> Self::VALUE_SHIFT) & u64::from(u16::MAX)) as u16
+    }
+
+    fn bits(self) -> u8 {
+        ((self.0 >> Self::BITS_SHIFT) & 0xf) as u8
+    }
+
+    fn extra_bits(self) -> u8 {
+        ((self.0 >> Self::EXTRA_BITS_SHIFT) & 0xf) as u8
+    }
+
+    fn subtable_bits(self) -> u8 {
+        ((self.0 >> Self::SUBTABLE_BITS_SHIFT) & 0xf) as u8
+    }
+
+    fn subtable_start(self) -> u16 {
+        ((self.0 >> Self::SUBTABLE_START_SHIFT) & u64::from(u16::MAX)) as u16
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,12 +336,11 @@ impl Huffman {
         let mut tree = Self::build(lengths)?;
         let mut table = build_decode_table(&tree, root_bits)?;
         for entry in &mut table.entries {
-            if entry.bits == 0 {
+            if entry.bits() == 0 {
                 continue;
             }
-            let (base, width) = decode_metadata(profile, entry.symbol);
-            entry.value_base = base;
-            entry.extra_bits = width;
+            let (base, width) = decode_metadata(profile, entry.symbol());
+            *entry = entry.with_metadata(base, width);
         }
         tree.decode_table = Some(table);
         tree.decode_profile = Some(profile);
@@ -309,20 +362,21 @@ impl Huffman {
             .ok_or_else(|| Error::new("internal Huffman decoder has no value profile"))?;
         if let Some(table) = &self.decode_table {
             if let Some((entry, code_bits)) = self.peek_decode_table(reader, table)? {
-                let total_bits = code_bits + entry.extra_bits;
+                let extra_bits = entry.extra_bits();
+                let total_bits = code_bits + extra_bits;
                 let packed = reader.peek(total_bits)?;
-                let extra = if entry.extra_bits == 0 {
+                let extra = if extra_bits == 0 {
                     0
                 } else {
-                    let mask = (1_u32 << entry.extra_bits) - 1;
+                    let mask = (1_u32 << extra_bits) - 1;
                     ((packed >> code_bits) & mask) as u16
                 };
                 reader.drop_bits(total_bits)?;
                 return Ok(DecodedValue {
-                    symbol: entry.symbol,
-                    value: entry.value_base + extra,
+                    symbol: entry.symbol(),
+                    value: entry.value_base() + extra,
                     extra,
-                    extra_bits: entry.extra_bits,
+                    extra_bits,
                 });
             }
         }
@@ -348,7 +402,7 @@ impl Huffman {
     fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
         if let Some((entry, bits)) = self.peek_decode_table(reader, table)? {
             reader.drop_bits(bits)?;
-            return Ok(entry.symbol);
+            return Ok(entry.symbol());
         }
         self.decode_canonical(reader)
     }
@@ -366,26 +420,29 @@ impl Huffman {
             Err(_) => return Ok(None),
         };
         let root_entry = table.entries[root_value as usize];
-        if root_entry.subtable_bits == 0 {
-            if root_entry.bits == 0 {
+        let subtable_bits = root_entry.subtable_bits();
+        if subtable_bits == 0 {
+            let bits = root_entry.bits();
+            if bits == 0 {
                 return Err(Error::new("invalid Huffman code in Deflate stream"));
             }
-            return Ok(Some((root_entry, root_entry.bits)));
+            return Ok(Some((root_entry, bits)));
         }
 
-        let lookup_bits = table.root_bits + root_entry.subtable_bits;
+        let lookup_bits = table.root_bits + subtable_bits;
         let value = match reader.peek(lookup_bits) {
             Ok(value) => value,
             Err(_) => return Ok(None),
         };
-        let subtable_mask = (1_u32 << root_entry.subtable_bits) - 1;
-        let subtable_index = usize::from(root_entry.subtable_start)
+        let subtable_mask = (1_u32 << subtable_bits) - 1;
+        let subtable_index = usize::from(root_entry.subtable_start())
             + ((value >> table.root_bits) & subtable_mask) as usize;
         let entry = table.entries[subtable_index];
-        if entry.bits == 0 {
+        let bits = entry.bits();
+        if bits == 0 {
             return Err(Error::new("invalid Huffman code in Deflate stream"));
         }
-        Ok(Some((entry, table.root_bits + entry.bits)))
+        Ok(Some((entry, table.root_bits + bits)))
     }
 
     fn decode_canonical(&self, reader: &mut BitReader<'_>) -> Result<u16> {
@@ -467,12 +524,8 @@ fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
         let end = first + usize::from(tree.code_count[length_index]);
         for &symbol in &tree.decode_symbols[first..end] {
             let code = tree.codes[usize::from(symbol)];
-            entries[usize::from(code.code)] = DecodeEntry {
-                symbol: code.symbol,
-                value_base: code.symbol,
-                bits: code.length,
-                ..DecodeEntry::default()
-            };
+            entries[usize::from(code.code)] =
+                DecodeEntry::direct(code.symbol, code.symbol, code.length);
         }
     }
 
@@ -484,11 +537,7 @@ fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
             let subtable_size = 1_usize << subtable_bits;
             entries.try_reserve(subtable_size).ok()?;
             entries.resize(entries.len() + subtable_size, DecodeEntry::default());
-            entries[prefix] = DecodeEntry {
-                subtable_bits,
-                subtable_start,
-                ..DecodeEntry::default()
-            };
+            entries[prefix] = DecodeEntry::subtable(subtable_bits, subtable_start);
         }
     }
 
@@ -496,17 +545,12 @@ fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
         let prefix = usize::from(code.code & root_mask);
         let root_entry = entries[prefix];
         let remaining_bits = code.length - root_bits;
-        let suffix_count = 1_usize << (root_entry.subtable_bits - remaining_bits);
+        let suffix_count = 1_usize << (root_entry.subtable_bits() - remaining_bits);
         let code_suffix = usize::from(code.code >> root_bits);
         for suffix in 0..suffix_count {
             let index =
-                usize::from(root_entry.subtable_start) + code_suffix + (suffix << remaining_bits);
-            entries[index] = DecodeEntry {
-                symbol: code.symbol,
-                value_base: code.symbol,
-                bits: remaining_bits,
-                ..DecodeEntry::default()
-            };
+                usize::from(root_entry.subtable_start()) + code_suffix + (suffix << remaining_bits);
+            entries[index] = DecodeEntry::direct(code.symbol, code.symbol, remaining_bits);
         }
     }
 
@@ -2124,6 +2168,11 @@ mod tests {
             }
         );
         assert_eq!(reader.bit_position(), 9);
+    }
+
+    #[test]
+    fn decode_entry_fits_one_u64() {
+        assert_eq!(std::mem::size_of::<DecodeEntry>(), 8);
     }
 
     #[test]
