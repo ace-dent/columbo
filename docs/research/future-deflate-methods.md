@@ -95,7 +95,7 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison | A format-specific diagnosed miss |
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
-| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product in the structurally bounded compact Max route; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
+| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
 | Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback | A real header requiring a retained alternate RLE histogram |
 | Runtime | Canonical plan and header caches; range and edge reuse; bounded fingerprints; parser/decode/emission hot paths | Measured duplicate work or a new profile hotspot |
 
@@ -111,9 +111,9 @@ which the bounded composition route supplies.
 | All-literals endpoint | Complete fixed/dynamic pricing for dense blocks through 80,000 decoded bytes, or blocks through 1,000,000 bytes with at most 256 matches; token allocation occurs only after a strict win | In a 34-file strict corpus, two outputs improved: 493,708 bytes and 7 bytes; Max found another 11 bytes on the larger result |
 | Symmetric and paired balanced-tree moves | Pair/quad Kraft-preserving moves on both alphabets; retain at most four moves per side and price at most sixteen pairs; Default requires non-positive combined payload delta; Max permits +18 bits | Removes the former literal-only asymmetry while preserving exact complete-header acceptance; focused literal, distance, paired, and opportunity tests pass |
 | Zopfli RLE-friendly pseudo-frequencies | One independently implemented paired Max candidate; no tree-family cross-product | Three of eleven Max files improved by 2, 13, and 9 bytes; other files tied; short no-gain cost was about 0.26 s/file |
-| Package-first exact package merge | Re-run Columbo's existing package-list reconstruction with package-before-leaf equality. The full-depth shape is added only to the exhaustive tree family. Every restricted depth compares leaf-first and package-first shapes; the ordinary frontier prices all four paired-alphabet combinations, while the compact structurally bounded route deduplicates both families before its independent alphabet cross-product. The completed incumbent and exact header price remain authoritative | A deterministic oracle found distinct trees with identical weighted payload cost. Across 31 files and 62 Default/Max records, 18 records covering 12 files improved, saving 33 file bytes / 285 meaningful bits in aggregate with no growth. Default saved 24 bytes / 197 bits; Max saved 9 bytes / 88 bits. Total wall time was 377.75 → 378.76 s (+0.27%); Max was 346.38 → 347.03 s (+0.19%). The isolated full-depth addition uniquely saved another 4 Max bits |
+| Package-first exact package merge | Re-run Columbo's existing package-list reconstruction with package-before-leaf equality. The full-depth shape is added only to the exhaustive tree family. Every restricted depth compares leaf-first and package-first shapes; the ordinary frontier prices all four paired-alphabet combinations, while Max deduplicates both families before its independent alphabet cross-product. The completed incumbent and exact header price remain authoritative | A deterministic oracle found distinct trees with identical weighted payload cost. Across 31 files and 62 Default/Max records, 18 records covering 12 files improved, saving 33 file bytes / 285 meaningful bits in aggregate with no growth. Default saved 24 bytes / 197 bits; Max saved 9 bytes / 88 bits. Total wall time was 377.75 → 378.76 s (+0.27%); Max was 346.38 → 347.03 s (+0.19%). The isolated full-depth addition uniquely saved another 4 Max bits |
 | Reduced-depth payload trees | Max only; build exact Defluff literal/distance pairs at maximum depths 10 and 9; no cross-product; poll the route deadline; accept only an exactly priced complete payload and dynamic header | Focused depth-10 and depth-9 cases beat every ordinary depth-15 tree-family pairing by 26 and 11 bits. Max A/B improved three of six PNGs by 5, 1, and 3 bytes and a 48.8 KiB GZIP by 2 bytes; aggregate PNG wall time was 88.132 → 88.250 s |
-| Bounded-depth terminal tree frontier | For every completed dynamic block, derive the minimum feasible maximum depth from `2^depth >= populated symbols`, then exact-price the deduplicated leaf-first and package-first raw-count trees for both alphabets and all four same-depth pairings at every ceiling through 14. Max uses its exhaustive header planner for these terminal candidates. Inside the existing compact work bound, Max also deduplicates both tie families across feasible depths for each alphabet and exact-prices their complete cross-product, allowing the literal/length and distance ceilings to differ. The unrestricted 15-bit completed parent remains an independent fallback. The general linear pass starts only while route time remains and polls the hard deadline between blocks. There is no corpus-trained file-size or token-count admission band | Against the pre-frontier binary, 55 of 176 PngSuite files became byte-smaller and eight more changed only by meaningful bits, saving 139 aggregate bytes with no growth; wall time was 27.70 → 27.82 s. Three unrelated medium GZIPs gained 3, 75, and 68 bytes (146 total). A timed deft4j Max sample reproduced three new wins totaling 5 file bytes / 19 meaningful bits; the 13-case final run had no loss and changed aggregate wall time from 176.36 to 176.81 s. The later fork audit added the package-first family with the separate 31-file evidence above |
+| Bounded-depth terminal tree frontier | For every completed dynamic block, derive the minimum feasible maximum depth from `2^depth >= populated symbols`, then exact-price the deduplicated leaf-first and package-first raw-count trees for both alphabets and all four same-depth pairings at every ceiling through 14. Max deduplicates both tie families across every feasible depth for each alphabet and exact-prices their complete cross-product, allowing the two alphabet ceilings to differ. Pairs are visited by increasing separable payload lower bound and poll the hard stop. If the hard boundary is already reached, a one-block rescue prices only the largest transmitted dynamic block under 1 MiB compressed, 1 MiB decoded, and 128 blocks. The unrestricted 15-bit completed parent remains independent. There is no corpus-trained admission band | Against the pre-frontier binary, 55 of 176 PngSuite files became byte-smaller and eight more changed only by meaningful bits, saving 139 aggregate bytes with no growth; wall time was 27.70 → 27.82 s. Three unrelated medium GZIPs gained 3, 75, and 68 bytes (146 total). Earlier timed validation reproduced 5 bytes / 19 bits. The general Max extension later reproduced three more wins conservatively totaling 26 bytes / 208 bits, with no reproduced loss and neutral aggregate timed runtime |
 | Compact payload-tree terminal floor | Terminal floor for completed compact Huffman streams: compare the raw bounded-depth frontier with independent Brotli fixed-point and classic Zopfli nearby-count seed families, the latter exact-priced at paired maximum depths 15 through 9. One bounded pair/quad tree-only closure prices shapes exposed by a winner and repeats the compact price once. At most eight blocks/4,096 tokens, 8 KiB compressed, and 128 KiB decoded; no token search or lineage displacement | Before the raw frontier was added, Default A/B across 176 PngSuite files selected smoothing in 36 of 166 Deflate streams and saved 300 aggregate bytes / 2,428 meaningful bits, with a 26-byte largest win. The classic Zopfli seeds uniquely added 4 bytes / 32 bits across four streams; the one-round balanced closure won 28 of 36 smoothed streams and added 19 bytes / 217 bits. Smoothing cost 51.633 ms across 165 eligible streams; closure cost 610.470 ms across its 36 inputs. Sample ZIP wins were 2 bytes and 9 bytes at complete-file level |
 | Header-aware proven-spelling composition | Max compact M3 only; source parent ≤4,000 tokens/80,000 bytes; generated spelling ≤8,000 tokens; 2–128 matches; target ≤8 matches; ≤4 spellings/match; beam 16; ≤32 exact plans | 98 of 1,706 eligible scanned blocks improved locally; final A/B wins were 1 byte/6 bits and 2 bits at equal bytes |
 | Adjacent-boundary reseat | Max comparison floors of 2–8 Huffman blocks; ≤8,192 tokens/512 KiB; keep one strongest strict replacement | Repeatable final wins: 10 bytes/80 bits, 1 byte/8 bits, and 3 bits at equal bytes |
@@ -142,6 +142,32 @@ timed output change from extending the existing balanced-tree closure, so that
 experiment was removed. Retention rests on complete finite frontiers and exact
 acceptance; the corpus supplies validation, not routing thresholds.
 
+### General mixed-depth frontier and lower-bound validation
+
+The follow-up froze commit `45571da` as binary `8318973a…` and compared it
+with retained build `3af16f7a…` through the same validating timed-deft4j
+harness on fifteen cases across PNG/APNG, ZIP, GZIP, and zlib. Literal and
+distance payload contributions are computed once;
+their sum is an admissible lower bound, so the planner may visit the smallest
+bound first and skip a dynamic-header search only when payload alone cannot
+strictly beat the complete incumbent.
+
+| Reproduced case | Conservative file-byte gain | Conservative meaningful-bit gain |
+| --- | ---: | ---: |
+| `steam-shop_apng/bored.png` | 19 | 150 |
+| `kensilverman-gz/pngout-20200115-linux.tar.gz` | 5 | 42 |
+| `medium-gz/asyoulik-gzip.txt.gz` | 2 | 16 |
+
+The conservative reproduced total is 26 bytes / 208 bits. The final paired run
+observed three wins totaling 31 bytes / 254 bits and changed aggregate Max time
+from 212.57 to 210.16 seconds. One ZIP run differed by 1 byte/1 bit, but immediate HEAD,
+scoring-only, and final repeats all tied at the same output, so the isolated
+row is recorded as deadline variance rather than a regression. Five Default
+controls were byte/bit identical; two baseline totals were 11.13 and 10.58
+seconds, and the retained build took 10.52 seconds. Exact frontier oracles,
+deadline-prefix tests, wrapper reparsing, and decoded-identity checks remain
+authoritative; measured files do not select depth, order, or eligibility.
+
 ## Retained execution optimizations
 
 Percentages are isolated controls and do not add linearly to whole-file time.
@@ -161,6 +187,7 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Packed 64-bit decode entry | 1.120 → 1.086 s on a 109-dynamic-block parse, about 3.0% | Entry-size invariant and generated-tree decode oracle |
 | Fixed 32-bit writer drain | Literal emission 62.24 → 52.42 ms, about 15.8%; match emission 147.33 → 115.72 ms, about 21.5% | Independent bit-vector oracle covers widths 0–32, alignment, direct bytes, drain boundaries, and partial tails in both writer modes |
 | Route-local header kernel cache | Neutral short Max control: 3.99 → 4.01 s | Exact length/policy key, collision verification, 512-entry cap, independent payload pricing |
+| Separable bounded-frontier payload scoring | Five Default controls were output-identical; two frozen-baseline totals were 11.13 and 10.58 s, versus 10.52 s retained | Literal and distance sums exactly reconstruct the prior payload score. Increasing-payload order is an admissible lower-bound traversal; only payloads already no better than a complete incumbent skip header construction |
 
 ## Rejected or deferred experiments
 
@@ -169,7 +196,7 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Experiment | Result | Reconsider only if |
 | --- | --- | --- |
 | K-best code-length-RLE feedback | One synthetic header saved 1 bit; 20 Default and 8 Max real comparisons produced no final gain; Default sample 2.67 → 4.00 s; isolated cleanup 84 → 178 ms | A diagnosed real header requires a specific alternate histogram or a cheaper frontier representation exists |
-| Central-planner broad reduced-depth cross-product | Depths 14–11 produced no unique wins in the original 162-file PNG probe when multiplied through the ordinary literal/distance family cross-product; that placement slowed the corpus by about 12% and a 48.8 KiB no-gain GZIP control from about 1.5 to 4.2 s | Keep the broad family multiplication rejected. Independently mixed raw-count alphabets are now confined to the compact terminal route, where the tree families are fixed, duplicate shapes are removed, work has structural bounds, and exact whole-stream wins are retained without redirecting feedback |
+| Central-planner broad reduced-depth cross-product | Depths 14–11 produced no unique wins in the original 162-file PNG probe when multiplied through the ordinary literal/distance family cross-product; that placement slowed the corpus by about 12% and a 48.8 KiB no-gain GZIP control from about 1.5 to 4.2 s | Keep the broad family multiplication rejected. Independently mixed raw-count alphabets now run only as an additive terminal frontier: tree families are fixed and deduplicated, payload bounds order/prune exact header work, deadline or explicit rescue bounds control work, and no intermediate feedback lineage is redirected |
 | Token-band-selected depth inside the central planner | One count-selected depth found attractive local trees, but changing intermediate prices redirected later feedback: PngSuite included final regressions (for example 1,688 → 1,692 and 1,568 → 1,569 bytes) and runtime rose about 4.8% | Keep the completed parent independent. The retained terminal sibling evaluates every mathematically feasible restricted ceiling and accepts only an exact whole-stream win |
 | Repeated post-smoothing balanced closure | Extending the retained one tree-only closure to four rounds added another 12 bytes / 106 bits on PngSuite, but raised isolated closure time from 0.619 to 1.550 s. A later deadline-aware Max-only fixed point produced no output change in the timed deft4j probe or isolated winning cases, while one isolated run was 0.43 s slower | A cheaper move frontier can recover the later rounds without repeating the complete bounded price |
 | Post-smoothing proven-feedback replay | The full compact feedback closure added the same 19 bytes as the retained direct tree-only closure but only 194 bits, costing 3.068 s instead of 0.619 s. Forcing its Max composition cost 9.348 s and reduced the win count | A diagnosed smoothed tree requires an actual token rewrite that the direct balanced-tree closure cannot reach |
@@ -236,7 +263,7 @@ identifiers, constants, or control flow were copied or translated.
 
 | 7-Zip area | Assessment | Columbo disposition |
 | --- | --- | --- |
-| [`DeflateEncoder.cpp`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/DeflateEncoder.cpp) bounded Huffman depth | Selects a reduced payload-tree depth from token-count bands | Retained as a more general additive frontier: prefix-code capacity derives the first feasible depth, every restricted ceiling through 14 is exactly priced, and the completed 15-bit parent remains independent. Max exhausts the bounded candidate's header encodings; the compact, structurally bounded route additionally prices every unique feasible literal/distance depth pairing. Neither eligibility nor depth selection is trained on the validation corpus |
+| [`DeflateEncoder.cpp`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/DeflateEncoder.cpp) bounded Huffman depth | Selects a reduced payload-tree depth from token-count bands | Retained as a more general additive frontier: prefix-code capacity derives the first feasible depth, every restricted ceiling through 14 is exactly priced, and the completed 15-bit parent remains independent. Max exhausts header encodings across every unique feasible literal/distance depth pairing, ordered by a mathematically admissible payload bound and constrained by deadline or explicit finalization work. Neither eligibility nor depth selection is trained on the validation corpus |
 | [`HuffmanDecoder.h`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/HuffmanDecoder.h) and [`DeflateDecoder.cpp`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/DeflateDecoder.cpp) table shapes | Use a compact direct table for the seven-bit code-length alphabet and 10/6-bit payload roots | Retained with independently derived Rust layouts: a checked 128-byte code-length table plus general two-level payload tables. The 10/6 roots also follow the alphabet-capacity rule of one bit above the balanced width |
 | Recursive block subdivision | Recursively considers midpoint subdivisions while pricing encoded blocks | Columbo already covers the existing-token portion more broadly with cumulative histograms, adaptive exact cuts, a residue-aware boundary graph, inside-match boundaries, reseat, and forced-split escape. 7-Zip's subdivision is coupled to its fresh match parser |
 | Optimal parsing, match finder, and repeated price feedback | Finds new LZ77 matches and reparses under updated prices | Out of scope: Columbo may rewrite only source-proven matches and literals |
@@ -311,17 +338,19 @@ header or boundary wins remain Max-only.
 
 Latest retained execution pass:
 
-- 451 Rust tests and formatting passed on Apple Silicon;
+- 453 Rust tests and formatting passed on Apple Silicon;
 - warning-free all-target Clippy passed after the retained change;
 - focused oracles cover canonical equivalence and physical-end fallback for
   the compact code-length decoder, generated payload decode tables, the
   prefix-capacity depth bound, exact dynamic-header cost, and complete
   payload-tree validity, plus exact enumeration of the independent alphabet
-  depth cross-product; and
+  depth cross-product, payload-lower-bound ordering, deadline prefix retention,
+  and rescue work limits; and
 - release A/B runs covered the 176-file PngSuite default corpus, three medium
   GZIPs, 804 KiB and 2.38 MiB GZIP controls, six Max PNGs, zlib controls, and
-  compact ZIP samples, plus a thirteen-case timed deft4j cross-format Max A/B.
-  The bounded-depth frontier produced no byte regression;
+  compact ZIP samples, plus thirteen- and fifteen-case timed deft4j
+  cross-format Max A/Bs. The bounded-depth frontier produced no reproduced
+  byte regression;
 - the Zopfli fork-network candidate used frozen baseline and candidate release
   binaries across 31 files from PNG, ZIP, and GZIP families. Its 62 paired
   Default/Max records contained 18 improvements and no output growth; and

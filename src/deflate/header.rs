@@ -301,22 +301,20 @@ pub(crate) fn token_bits_from_frequencies(
     distance_lengths: &[u8],
     extra_bits: u64,
 ) -> Option<u64> {
-    let mut bits = extra_bits;
-    for (symbol, &frequency) in literal_frequencies.iter().enumerate() {
+    let literal_bits = alphabet_payload_bits(literal_frequencies, literal_lengths)?;
+    let distance_bits = alphabet_payload_bits(distance_frequencies, distance_lengths)?;
+    extra_bits
+        .checked_add(literal_bits)?
+        .checked_add(distance_bits)
+}
+
+fn alphabet_payload_bits<const N: usize>(frequencies: &[u32; N], lengths: &[u8]) -> Option<u64> {
+    let mut bits = 0_u64;
+    for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency == 0 {
             continue;
         }
-        let length = *literal_lengths.get(symbol)?;
-        if length == 0 {
-            return None;
-        }
-        bits = bits.checked_add(u64::from(frequency) * u64::from(length))?;
-    }
-    for (symbol, &frequency) in distance_frequencies.iter().enumerate() {
-        if frequency == 0 {
-            continue;
-        }
-        let length = *distance_lengths.get(symbol)?;
+        let length = *lengths.get(symbol)?;
         if length == 0 {
             return None;
         }
@@ -1129,6 +1127,31 @@ fn explicit_exact_tree_candidate(
     exhaustive: bool,
     header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
+    let data_bits = token_bits_from_frequencies(
+        literal_frequencies,
+        distance_frequencies,
+        literal_lengths,
+        distance_lengths,
+        extra_bits,
+    )?;
+    price_explicit_exact_tree_candidate(
+        distance_frequencies,
+        literal_lengths,
+        distance_lengths,
+        data_bits,
+        exhaustive,
+        header_cache,
+    )
+}
+
+fn price_explicit_exact_tree_candidate(
+    distance_frequencies: &[u32; 30],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+    exhaustive: bool,
+    header_cache: &mut HeaderPlanCache,
+) -> Option<DynamicPlan> {
     if literal_lengths.get(256).copied().unwrap_or(0) == 0
         || !payload_tree_shape_is_valid(literal_lengths, false)
         || !payload_tree_shape_is_valid(distance_lengths, true)
@@ -1139,14 +1162,6 @@ fn explicit_exact_tree_candidate(
     {
         return None;
     }
-
-    let data_bits = token_bits_from_frequencies(
-        literal_frequencies,
-        distance_frequencies,
-        literal_lengths,
-        distance_lengths,
-        extra_bits,
-    )?;
     plan_for_explicit_lengths_with_cost_cached(
         literal_lengths,
         distance_lengths,
@@ -1154,6 +1169,136 @@ fn explicit_exact_tree_candidate(
         exhaustive,
         header_cache,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn price_exact_tree_cross_product(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    literal_candidates: &[Vec<u8>],
+    distance_candidates: &[Vec<u8>],
+    extra_bits: u64,
+    exhaustive_header: bool,
+    header_cache: &mut HeaderPlanCache,
+    best: &mut Option<DynamicPlan>,
+    stop: &mut SearchStop<'_>,
+) -> bool {
+    let literal_payload_bits: Vec<Option<u64>> = literal_candidates
+        .iter()
+        .map(|lengths| alphabet_payload_bits(literal_frequencies, lengths))
+        .collect();
+    let distance_payload_bits: Vec<Option<u64>> = distance_candidates
+        .iter()
+        .map(|lengths| alphabet_payload_bits(distance_frequencies, lengths))
+        .collect();
+    let pair_capacity = literal_candidates
+        .len()
+        .checked_mul(distance_candidates.len())
+        .unwrap_or(0);
+    let mut ordered_pairs = Vec::new();
+    if ordered_pairs.try_reserve_exact(pair_capacity).is_ok() {
+        for (literal_index, &literal_bits) in literal_payload_bits.iter().enumerate() {
+            let Some(literal_bits) = literal_bits else {
+                continue;
+            };
+            for (distance_index, &distance_bits) in distance_payload_bits.iter().enumerate() {
+                let Some(data_bits) = distance_bits.and_then(|distance_bits| {
+                    extra_bits
+                        .checked_add(literal_bits)?
+                        .checked_add(distance_bits)
+                }) else {
+                    continue;
+                };
+                ordered_pairs.push((data_bits, literal_index, distance_index));
+            }
+        }
+        // Payload cost is an admissible lower bound on complete dynamic-block
+        // cost. Visiting the smallest bound first maximizes useful work before
+        // a deadline and lets the exact incumbent reject hopeless headers;
+        // it changes neither the finite candidate set nor acceptance.
+        ordered_pairs.sort_unstable();
+        for (data_bits, literal_index, distance_index) in ordered_pairs {
+            if !price_exact_tree_pair(
+                distance_frequencies,
+                &literal_candidates[literal_index],
+                &distance_candidates[distance_index],
+                data_bits,
+                exhaustive_header,
+                header_cache,
+                best,
+                stop,
+            ) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Allocation failure is not a reason to lose an otherwise valid frontier;
+    // retain the original deterministic traversal without the ordering aid.
+    for (literal_index, &literal_bits) in literal_payload_bits.iter().enumerate() {
+        let Some(literal_bits) = literal_bits else {
+            continue;
+        };
+        for (distance_index, &distance_bits) in distance_payload_bits.iter().enumerate() {
+            let Some(data_bits) = distance_bits.and_then(|distance_bits| {
+                extra_bits
+                    .checked_add(literal_bits)?
+                    .checked_add(distance_bits)
+            }) else {
+                continue;
+            };
+            if !price_exact_tree_pair(
+                distance_frequencies,
+                &literal_candidates[literal_index],
+                &distance_candidates[distance_index],
+                data_bits,
+                exhaustive_header,
+                header_cache,
+                best,
+                stop,
+            ) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn price_exact_tree_pair(
+    distance_frequencies: &[u32; 30],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+    exhaustive_header: bool,
+    header_cache: &mut HeaderPlanCache,
+    best: &mut Option<DynamicPlan>,
+    stop: &mut SearchStop<'_>,
+) -> bool {
+    if stop.reached() {
+        return false;
+    }
+    // A dynamic header has positive cost. If its payload alone cannot
+    // strictly beat the completed incumbent, constructing every RLE and
+    // code-length-tree spelling cannot change the result.
+    if best
+        .as_ref()
+        .is_some_and(|current| data_bits >= current.bits)
+    {
+        return true;
+    }
+    if let Some(candidate) = price_explicit_exact_tree_candidate(
+        distance_frequencies,
+        literal_lengths,
+        distance_lengths,
+        data_bits,
+        exhaustive_header,
+        header_cache,
+    ) {
+        keep_better(best, candidate);
+    }
+    true
 }
 
 /// Price every feasible restricted payload-tree depth without changing tokens.
@@ -1175,6 +1320,7 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
     strict: bool,
     exhaustive_header: bool,
     independent_depths: bool,
+    stop: &mut SearchStop<'_>,
 ) -> Option<DynamicPlan> {
     let mut build_literal_frequencies = *literal_frequencies;
     ensure_code_symbols(&mut build_literal_frequencies, strict);
@@ -1205,21 +1351,17 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
             push_unique(&mut distance_candidates, defluff);
             push_unique(&mut distance_candidates, package_first);
         }
-        for literal_lengths in &literal_candidates {
-            for distance_lengths in &distance_candidates {
-                if let Some(candidate) = explicit_exact_tree_candidate(
-                    literal_frequencies,
-                    distance_frequencies,
-                    literal_lengths,
-                    distance_lengths,
-                    extra_bits,
-                    exhaustive_header,
-                    &mut header_cache,
-                ) {
-                    keep_better(&mut best, candidate);
-                }
-            }
-        }
+        price_exact_tree_cross_product(
+            literal_frequencies,
+            distance_frequencies,
+            &literal_candidates,
+            &distance_candidates,
+            extra_bits,
+            exhaustive_header,
+            &mut header_cache,
+            &mut best,
+            stop,
+        );
     } else {
         let minimum_depth = minimum_complete_tree_depth(&build_literal_frequencies)
             .max(minimum_complete_tree_depth(&build_distance_frequencies));
@@ -1246,20 +1388,18 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
             );
             push_unique(&mut distance_candidates, distance_defluff);
             push_unique(&mut distance_candidates, distance_package_first);
-            for literal_lengths in &literal_candidates {
-                for distance_lengths in &distance_candidates {
-                    if let Some(candidate) = explicit_exact_tree_candidate(
-                        literal_frequencies,
-                        distance_frequencies,
-                        literal_lengths,
-                        distance_lengths,
-                        extra_bits,
-                        exhaustive_header,
-                        &mut header_cache,
-                    ) {
-                        keep_better(&mut best, candidate);
-                    }
-                }
+            if !price_exact_tree_cross_product(
+                literal_frequencies,
+                distance_frequencies,
+                &literal_candidates,
+                &distance_candidates,
+                extra_bits,
+                exhaustive_header,
+                &mut header_cache,
+                &mut best,
+                stop,
+            ) {
+                break;
             }
         }
     }
@@ -3181,6 +3321,7 @@ mod tests {
             false,
             false,
             false,
+            &mut SearchStop::never(),
         )
         .unwrap();
         let minimum_depth = minimum_complete_tree_depth(&literal_frequencies)
@@ -3231,6 +3372,7 @@ mod tests {
             false,
             true,
             true,
+            &mut SearchStop::never(),
         )
         .unwrap();
 
@@ -3277,6 +3419,50 @@ mod tests {
             }
         }
         assert_eq!(actual, expected.unwrap());
+    }
+
+    #[test]
+    fn independent_depth_frontier_returns_its_best_complete_plan_on_stop() {
+        let (literal_frequencies, distance_frequencies) = reduced_depth_fixture(0xee81_ca19);
+        let complete = plan_bounded_depth_tree_candidate(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            false,
+            true,
+            true,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
+
+        let mut polls = 0;
+        let mut stop_after_two = || {
+            polls += 1;
+            polls > 2
+        };
+        let partial = plan_bounded_depth_tree_candidate(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            false,
+            true,
+            true,
+            &mut SearchStop::callback(&mut stop_after_two),
+        )
+        .unwrap();
+
+        assert_eq!(polls, 3);
+        assert!(partial.bits >= complete.bits);
+        assert!(plan_bounded_depth_tree_candidate(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            false,
+            true,
+            true,
+            &mut SearchStop::always(),
+        )
+        .is_none());
     }
 
     #[test]

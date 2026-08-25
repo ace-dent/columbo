@@ -99,6 +99,11 @@ const DEFLATE_MAX_STORED_BLOCK_PLAIN: u64 = 65_535;
 const PARALLEL_ROUTE_MAX_COMPRESSED: usize = 8 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_MODEL: usize = 64 * 1_024 * 1_024;
+// A post-deadline tree rescue reparses and may re-emit its completed parent.
+// Cap both byte traversals at one MiB and the block walk at the existing
+// narrow-list bound; only one block receives the fixed-alphabet tree search.
+const BOUNDED_DEPTH_RESCUE_MAX_COMPRESSED: usize = 1_024 * 1_024;
+const BOUNDED_DEPTH_RESCUE_MAX_DECODED: u64 = 1_024 * 1_024;
 // A small ordinary floor is cheap enough to establish before launching the
 // heavier source graphs. Above this class, overlap preserves max-search wall
 // time unless the floor's decoded work is itself large enough to cause working
@@ -1701,17 +1706,29 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // The compact pass above shares this frontier when its structural work
     // bounds apply. Every other completed stream receives the general linear
     // sibling, so an existing compact smoother gate cannot create a coverage
-    // hole. It starts only while route time remains, observes the hard stop
-    // between blocks, and can never discard the incumbent.
-    if !bounded_depth_covered && bounded_depth_tree_eligible && deadline.can_start_route() {
+    // hole. Like the compact terminal floor, this is bounded finalization of
+    // the selected lineage rather than a new heuristic route. It polls the
+    // hard stop between exact tree pairs and blocks; at that boundary the
+    // explicit one-block rescue above finishes only its fixed work class. Both
+    // forms retain the complete incumbent.
+    let mut bounded_depth_stop = deadline.hard_stop();
+    let bounded_depth_hard_expired = bounded_depth_stop.reached();
+    if !bounded_depth_covered
+        && bounded_depth_tree_eligible
+        && (!bounded_depth_hard_expired || bounded_depth_stop.permits_bounded_finalization())
+    {
         let tree_step = progress.start("Bounded-depth tree floor");
-        let tree = refine_with_bounded_depth_tree_floor(
-            &candidate,
-            options,
-            decoded_limit,
-            identity,
-            &mut deadline.hard_stop(),
-        )?;
+        let tree = if bounded_depth_hard_expired {
+            refine_with_bounded_depth_tree_rescue(&candidate, options, decoded_limit, identity)?
+        } else {
+            refine_with_bounded_depth_tree_floor(
+                &candidate,
+                options,
+                decoded_limit,
+                identity,
+                &mut bounded_depth_stop,
+            )?
+        };
         tree_step.finish(tree.as_ref().map(|tree| {
             candidate_progress(
                 tree,
@@ -3739,7 +3756,10 @@ fn refine_with_compact_balanced_tree_floor(
 /// Apply the complete feasible restricted-depth frontier to a completed
 /// Huffman stream. This is a terminal sibling, so a locally attractive tree
 /// can never redirect or replace the established search lineage unless the
-/// fully emitted stream is strictly smaller.
+/// fully emitted stream is strictly smaller. If the hard stop closes during a
+/// block, its best completed tree is retained and later blocks reuse their
+/// originals, preserving a complete stream prefix rather than losing the
+/// whole terminal pass.
 fn refine_with_bounded_depth_tree_floor(
     candidate: &Candidate,
     options: &Options,
@@ -3758,14 +3778,15 @@ fn refine_with_bounded_depth_tree_floor(
     }
     let mut alignment = 0_u8;
     let mut improved = false;
+    let mut search_open = true;
     for block in &stream.blocks {
-        if expired.reached() {
-            return Ok(None);
+        if search_open && expired.reached() {
+            search_open = false;
         }
         let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
             return Ok(None);
         };
-        let bounded = (block.source_type == SourceBlockType::Dynamic)
+        let bounded = (search_open && block.source_type == SourceBlockType::Dynamic)
             .then(|| {
                 plan_bounded_depth_tree_candidate(
                     &block.tokens,
@@ -3773,7 +3794,8 @@ fn refine_with_bounded_depth_tree_floor(
                     &block.distance_frequencies,
                     options.strict,
                     options.exhaustive,
-                    false,
+                    options.exhaustive,
+                    expired,
                 )
             })
             .flatten()
@@ -3801,6 +3823,101 @@ fn refine_with_bounded_depth_tree_floor(
     let rebuilt =
         build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)?;
     Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("Bounded-depth tree floor")))
+}
+
+/// Finish one exact mixed-depth tree probe after the hard search boundary.
+///
+/// Payload/header search is independent of token count once frequencies are
+/// known, so one dynamic block has a fixed Deflate-alphabet frontier. Choose
+/// the largest transmitted dynamic block, price that complete frontier, and
+/// emit at most one bounded stream sibling. One-MiB compressed/decoded limits
+/// and the existing 128-block narrow-list bound cap reparse and emission work;
+/// no file family or measured corpus band participates in admission.
+fn refine_with_bounded_depth_tree_rescue(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<Option<Candidate>> {
+    if !options.exhaustive
+        || !bounded_depth_rescue_sizes_are_bounded(candidate.data.len(), identity.decoded_size)
+    {
+        return Ok(None);
+    }
+    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    if stream.blocks.len() > NARROW_SOURCE_LIST_MAX_BLOCKS {
+        return Ok(None);
+    }
+    let Some(priority_block) = stream
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| block.source_type == SourceBlockType::Dynamic)
+        .max_by_key(|(_, block)| block.original.map_or(0, |original| original.len))
+        .map(|(index, _)| index)
+    else {
+        return Ok(None);
+    };
+
+    let mut plans = Vec::new();
+    if plans.try_reserve_exact(stream.blocks.len()).is_err() {
+        return Ok(None);
+    }
+    let mut alignment = 0_u8;
+    let mut improved = false;
+    let mut never_expires = SearchStop::never();
+    for (block_index, block) in stream.blocks.iter().enumerate() {
+        let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
+            return Ok(None);
+        };
+        let bounded = (block_index == priority_block)
+            .then(|| {
+                plan_bounded_depth_tree_candidate(
+                    &block.tokens,
+                    &block.literal_frequencies,
+                    &block.distance_frequencies,
+                    options.strict,
+                    true,
+                    true,
+                    &mut never_expires,
+                )
+            })
+            .flatten()
+            .filter(|dynamic| dynamic.bits < original.len);
+        let (bits, representation) = if let Some(dynamic) = bounded {
+            improved = true;
+            (dynamic.bits, Representation::Dynamic(dynamic))
+        } else {
+            (original.len, Representation::Original(original))
+        };
+        plans.push(PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            bits,
+            representation,
+            source_type: block.source_type,
+        });
+        alignment = ((u64::from(alignment) + bits) & 7) as u8;
+    }
+    if !improved {
+        return Ok(None);
+    }
+
+    let source = rewritten_input(candidate, &stream, decoded_limit, identity);
+    let rebuilt = build_candidate_from_plans(
+        source,
+        plans,
+        options,
+        0,
+        ReplayPlanner::Full,
+        &mut never_expires,
+    )?;
+    Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("Bounded-depth tree rescue")))
+}
+
+fn bounded_depth_rescue_sizes_are_bounded(compressed_bytes: usize, decoded_bytes: u64) -> bool {
+    compressed_bytes <= BOUNDED_DEPTH_RESCUE_MAX_COMPRESSED
+        && decoded_bytes <= BOUNDED_DEPTH_RESCUE_MAX_DECODED
 }
 
 /// Apply raw restricted-depth and RLE-smoothed payload trees to a completed
@@ -3839,6 +3956,7 @@ fn refine_with_compact_payload_tree_floor(
     }
     let mut alignment = 0_u8;
     let mut improved = false;
+    let mut never_expires = SearchStop::never();
     for block in &stream.blocks {
         let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
             return Ok((false, None));
@@ -3852,6 +3970,7 @@ fn refine_with_compact_payload_tree_floor(
                     options.strict,
                     options.exhaustive,
                     options.exhaustive,
+                    &mut never_expires,
                 );
                 if let Some(smoothed) = plan_rle_smoothed_tree_candidate(
                     &block.tokens,
@@ -6025,6 +6144,22 @@ mod tests {
             1,
             oversized_token_count,
             1,
+        ));
+    }
+
+    #[test]
+    fn bounded_depth_rescue_has_explicit_reparse_and_emission_limits() {
+        assert!(bounded_depth_rescue_sizes_are_bounded(
+            BOUNDED_DEPTH_RESCUE_MAX_COMPRESSED,
+            BOUNDED_DEPTH_RESCUE_MAX_DECODED,
+        ));
+        assert!(!bounded_depth_rescue_sizes_are_bounded(
+            BOUNDED_DEPTH_RESCUE_MAX_COMPRESSED + 1,
+            1,
+        ));
+        assert!(!bounded_depth_rescue_sizes_are_bounded(
+            1,
+            BOUNDED_DEPTH_RESCUE_MAX_DECODED + 1,
         ));
     }
 
