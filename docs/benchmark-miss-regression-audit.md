@@ -18,7 +18,7 @@ current results.
 | --- | ---: | --- | --- |
 | DeflOpt full journal | 1,914 rows / 957 pairs | `c09b1fc3…` | 14 strict-policy rows; no errors |
 | DeflOpt current family sample | 36 rows / 18 pairs | `9779c011…` | no miss, no error, Max never worse than Default |
-| Defluff relaxed journal | all 66 pairs | `db1556f4…` | no miss, error, or prior-result regression |
+| Defluff relaxed journal | all 66 pairs | `3af16f7a…` | no miss, error, or prior-result regression; 46 outputs improve and none regress |
 | timed deft4j full journal | 1,621 rows | `ef63e322…` | 17 strict-policy rows and one safe PNG-preservation row; no errors |
 | timed deft4j current family sample | 25 rows | `9779c011…` | one known strict-policy miss; no errors |
 | timed deft4j current PngSuite group | all 161 paired files | `9779c011…` | three strict-policy rows; no errors; 38 bytes / 298 bits smaller than the old journal |
@@ -27,12 +27,12 @@ current results.
 | Priority guard | 100 unique files | `fa9b3559…` | 79 floors pass; 21 older floors remain; no new failure |
 
 The current candidate is `target/release/columbo`, SHA-256
-`9779c0115ff8bb08fd3fd852faa2c425520c62e26fd1c227aee3b20ff2ad01f3`.
-The complete guard and scoped APNG evidence use the immediately preceding
-`fa9b3559…` build. The only intervening source change replaces an anonymous
-worker-result tuple with named fields. On the current build, all 61 DeflOpt and
-deft4j family-sample outputs reproduce the earlier byte and bit counts exactly,
-and the four guards repaired by the accepted routing changes pass directly.
+`3af16f7a3e096c4dd1634a2cefeae832113a3b052120bc45275dd8c44b4648f1`.
+Its complete Defluff journal is current. The DeflOpt, deft4j, and PngSuite
+family samples use the preceding `9779c011…` candidate; the complete guard and
+scoped APNG evidence use `fa9b3559…`. Hashes remain explicit because the latest
+bounded-tree frontier change can affect Max routing and those larger journals
+have not been relabelled as current-source results.
 
 ## Reference misses
 
@@ -56,9 +56,10 @@ refresh finishes.
 
 Defluff uses the compatibility-sensitive spellings exposed by
 `--strict 0`; the comparison is therefore relaxed on both sides. All 66 cases
-complete. Columbo is equal on 15, strictly better on 51, and smaller by 32
-bytes / 318 meaningful bits in aggregate. Strictness is never relaxed in
-ordinary Default use.
+complete. Columbo is equal on eight, strictly better on 58, and smaller by 102
+bytes / 852 meaningful bits in aggregate. Compared with the preceding accepted
+run, 46 outputs improve by 70 bytes / 534 bits in aggregate and none regress.
+Strictness is never relaxed in ordinary Default use.
 
 ### Timed deft4j
 
