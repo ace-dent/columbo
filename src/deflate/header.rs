@@ -25,6 +25,19 @@ use super::stop::SearchStop;
 const INF: u64 = u64::MAX / 4;
 const MAX_HEADER_PLAN_CACHE_ENTRIES: usize = 512;
 const REDUCED_PAYLOAD_TREE_DEPTHS: [u8; 2] = [10, 9];
+const MAX_RESTRICTED_PAYLOAD_TREE_DEPTH: u8 = 14;
+
+fn minimum_complete_tree_depth(frequencies: &[u32]) -> u8 {
+    let populated = frequencies
+        .iter()
+        .filter(|&&frequency| frequency != 0)
+        .count();
+    if populated <= 1 {
+        1
+    } else {
+        (usize::BITS - (populated - 1).leading_zeros()) as u8
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct HeaderPlanCacheStats {
@@ -474,6 +487,7 @@ pub(crate) fn best_dynamic_plan_cached(
                 &build_distance_frequencies,
                 extra_bits,
                 max_bits,
+                true,
                 header_cache,
             ) {
                 keep_better(&mut best, candidate);
@@ -1085,6 +1099,7 @@ fn exact_tree_candidate(
     build_distance_frequencies: &[u32; 30],
     extra_bits: u64,
     max_bits: u8,
+    exhaustive: bool,
     header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
     let literal_lengths = make_lengths_defluff_exact(build_literal_frequencies, max_bits, 0);
@@ -1112,9 +1127,49 @@ fn exact_tree_candidate(
         &literal_lengths,
         &distance_lengths,
         data_bits,
-        true,
+        exhaustive,
         header_cache,
     )
+}
+
+/// Price every feasible restricted payload-tree depth without changing tokens.
+///
+/// The minimum comes from the prefix-code capacity bound `2^depth >= leaves`;
+/// the frontier then covers every ceiling below Deflate's unrestricted
+/// fifteen-bit maximum. This avoids using corpus-trained token-count bands to
+/// choose one ceiling. The paired candidate remains additive at stream level:
+/// callers retain their completed parent and accept it only after exact
+/// emission.
+pub(crate) fn plan_bounded_depth_tree_candidate(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    strict: bool,
+) -> Option<DynamicPlan> {
+    let mut build_literal_frequencies = *literal_frequencies;
+    ensure_code_symbols(&mut build_literal_frequencies, strict);
+    let mut build_distance_frequencies = *distance_frequencies;
+    ensure_distance_symbols(&mut build_distance_frequencies, strict);
+    let minimum_depth = minimum_complete_tree_depth(&build_literal_frequencies)
+        .max(minimum_complete_tree_depth(&build_distance_frequencies));
+    let extra_bits = token_extra_bits(tokens);
+    let mut header_cache = HeaderPlanCache::new();
+    let mut best = None;
+    for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
+        if let Some(candidate) = exact_tree_candidate(
+            literal_frequencies,
+            distance_frequencies,
+            &build_literal_frequencies,
+            &build_distance_frequencies,
+            extra_bits,
+            max_bits,
+            false,
+            &mut header_cache,
+        ) {
+            keep_better(&mut best, candidate);
+        }
+    }
+    best
 }
 
 /// Price a compact RLE-smoothed payload-tree frontier.
@@ -1160,6 +1215,7 @@ pub(crate) fn plan_rle_smoothed_tree_candidate(
                 build_distance_frequencies,
                 extra_bits,
                 max_bits,
+                true,
                 &mut cache,
             ) {
                 keep_better(&mut best, candidate);
@@ -3012,6 +3068,47 @@ mod tests {
     }
 
     #[test]
+    fn minimum_complete_depth_follows_prefix_code_capacity() {
+        assert_eq!(minimum_complete_tree_depth(&[]), 1);
+        assert_eq!(minimum_complete_tree_depth(&[1]), 1);
+        assert_eq!(minimum_complete_tree_depth(&[1, 1]), 1);
+        assert_eq!(minimum_complete_tree_depth(&[1, 1, 1]), 2);
+        assert_eq!(minimum_complete_tree_depth(&[1; 256]), 8);
+        assert_eq!(minimum_complete_tree_depth(&[1; 257]), 9);
+    }
+
+    #[test]
+    fn bounded_depth_frontier_matches_every_feasible_restricted_ceiling() {
+        let (literal_frequencies, distance_frequencies) = reduced_depth_fixture(0x9e37_79b9);
+        let actual = plan_bounded_depth_tree_candidate(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            false,
+        )
+        .unwrap();
+        let minimum_depth = minimum_complete_tree_depth(&literal_frequencies)
+            .max(minimum_complete_tree_depth(&distance_frequencies));
+        let mut cache = HeaderPlanCache::new();
+        let mut expected = None;
+        for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
+            if let Some(candidate) = exact_tree_candidate(
+                &literal_frequencies,
+                &distance_frequencies,
+                &literal_frequencies,
+                &distance_frequencies,
+                0,
+                max_bits,
+                false,
+                &mut cache,
+            ) {
+                keep_better(&mut expected, candidate);
+            }
+        }
+        assert_eq!(actual, expected.unwrap());
+    }
+
+    #[test]
     fn reduced_depth_candidates_beat_full_depth_tree_families() {
         for (seed, max_bits, expected_bits) in [
             (0x9e37_79b9_u32, 10_u8, (48_667, 48_693)),
@@ -3026,6 +3123,7 @@ mod tests {
                 &distance_frequencies,
                 0,
                 max_bits,
+                true,
                 &mut cache,
             )
             .unwrap();

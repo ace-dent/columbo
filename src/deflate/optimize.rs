@@ -14,7 +14,8 @@ use super::bitstream::BitWriter;
 use super::block::{emit_block, plan_block, reusable_original_bits};
 use super::deft4j::plan_source_blocks;
 use super::header::{
-    balanced_tree_opportunities, plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths,
+    balanced_tree_opportunities, plan_bounded_depth_tree_candidate,
+    plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths,
     plan_rle_smoothed_tree_candidate, BalancedTreeOpportunities,
 };
 use super::model::{
@@ -473,6 +474,10 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     let smoothed_tree_eligible = !options.timeout.is_zero()
         && original.len() <= COMPACT_TREE_MAX_COMPRESSED
         && parsed.decoded_size <= COMPACT_TREE_MAX_DECODED;
+    // The general depth floor is a linear terminal pass over any completed
+    // stream. Admission depends on available route time, not on a
+    // corpus-trained size band; exact whole-stream pricing decides acceptance.
+    let bounded_depth_tree_eligible = !options.timeout.is_zero();
     let compact_proven_feedback_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && source.blocks.len() == 1
@@ -1656,14 +1661,12 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         candidate.replace_if_smaller(complete_default);
     }
 
-    // This bounded exact-tree price is deterministic finalization of the
-    // already completed winner. Finish it even after the soft route deadline,
-    // just as the lineage-specific balanced-tree floor above does; it cannot
-    // start another token search or discard the incumbent.
+    let mut bounded_depth_covered = false;
     if smoothed_tree_eligible {
-        let tree_step = progress.start("RLE-smoothed tree floor");
-        let mut tree =
-            refine_with_rle_smoothed_tree_floor(&candidate, options, decoded_limit, identity)?;
+        let tree_step = progress.start("Compact payload-tree floor");
+        let (covered, tree) =
+            refine_with_compact_payload_tree_floor(&candidate, options, decoded_limit, identity)?;
+        bounded_depth_covered = covered;
         tree_step.finish(tree.as_ref().map(|tree| {
             candidate_progress(
                 tree,
@@ -1671,10 +1674,13 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 tree.is_strictly_smaller_than_source(source),
             )
         }));
-        if let Some(tree) = tree.as_mut() {
-            let closure_step = progress.start("RLE-smoothed balanced-tree closure");
-            let closure = refine_with_rle_smoothed_balanced_tree_closure(
-                tree,
+        let compact_payload_tree_won = tree
+            .map(|tree| candidate.replace_if_smaller(tree))
+            .unwrap_or(false);
+        if compact_payload_tree_won {
+            let closure_step = progress.start("Compact payload-tree balanced closure");
+            let closure = refine_with_compact_payload_tree_balanced_closure(
+                &candidate,
                 options,
                 decoded_limit,
                 identity,
@@ -1687,9 +1693,32 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 )
             }));
             if let Some(closure) = closure {
-                tree.replace_if_smaller(closure);
+                candidate.replace_if_smaller(closure);
             }
         }
+    }
+
+    // The compact pass above shares this frontier when its structural work
+    // bounds apply. Every other completed stream receives the general linear
+    // sibling, so an existing compact smoother gate cannot create a coverage
+    // hole. It starts only while route time remains, observes the hard stop
+    // between blocks, and can never discard the incumbent.
+    if !bounded_depth_covered && bounded_depth_tree_eligible && deadline.can_start_route() {
+        let tree_step = progress.start("Bounded-depth tree floor");
+        let tree = refine_with_bounded_depth_tree_floor(
+            &candidate,
+            options,
+            decoded_limit,
+            identity,
+            &mut deadline.hard_stop(),
+        )?;
+        tree_step.finish(tree.as_ref().map(|tree| {
+            candidate_progress(
+                tree,
+                source.meaningful_bits,
+                tree.is_strictly_smaller_than_source(source),
+            )
+        }));
         if let Some(tree) = tree {
             candidate.replace_if_smaller(tree);
         }
@@ -3707,35 +3736,22 @@ fn refine_with_compact_balanced_tree_floor(
     .map(|candidate| Some(candidate.named("Columbo compact balanced-tree floor")))
 }
 
-/// Apply RLE-smoothed payload trees to a completed compact Huffman stream.
-///
-/// Keeping this out of the central block planner is deliberate: tree prices
-/// influence later token feedback, so replacing an intermediate winner can
-/// lose a better downstream fixed point. This terminal sibling preserves the
-/// completed parent and is accepted only after exact whole-stream emission.
-fn refine_with_rle_smoothed_tree_floor(
+/// Apply the complete feasible restricted-depth frontier to a completed
+/// Huffman stream. This is a terminal sibling, so a locally attractive tree
+/// can never redirect or replace the established search lineage unless the
+/// fully emitted stream is strictly smaller.
+fn refine_with_bounded_depth_tree_floor(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
     identity: StreamIdentity,
+    expired: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
     let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
-    if stream.blocks.is_empty()
-        || stream.blocks.len() > RLE_SMOOTHED_TREE_FLOOR_MAX_BLOCKS
-        || stream
-            .blocks
-            .iter()
-            .any(|block| block.source_type == SourceBlockType::Stored)
-        || stream
-            .blocks
-            .iter()
-            .try_fold(0_usize, |count, block| {
-                count.checked_add(block.tokens.len())
-            })
-            .map_or(true, |count| count > COMPACT_TREE_MAX_TOKENS)
-    {
+    if stream.blocks.is_empty() {
         return Ok(None);
     }
+
     let mut plans = Vec::new();
     if plans.try_reserve_exact(stream.blocks.len()).is_err() {
         return Ok(None);
@@ -3743,12 +3759,15 @@ fn refine_with_rle_smoothed_tree_floor(
     let mut alignment = 0_u8;
     let mut improved = false;
     for block in &stream.blocks {
+        if expired.reached() {
+            return Ok(None);
+        }
         let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
             return Ok(None);
         };
-        let smoothed = (block.source_type == SourceBlockType::Dynamic)
+        let bounded = (block.source_type == SourceBlockType::Dynamic)
             .then(|| {
-                plan_rle_smoothed_tree_candidate(
+                plan_bounded_depth_tree_candidate(
                     &block.tokens,
                     &block.literal_frequencies,
                     &block.distance_frequencies,
@@ -3757,7 +3776,7 @@ fn refine_with_rle_smoothed_tree_floor(
             })
             .flatten()
             .filter(|dynamic| dynamic.bits < original.len);
-        let (bits, representation) = if let Some(dynamic) = smoothed {
+        let (bits, representation) = if let Some(dynamic) = bounded {
             improved = true;
             (dynamic.bits, Representation::Dynamic(dynamic))
         } else {
@@ -3775,6 +3794,96 @@ fn refine_with_rle_smoothed_tree_floor(
     if !improved {
         return Ok(None);
     }
+
+    let source = rewritten_input(candidate, &stream, decoded_limit, identity);
+    let rebuilt =
+        build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)?;
+    Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("Bounded-depth tree floor")))
+}
+
+/// Apply raw restricted-depth and RLE-smoothed payload trees to a completed
+/// compact Huffman stream.
+///
+/// Keeping this out of the central block planner is deliberate: tree prices
+/// influence later token feedback, so replacing an intermediate winner can
+/// lose a better downstream fixed point. This terminal sibling preserves the
+/// completed parent and is accepted only after exact whole-stream emission.
+fn refine_with_compact_payload_tree_floor(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<(bool, Option<Candidate>)> {
+    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    if stream.blocks.is_empty()
+        || stream.blocks.len() > RLE_SMOOTHED_TREE_FLOOR_MAX_BLOCKS
+        || stream
+            .blocks
+            .iter()
+            .any(|block| block.source_type == SourceBlockType::Stored)
+        || stream
+            .blocks
+            .iter()
+            .try_fold(0_usize, |count, block| {
+                count.checked_add(block.tokens.len())
+            })
+            .map_or(true, |count| count > COMPACT_TREE_MAX_TOKENS)
+    {
+        return Ok((false, None));
+    }
+    let mut plans = Vec::new();
+    if plans.try_reserve_exact(stream.blocks.len()).is_err() {
+        return Ok((false, None));
+    }
+    let mut alignment = 0_u8;
+    let mut improved = false;
+    for block in &stream.blocks {
+        let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
+            return Ok((false, None));
+        };
+        let tree_candidate = (block.source_type == SourceBlockType::Dynamic)
+            .then(|| {
+                let mut best = plan_bounded_depth_tree_candidate(
+                    &block.tokens,
+                    &block.literal_frequencies,
+                    &block.distance_frequencies,
+                    options.strict,
+                );
+                if let Some(smoothed) = plan_rle_smoothed_tree_candidate(
+                    &block.tokens,
+                    &block.literal_frequencies,
+                    &block.distance_frequencies,
+                    options.strict,
+                ) {
+                    if best
+                        .as_ref()
+                        .map_or(true, |current| smoothed.bits < current.bits)
+                    {
+                        best = Some(smoothed);
+                    }
+                }
+                best
+            })
+            .flatten()
+            .filter(|dynamic| dynamic.bits < original.len);
+        let (bits, representation) = if let Some(dynamic) = tree_candidate {
+            improved = true;
+            (dynamic.bits, Representation::Dynamic(dynamic))
+        } else {
+            (original.len, Representation::Original(original))
+        };
+        plans.push(PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            bits,
+            representation,
+            source_type: block.source_type,
+        });
+        alignment = ((u64::from(alignment) + bits) & 7) as u8;
+    }
+    if !improved {
+        return Ok((true, None));
+    }
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     let mut never_expires = SearchStop::never();
     let rebuilt = build_candidate_from_plans(
@@ -3785,7 +3894,10 @@ fn refine_with_rle_smoothed_tree_floor(
         ReplayPlanner::Full,
         &mut never_expires,
     )?;
-    Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("RLE-smoothed tree floor")))
+    Ok((
+        true,
+        (rebuilt.bits < candidate.bits).then(|| rebuilt.named("Compact payload-tree floor")),
+    ))
 }
 
 /// Stabilize one balanced-tree rewrite through proven-feedback's fixed point.
@@ -3807,14 +3919,15 @@ fn refine_with_compact_proven_feedback(
     build_compact_proven_feedback_candidate(source, options, &mut never_expires)
 }
 
-/// Close the bounded tree-shape dependency exposed by a winning smoother.
+/// Close the bounded tree-shape dependency exposed by a winning payload-tree
+/// floor.
 ///
 /// The fixed-point smoother can expose a profitable pair/quad Kraft move that
 /// the parent tree did not contain. Price that already-bounded tree-only floor
 /// once, then reapply smoothing without rerunning token feedback or the
 /// ordinary/Max planner. Further rounds produce diminishing corpus gains for
 /// a measurable Default slowdown, so they remain a rejected expansion.
-fn refine_with_rle_smoothed_balanced_tree_closure(
+fn refine_with_compact_payload_tree_balanced_closure(
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
@@ -3826,11 +3939,11 @@ fn refine_with_rle_smoothed_balanced_tree_closure(
         return Ok(None);
     };
     if let Some(smoothed) =
-        refine_with_rle_smoothed_tree_floor(&closed, options, decoded_limit, identity)?
+        refine_with_compact_payload_tree_floor(&closed, options, decoded_limit, identity)?.1
     {
         closed.replace_if_smaller(smoothed);
     }
-    Ok(Some(closed.named("RLE-smoothed balanced-tree closure")))
+    Ok(Some(closed.named("Compact payload-tree balanced closure")))
 }
 
 /// Apply the full Columbo max planner to a complete rewritten candidate.
@@ -4721,7 +4834,7 @@ mod tests {
             representation: Representation::Original(original),
             source_type: block.source_type,
         };
-        let (data, bits) = emit_plans(&raw, &[plan.clone(), plan], true).unwrap();
+        let (data, bits) = emit_plans(&raw, &[plan.clone(), plan.clone()], true).unwrap();
         let combined = parse_stream(&data, 1 << 20).unwrap();
         assert_eq!(combined.blocks.len(), 2);
         let identity = StreamIdentity {
@@ -4738,10 +4851,15 @@ mod tests {
             max_planner_is_stable: false,
         };
 
-        let refined =
-            refine_with_rle_smoothed_tree_floor(&candidate, &Options::default(), 1 << 20, identity)
-                .unwrap()
-                .unwrap();
+        let refined = refine_with_compact_payload_tree_floor(
+            &candidate,
+            &Options::default(),
+            1 << 20,
+            identity,
+        )
+        .unwrap()
+        .1
+        .unwrap();
 
         assert!(refined.bits < candidate.bits);
         let reparsed = parse_validated_rewrite(&refined.data, 1 << 20, identity).unwrap();
@@ -4750,6 +4868,39 @@ mod tests {
             .blocks
             .iter()
             .all(|block| block.source_type == SourceBlockType::Dynamic));
+
+        let (data, bits) = emit_plans(&raw, &vec![plan; 9], true).unwrap();
+        let combined = parse_stream(&data, 1 << 20).unwrap();
+        let identity = StreamIdentity {
+            decoded_size: combined.decoded_size,
+            crc32: combined.crc32,
+            adler32: combined.adler32,
+        };
+        let candidate = Candidate {
+            data,
+            bits,
+            plans: Vec::new(),
+            block_report: None,
+            route: "test",
+            max_planner_is_stable: false,
+        };
+        let (covered, compact) = refine_with_compact_payload_tree_floor(
+            &candidate,
+            &Options::default(),
+            1 << 20,
+            identity,
+        )
+        .unwrap();
+        assert!(!covered);
+        assert!(compact.is_none());
+        refine_with_bounded_depth_tree_floor(
+            &candidate,
+            &Options::default(),
+            1 << 20,
+            identity,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
     }
 
     #[test]

@@ -33,6 +33,8 @@ the following exists:
   (v1.26 `HEAD`) verified 25 August 2026. Since `b122c8b`, only CI,
   release-note, and public-header files changed; compressor and decompressor
   sources did not.
+- 7-Zip [`f9d78aff`](https://github.com/ip7z/7zip/commit/f9d78aff31a5f2521ae7ddbdc97c4a8855808959)
+  (26.02 `HEAD`) verified 25 August 2026.
 - Turtledeflate classifications are pinned separately in
   [`turtledeflate-methods.md`](./turtledeflate-methods.md).
 
@@ -67,7 +69,7 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison | A format-specific diagnosed miss |
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
-| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
+| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
 | Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; bounded feedback | A real header requiring a retained alternate RLE histogram |
 | Runtime | Canonical plan and header caches; range and edge reuse; bounded fingerprints; parser/decode/emission hot paths | Measured duplicate work or a new profile hotspot |
 
@@ -84,7 +86,8 @@ which the bounded composition route supplies.
 | Symmetric and paired balanced-tree moves | Pair/quad Kraft-preserving moves on both alphabets; retain at most four moves per side and price at most sixteen pairs; Default requires non-positive combined payload delta; Max permits +18 bits | Removes the former literal-only asymmetry while preserving exact complete-header acceptance; focused literal, distance, paired, and opportunity tests pass |
 | Zopfli RLE-friendly pseudo-frequencies | One independently implemented paired Max candidate; no tree-family cross-product | Three of eleven Max files improved by 2, 13, and 9 bytes; other files tied; short no-gain cost was about 0.26 s/file |
 | Reduced-depth payload trees | Max only; build exact Defluff literal/distance pairs at maximum depths 10 and 9; no cross-product; poll the route deadline; accept only an exactly priced complete payload and dynamic header | Focused depth-10 and depth-9 cases beat every ordinary depth-15 tree-family pairing by 26 and 11 bits. Max A/B improved three of six PNGs by 5, 1, and 3 bytes and a 48.8 KiB GZIP by 2 bytes; aggregate PNG wall time was 88.132 → 88.250 s |
-| Dual RLE-smoothed terminal tree frontier | Terminal floor for completed compact Huffman streams: build independent Brotli fixed-point and classic Zopfli nearby-count seed families, then exact-price paired maximum depths 15 through 9 against the original token counts. One bounded pair/quad tree-only closure prices shapes exposed by a winning smoother and resmooths once. At most eight blocks/4,096 tokens, 8 KiB compressed, and 128 KiB decoded; no token search or lineage displacement | Default A/B across 176 PngSuite files selected the family in 36 of 166 Deflate streams and saved 300 aggregate bytes / 2,428 meaningful bits, with a 26-byte largest win. Nine streams gained 17 bytes / 115 bits from reduced depths beyond depth 15; the classic Zopfli seeds uniquely added 4 bytes / 32 bits across four streams; and the one-round balanced closure won 28 of 36 smoothed streams and added 19 bytes / 217 bits. Smoothing cost 51.633 ms across 165 eligible streams; closure cost 610.470 ms across its 36 inputs. Sample ZIP wins were 2 bytes and 9 bytes at complete-file level |
+| Bounded-depth terminal tree frontier | For every completed dynamic block, derive the minimum feasible maximum depth from `2^depth >= populated symbols`, then exact-price one paired raw-count Defluff tree at every ceiling through 14. The unrestricted 15-bit completed parent remains an independent fallback. The general linear pass starts only while route time remains and polls the hard deadline between blocks; compact streams share their existing bounded terminal pass, with the general pass as a structural-limit fallback. There is no corpus-trained file-size or token-count admission band | Against the pre-frontier binary, 55 of 176 PngSuite files became byte-smaller and eight more changed only by meaningful bits, saving 139 aggregate bytes with no growth; wall time was 27.70 → 27.82 s. Three unrelated medium GZIPs gained 3, 75, and 68 bytes (146 total). An 804 KiB GZIP gained 361 bytes; a 2.38 MiB no-gain control retained its incumbent exactly |
+| Compact payload-tree terminal floor | Terminal floor for completed compact Huffman streams: compare the raw bounded-depth frontier with independent Brotli fixed-point and classic Zopfli nearby-count seed families, the latter exact-priced at paired maximum depths 15 through 9. One bounded pair/quad tree-only closure prices shapes exposed by a winner and repeats the compact price once. At most eight blocks/4,096 tokens, 8 KiB compressed, and 128 KiB decoded; no token search or lineage displacement | Before the raw frontier was added, Default A/B across 176 PngSuite files selected smoothing in 36 of 166 Deflate streams and saved 300 aggregate bytes / 2,428 meaningful bits, with a 26-byte largest win. The classic Zopfli seeds uniquely added 4 bytes / 32 bits across four streams; the one-round balanced closure won 28 of 36 smoothed streams and added 19 bytes / 217 bits. Smoothing cost 51.633 ms across 165 eligible streams; closure cost 610.470 ms across its 36 inputs. Sample ZIP wins were 2 bytes and 9 bytes at complete-file level |
 | Header-aware proven-spelling composition | Max compact M3 only; source parent ≤4,000 tokens/80,000 bytes; generated spelling ≤8,000 tokens; 2–128 matches; target ≤8 matches; ≤4 spellings/match; beam 16; ≤32 exact plans | 98 of 1,706 eligible scanned blocks improved locally; final A/B wins were 1 byte/6 bits and 2 bits at equal bytes |
 | Adjacent-boundary reseat | Max comparison floors of 2–8 Huffman blocks; ≤8,192 tokens/512 KiB; keep one strongest strict replacement | Repeatable final wins: 10 bytes/80 bits, 1 byte/8 bits, and 3 bits at equal bytes |
 | Forced-split escape | Max only; 2–7 Huffman blocks; ≤8,192 tokens/512 KiB; force one well-separated runner-up adaptive basin, replan two children, then attempt one reseat | Reproducible 4-byte/25-bit final win; no displacement in the first wider PNG/APNG sample |
@@ -97,7 +100,8 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | --- | ---: | --- |
 | Safe scratch match expansion and sliced history-ring updates | 26.44 → 10.30 ms, about 61% | Oracle covers all match lengths, overlap periods, ring wrap, and sampled distances through 32,768 |
 | Decode entries carry base value and extra-bit width | 10.88 → 10.18 ms, about 6.4% | Canonical fallback and generated-table comparisons |
-| Literal/distance decode roots of 10/8 bits | About 2.3% faster real-stream parsing than 9/9 | Generated trees across root widths 7–11 |
+| Literal/distance decode roots of 10/6 bits | The distance change from eight to six bits was about 1–1.5% faster on three real parsing controls; a weighted synthetic decode was about 3% faster | Root widths are one bit above `ceil(log2(max alphabet size))`: 10 for 288 literal/length symbols and 6 for 32 distance symbols. Generated-tree oracles cover root widths 7–11, and the retained distance width passed real-stream A/B |
+| Single-level code-length decoder | Build was 64–67% faster and decode 53–54% faster in isolated release controls | Deflate's 19-symbol code-length alphabet has a format maximum of seven bits, so an independently built 128-byte table stores symbol and width directly. Canonical-table comparison, malformed-shape rejection, and physical-end fallback tests pass |
 | Contiguous progressive root-table expansion | 24.01 → 18.67 ms for 20,000 deep-table builds, about 22%; about 0.3% on real parsing | Canonical table oracle |
 | Generic Huffman construction | Variant zero about 34.5% faster; variant one about 45%; mixed-tie variants about 91% | Exact topology oracle across 19-, 30-, and 286-symbol alphabets and wrapped counts |
 | Match codeword plus extra field in one write | 1.68 → 1.16 ms for 100,000 matches, about 31% | Byte-identical wrapper differentials |
@@ -115,7 +119,8 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Experiment | Result | Reconsider only if |
 | --- | --- | --- |
 | K-best code-length-RLE feedback | One synthetic header saved 1 bit; 20 Default and 8 Max real comparisons produced no final gain; Default sample 2.67 → 4.00 s; isolated cleanup 84 → 178 ms | A diagnosed real header requires a specific alternate histogram or a cheaper frontier representation exists |
-| Broad reduced-depth tree frontier | Depths 14–11 produced no unique wins in a 162-file PNG probe; multiplying reduced literal/distance trees through the existing family cross-product slowed that corpus by about 12% and a 48.8 KiB no-gain GZIP control from about 1.5 to 4.2 s | A diagnosed miss needs one of the omitted depths or a substantially cheaper joint frontier |
+| Central-planner broad reduced-depth cross-product | Depths 14–11 produced no unique wins in the original 162-file PNG probe when multiplied through the ordinary literal/distance family cross-product; that placement slowed the corpus by about 12% and a 48.8 KiB no-gain GZIP control from about 1.5 to 4.2 s | Superseded for raw-count trees by the retained paired terminal frontier. Do not restore a family cross-product without a diagnosed tree requiring independently mixed alphabets |
+| Token-band-selected depth inside the central planner | One count-selected depth found attractive local trees, but changing intermediate prices redirected later feedback: PngSuite included final regressions (for example 1,688 → 1,692 and 1,568 → 1,569 bytes) and runtime rose about 4.8% | Keep the completed parent independent. The retained terminal sibling evaluates every mathematically feasible restricted ceiling and accepts only an exact whole-stream win |
 | Repeated post-smoothing balanced closure | Extending the retained one tree-only closure to four rounds added another 12 bytes / 106 bits on PngSuite, but raised isolated closure time from 0.619 to 1.550 s | A cheaper move frontier can recover the later rounds without repeating the complete bounded price |
 | Post-smoothing proven-feedback replay | The full compact feedback closure added the same 19 bytes as the retained direct tree-only closure but only 194 bits, costing 3.068 s instead of 0.619 s. Forcing its Max composition cost 9.348 s and reduced the win count | A diagnosed smoothed tree requires an actual token rewrite that the direct balanced-tree closure cannot reach |
 | Unused-symbol tree graft | Constructed win; 0 wins across 1,278 source dynamic blocks and 6 full Max routes; broad placement roughly doubled a short control | A diagnosed tree has the exact missing graft shape |
@@ -146,6 +151,29 @@ bulk history update. Columbo must still materialize one literal token and its
 frequency per byte; an output-only stored/literal shortcut is incompatible
 with its persistent model.
 
+## 7-Zip pinned-source audit
+
+The 25 August 2026 audit used 7-Zip 26.02 commit
+[`f9d78aff`](https://github.com/ip7z/7zip/commit/f9d78aff31a5f2521ae7ddbdc97c4a8855808959).
+The implementation was studied for algorithmic structure only; no 7-Zip code,
+identifiers, constants, or control flow were copied or translated.
+
+| 7-Zip area | Assessment | Columbo disposition |
+| --- | --- | --- |
+| [`DeflateEncoder.cpp`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/DeflateEncoder.cpp) bounded Huffman depth | Selects a reduced payload-tree depth from token-count bands | Retained as a more general additive frontier: prefix-code capacity derives the first feasible depth, every restricted ceiling through 14 is exactly priced, and the completed 15-bit parent remains independent. Neither eligibility nor depth selection is trained on the validation corpus |
+| [`HuffmanDecoder.h`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/HuffmanDecoder.h) and [`DeflateDecoder.cpp`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/CPP/7zip/Compress/DeflateDecoder.cpp) table shapes | Use a compact direct table for the seven-bit code-length alphabet and 10/6-bit payload roots | Retained with independently derived Rust layouts: a checked 128-byte code-length table plus general two-level payload tables. The 10/6 roots also follow the alphabet-capacity rule of one bit above the balanced width |
+| Recursive block subdivision | Recursively considers midpoint subdivisions while pricing encoded blocks | Columbo already covers the existing-token portion more broadly with cumulative histograms, adaptive exact cuts, a residue-aware boundary graph, inside-match boundaries, reseat, and forced-split escape. 7-Zip's subdivision is coupled to its fresh match parser |
+| Optimal parsing, match finder, and repeated price feedback | Finds new LZ77 matches and reparses under updated prices | Out of scope: Columbo may rewrite only source-proven matches and literals |
+| [`HuffEnc.c`](https://github.com/ip7z/7zip/blob/f9d78aff31a5f2521ae7ddbdc97c4a8855808959/C/HuffEnc.c) low-count leaf buckets | Reduces sorting work for a different Huffman construction path | Not retained. Columbo's alphabets are at most 286 symbols, its generic builders already have exact topology oracles and optimized two-front/heap paths, and profiling did not identify leaf sorting as a remaining hotspot. Replacing the ordering would also create a new tree family rather than a topology-preserving speed change |
+| Word-oriented bit I/O and architecture-specific checksum paths | Optimize a different buffered-I/O and platform model | Existing Columbo controls rejected a wider reader refill and wider writer drain. Intrinsics conflict with `forbid(unsafe_code)`, and no checksum hotspot was measured |
+
+The new frontier has no empirical size gate. Compact streams receive it inside
+their existing bounded tree-only finalizer; every other completed topology can
+use the general pass while route time remains. The general pass polls the hard
+deadline between blocks, performs linear reparse/emission work within the
+parser's existing model limits, and replaces the incumbent only after exact
+emitted-bit comparison.
+
 ## ECT pinned-source audit
 
 The 25 August 2026 audit used ECT commit
@@ -155,7 +183,7 @@ recompression and container transforms that would change Columbo's scope.
 
 | ECT area | Assessment | Disposition |
 | --- | --- | --- |
-| [`GetAdvancedLengths`](https://github.com/fhanau/Efficient-Compression-Tool/blob/ab3f68bf4f0b1fdfb1646c6c70aa54a59d2515bb/src/zopfli/deflate.cpp#L681-L770) | Compares raw counts, classic Zopfli nearby-count smoothing, Brotli fixed-point smoothing, and reduced maximum depths | Raw depth 10/9 is retained in Max. Both smoothing families are independently priced at every depth from 15 through 9 in the bounded terminal frontier; keeping both produced unique wins. Depths 14–11 had no unique raw-count wins in the wider probe |
+| [`GetAdvancedLengths`](https://github.com/fhanau/Efficient-Compression-Tool/blob/ab3f68bf4f0b1fdfb1646c6c70aa54a59d2515bb/src/zopfli/deflate.cpp#L681-L770) | Compares raw counts, classic Zopfli nearby-count smoothing, Brotli fixed-point smoothing, and reduced maximum depths | Raw depth 10/9 remains in Max. Both smoothing families are independently priced at every depth from 15 through 9 in the compact terminal floor. The later 7-Zip audit motivated moving raw restricted depths into an additive completed-stream frontier; that placement made depths previously lost to central feedback useful without a family cross-product |
 | Dynamic-header spelling | ECT tries repeat-code masks and a small collection of header encodings | Already covered by Columbo's all-mask grid, balanced/residual and zero-continuation spellings, exact shortest RLE, and feedback/pruned-header routes |
 | `ReplaceBadCodes` | Replaces length-3 through length-7 matches with known literals under one priced tree, then rebuilds | Already covered more broadly by Columbo's exact match-to-literal families, all-literals endpoint, and header-aware/proven feedback |
 | Block splitting | Coarse-to-fine 3/9 probes on a greedy LZ parse, entropy or exact-count pricing, and largest-block recursion | Existing-token portion is covered by cumulative histograms, adaptive exact pricing, internal-match cuts, boundary graph, reseat, and forced-split escape. ECT's pre-split greedy match discovery is out of scope |
@@ -171,8 +199,9 @@ recompression and container transforms that would change Columbo's scope.
 | [Google Zopfli](https://github.com/google/zopfli) | All repeat-code masks; RLE-friendly pseudo-frequencies | Masks were already covered; pseudo-frequencies retained independently as one Max candidate. Optimal parsing, match discovery, and repeated block splitting are out of scope |
 | [QVXLabs Zopfli](https://github.com/QVXLabs/zopfli) | Fixed-point costs, reusable match caches, scaled iterations | Depends on fresh LZ77 parsing; comparison-encoder work only |
 | [libdeflate](https://github.com/ebiggers/libdeflate) | Match cache and minimum-cost parse, feedback passes, all-literals fallback, fixed-tree small-block pricing, fast tables/copies/bit I/O | All-literals and useful portable execution themes are implemented; remaining ratio methods require new matches; remaining hardware checksum/CPU dispatch work lacks a significant Columbo hotspot |
-| [7-Zip](https://github.com/ip7z/7zip) and [AdvanceCOMP](https://github.com/amadvance/advancecomp) | Priced optimal parsing and recompression | Outside existing-token scope |
-| [ECT](https://github.com/fhanau/Efficient-Compression-Tool) | Modified zlib/Zopfli recompression; newer Brotli fixed-point count smoothing beside classic Zopfli smoothing; exact comparison across reduced maximum payload-tree depths; coarse-to-fine block splitting; short-match literal replacement | Both smoothing families are retained independently as one bounded terminal tree frontier, and the raw reduced-depth dimension as paired depth-10/depth-9 Max candidates. Columbo already has broader header-RLE masks, match-to-literal feedback, adaptive/exact-histogram splitting, bounded reseat/escape routes, and parallel range pricing. Fresh match discovery, recompression, PNG pixel transforms, and JPEG work remain outside scope |
+| [7-Zip](https://github.com/ip7z/7zip) | Token-count-selected payload-tree depth; compact code-length decoder; 10/6-bit payload decode roots; recursive splitting; priced optimal parsing and match finding | Restricted depths are generalized into a complete feasible terminal frontier; the compact decoder and 10/6 roots are retained independently. Existing Columbo boundaries cover the in-scope split dimension. Fresh match discovery and optimal LZ parsing remain outside scope |
+| [AdvanceCOMP](https://github.com/amadvance/advancecomp) | Recompression | Outside existing-token scope |
+| [ECT](https://github.com/fhanau/Efficient-Compression-Tool) | Modified zlib/Zopfli recompression; newer Brotli fixed-point count smoothing beside classic Zopfli smoothing; exact comparison across reduced maximum payload-tree depths; coarse-to-fine block splitting; short-match literal replacement | Both smoothing families are retained independently in one compact terminal tree floor, with the raw reduced-depth dimension covered by Max depth-10/depth-9 pairs and the complete feasible terminal frontier. Columbo already has broader header-RLE masks, match-to-literal feedback, adaptive/exact-histogram splitting, bounded reseat/escape routes, and parallel range pricing. Fresh match discovery, recompression, PNG pixel transforms, and JPEG work remain outside scope |
 | Turtledeflate | Match enumeration, parse models, boundary refinement | Independent cumulative-histogram, adaptive-boundary, reseat, and forced-split concepts are implemented; match discovery remains excluded |
 
 ## Source map
@@ -206,15 +235,17 @@ header or boundary wins remain Max-only.
 
 Latest retained execution pass:
 
-- 444 Rust tests and formatting passed on Apple Silicon;
+- 449 Rust tests and formatting passed on Apple Silicon;
 - warning-free all-target Clippy passed after the retained change;
-- focused exact-cost oracles cover both retained maximum depths and complete
+- focused oracles cover canonical equivalence and physical-end fallback for
+  the compact code-length decoder, generated payload decode tables, the
+  prefix-capacity depth bound, exact dynamic-header cost, and complete
   payload-tree validity; and
-- release A/B runs covered the 176-file PngSuite default corpus, six Max PNGs,
-  GZIP controls, zlib controls, and compact ZIP samples. The new terminal
-  smoother won 36 PngSuite streams with no regressions; every emitted
-  contender remains subject to Columbo's wrapper reparse and decoded-identity
-  checks.
+- release A/B runs covered the 176-file PngSuite default corpus, three medium
+  GZIPs, 804 KiB and 2.38 MiB GZIP controls, six Max PNGs, zlib controls, and
+  compact ZIP samples. The bounded-depth frontier produced no byte regression;
+  every emitted contender remains subject to Columbo's wrapper reparse and
+  decoded-identity checks.
 
 ## Provenance and licensing
 
@@ -226,11 +257,15 @@ from Columbo's data model, invariants, and exact-cost behavior.
 - ECT source was not copied or translated. Its search exposed the general
   reduced-maximum-depth dimension and the value of comparing Zopfli's classic
   nearby-count smoother with Brotli's newer fixed-point smoother for Deflate.
-  Columbo's two-depth raw policy, fixed-size transforms, existing exact
-  package-merge builder, paired terminal frontier, work gates, complete-header
-  pricing, and regression fixtures are independently written. The transforms
-  retain explicit Google Zopfli Apache-2.0 and Google Brotli MIT attribution
-  beside their implementations.
+  Columbo's raw frontiers, fixed-size transforms, existing exact package-merge
+  builder, work policy, complete-header pricing, and regression fixtures are
+  independently written. The transforms retain explicit Google Zopfli
+  Apache-2.0 and Google Brotli MIT attribution beside their implementations.
+- 7-Zip source was not copied or translated. Its audit identified the useful
+  bounded-depth and decoder-table dimensions. Columbo independently derives a
+  full feasible depth frontier from prefix-code capacity, uses exact terminal
+  acceptance rather than upstream token bands, and builds Rust-specific decode
+  layouts with separate malformed-input and end-of-buffer handling.
 - libdeflate source was not copied or translated. The source-bit residue path,
   parser accounting, 64-bit decode layout, fixed 32-bit writer drain, names,
   tests, and control flow are Columbo-specific.

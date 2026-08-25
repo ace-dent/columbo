@@ -13,9 +13,8 @@ use std::sync::OnceLock;
 
 use super::bitstream::BitReader;
 use super::huffman::{
-    code_length_tree_shape_is_valid, payload_tree_shape_is_valid, Huffman,
-    DISTANCE_DECODE_ROOT_BITS, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
-    LITERAL_LENGTH_DECODE_ROOT_BITS,
+    payload_tree_shape_is_valid, CodeLengthDecoder, Huffman, DISTANCE_DECODE_ROOT_BITS,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS, LITERAL_LENGTH_DECODE_ROOT_BITS,
 };
 use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, RleToken, SourceBlockType, Token,
@@ -361,13 +360,10 @@ impl Parser<'_> {
         for &symbol in &CODE_LENGTH_ORDER[..hclen] {
             code_length_lengths[symbol] = self.reader.read(3)? as u8;
         }
-        let code_length_tree = Huffman::build_decoder(&code_length_lengths)
-            .ok_or_else(|| Error::new("invalid code-length Huffman tree"))?;
         // The code-length alphabet has none of the one-symbol exceptions used
         // by payload trees. zlib-compatible decoders require it to be complete.
-        if !code_length_tree_shape_is_valid(&code_length_lengths) {
-            return Err(Error::new("invalid code-length Huffman tree"));
-        }
+        let code_length_tree = CodeLengthDecoder::build(&code_length_lengths)
+            .ok_or_else(|| Error::new("invalid code-length Huffman tree"))?;
 
         let target = hlit + hdist;
         let mut lengths = Vec::with_capacity(target);

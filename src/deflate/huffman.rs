@@ -10,11 +10,15 @@ const MAX_CODE_BITS: usize = 15;
 const MAX_C_CODES: usize = 320;
 const MAX_TRACKED_DEPTH: usize = 63;
 const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
+#[cfg(test)]
 const DEFAULT_DECODE_ROOT_BITS: u8 = 9;
-// Payload alphabets use independently measured lookup/build/cache tradeoffs.
-// Code-length trees use the default but naturally cap at their seven-bit max.
+const CODE_LENGTH_DECODE_BITS: u8 = 7;
+const CODE_LENGTH_DECODE_SIZE: usize = 1 << CODE_LENGTH_DECODE_BITS;
+// Each payload root is one lookup bit above the balanced width implied by its
+// maximum alphabet: ceil(log2(288)) + 1 and ceil(log2(32)) + 1. Measurements
+// verify the format-derived choice against build/cache costs.
 pub(crate) const LITERAL_LENGTH_DECODE_ROOT_BITS: u8 = 10;
-pub(crate) const DISTANCE_DECODE_ROOT_BITS: u8 = 8;
+pub(crate) const DISTANCE_DECODE_ROOT_BITS: u8 = 6;
 
 const fn make_fixed_literal_code_lengths() -> [u8; 288] {
     let mut lengths = [0_u8; 288];
@@ -227,6 +231,81 @@ pub(crate) struct DecodedValue {
     pub(crate) extra_bits: u8,
 }
 
+/// Compact decoder for Deflate's 19-symbol code-length alphabet.
+///
+/// Every transmitted code length is at most seven bits, so one complete
+/// 128-entry table can store both the symbol and width in a byte. Payload
+/// alphabets keep the general two-level decoder and its value metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeLengthDecoder {
+    entries: [u8; CODE_LENGTH_DECODE_SIZE],
+}
+
+impl CodeLengthDecoder {
+    pub(crate) fn build(lengths: &[u8; 19]) -> Option<Self> {
+        if lengths
+            .iter()
+            .any(|&length| length > CODE_LENGTH_DECODE_BITS)
+            || !code_length_tree_shape_is_valid(lengths)
+        {
+            return None;
+        }
+
+        let mut count_by_length = [0_u16; CODE_LENGTH_DECODE_BITS as usize + 1];
+        for &length in lengths {
+            if length != 0 {
+                count_by_length[usize::from(length)] += 1;
+            }
+        }
+        let mut next_code = [0_u16; CODE_LENGTH_DECODE_BITS as usize + 1];
+        let mut code = 0_u16;
+        for bits in 1..=usize::from(CODE_LENGTH_DECODE_BITS) {
+            code = (code + count_by_length[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        let mut entries = [u8::MAX; CODE_LENGTH_DECODE_SIZE];
+        for (symbol, &length) in lengths.iter().enumerate() {
+            if length == 0 {
+                continue;
+            }
+            let index = usize::from(length);
+            let wire_code = usize::from(reverse_bits(next_code[index], length));
+            let stride = 1_usize << length;
+            let packed = ((symbol as u8) << 3) | length;
+            for slot in (wire_code..CODE_LENGTH_DECODE_SIZE).step_by(stride) {
+                entries[slot] = packed;
+            }
+            next_code[index] += 1;
+        }
+        entries
+            .iter()
+            .all(|&entry| entry != u8::MAX)
+            .then_some(Self { entries })
+    }
+
+    pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        if let Ok(value) = reader.peek(CODE_LENGTH_DECODE_BITS) {
+            let packed = self.entries[value as usize];
+            reader.drop_bits(packed & 7)?;
+            return Ok(u16::from(packed >> 3));
+        }
+
+        // A valid final stream can have fewer than seven physical bits left
+        // after a short codeword. Find that short code without requiring the
+        // wide table lookup to read past the input.
+        for bits in 1..=CODE_LENGTH_DECODE_BITS {
+            let value = reader.peek(bits)?;
+            let packed = self.entries[value as usize];
+            if packed & 7 == bits {
+                reader.drop_bits(bits)?;
+                return Ok(u16::from(packed >> 3));
+            }
+        }
+        Err(Error::new("invalid Huffman code in Deflate stream"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DecodeTable {
     entries: Vec<DecodeEntry>,
@@ -305,10 +384,12 @@ impl Huffman {
     /// Build the same canonical representation plus the parser's two-level
     /// decode table. Planner and emitter trees use `build()` so they do not pay
     /// this allocation cost.
+    #[cfg(test)]
     pub(crate) fn build_decoder(lengths: &[u8]) -> Option<Self> {
         Self::build_decoder_with_root_bits(lengths, DEFAULT_DECODE_ROOT_BITS)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_decoder_with_root_bits(lengths: &[u8], root_bits: u8) -> Option<Self> {
         let mut tree = Self::build(lengths)?;
         tree.decode_table = Some(build_decode_table(&tree, root_bits)?);
@@ -348,6 +429,7 @@ impl Huffman {
     }
 
     /// Decode one symbol, consuming no more than the tree's maximum length.
+    #[cfg(test)]
     pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         if let Some(table) = &self.decode_table {
             return self.decode_table(reader, table);
@@ -399,6 +481,7 @@ impl Huffman {
         })
     }
 
+    #[cfg(test)]
     fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
         if let Some((entry, bits)) = self.peek_decode_table(reader, table)? {
             reader.drop_bits(bits)?;
@@ -570,10 +653,8 @@ pub(crate) fn fixed_trees() -> (&'static Huffman, &'static Huffman) {
     static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     let (literal_length, distance) = FIXED.get_or_init(|| {
         (
-            Huffman::build_decoder(&FIXED_LITERAL_CODE_LENGTHS)
-                .expect("fixed literal tree is valid"),
-            Huffman::build_decoder(&FIXED_DISTANCE_CODE_LENGTHS)
-                .expect("fixed distance tree is valid"),
+            Huffman::build(&FIXED_LITERAL_CODE_LENGTHS).expect("fixed literal tree is valid"),
+            Huffman::build(&FIXED_DISTANCE_CODE_LENGTHS).expect("fixed distance tree is valid"),
         )
     });
     (literal_length, distance)
@@ -2164,6 +2245,57 @@ mod tests {
                 assert_eq!(canonical_reader.bit_position(), table_reader.bit_position());
             }
         }
+    }
+
+    #[test]
+    fn compact_code_length_decoder_matches_canonical_table() {
+        let mut lengths = [0_u8; 19];
+        lengths[..8].copy_from_slice(&[2, 3, 3, 3, 3, 3, 4, 4]);
+        let canonical = Huffman::build(&lengths).unwrap();
+        let compact = CodeLengthDecoder::build(&lengths).unwrap();
+        let symbols = [7, 0, 3, 6, 5, 2, 1, 4, 0, 7];
+        let mut writer = BitWriter::default();
+        for symbol in symbols {
+            let code = canonical.code(symbol).unwrap();
+            writer.write(u32::from(code.code), code.length).unwrap();
+        }
+        let encoded = writer.into_bytes();
+        let mut canonical_reader = BitReader::new(&encoded);
+        let mut compact_reader = BitReader::new(&encoded);
+        for symbol in symbols {
+            assert_eq!(
+                canonical.decode(&mut canonical_reader).unwrap(),
+                symbol as u16
+            );
+            assert_eq!(compact.decode(&mut compact_reader).unwrap(), symbol as u16);
+            assert_eq!(
+                canonical_reader.bit_position(),
+                compact_reader.bit_position()
+            );
+        }
+    }
+
+    #[test]
+    fn compact_code_length_decoder_rejects_invalid_shapes() {
+        assert!(CodeLengthDecoder::build(&[0; 19]).is_none());
+        let mut incomplete = [0_u8; 19];
+        incomplete[0] = 1;
+        assert!(CodeLengthDecoder::build(&incomplete).is_none());
+        let mut overlong = [0_u8; 19];
+        overlong[0] = 8;
+        assert!(CodeLengthDecoder::build(&overlong).is_none());
+    }
+
+    #[test]
+    fn compact_code_length_decoder_accepts_a_short_code_at_physical_end() {
+        let mut lengths = [0_u8; 19];
+        lengths[0] = 1;
+        lengths[1] = 1;
+        let decoder = CodeLengthDecoder::build(&lengths).unwrap();
+        let mut reader = BitReader::new(&[0]);
+        reader.read(7).unwrap();
+        assert_eq!(decoder.decode(&mut reader).unwrap(), 0);
+        assert_eq!(reader.bit_position(), 8);
     }
 
     #[test]
