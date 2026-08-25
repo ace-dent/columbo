@@ -1105,9 +1105,30 @@ fn exact_tree_candidate(
     let literal_lengths = make_lengths_defluff_exact(build_literal_frequencies, max_bits, 0);
     let distance_lengths = make_lengths_defluff_exact(build_distance_frequencies, max_bits, 0);
 
+    explicit_exact_tree_candidate(
+        literal_frequencies,
+        distance_frequencies,
+        &literal_lengths,
+        &distance_lengths,
+        extra_bits,
+        exhaustive,
+        header_cache,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explicit_exact_tree_candidate(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    extra_bits: u64,
+    exhaustive: bool,
+    header_cache: &mut HeaderPlanCache,
+) -> Option<DynamicPlan> {
     if literal_lengths.get(256).copied().unwrap_or(0) == 0
-        || !payload_tree_shape_is_valid(&literal_lengths, false)
-        || !payload_tree_shape_is_valid(&distance_lengths, true)
+        || !payload_tree_shape_is_valid(literal_lengths, false)
+        || !payload_tree_shape_is_valid(distance_lengths, true)
         || distance_frequencies
             .iter()
             .enumerate()
@@ -1119,13 +1140,13 @@ fn exact_tree_candidate(
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
         distance_frequencies,
-        &literal_lengths,
-        &distance_lengths,
+        literal_lengths,
+        distance_lengths,
         extra_bits,
     )?;
     plan_for_explicit_lengths_with_cost_cached(
-        &literal_lengths,
-        &distance_lengths,
+        literal_lengths,
+        distance_lengths,
         data_bits,
         exhaustive,
         header_cache,
@@ -1137,36 +1158,78 @@ fn exact_tree_candidate(
 /// The minimum comes from the prefix-code capacity bound `2^depth >= leaves`;
 /// the frontier then covers every ceiling below Deflate's unrestricted
 /// fifteen-bit maximum. This avoids using corpus-trained token-count bands to
-/// choose one ceiling. The paired candidate remains additive at stream level:
-/// callers retain their completed parent and accept it only after exact
-/// emission.
+/// choose one ceiling. The ordinary frontier pairs equal ceilings. A caller
+/// with a separate structural work bound may instead request the complete
+/// cross-product of the unique feasible trees for each alphabet; this is a
+/// finite tree-shape dimension, not a corpus gate. Both forms remain additive
+/// at stream level: callers retain their completed parent and accept a sibling
+/// only after exact emission.
 pub(crate) fn plan_bounded_depth_tree_candidate(
     tokens: &[Token],
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
     strict: bool,
+    exhaustive_header: bool,
+    independent_depths: bool,
 ) -> Option<DynamicPlan> {
     let mut build_literal_frequencies = *literal_frequencies;
     ensure_code_symbols(&mut build_literal_frequencies, strict);
     let mut build_distance_frequencies = *distance_frequencies;
     ensure_distance_symbols(&mut build_distance_frequencies, strict);
-    let minimum_depth = minimum_complete_tree_depth(&build_literal_frequencies)
-        .max(minimum_complete_tree_depth(&build_distance_frequencies));
     let extra_bits = token_extra_bits(tokens);
     let mut header_cache = HeaderPlanCache::new();
     let mut best = None;
-    for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
-        if let Some(candidate) = exact_tree_candidate(
-            literal_frequencies,
-            distance_frequencies,
-            &build_literal_frequencies,
-            &build_distance_frequencies,
-            extra_bits,
-            max_bits,
-            false,
-            &mut header_cache,
-        ) {
-            keep_better(&mut best, candidate);
+
+    if independent_depths {
+        let mut literal_candidates = Vec::new();
+        for max_bits in minimum_complete_tree_depth(&build_literal_frequencies)
+            ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
+        {
+            push_unique(
+                &mut literal_candidates,
+                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0),
+            );
+        }
+        let mut distance_candidates = Vec::new();
+        for max_bits in minimum_complete_tree_depth(&build_distance_frequencies)
+            ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
+        {
+            push_unique(
+                &mut distance_candidates,
+                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0),
+            );
+        }
+        for literal_lengths in &literal_candidates {
+            for distance_lengths in &distance_candidates {
+                if let Some(candidate) = explicit_exact_tree_candidate(
+                    literal_frequencies,
+                    distance_frequencies,
+                    literal_lengths,
+                    distance_lengths,
+                    extra_bits,
+                    exhaustive_header,
+                    &mut header_cache,
+                ) {
+                    keep_better(&mut best, candidate);
+                }
+            }
+        }
+    } else {
+        let minimum_depth = minimum_complete_tree_depth(&build_literal_frequencies)
+            .max(minimum_complete_tree_depth(&build_distance_frequencies));
+        for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
+            if let Some(candidate) = exact_tree_candidate(
+                literal_frequencies,
+                distance_frequencies,
+                &build_literal_frequencies,
+                &build_distance_frequencies,
+                extra_bits,
+                max_bits,
+                exhaustive_header,
+                &mut header_cache,
+            ) {
+                keep_better(&mut best, candidate);
+            }
         }
     }
     best
@@ -3085,6 +3148,8 @@ mod tests {
             &literal_frequencies,
             &distance_frequencies,
             false,
+            false,
+            false,
         )
         .unwrap();
         let minimum_depth = minimum_complete_tree_depth(&literal_frequencies)
@@ -3103,6 +3168,62 @@ mod tests {
                 &mut cache,
             ) {
                 keep_better(&mut expected, candidate);
+            }
+        }
+        assert_eq!(actual, expected.unwrap());
+    }
+
+    #[test]
+    fn independent_depth_frontier_matches_the_exact_alphabet_cross_product() {
+        let (literal_frequencies, distance_frequencies) = reduced_depth_fixture(0xee81_ca19);
+        let actual = plan_bounded_depth_tree_candidate(
+            &[],
+            &literal_frequencies,
+            &distance_frequencies,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+
+        let mut build_literal_frequencies = literal_frequencies;
+        ensure_code_symbols(&mut build_literal_frequencies, false);
+        let mut build_distance_frequencies = distance_frequencies;
+        ensure_distance_symbols(&mut build_distance_frequencies, false);
+        let mut literal_candidates = Vec::new();
+        for max_bits in minimum_complete_tree_depth(&build_literal_frequencies)
+            ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
+        {
+            push_unique(
+                &mut literal_candidates,
+                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0),
+            );
+        }
+        let mut distance_candidates = Vec::new();
+        for max_bits in minimum_complete_tree_depth(&build_distance_frequencies)
+            ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
+        {
+            push_unique(
+                &mut distance_candidates,
+                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0),
+            );
+        }
+
+        let mut cache = HeaderPlanCache::new();
+        let mut expected = None;
+        for literal_lengths in &literal_candidates {
+            for distance_lengths in &distance_candidates {
+                if let Some(candidate) = explicit_exact_tree_candidate(
+                    &literal_frequencies,
+                    &distance_frequencies,
+                    literal_lengths,
+                    distance_lengths,
+                    0,
+                    true,
+                    &mut cache,
+                ) {
+                    keep_better(&mut expected, candidate);
+                }
             }
         }
         assert_eq!(actual, expected.unwrap());

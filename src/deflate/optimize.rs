@@ -3772,6 +3772,8 @@ fn refine_with_bounded_depth_tree_floor(
                     &block.literal_frequencies,
                     &block.distance_frequencies,
                     options.strict,
+                    options.exhaustive,
+                    false,
                 )
             })
             .flatten()
@@ -3848,6 +3850,8 @@ fn refine_with_compact_payload_tree_floor(
                     &block.literal_frequencies,
                     &block.distance_frequencies,
                     options.strict,
+                    options.exhaustive,
+                    options.exhaustive,
                 );
                 if let Some(smoothed) = plan_rle_smoothed_tree_candidate(
                     &block.tokens,
