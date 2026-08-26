@@ -24,15 +24,14 @@ current results.
 | timed deft4j current PngSuite group | all 161 paired files | `9779c011…` | three strict-policy rows; no errors; 38 bytes / 298 bits smaller than the old journal |
 | Steam APNG stopped full journal | 2,431 rows | `f287245e…` | historical evidence only: 12 misses and 54 errors |
 | Steam APNG current scoped replay | 12 former misses in Max and Default | `fa9b3559…` | no reference miss, Default/Max gate failure, or format error |
-| Priority guard | 100 unique files | `fa9b3559…` | 79 floors pass; 21 older floors remain; no new failure |
+| Priority guard | 100 unique files | `7ae764de…` | 91 floors pass at their recorded allowance; two more recover with longer time; Max never trails current Default |
 
 The current candidate is `target/release/columbo`, SHA-256
-`3af16f7a3e096c4dd1634a2cefeae832113a3b052120bc45275dd8c44b4648f1`.
-Its complete Defluff journal is current. The DeflOpt, deft4j, and PngSuite
-family samples use the preceding `9779c011…` candidate; the complete guard and
-scoped APNG evidence use `fa9b3559…`. Hashes remain explicit because the latest
-bounded-tree frontier change can affect Max routing and those larger journals
-have not been relabelled as current-source results.
+`7ae764def6e6adb16ab76227a2567d41036776501c1dd92ffbd5619c62131140`.
+The complete Defluff journal and the DeflOpt, deft4j, PngSuite, and scoped APNG
+samples above retain their recorded executable hashes. The priority guard is
+the current-source evidence; older journals have not been relabelled as
+current results.
 
 ## Reference misses
 
@@ -115,34 +114,28 @@ by 20,169 bytes / 151,865 bits in aggregate.
 `work/regression-guard.json` remains authoritative. It contains the latest 100
 unique `(format, source)` identities; insertion deduplicates a recurring file.
 The expanded guard currently covers 71 deft4j cases and 29 DeflOpt cases across
-96 PNG and four ZIP inputs. The complete `fa9b3559…` guard run performed 142
-serial trials, including confirmation reruns: 79 historical floors pass and 21
-remain. No previously passing guard became a failure. The exact current build
-also passes the four floors directly repaired by the last accepted changes.
+96 PNG and four ZIP inputs. The complete current-source run performed 118
+serial trials, including confirmation reruns: 91 historical floors pass at
+their recorded allowance and nine remain. Every Max+5s row equals or beats the
+Default result produced by the same executable. The failures below compare
+only with older Columbo peaks.
+
+A separate old-HEAD/current-source comparison produced byte-for-byte identical
+Default artifacts for a five-file stride through the guard plus explicit PNG,
+ZIP, GZIP, and zlib coverage: 22 of 22 outputs matched. The Max-floor changes
+therefore do not alter Default routing or output.
 
 | File | Mode | Byte loss | Bit loss | Disposition |
 | --- | --- | ---: | ---: | --- |
-| `css-ig-net/sample_69.png` | Max+5s | 3 | 25 | isolated older search basin |
-| `medium/LevelLoading.png` | Max+5s | 50 | 397 | accepted broad-route trade-off; not recovered at 30 s |
-| `css-ig-net/videocameraclassic.png` | Default | 1 | 2 | small lost historical basin |
-| `small/document.png` | Max+5s | 1 | 6 | small lost historical basin |
-| `css-ig-net/briefcase.png` | Max+5s | 1 | 5 | small lost historical basin |
-| `small/news.png` | Max+5s | 1 | 4 | small lost historical basin |
-| `medium/keyboard.png` | Max+5s | 1 | 6 | small lost historical basin |
-| `css-ig-net/barchart.png` | Default | 0 | 2 | equal bytes; historical bit floor |
-| `oxipng/grayscale_2_should_be_grayscale_1.png` | Max | 0 | 4 | equal bytes; historical bit floor |
+| `medium/LevelLoading.png` | Max+5s | 9 | 68 | older route basin; not recovered at 60 s |
+| `small/check.png` | Max+5s | 1 | 1 | recovered at 20 s |
 | `pkmn-bw/000-Logo-2.png` | Max | 0 | 2 | equal bytes; historical bit floor |
-| `css-ig-net/bad-paletted.png` | Max | 6 | 45 | isolated older search basin |
-| `PngSuite/ctzn0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
-| `PngSuite/ct1n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
-| `PngSuite/ct0n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
-| `PngSuite/cm9n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
-| `PngSuite/cm0n0g04.png` | Max | 1 | 6 | shared PngSuite stream family |
-| `PngSuite/cdhn2c08.png` | Max | 2 | 18 | PngSuite structural cluster |
-| `PngSuite/bgyn6a16.png` | Max | 22 | 171 | identical raw stream/floor with `basn` and `bgan` |
-| `PngSuite/bgan6a16.png` | Max | 22 | 171 | identical raw stream/floor with `basn` and `bgyn` |
-| `PngSuite/basn6a16.png` | Max | 22 | 171 | identical raw stream/floor with `bgan` and `bgyn` |
-| `PngSuite/PngSuite.png` | Max | 5 | 35 | PngSuite structural cluster |
+| `css-ig-net/bad-paletted.png` | Max | 6 | 45 | older route basin; not recovered at 60 s |
+| `css-ig-net/Mango512.png` | Max | 111 | 888 | recovered at 32 s |
+| `PngSuite/cdhn2c08.png` | Max | 2 | 12 | older route basin; not recovered at 60 s |
+| `PngSuite/bgyn6a16.png` | Max | 12 | 97 | identical raw stream/floor with `basn` and `bgan` |
+| `PngSuite/bgan6a16.png` | Max | 12 | 97 | identical raw stream/floor with `basn` and `bgyn` |
+| `PngSuite/basn6a16.png` | Max | 12 | 97 | identical raw stream/floor with `bgan` and `bgyn` |
 
 The accepted narrow-continuation changes newly recover four substantial guards
 without a filename or timing gate:
@@ -160,6 +153,9 @@ without a filename or timing gate:
 Earlier accepted changes also retain these important guards at their normal
 allowance:
 
+- `css-ig-net/sample_69.png`: 50,036 bytes / 399,784 bits, improving its
+  historical floor after restoring complementary individual pruning to the
+  source-ordered no-split route;
 - `oxipng/rgba_16_should_be_palette_2.png`: 3,751 bytes / 29,500 bits;
 - `css-ig-net/sample_71-fs8.png`: 11,013 bytes / 80,136 bits in three repeated
   runs;
@@ -174,18 +170,23 @@ allowance:
 
 Longer trials distinguish deadline pressure from route removal. Besides the
 ZIP case above, historical `small/bomb.png` and `medium/loupe-fs8.png` floors
-recover or improve with 30 seconds. `LevelLoading.png` does not, so its
-residual is not described as time-limited. The three `basn`/`bgan`/`bgyn`
-fixtures contain the same raw Deflate stream and therefore represent one
-structural miss, not three independent optimizer failures. Ten- and 30-second
-runs produce the same 3,425-byte / 26,762-bit result; a second Columbo pass
-reaches 3,424 bytes / 26,759 bits and then stops, still above the 3,403-byte /
+recover or improve with 30 seconds. The current `small/check.png` miss recovers
+at 20 seconds and `Mango512.png` recovers at 32 seconds. Three independent
+60-second trials do not recover `LevelLoading.png`, `000-Logo-2.png`,
+`bad-paletted.png`, `cdhn2c08.png`, or the shared `basn` stream family, so none
+is described as time-limited.
+
+The three `basn`/`bgan`/`bgyn` fixtures contain the same raw Deflate stream and
+therefore represent one structural miss, not three independent optimizer
+failures. The current build produces 3,415 bytes / 26,688 bits for
+`basn6a16.png` at both ten and 60 seconds, still above the 3,403-byte /
 26,591-bit recorded floor. Strictness does not change that result.
 
 The PngSuite floors came from an unretained experimental executable. Rebuilding
-every unique reachable v0.4 source snapshot did not reproduce them; retained
-versions range from 3,432 bytes / 26,818 bits to the current 3,425 bytes /
-26,762 bits for `bgan6a16.png`. The guard remains useful evidence that a search
+every unique reachable v0.4 source snapshot did not reproduce them. Retained
+older builds range from 3,432 bytes / 26,818 bits to 3,425 bytes / 26,762 bits;
+the current invariant build reaches 3,415 bytes / 26,688 bits. The guard
+remains useful evidence that a search
 basin may have been lost, but more time, relaxed output, repeated current
 passes, and every reconstructable historical source have not recovered it.
 
