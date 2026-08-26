@@ -133,14 +133,14 @@ pub(crate) struct RawOptimization {
     pub(crate) timed_out: bool,
 }
 
-/// Decide whether max mode must finish its ordinary-mode comparison floor.
+/// Decide how a caller establishes the ordinary-mode comparison floor.
 ///
 /// A standalone stream uses [`DefaultFloor::Complete`] to try the ordinary
 /// route before max-only work. A single scheduled PNG image uses
 /// [`DefaultFloor::CompleteThenBounded`] for the same ordering before PNG's
-/// bounded max routes. Both still observe the hard deadline: with sufficient
-/// time they retain the ordinary result, while a short run may fall back to
-/// any earlier complete candidate. Multi-stream containers use
+/// bounded max routes. Both finish the comparison floor even when Max's
+/// optional-search deadline expires: timeout pressure may curtail Max work,
+/// but it must never make Max worse than Default. Multi-stream containers use
 /// [`DefaultFloor::Shared`] so one member cannot consume time needed by later
 /// members. [`DefaultFloor::SharedExact`] keeps the same multi-stream schedule
 /// but retains the complete ordinary feedback endpoint before Max-only work.
@@ -153,6 +153,9 @@ pub(crate) struct RawOptimization {
 /// means the caller
 /// already retains the complete input stream as its comparison floor, so
 /// descendants can begin without rebuilding an ordinary candidate.
+/// [`DefaultFloor::MandatoryComplete`] is the corresponding policy for a
+/// container-level Default branch built on behalf of Max: the branch uses
+/// ordinary routes, but its raw members cannot be interrupted by Max's clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
     Complete,
@@ -162,11 +165,12 @@ pub(crate) enum DefaultFloor {
     ApngDefault,
     ApngMax,
     Established,
+    MandatoryComplete,
 }
 
 impl DefaultFloor {
     fn is_bounded(self) -> bool {
-        !matches!(self, Self::Complete)
+        !matches!(self, Self::Complete | Self::MandatoryComplete)
     }
 
     fn uses_bounded_png_routes(self) -> bool {
@@ -432,7 +436,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
             | DefaultFloor::ApngDefault
             | DefaultFloor::ApngMax => true,
             DefaultFloor::Established => false,
-            DefaultFloor::Complete => false,
+            DefaultFloor::Complete | DefaultFloor::MandatoryComplete => false,
         };
     let guaranteed_floor_step =
         prebuild_floor_first.then(|| progress.start("Normal comparison floor"));
@@ -440,19 +444,21 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     let mut guaranteed_floor_candidate = if default_floor == DefaultFloor::Established {
         Some(established_floor_candidate(source)?)
     } else if prebuild_floor_first {
-        Some(
-            if matches!(
-                default_floor,
-                DefaultFloor::CompleteThenBounded | DefaultFloor::SharedExact
-            ) {
-                let floors =
-                    build_complete_default_floor_candidate(source, options, &deadline, progress)?;
+        Some(match default_floor {
+            DefaultFloor::CompleteThenBounded | DefaultFloor::SharedExact => {
+                let floors = build_complete_default_floor_candidate(source, options, progress)?;
                 complete_default_candidate = Some(floors.complete);
                 floors.max_seed
-            } else {
-                build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?
-            },
-        )
+            }
+            // APNG Default deliberately uses one initial planner per
+            // image. Completing Max's existing replay-bounded seed is
+            // already a superset of that work and avoids adding the
+            // standalone feedback family to every animation frame.
+            DefaultFloor::ApngMax => {
+                build_bounded_floor_candidate(source, options, &mut SearchStop::never())?
+            }
+            _ => build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?,
+        })
     } else {
         None
     };
@@ -471,18 +477,6 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     let compact_tree_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && compact_balanced_tree_source_eligible(original.len(), parsed.decoded_size, &blocks);
-    // The fixed-point and nearby-count smoothers each use a seven-pair exact
-    // tree frontier, but keep their terminal reparse inside the same compact
-    // memory/work class. Unlike the PNG-specific balanced-tree routes this can
-    // also help standalone streams, and the completed output rather than the
-    // source decides whether its final block topology is applicable.
-    let smoothed_tree_eligible = !options.timeout.is_zero()
-        && original.len() <= COMPACT_TREE_MAX_COMPRESSED
-        && parsed.decoded_size <= COMPACT_TREE_MAX_DECODED;
-    // The general depth floor is a linear terminal pass over any completed
-    // stream. Admission depends on available route time, not on a
-    // corpus-trained size band; exact whole-stream pricing decides acceptance.
-    let bounded_depth_tree_eligible = !options.timeout.is_zero();
     let compact_proven_feedback_eligible = options.exhaustive
         && default_floor.uses_bounded_png_routes()
         && source.blocks.len() == 1
@@ -543,6 +537,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 build_bounded_phase_candidates(
                     source,
                     options,
+                    default_floor == DefaultFloor::CompleteThenBounded,
                     png_policy == BoundedPngMaxPolicy::FloorExpansion,
                     run_deft4j,
                     run_narrow_source,
@@ -1414,16 +1409,21 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     let mut candidate = if let Some(floor) = bounded_floor_candidate {
         floor
     } else if options.exhaustive {
-        // Max mode tries the genuine normal-mode route first. Its best complete
-        // candidate remains the comparison floor, but the hard deadline may
-        // stop an unusually slow route before all of its replay work finishes.
+        // Max mode finishes the genuine normal-mode route first. Its best
+        // complete candidate remains the comparison floor even when the Max
+        // deadline has already curtailed optional search.
         match default_floor {
             DefaultFloor::Complete => {
-                let floors =
-                    build_complete_default_floor_candidate(source, options, &deadline, progress)?;
+                let floors = build_complete_default_floor_candidate(source, options, progress)?;
                 complete_default_candidate = Some(floors.complete);
                 floors.max_seed
             }
+            DefaultFloor::MandatoryComplete => build_candidate(
+                source,
+                options,
+                DEFAULT_RAW_REPLAY_LIMIT,
+                &mut SearchStop::never(),
+            )?,
             DefaultFloor::CompleteThenBounded
             | DefaultFloor::Shared
             | DefaultFloor::SharedExact
@@ -1440,6 +1440,13 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         // routes to every frame made Default scale with route count rather
         // than useful savings.
         build_apng_default_candidate(source, options, &mut deadline.hard_stop())?
+    } else if default_floor == DefaultFloor::MandatoryComplete {
+        build_candidate(
+            source,
+            options,
+            DEFAULT_RAW_REPLAY_LIMIT,
+            &mut SearchStop::never(),
+        )?
     } else {
         build_candidate(
             source,
@@ -1461,8 +1468,13 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // Standalone, metadata, and other shared callers retain their existing
     // fixed points; Max covers the broader APNG feedback families.
     if !options.exhaustive && default_floor != DefaultFloor::ApngDefault {
+        let floor_work = if default_floor == DefaultFloor::MandatoryComplete {
+            DefaultFloorWork::Mandatory
+        } else {
+            DefaultFloorWork::Timed(&deadline)
+        };
         candidate =
-            improve_default_floor_with_feedback(source, options, &deadline, progress, candidate)?;
+            improve_default_floor_with_feedback(source, options, floor_work, progress, candidate)?;
     }
     // Any separately completed topology floor is consumed by the bounded phase
     // and returned as `bounded_floor_candidate`.
@@ -1666,79 +1678,18 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         candidate.replace_if_smaller(complete_default);
     }
 
-    let mut bounded_depth_covered = false;
-    if smoothed_tree_eligible {
-        let tree_step = progress.start("Compact payload-tree floor");
-        let (covered, tree) =
-            refine_with_compact_payload_tree_floor(&candidate, options, decoded_limit, identity)?;
-        bounded_depth_covered = covered;
-        tree_step.finish(tree.as_ref().map(|tree| {
-            candidate_progress(
-                tree,
-                source.meaningful_bits,
-                tree.is_strictly_smaller_than_source(source),
-            )
-        }));
-        let compact_payload_tree_won = tree
-            .map(|tree| candidate.replace_if_smaller(tree))
-            .unwrap_or(false);
-        if compact_payload_tree_won {
-            let closure_step = progress.start("Compact payload-tree balanced closure");
-            let closure = refine_with_compact_payload_tree_balanced_closure(
-                &candidate,
-                options,
-                decoded_limit,
-                identity,
-            )?;
-            closure_step.finish(closure.as_ref().map(|closure| {
-                candidate_progress(
-                    closure,
-                    source.meaningful_bits,
-                    closure.is_strictly_smaller_than_source(source),
-                )
-            }));
-            if let Some(closure) = closure {
-                candidate.replace_if_smaller(closure);
-            }
-        }
-    }
-
-    // The compact pass above shares this frontier when its structural work
-    // bounds apply. Every other completed stream receives the general linear
-    // sibling, so an existing compact smoother gate cannot create a coverage
-    // hole. Like the compact terminal floor, this is bounded finalization of
-    // the selected lineage rather than a new heuristic route. It polls the
-    // hard stop between exact tree pairs and blocks; at that boundary the
-    // explicit one-block rescue above finishes only its fixed work class. Both
-    // forms retain the complete incumbent.
-    let mut bounded_depth_stop = deadline.hard_stop();
-    let bounded_depth_hard_expired = bounded_depth_stop.reached();
-    if !bounded_depth_covered
-        && bounded_depth_tree_eligible
-        && (!bounded_depth_hard_expired || bounded_depth_stop.permits_bounded_finalization())
-    {
-        let tree_step = progress.start("Bounded-depth tree floor");
-        let tree = if bounded_depth_hard_expired {
-            refine_with_bounded_depth_tree_rescue(&candidate, options, decoded_limit, identity)?
-        } else {
-            refine_with_bounded_depth_tree_floor(
-                &candidate,
-                options,
-                decoded_limit,
-                identity,
-                &mut bounded_depth_stop,
-            )?
-        };
-        tree_step.finish(tree.as_ref().map(|tree| {
-            candidate_progress(
-                tree,
-                source.meaningful_bits,
-                tree.is_strictly_smaller_than_source(source),
-            )
-        }));
-        if let Some(tree) = tree {
-            candidate.replace_if_smaller(tree);
-        }
+    // Default runs these floors inside `improve_default_floor_with_feedback`
+    // so Max can retain the exact same completed comparison endpoint. Max
+    // applies them again only to its final incumbent, where they remain
+    // additive and cannot discard that endpoint.
+    if options.exhaustive {
+        candidate = improve_with_terminal_tree_floors(
+            source,
+            options,
+            DefaultFloorWork::Timed(&deadline),
+            progress,
+            candidate,
+        )?;
     }
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
@@ -1762,7 +1713,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     } else {
         candidate.data.len()
     };
-    let timed_out = deadline.was_triggered();
+    let timed_out = default_floor != DefaultFloor::MandatoryComplete && deadline.was_triggered();
     progress.blocks(final_report);
     progress.finish(
         selected_route,
@@ -2522,6 +2473,7 @@ fn rewritten_input<'a>(
 fn build_bounded_phase_candidates(
     source: CandidateInput<'_>,
     options: &Options,
+    preserve_complete_default: bool,
     run_seeded_max: bool,
     run_deft4j: bool,
     run_narrow: bool,
@@ -2656,12 +2608,14 @@ fn build_bounded_phase_candidates(
         && (!run_single_source_max || !run_source_max)
         && route_window.can_start_route();
     if !run_deft4j && !run_narrow && !run_source_max && !run_proven_feedback {
-        let (floor, floor_seeded) = build_bounded_floor_descendants(
+        let (floor, floor_seeded) = build_bounded_floor_descendants_preserving_default(
             source,
             options,
+            preserve_complete_default,
             run_seeded_max,
             &route_window,
             completed_floor,
+            progress,
         )?;
         return Ok(BoundedPhaseCandidates {
             floor: Some(floor),
@@ -2676,11 +2630,13 @@ fn build_bounded_phase_candidates(
         let mut candidates = build_bounded_phase_candidates_sequential(
             source,
             options,
+            preserve_complete_default,
             run_seeded_max,
             run_deft4j,
             run_narrow,
             &route_window,
             completed_floor,
+            progress,
         )?;
         if let Some(prebuilt) = prebuilt_deft4j {
             replace_optional_if_smaller(&mut candidates.deft4j, prebuilt);
@@ -2705,10 +2661,10 @@ fn build_bounded_phase_candidates(
                 .name("columbo-no-split".into())
                 .spawn_scoped(scope, || {
                     run_route_with_cancellation(deadline, || {
-                        // The streamlined no-split walk owns cumulative
-                        // pruning and adjacent merges, so it can forward a
-                        // complete incumbent at the shared phase boundary
-                        // without repeating source-max's individual pruning.
+                        // The no-split walk combines block-local pruning with
+                        // adjacent merges. That ordering is complementary to
+                        // source max: an early block choice changes alignment
+                        // and merge prices for every later source block.
                         build_narrow_source_candidate(
                             source,
                             options,
@@ -2755,12 +2711,14 @@ fn build_bounded_phase_candidates(
         // ordinary deadline check. Join every successfully spawned worker
         // before choosing the fixed deft4j/narrow/floor error order below.
         let floor = run_route_with_cancellation(deadline, || {
-            build_bounded_floor_descendants(
+            build_bounded_floor_descendants_preserving_default(
                 source,
                 options,
+                preserve_complete_default,
                 run_seeded_max,
                 &route_window,
                 completed_floor,
+                progress,
             )
         });
         let deft4j = match deft4j_worker.flatten() {
@@ -2842,15 +2800,35 @@ fn build_bounded_phase_candidates(
 }
 
 /// Retain the deft4j/narrow/floor deadline order without overlapping arenas.
+#[allow(clippy::too_many_arguments)]
 fn build_bounded_phase_candidates_sequential(
     source: CandidateInput<'_>,
     options: &Options,
+    preserve_complete_default: bool,
     run_seeded_max: bool,
     run_deft4j: bool,
     run_narrow: bool,
     route_window: &RouteWindow<'_>,
     completed_floor: Option<Candidate>,
+    progress: Progress,
 ) -> Result<BoundedPhaseCandidates> {
+    // A serial work class cannot overlap its exact comparison floor with the
+    // independent source routes. Establish the mandatory floor first so those
+    // optional routes can never consume the result Max promises to retain.
+    let mut completed_floor = completed_floor;
+    let preserved_floor = preserve_complete_default
+        .then(|| {
+            build_bounded_floor_descendants_preserving_default(
+                source,
+                options,
+                true,
+                run_seeded_max,
+                route_window,
+                completed_floor.take(),
+                progress,
+            )
+        })
+        .transpose()?;
     let deft4j = if run_deft4j && route_window.can_start_route() {
         build_deft4j_source_candidate(source, options, &mut route_window.stop())?
     } else {
@@ -2866,13 +2844,16 @@ fn build_bounded_phase_candidates_sequential(
     } else {
         None
     };
-    let (floor, floor_seeded) = build_bounded_floor_descendants(
-        source,
-        options,
-        run_seeded_max,
-        route_window,
-        completed_floor,
-    )?;
+    let (floor, floor_seeded) = match preserved_floor {
+        Some(floor) => floor,
+        None => build_bounded_floor_descendants(
+            source,
+            options,
+            run_seeded_max,
+            route_window,
+            completed_floor,
+        )?,
+    };
     Ok(BoundedPhaseCandidates {
         floor: Some(floor),
         floor_seeded,
@@ -2972,6 +2953,37 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
     })
 }
 
+/// Controls whether ordinary comparison work may be interrupted.
+///
+/// A normal invocation remains governed by its configured deadline. Max uses
+/// `Mandatory` only for the Default dependency it promises to dominate; every
+/// Max-exclusive descendant continues to use the ordinary timed policy.
+#[derive(Clone, Copy)]
+enum DefaultFloorWork<'a> {
+    Timed(&'a Deadline),
+    Mandatory,
+}
+
+impl<'a> DefaultFloorWork<'a> {
+    fn can_start_route(self) -> bool {
+        match self {
+            Self::Timed(deadline) => deadline.can_start_route(),
+            Self::Mandatory => true,
+        }
+    }
+
+    fn stop(self) -> SearchStop<'a> {
+        match self {
+            Self::Timed(deadline) => deadline.hard_stop(),
+            Self::Mandatory => SearchStop::never(),
+        }
+    }
+
+    fn is_mandatory(self) -> bool {
+        matches!(self, Self::Mandatory)
+    }
+}
+
 /// Add the bounded siblings that form the complete ordinary-mode floor.
 ///
 /// These routes are deliberately shared by a normal invocation and the floor
@@ -2981,7 +2993,7 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
 fn improve_default_floor_with_feedback(
     source: CandidateInput<'_>,
     options: &Options,
-    deadline: &Deadline,
+    floor_work: DefaultFloorWork<'_>,
     progress: Progress,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
@@ -2991,10 +3003,11 @@ fn improve_default_floor_with_feedback(
     // ordinary endpoint ordering. Retain both as complete candidates whenever
     // the source contains a proved match and the whole sibling is within its
     // explicit token/plain work bounds.
-    if compact_source_has_bounded_match_preserving_feedback(source) && deadline.can_start_route() {
+    if compact_source_has_bounded_match_preserving_feedback(source) && floor_work.can_start_route()
+    {
         let step = progress.start("Columbo match-preserving feedback");
         let contender =
-            build_compact_proven_feedback_candidate(source, options, &mut deadline.hard_stop())?;
+            build_compact_proven_feedback_candidate(source, options, &mut floor_work.stop())?;
         step.finish(contender.as_ref().map(|candidate| {
             candidate_progress(
                 candidate,
@@ -3006,13 +3019,14 @@ fn improve_default_floor_with_feedback(
             candidate.replace_if_smaller(contender);
         }
     }
-    if compact_source_has_bounded_integrated_proven_feedback(source) && deadline.can_start_route() {
+    if compact_source_has_bounded_integrated_proven_feedback(source) && floor_work.can_start_route()
+    {
         let step = progress.start("Columbo integrated proven feedback");
         let contender = build_compact_integrated_proven_feedback_candidate(
             source,
             options,
             &candidate,
-            &mut deadline.hard_stop(),
+            &mut floor_work.stop(),
         )?;
         step.finish(contender.as_ref().map(|candidate| {
             candidate_progress(
@@ -3050,6 +3064,108 @@ fn improve_default_floor_with_feedback(
             candidate.is_strictly_smaller_than_source(source),
         )));
     }
+    improve_with_terminal_tree_floors(source, options, floor_work, progress, candidate)
+}
+
+/// Apply terminal tree-only improvements to one already complete candidate.
+///
+/// This sequence is shared deliberately by an ordinary invocation and Max's
+/// retained Default comparison floor. Keeping every Default terminal method
+/// here prevents a newly added cleanup pass from silently making Max worse
+/// when its independent searches consume the remaining deadline.
+fn improve_with_terminal_tree_floors(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    // The fixed-point and nearby-count smoothers each use a seven-pair exact
+    // tree frontier, but keep their terminal reparse inside the same compact
+    // memory/work class. The completed output, rather than the source, decides
+    // whether its final block topology is applicable.
+    let smoothed_tree_eligible = (floor_work.is_mandatory() || !options.timeout.is_zero())
+        && source.compressed.len() <= COMPACT_TREE_MAX_COMPRESSED
+        && source.identity.decoded_size <= COMPACT_TREE_MAX_DECODED;
+    let mut bounded_depth_covered = false;
+    if smoothed_tree_eligible {
+        let tree_step = progress.start("Compact payload-tree floor");
+        let (covered, tree) = refine_with_compact_payload_tree_floor(
+            &candidate,
+            options,
+            source.decoded_limit,
+            source.identity,
+        )?;
+        bounded_depth_covered = covered;
+        tree_step.finish(tree.as_ref().map(|tree| {
+            candidate_progress(
+                tree,
+                source.meaningful_bits,
+                tree.is_strictly_smaller_than_source(source),
+            )
+        }));
+        let compact_payload_tree_won = tree
+            .map(|tree| candidate.replace_if_smaller(tree))
+            .unwrap_or(false);
+        if compact_payload_tree_won {
+            let closure_step = progress.start("Compact payload-tree balanced closure");
+            let closure = refine_with_compact_payload_tree_balanced_closure(
+                &candidate,
+                options,
+                source.decoded_limit,
+                source.identity,
+            )?;
+            closure_step.finish(closure.as_ref().map(|closure| {
+                candidate_progress(
+                    closure,
+                    source.meaningful_bits,
+                    closure.is_strictly_smaller_than_source(source),
+                )
+            }));
+            if let Some(closure) = closure {
+                candidate.replace_if_smaller(closure);
+            }
+        }
+    }
+
+    // The compact pass above shares this frontier when its structural work
+    // bounds apply. Every other completed stream receives the general linear
+    // sibling. At the hard boundary, the explicitly bounded rescue finishes
+    // one fixed work unit while retaining the complete incumbent.
+    let mut bounded_depth_stop = floor_work.stop();
+    let bounded_depth_hard_expired = bounded_depth_stop.reached();
+    if !bounded_depth_covered
+        && (floor_work.is_mandatory() || !options.timeout.is_zero())
+        && (!bounded_depth_hard_expired || bounded_depth_stop.permits_bounded_finalization())
+    {
+        let tree_step = progress.start("Bounded-depth tree floor");
+        let tree = if bounded_depth_hard_expired {
+            refine_with_bounded_depth_tree_rescue(
+                &candidate,
+                options,
+                source.decoded_limit,
+                source.identity,
+            )?
+        } else {
+            refine_with_bounded_depth_tree_floor(
+                &candidate,
+                options,
+                source.decoded_limit,
+                source.identity,
+                &mut bounded_depth_stop,
+            )?
+        };
+        tree_step.finish(tree.as_ref().map(|tree| {
+            candidate_progress(
+                tree,
+                source.meaningful_bits,
+                tree.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(tree) = tree {
+            candidate.replace_if_smaller(tree);
+        }
+    }
     Ok(candidate)
 }
 
@@ -3069,7 +3185,6 @@ struct CompleteDefaultFloor {
 fn build_complete_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
-    deadline: &Deadline,
     progress: Progress,
 ) -> Result<CompleteDefaultFloor> {
     let mut floor_options = options.clone();
@@ -3078,11 +3193,16 @@ fn build_complete_default_floor_candidate(
         source,
         &floor_options,
         DEFAULT_RAW_REPLAY_LIMIT,
-        &mut deadline.hard_stop(),
+        &mut SearchStop::never(),
     )?;
     let max_seed = candidate.clone().named("Normal floor");
-    let complete =
-        improve_default_floor_with_feedback(source, &floor_options, deadline, progress, candidate)?;
+    let complete = improve_default_floor_with_feedback(
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        candidate,
+    )?;
     Ok(CompleteDefaultFloor { max_seed, complete })
 }
 
@@ -3140,6 +3260,45 @@ fn build_bounded_floor_descendants(
     // Inspect the plans already retained by the floor. Re-parsing merely to
     // rediscover this topology would spend time and allocate another model.
     continue_bounded_floor_lineage(source, floor, options, route_window, true)
+}
+
+/// Build the bounded lineage while retaining the exact ordinary endpoint.
+///
+/// Medium multi-block PNG streams reach this helper from the concurrent phase:
+/// their independent Max workers continue in parallel, while this route runs
+/// the same complete sequence as Default and keeps that result separate from
+/// the historical Max seed. This closes the comparison-floor invariant
+/// without serializing work that was deliberately admitted for concurrency.
+#[allow(clippy::too_many_arguments)]
+fn build_bounded_floor_descendants_preserving_default(
+    source: CandidateInput<'_>,
+    options: &Options,
+    preserve_complete_default: bool,
+    run_seeded_max: bool,
+    route_window: &RouteWindow<'_>,
+    completed_floor: Option<Candidate>,
+    progress: Progress,
+) -> Result<(Candidate, Option<Candidate>)> {
+    if !preserve_complete_default || completed_floor.is_some() {
+        return build_bounded_floor_descendants(
+            source,
+            options,
+            run_seeded_max,
+            route_window,
+            completed_floor,
+        );
+    }
+
+    let floors = build_complete_default_floor_candidate(source, options, progress)?;
+    let complete = floors.complete;
+    let (_, descendant) = build_bounded_floor_descendants(
+        source,
+        options,
+        run_seeded_max,
+        route_window,
+        Some(floors.max_seed),
+    )?;
+    Ok((complete, descendant))
 }
 
 fn continue_bounded_floor_lineage(
@@ -3297,11 +3456,11 @@ fn build_narrow_source_candidate(
     expired: &mut SearchStop<'_>,
     refinement_stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
-    // The dedicated source-max route owns one-match-at-a-time pruning, while
-    // the deft4j-derived seed already supplies table-driven pruning states.
-    // Repeating the individual family in this sibling delays later source
-    // blocks; keep no-split focused on its distinct cumulative pruning order
-    // and adjacent merges.
+    // Keep individual and cumulative pruning together in this source-ordered
+    // sibling. Their choices are not interchangeable with source max: a local
+    // win can alter alignment and the adjacent-merge prices of later blocks.
+    // Removing the individual phase lost complete endpoints on multi-block
+    // streams even when source max ran concurrently.
     let Some(plans) = plan_source_no_split_route(source.blocks, 0, options, &mut *expired) else {
         return Ok(None);
     };
@@ -5165,8 +5324,9 @@ mod tests {
         assert_eq!(second.info.deflate_bits, first.info.deflate_bits);
         assert_eq!(second.data, first.data);
 
-        // A zero-budget max run keeps a complete source fallback instead of
-        // making the comparison floor an unbounded timeout exception.
+        // Even a zero-budget max run must finish and retain Default. The zero
+        // allowance disables Max-exclusive routes; it cannot weaken the
+        // mandatory comparison floor.
         let zero_budget_max = Options {
             exhaustive: true,
             strict: false,
@@ -5175,8 +5335,8 @@ mod tests {
         };
         let stopped = optimize_raw(input, &zero_budget_max).unwrap();
         assert!(stopped.timed_out);
-        assert_eq!(stopped.info.deflate_bits, source.meaningful_bits);
-        assert_eq!(stopped.data, input);
+        assert!(stopped.data.len() <= first.data.len());
+        assert!(stopped.info.deflate_bits <= first.info.deflate_bits);
 
         // With sufficient time, max mode closes the same feedback graph in one
         // invocation and is itself at a fixed point.
@@ -5191,43 +5351,49 @@ mod tests {
     }
 
     #[test]
-    fn sufficient_time_max_floors_retain_their_exact_default_endpoint() {
-        let default_options = Options {
-            strict: false,
-            timeout: Duration::from_secs(1),
-            ..Options::default()
-        };
-        let default = optimize_raw_prefix_with_floor(
-            FEEDBACK_RAW,
-            &default_options,
-            86,
-            DefaultFloor::Shared,
-        )
-        .unwrap();
-        let apng_default = optimize_raw_prefix_with_floor(
-            FEEDBACK_RAW,
-            &default_options,
-            86,
-            DefaultFloor::ApngDefault,
-        )
-        .unwrap();
-        let max_options = Options {
-            exhaustive: true,
-            ..default_options
-        };
+    fn zero_budget_max_floors_retain_their_exact_default_endpoint() {
+        for strict in [true, false] {
+            let default_options = Options {
+                strict,
+                timeout: Duration::from_secs(1),
+                ..Options::default()
+            };
+            let default = optimize_raw_prefix_with_floor(
+                FEEDBACK_RAW,
+                &default_options,
+                86,
+                DefaultFloor::Shared,
+            )
+            .unwrap();
+            let apng_default = optimize_raw_prefix_with_floor(
+                FEEDBACK_RAW,
+                &default_options,
+                86,
+                DefaultFloor::ApngDefault,
+            )
+            .unwrap();
+            let max_options = Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..default_options
+            };
 
-        for (floor, expected) in [
-            (DefaultFloor::Complete, &default),
-            (DefaultFloor::SharedExact, &default),
-            (DefaultFloor::ApngMax, &apng_default),
-        ] {
-            let maximum =
-                optimize_raw_prefix_with_floor(FEEDBACK_RAW, &max_options, 86, floor).unwrap();
-            assert!(maximum.data.len() <= expected.data.len(), "{floor:?}");
-            assert!(
-                maximum.info.deflate_bits <= expected.info.deflate_bits,
-                "{floor:?}"
-            );
+            for (floor, expected) in [
+                (DefaultFloor::Complete, &default),
+                (DefaultFloor::SharedExact, &default),
+                (DefaultFloor::ApngMax, &apng_default),
+            ] {
+                let maximum =
+                    optimize_raw_prefix_with_floor(FEEDBACK_RAW, &max_options, 86, floor).unwrap();
+                assert!(
+                    maximum.data.len() <= expected.data.len(),
+                    "{floor:?}, strict={strict}"
+                );
+                assert!(
+                    maximum.info.deflate_bits <= expected.info.deflate_bits,
+                    "{floor:?}, strict={strict}"
+                );
+            }
         }
     }
 
@@ -5890,6 +6056,74 @@ mod tests {
     }
 
     #[test]
+    fn deferred_bounded_png_floor_retains_exact_default_at_zero_timeout() {
+        // Exercise the path used by medium multi-block PNG streams, where the
+        // exact Default dependency is established inside the bounded phase
+        // rather than by the earlier compact/large-stream prebuild.
+        let (literal, _) = fixed_trees();
+        let end = literal.code(256).unwrap();
+        let mut writer = BitWriter::default();
+        for (index, value) in b"ab".iter().copied().enumerate() {
+            let code = literal.code(usize::from(value)).unwrap();
+            writer.write(u32::from(index == 1), 1).unwrap();
+            writer.write(1, 2).unwrap();
+            writer.write(u32::from(code.code), code.length).unwrap();
+            writer.write(u32::from(end.code), end.length).unwrap();
+        }
+        let input = writer.into_bytes();
+        let parsed = parse_stream(&input, 2).unwrap();
+        let source = CandidateInput {
+            compressed: &input,
+            blocks: &parsed.blocks,
+            meaningful_bits: parsed.meaningful_bits,
+            decoded_limit: 2,
+            identity: StreamIdentity {
+                decoded_size: parsed.decoded_size,
+                crc32: parsed.crc32,
+                adler32: parsed.adler32,
+            },
+        };
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::ZERO,
+            ..Options::default()
+        };
+        let deadline = Deadline::new(Instant::now(), Duration::ZERO);
+        let candidates = build_bounded_phase_candidates(
+            source,
+            &options,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            &deadline,
+            Progress::begin(
+                &options,
+                deadline.started,
+                StreamProgress {
+                    blocks: parsed.source_block_count,
+                    compressed_bytes: input.len(),
+                    decoded_bytes: parsed.decoded_size,
+                    empty_blocks: parsed.source_empty_block_count,
+                    meaningful_bits: parsed.meaningful_bits,
+                    parse_elapsed: Duration::ZERO,
+                },
+                None,
+            ),
+            None,
+        )
+        .unwrap();
+        let floor = candidates.floor.unwrap();
+        let ordinary = optimize_raw(&input, &Options::default()).unwrap();
+
+        assert!(floor.data.len() <= ordinary.data.len());
+        assert!(floor.bits <= ordinary.info.deflate_bits);
+    }
+
+    #[test]
     fn compact_split_floor_gate_is_tightly_bounded() {
         let (literal, _) = fixed_trees();
         let value = literal.code(usize::from(b'a')).unwrap();
@@ -6263,7 +6497,6 @@ mod tests {
         let complete = build_complete_default_floor_candidate(
             source,
             &options,
-            &deadline,
             Progress::begin(
                 &options,
                 deadline.started,
@@ -6288,6 +6521,56 @@ mod tests {
         );
         assert_eq!(complete.data, ordinary.data);
         assert_eq!(complete.bits, ordinary.info.deflate_bits);
+    }
+
+    #[test]
+    fn complete_png_floor_includes_terminal_tree_methods() {
+        // This stream receives a material terminal payload-tree improvement.
+        // It guards the architectural boundary that previously let Default
+        // apply the method only after Max had captured its comparison floor.
+        let input = png_raw_deflate(RLE_SMOOTHING_PNG);
+        let parsed = parse_stream(&input, 1 << 20).unwrap();
+        let source = CandidateInput {
+            compressed: &input,
+            blocks: &parsed.blocks,
+            meaningful_bits: parsed.meaningful_bits,
+            decoded_limit: 1 << 20,
+            identity: StreamIdentity {
+                decoded_size: parsed.decoded_size,
+                crc32: parsed.crc32,
+                adler32: parsed.adler32,
+            },
+        };
+        let options = Options {
+            exhaustive: true,
+            timeout: Duration::MAX,
+            ..Options::default()
+        };
+        let deadline = Deadline::new(Instant::now(), Duration::MAX);
+        let complete = build_complete_default_floor_candidate(
+            source,
+            &options,
+            Progress::begin(
+                &options,
+                deadline.started,
+                StreamProgress {
+                    blocks: parsed.source_block_count,
+                    compressed_bytes: input.len(),
+                    decoded_bytes: parsed.decoded_size,
+                    empty_blocks: parsed.source_empty_block_count,
+                    meaningful_bits: parsed.meaningful_bits,
+                    parse_elapsed: Duration::ZERO,
+                },
+                None,
+            ),
+        )
+        .unwrap()
+        .complete;
+        let ordinary = optimize_raw(&input, &Options::default()).unwrap();
+
+        assert_eq!(complete.data, ordinary.data);
+        assert_eq!(complete.bits, ordinary.info.deflate_bits);
+        assert!(complete.bits < parsed.meaningful_bits);
     }
 
     #[test]

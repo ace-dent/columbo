@@ -761,7 +761,7 @@ fn precompute_max_metadata_floors(
                 chunk.kind,
                 chunk.data,
                 &floor_options,
-                DefaultFloor::Complete,
+                DefaultFloor::MandatoryComplete,
                 budget,
             )
         };
@@ -1838,7 +1838,13 @@ fn optimize_image_streams(
         complete.push(frame.expect("every APNG frame has a representative result"));
     }
 
-    let _ = reuse_best_exact_frames(&mut complete, &mut || budget.deadline.remaining().is_zero());
+    // Max must also retain every file-level saving available to Default.
+    // Exact-frame reuse has an explicit work cap, so finish that bounded pass
+    // even when Max-exclusive search has consumed the wall-clock allowance.
+    let mandatory_default_comparison = options.exhaustive;
+    let _ = reuse_best_exact_frames(&mut complete, &mut || {
+        !mandatory_default_comparison && budget.deadline.remaining().is_zero()
+    });
     Ok((
         optimized_idat.expect("the IDAT job is always present"),
         complete,
@@ -3006,35 +3012,41 @@ mod tests {
     }
 
     #[test]
-    fn sufficient_time_static_png_max_dominates_default_in_bytes_and_bits() {
+    fn zero_budget_static_png_max_retains_default_in_bytes_and_bits() {
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &feedback_ihdr()));
         input.extend(chunk(*b"IDAT", &feedback_zlib()));
         input.extend(chunk(*b"IEND", &[]));
-        let default_options = Options {
-            strict: false,
-            timeout: Duration::from_secs(1),
-            ..Options::default()
-        };
-        let default =
-            optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
-                .unwrap();
-        let maximum = optimize_preflight_once(
-            &input,
-            &Options {
-                exhaustive: true,
-                ..default_options
-            },
-            parse(&input, false).unwrap(),
-        )
-        .unwrap();
+        for strict in [true, false] {
+            let default_options = Options {
+                strict,
+                timeout: Duration::from_secs(1),
+                ..Options::default()
+            };
+            let default =
+                optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
+                    .unwrap();
+            let maximum = optimize_preflight_once(
+                &input,
+                &Options {
+                    exhaustive: true,
+                    timeout: Duration::ZERO,
+                    ..default_options
+                },
+                parse(&input, false).unwrap(),
+            )
+            .unwrap();
 
-        assert!(maximum.data.len() <= default.data.len());
-        assert!(maximum.output_deflate_bits <= default.output_deflate_bits);
+            assert!(maximum.data.len() <= default.data.len(), "strict={strict}");
+            assert!(
+                maximum.output_deflate_bits <= default.output_deflate_bits,
+                "strict={strict}"
+            );
+        }
     }
 
     #[test]
-    fn sufficient_time_unraced_apng_max_dominates_default_in_bytes_and_bits() {
+    fn zero_budget_unraced_apng_max_retains_default_in_bytes_and_bits() {
         let zlib = feedback_zlib();
         let mut input = SIGNATURE.to_vec();
         input.extend(chunk(*b"IHDR", &feedback_ihdr()));
@@ -3054,26 +3066,32 @@ mod tests {
         input.extend(chunk(*b"fdAT", &frame_data));
         input.extend(chunk(*b"IEND", &[]));
 
-        let default_options = Options {
-            strict: false,
-            timeout: Duration::from_secs(2),
-            ..Options::default()
-        };
-        let default =
-            optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
-                .unwrap();
-        let maximum = optimize_preflight_once(
-            &input,
-            &Options {
-                exhaustive: true,
-                ..default_options
-            },
-            parse(&input, false).unwrap(),
-        )
-        .unwrap();
+        for strict in [true, false] {
+            let default_options = Options {
+                strict,
+                timeout: Duration::from_secs(2),
+                ..Options::default()
+            };
+            let default =
+                optimize_preflight_once(&input, &default_options, parse(&input, false).unwrap())
+                    .unwrap();
+            let maximum = optimize_preflight_once(
+                &input,
+                &Options {
+                    exhaustive: true,
+                    timeout: Duration::ZERO,
+                    ..default_options
+                },
+                parse(&input, false).unwrap(),
+            )
+            .unwrap();
 
-        assert!(maximum.data.len() <= default.data.len());
-        assert!(maximum.output_deflate_bits <= default.output_deflate_bits);
+            assert!(maximum.data.len() <= default.data.len(), "strict={strict}");
+            assert!(
+                maximum.output_deflate_bits <= default.output_deflate_bits,
+                "strict={strict}"
+            );
+        }
     }
 
     #[test]
@@ -4463,7 +4481,7 @@ mod tests {
 
         let options = Options {
             exhaustive: true,
-            timeout: Duration::from_secs(1),
+            timeout: Duration::ZERO,
             ..Options::default()
         };
         let parsed = parse(&input, false).unwrap();

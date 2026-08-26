@@ -321,7 +321,7 @@ fn optimize_max_parallel(
             optimize_once(
                 input,
                 &floor_options,
-                DefaultFloor::Complete,
+                DefaultFloor::MandatoryComplete,
                 ParallelMemberPolicy::AnyIndependentWork,
                 ZIP_DEFAULT_FLOOR_PRODUCER,
                 parsed,
@@ -375,7 +375,7 @@ fn optimize_max_sequential(
     let floor = optimize_once(
         input,
         &floor_options,
-        DefaultFloor::Complete,
+        DefaultFloor::MandatoryComplete,
         ParallelMemberPolicy::UniformWorkOnly,
         ZIP_DEFAULT_FLOOR_PRODUCER,
         parsed,
@@ -2176,7 +2176,7 @@ mod tests {
             &input,
             &Options {
                 exhaustive: true,
-                timeout: Duration::from_secs(1),
+                timeout: Duration::ZERO,
                 ..Options::default()
             },
             &parsed,

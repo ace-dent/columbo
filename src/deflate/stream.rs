@@ -147,8 +147,10 @@ enum SourceBlockSearch {
         /// The completed compact proven lineage beat the normal floor.
         integrated_compact_proven: bool,
     },
-    /// One cumulative whole-block ladder, leaving individual pruning, splits,
-    /// and iterative work to sibling routes.
+    /// One source-ordered whole-block ladder. It combines individual and
+    /// cumulative pruning because their block-local choices can change the
+    /// alignment and merge prices seen by later blocks; splits and iterative
+    /// work remain with sibling routes.
     Narrow,
     /// Deterministic table floors only, for a selected terminal seed.
     Floor,
@@ -2998,10 +3000,10 @@ fn plan_source_with_search(
         SourceBlockSearch::Narrow => {
             let plan = match plan_source_block(block, alignment, options, stop) {
                 Some(seed) if !stop.reached() => plan_block_with_seeded_narrow_search(
-                    block, alignment, options, false, seed, stop,
+                    block, alignment, options, true, seed, stop,
                 ),
                 Some(seed) => seed,
-                None => plan_block_with_narrow_search(block, alignment, options, false, stop),
+                None => plan_block_with_narrow_search(block, alignment, options, true, stop),
             };
             vec![plan]
         }

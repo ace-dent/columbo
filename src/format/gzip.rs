@@ -473,25 +473,31 @@ mod tests {
     }
 
     #[test]
-    fn sufficient_time_gzip_max_dominates_default_in_bytes_and_bits() {
+    fn zero_budget_gzip_max_retains_default_in_bytes_and_bits() {
         let input = feedback_member();
-        let default_options = Options {
-            strict: false,
-            timeout: Duration::from_secs(1),
-            ..Options::default()
-        };
-        let default = optimize(&input, &default_options).unwrap();
-        let maximum = optimize(
-            &input,
-            &Options {
-                exhaustive: true,
-                ..default_options
-            },
-        )
-        .unwrap();
+        for strict in [true, false] {
+            let default_options = Options {
+                strict,
+                timeout: Duration::from_secs(1),
+                ..Options::default()
+            };
+            let default = optimize(&input, &default_options).unwrap();
+            let maximum = optimize(
+                &input,
+                &Options {
+                    exhaustive: true,
+                    timeout: Duration::ZERO,
+                    ..default_options
+                },
+            )
+            .unwrap();
 
-        assert!(maximum.data.len() <= default.data.len());
-        assert!(aggregate_deflate_bits(&maximum.data) <= aggregate_deflate_bits(&default.data));
+            assert!(maximum.data.len() <= default.data.len(), "strict={strict}");
+            assert!(
+                aggregate_deflate_bits(&maximum.data) <= aggregate_deflate_bits(&default.data),
+                "strict={strict}"
+            );
+        }
     }
 
     #[test]

@@ -74,7 +74,10 @@ pub struct Options {
     /// Embedded PNG frames, GZIP members, and ZIP entries share this budget;
     /// no new route starts after it expires. An active route may use ten
     /// percent plus one second to finalize its best candidate. Validation and
-    /// the complete no-growth fallback are never skipped.
+    /// the complete no-growth fallback are never skipped. In Max mode, the
+    /// mandatory Default comparison floor also finishes outside this optional
+    /// search budget when necessary, because Max may never return a worse
+    /// result than Default.
     pub timeout: Duration,
     /// Maximum number of compressed bytes accepted from the supplied file.
     pub max_input_bytes: u64,
