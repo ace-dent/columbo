@@ -832,9 +832,9 @@ fn parse_timeout(value: &OsStr) -> Option<Duration> {
 }
 
 fn parse_strict(value: &OsStr) -> Option<bool> {
-    match value.to_str()?.trim_start().parse::<i64>().ok()? {
-        0 => Some(false),
-        1 => Some(true),
+    match value.to_str()?.trim_start() {
+        "0" => Some(false),
+        "1" => Some(true),
         _ => None,
     }
 }
@@ -1293,6 +1293,9 @@ mod tests {
         for arguments in [
             vec!["--strict", "2", "in"],
             vec!["--strict", "true", "in"],
+            vec!["--strict=+1", "in"],
+            vec!["--strict=01", "in"],
+            vec!["--strict=-0", "in"],
             vec!["--strict"],
         ] {
             let error = match parse_args(arguments.into_iter().map(OsString::from)) {

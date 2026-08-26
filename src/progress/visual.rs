@@ -1332,11 +1332,23 @@ fn terminal_columns() -> usize {
         .or_else(|| {
             env::var("COLUMNS")
                 .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&columns| columns != 0)
+                .and_then(|value| parse_terminal_columns(&value))
         })
         .unwrap_or(DEFAULT_COLUMNS)
         .min(MAX_TERMINAL_COLUMNS)
+}
+
+fn parse_terminal_columns(value: &str) -> Option<usize> {
+    let mut columns = 0_usize;
+    for byte in value.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        columns = columns
+            .checked_mul(10)?
+            .checked_add(usize::from(byte - b'0'))?;
+    }
+    (columns != 0).then_some(columns)
 }
 
 #[cfg(unix)]
@@ -1350,12 +1362,12 @@ fn query_terminal_columns() -> Option<usize> {
     if !output.status.success() {
         return None;
     }
-    std::str::from_utf8(&output.stdout)
-        .ok()?
-        .split_whitespace()
-        .next_back()?
-        .parse()
-        .ok()
+    parse_terminal_columns(
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .split_whitespace()
+            .next_back()?,
+    )
 }
 
 #[cfg(not(unix))]
@@ -1517,6 +1529,15 @@ mod tests {
             status: String::new(),
             work: None,
         }
+    }
+
+    #[test]
+    fn terminal_columns_accept_only_nonzero_decimal_digits() {
+        assert_eq!(parse_terminal_columns("80"), Some(80));
+        for invalid in ["", "0", "+80", " 80", "80 ", "8.0"] {
+            assert_eq!(parse_terminal_columns(invalid), None);
+        }
+        assert_eq!(parse_terminal_columns(&format!("{}0", usize::MAX)), None);
     }
 
     #[test]

@@ -2146,6 +2146,16 @@ fn parallel_image_job_timeout(
     scale_duration(soft_budget, weight as f64 / total_weight as f64)
 }
 
+/// Keep the standard unstable sorter from specializing its relatively large
+/// implementation to the APNG frame comparator.
+#[inline(never)]
+fn sort_frame_indices(
+    indices: &mut [usize],
+    compare: &mut dyn FnMut(usize, usize) -> std::cmp::Ordering,
+) {
+    indices.sort_unstable_by(|&left, &right| compare(left, right));
+}
+
 /// Find the earliest exact-compressed representative in O(n log n) compares.
 /// Sorting slices directly avoids adversarial hash-collision buckets.
 fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Vec<usize>> {
@@ -2157,7 +2167,7 @@ fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Ve
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::new("could not allocate PNG frame model"))?;
     order.extend(0..frames.len());
-    order.sort_unstable_by(|&left, &right| {
+    sort_frame_indices(&mut order, &mut |left, right| {
         (frames[left].as_slice(), decoded_sizes[left])
             .cmp(&(frames[right].as_slice(), decoded_sizes[right]))
             .then_with(|| left.cmp(&right))
