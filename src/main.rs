@@ -797,16 +797,37 @@ fn starts_with_dash(value: &OsStr) -> bool {
 }
 
 fn parse_timeout(value: &OsStr) -> Option<Duration> {
-    // strtod(), used by the original Columbo C CLI, accepts leading but not
-    // trailing space.
-    let text = value.to_str()?.trim_start();
-    let seconds: f64 = text.parse().ok()?;
-    if !seconds.is_finite() || seconds < 0.0 {
+    let text = value.to_str()?.as_bytes();
+    let limit = MAX_TIMEOUT.as_secs().saturating_add(1);
+    let mut seconds = 0_u64;
+    let mut decimal = false;
+    let mut integer_digit = false;
+    let mut fractional_digit = false;
+    let mut fractional_value = false;
+    for &byte in text {
+        match byte {
+            b'0'..=b'9' => {
+                if decimal {
+                    fractional_digit = true;
+                    fractional_value |= byte != b'0';
+                } else {
+                    integer_digit = true;
+                    seconds = seconds
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(byte - b'0'))
+                        .min(limit);
+                }
+            }
+            b'.' if !decimal && integer_digit => decimal = true,
+            _ => return None,
+        }
+    }
+    if !integer_digit || (decimal && !fractional_digit) || (seconds == 0 && !fractional_value) {
         return None;
     }
-    let seconds = seconds
-        .clamp(MIN_TIMEOUT.as_secs_f64(), MAX_TIMEOUT.as_secs_f64())
-        .ceil() as u64;
+    seconds = seconds
+        .saturating_add(u64::from(fractional_value))
+        .clamp(MIN_TIMEOUT.as_secs(), MAX_TIMEOUT.as_secs());
     Some(Duration::from_secs(seconds))
 }
 
@@ -819,7 +840,7 @@ fn parse_strict(value: &OsStr) -> Option<bool> {
 }
 
 fn timeout_error() -> CliError {
-    CliError::message("--timeout requires a non-negative number of seconds", false)
+    CliError::message("--timeout requires a positive number of seconds", false)
 }
 
 fn strict_error() -> CliError {
@@ -1250,7 +1271,15 @@ mod tests {
             parse_timeout(OsStr::new("9999")),
             Some(Duration::from_secs(4_000))
         );
+        assert_eq!(parse_timeout(OsStr::new("1.0")), Some(MIN_TIMEOUT));
+        assert_eq!(parse_timeout(OsStr::new("0")), None);
+        assert_eq!(parse_timeout(OsStr::new("0.0")), None);
         assert_eq!(parse_timeout(OsStr::new("-1")), None);
+        assert_eq!(parse_timeout(OsStr::new("+10")), None);
+        assert_eq!(parse_timeout(OsStr::new("1e2")), None);
+        assert_eq!(parse_timeout(OsStr::new("10.")), None);
+        assert_eq!(parse_timeout(OsStr::new(".1")), None);
+        assert_eq!(parse_timeout(OsStr::new("1.2.3")), None);
     }
 
     #[test]

@@ -361,9 +361,11 @@ impl Renderer {
             .iter()
             .filter_map(|(&report_id, view)| (view.id == stream_id).then_some(report_id))
             .collect();
-        report_ids.sort_unstable_by_key(|report_id| {
-            let view = &self.views[report_id];
-            (super::report_order(view.note), *report_id)
+        super::sort_tiny_by(&mut report_ids, |left_id, right_id| {
+            let left = &self.views[left_id];
+            let right = &self.views[right_id];
+            (super::report_order(left.note), left_id)
+                .cmp(&(super::report_order(right.note), right_id))
         });
         let color = color_enabled();
         let glyphs = Glyphs::for_unicode(self.unicode);
@@ -800,7 +802,7 @@ fn source_bits_by_output_block(source: &BlockReport, output: &BlockReport) -> Op
         if covered != source_decoded || shares.is_empty() {
             return None;
         }
-        shares.sort_unstable_by(|left, right| {
+        super::sort_tiny_by(&mut shares, |left, right| {
             right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
         });
         let residual = usize::try_from(source_bits.checked_sub(assigned)?).ok()?;
@@ -851,7 +853,7 @@ fn proportional_widths(weights: &[u64], width: usize) -> Option<Vec<usize>> {
         assigned_extra = assigned_extra.checked_add(quotient)?;
         remainders.push((scaled % total_weight, weight, index));
     }
-    remainders.sort_unstable_by(|left, right| right.cmp(left));
+    super::sort_tiny_by(&mut remainders, |left, right| right.cmp(left));
     for &(_, _, index) in remainders
         .iter()
         .take(extra_columns.checked_sub(assigned_extra)?)
@@ -999,7 +1001,7 @@ fn complete_segment_widths(report: &BlockReport, width: usize) -> Option<Vec<usi
         remainders.push((scaled % total_bits, block.output_bits, index));
     }
 
-    remainders.sort_unstable_by(|left, right| right.cmp(left));
+    super::sort_tiny_by(&mut remainders, |left, right| right.cmp(left));
     for &(_, _, index) in remainders
         .iter()
         .take(extra_columns.saturating_sub(assigned_extra))
@@ -1053,7 +1055,7 @@ fn select_dense_blocks(report: &BlockReport, target: usize) -> Vec<usize> {
         .enumerate()
         .map(|(index, block)| (block.output_bits, index))
         .collect();
-    by_size.sort_unstable();
+    super::sort_tiny_by(&mut by_size, Ord::cmp);
     let tiny_budget = (target / 4).max(1);
     for &(_, index) in by_size.iter().take(tiny_budget) {
         choose_block(&mut chosen, &mut count, target, index);
@@ -1122,7 +1124,7 @@ fn selected_cells(
             assigned_extra = assigned_extra.saturating_add(quotient);
             remainders.push((scaled % total_bits, bits, position));
         }
-        remainders.sort_unstable_by(|left, right| right.cmp(left));
+        super::sort_tiny_by(&mut remainders, |left, right| right.cmp(left));
         for &(_, _, position) in remainders
             .iter()
             .take(extra_columns.saturating_sub(assigned_extra))

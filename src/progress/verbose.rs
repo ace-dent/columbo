@@ -87,7 +87,11 @@ impl Reports {
             .iter()
             .filter_map(|(&report_id, report)| (report.stream_id == stream_id).then_some(report_id))
             .collect();
-        sort_report_ids(&mut report_ids, &self.reports);
+        super::sort_tiny_by(&mut report_ids, |left_id, right_id| {
+            let left = &self.reports[left_id];
+            let right = &self.reports[right_id];
+            (left.order, left_id).cmp(&(right.order, right_id))
+        });
         let mut finished = Vec::with_capacity(report_ids.len());
         for report_id in report_ids {
             let report = self
@@ -110,26 +114,6 @@ impl Reports {
         });
         self.cached_bytes = 0;
         reports.into_iter().map(|(_, report)| report).collect()
-    }
-}
-
-/// Sort tiny per-stream lineage lists without instantiating the generic slice sorter.
-#[cold]
-#[inline(never)]
-fn sort_report_ids(report_ids: &mut [usize], reports: &BTreeMap<usize, Report>) {
-    for index in 1..report_ids.len() {
-        let mut current = index;
-        while current != 0 {
-            let left_id = report_ids[current - 1];
-            let right_id = report_ids[current];
-            let left = &reports[&left_id];
-            let right = &reports[&right_id];
-            if (left.order, left_id) <= (right.order, right_id) {
-                break;
-            }
-            report_ids.swap(current - 1, current);
-            current -= 1;
-        }
     }
 }
 

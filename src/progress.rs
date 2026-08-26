@@ -38,6 +38,21 @@ const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
 
+/// Sort reporting-only collections whose length is deliberately tiny.
+///
+/// This keeps the general-purpose slice sorter out of cold presentation paths.
+#[cold]
+#[inline(never)]
+fn sort_tiny_by<T>(values: &mut [T], mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering) {
+    for index in 1..values.len() {
+        let mut current = index;
+        while current != 0 && compare(&values[current], &values[current - 1]).is_lt() {
+            values.swap(current, current - 1);
+            current -= 1;
+        }
+    }
+}
+
 fn start_report_spinner(deadline: Instant) {
     stop_report_spinner();
     let spinner = Spinner::start(true, deadline);
