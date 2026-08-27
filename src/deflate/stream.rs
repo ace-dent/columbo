@@ -147,11 +147,11 @@ enum SourceBlockSearch {
         /// The completed compact proven lineage beat the normal floor.
         integrated_compact_proven: bool,
     },
-    /// One source-ordered whole-block ladder. It combines individual and
-    /// cumulative pruning because their block-local choices can change the
-    /// alignment and merge prices seen by later blocks; splits and iterative
-    /// work remain with sibling routes.
-    Narrow,
+    /// One source-ordered whole-block ladder with an explicit local-pruning
+    /// policy. Keeping the two policies distinct preserves their different
+    /// downstream alignments and merge prices; splits and iterative work
+    /// remain with sibling routes.
+    Narrow { individual_prune: bool },
     /// Deterministic table floors only, for a selected terminal seed.
     Floor,
 }
@@ -734,15 +734,41 @@ fn plan_global_boundary_graph(
 /// Run the direct source-order route used when broad split search is a poor
 /// use of a bounded max budget.
 ///
-/// Every original Huffman block receives one narrow whole-block search and
+/// Every original Huffman block receives one cumulative whole-block search and
 /// profitable adjacent pairs are retried greedily. The route is additive to
-/// [`plan_stream`]: it deliberately omits grouping, split probes, boundary DP,
-/// and iterative state queues so a long regular chain can finish within its
-/// own wall-clock slice.
+/// [`plan_stream`]: it deliberately omits grouping, individual pruning, split
+/// probes, boundary DP, and iterative state queues so a long regular chain can
+/// finish within its own wall-clock slice.
 pub(crate) fn plan_source_no_split_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    plan_source_no_split_route_with_pruning(blocks, start_alignment, options, false, stop)
+}
+
+/// Run the complementary source-order walk with individual pruning enabled.
+///
+/// Keeping it distinct from the cumulative walk preserves the different
+/// alignments and adjacent-merge prices produced by local pruning rather than
+/// discarding either topology by immediate encoded-size comparison. Max gives
+/// short source lists this policy first and longer lists the cumulative policy
+/// first; sufficient remaining time admits the complementary walk.
+pub(crate) fn plan_source_individual_no_split_route(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    plan_source_no_split_route_with_pruning(blocks, start_alignment, options, true, stop)
+}
+
+fn plan_source_no_split_route_with_pruning(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    individual_prune: bool,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let prepared = prepare_blocks(blocks);
@@ -758,7 +784,7 @@ pub(crate) fn plan_source_no_split_route(
         start_alignment,
         options,
         AdjacentMergeSearch::LongRun,
-        SourceBlockSearch::Narrow,
+        SourceBlockSearch::Narrow { individual_prune },
         &mut plan_cache,
         stop,
         None,
@@ -2997,13 +3023,20 @@ fn plan_source_with_search(
             plan_cache,
             stop,
         ),
-        SourceBlockSearch::Narrow => {
+        SourceBlockSearch::Narrow { individual_prune } => {
             let plan = match plan_source_block(block, alignment, options, stop) {
                 Some(seed) if !stop.reached() => plan_block_with_seeded_narrow_search(
-                    block, alignment, options, true, seed, stop,
+                    block,
+                    alignment,
+                    options,
+                    individual_prune,
+                    seed,
+                    stop,
                 ),
                 Some(seed) => seed,
-                None => plan_block_with_narrow_search(block, alignment, options, true, stop),
+                None => {
+                    plan_block_with_narrow_search(block, alignment, options, individual_prune, stop)
+                }
             };
             vec![plan]
         }

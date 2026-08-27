@@ -32,9 +32,9 @@ use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,
     plan_compact_source_split_floor, plan_compact_source_split_floor_until, plan_fragmented_replay,
-    plan_integrated_proven_source_route, plan_proven_submatch_route, plan_source_no_split_route,
-    plan_stream, plan_stream_from_established_floor, plan_stream_with_progress,
-    plan_terminal_merge_route,
+    plan_integrated_proven_source_route, plan_proven_submatch_route,
+    plan_source_individual_no_split_route, plan_source_no_split_route, plan_stream,
+    plan_stream_from_established_floor, plan_stream_with_progress, plan_terminal_merge_route,
 };
 
 // Long source-block chains can need one pass to establish profitable adjacent
@@ -49,6 +49,12 @@ const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
 // fixed point given sufficient time without an arbitrary eight-round cutoff.
 const MAX_RAW_REPLAY_LIMIT: usize = usize::MAX;
 const NARROW_SOURCE_LIST_MAX_BLOCKS: usize = 128;
+// Three source blocks expose at most two adjacent-merge boundaries, so the
+// individual-pruning walk can still cover the complete short list. Longer
+// chains prioritize cumulative pruning first: local work on an early block can
+// otherwise consume the route window before later alignment/merge states are
+// visited. The complementary policy remains eligible later in Max.
+const CUMULATIVE_NO_SPLIT_MIN_SOURCE_BLOCKS: usize = 4;
 const WEAK_DEFT4J_GAIN_BASIS_POINTS: u64 = 200;
 // The no-split sibling is linear in the source block list, but each bounded
 // per-block search retains route-local candidates. Pair a 1 MiB compressed
@@ -1053,13 +1059,6 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 candidate_exposes_new_parent(narrow, source),
                 narrow,
                 source,
-                &[
-                    bounded_floor_candidate.as_ref(),
-                    floor_seeded_candidate.as_ref(),
-                    deft4j_candidate.as_ref(),
-                    source_max_candidate.as_ref(),
-                    complete_default_candidate.as_ref(),
-                ],
             )
         })
         && deadline.can_start_route();
@@ -1385,7 +1384,31 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         // refinement can otherwise retain another expanded token graph.
         deft4j.plans.clear();
     }
-    if let Some(narrow) = narrow_candidate {
+    if let Some(mut narrow) = narrow_candidate {
+        // A changed no-split topology can lose the immediate encoded-size
+        // comparison yet win after the bounded terminal tree closure. Close
+        // that branch only when another completed candidate would otherwise
+        // discard it; a no-split winner receives the same work once at Max's
+        // ordinary terminal stage.
+        let narrow_would_be_retained = [
+            bounded_floor_candidate.as_ref(),
+            floor_seeded_candidate.as_ref(),
+            deft4j_candidate.as_ref(),
+            source_max_candidate.as_ref(),
+            complete_default_candidate.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .all(|other| narrow.is_strictly_smaller_than(other));
+        if candidate_exposes_new_parent(&narrow, source) && !narrow_would_be_retained {
+            narrow = improve_with_terminal_tree_floors(
+                source,
+                options,
+                DefaultFloorWork::Timed(&deadline),
+                progress,
+                narrow,
+            )?;
+        }
         replace_optional_if_smaller(&mut deft4j_candidate, narrow);
     }
 
@@ -1492,14 +1515,40 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         }));
     }
 
-    if let Some(seeded) = floor_seeded_candidate {
+    if let Some(mut seeded) = floor_seeded_candidate {
+        // The retained Default floor may be immediately smaller while a
+        // distinct floor-seeded topology reaches a better terminal tree
+        // fixed point. Close that losing branch before score comparison;
+        // when it already wins, the ordinary Max terminal stage does this
+        // work once instead.
+        if !seeded.is_strictly_smaller_than(&candidate) {
+            seeded = improve_with_terminal_tree_floors(
+                source,
+                options,
+                DefaultFloorWork::Timed(&deadline),
+                progress,
+                seeded,
+            )?;
+        }
         candidate.replace_if_smaller(seeded);
     }
 
     if let Some(deft4j) = &mut deft4j_candidate {
         deft4j.plans.clear();
     }
-    if let Some(deft4j) = deft4j_candidate {
+    if let Some(mut deft4j) = deft4j_candidate {
+        // The deft4j-derived source graph is another independent topology;
+        // encoded-size dominance is sound only after its bounded tree-only
+        // closure has been priced.
+        if !deft4j.is_strictly_smaller_than(&candidate) {
+            deft4j = improve_with_terminal_tree_floors(
+                source,
+                options,
+                DefaultFloorWork::Timed(&deadline),
+                progress,
+                deft4j,
+            )?;
+        }
         candidate.replace_if_smaller(deft4j);
     }
 
@@ -1606,6 +1655,23 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                     max_candidate.replace_if_smaller(tree);
                 }
             }
+            // Encoded size does not dominate a different token/tree topology
+            // before terminal tree closure. In particular, a newly retained
+            // Default floor can be smaller than this source-max parent while
+            // the latter still reaches the best payload-tree fixed point.
+            // Close only a losing branch here: a winning source-max candidate
+            // receives the same terminal work once at the end of Max, so this
+            // preserves the independent search basin without duplicating its
+            // finalization on the common path.
+            if !max_candidate.is_strictly_smaller_than(&candidate) {
+                max_candidate = improve_with_terminal_tree_floors(
+                    source,
+                    options,
+                    DefaultFloorWork::Timed(&deadline),
+                    progress,
+                    max_candidate,
+                )?;
+            }
             source_max_stabilized_incumbent = candidate.is_encoding_stabilized_by(&max_candidate);
             candidate.replace_if_smaller(max_candidate);
         }
@@ -1651,6 +1717,50 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 )));
             }
             candidate.replace_if_smaller(seeded_candidate);
+        }
+    }
+
+    // The topology-selected no-split lineage owns the early bounded window:
+    // short lists keep individual pruning, while long lists first ensure that
+    // cumulative search reaches every source block.
+    // With time still available, retain the complementary pruning policy as
+    // its own topology rather than folding a locally smaller block choice into
+    // (and potentially redirecting) the established no-split candidate.
+    let run_complementary_narrow = options.exhaustive
+        && default_floor.uses_bounded_png_routes()
+        && run_narrow_source
+        && deadline.can_start_route();
+    let complementary_narrow_step =
+        run_complementary_narrow.then(|| progress.start("Columbo complementary no-split route"));
+    if run_complementary_narrow {
+        let mut route_stop = deadline.hard_stop();
+        let mut refinement_stop = deadline.hard_stop();
+        let complementary = build_complementary_narrow_source_candidate(
+            source,
+            options,
+            &mut route_stop,
+            &mut refinement_stop,
+        )?;
+        if let Some(mut contender) = complementary {
+            if !contender.is_strictly_smaller_than(&candidate) {
+                contender = improve_with_terminal_tree_floors(
+                    source,
+                    options,
+                    DefaultFloorWork::Timed(&deadline),
+                    progress,
+                    contender,
+                )?;
+            }
+            if let Some(step) = complementary_narrow_step {
+                step.finish(Some(candidate_progress(
+                    &contender,
+                    source.meaningful_bits,
+                    contender.is_strictly_smaller_than_source(source),
+                )));
+            }
+            candidate.replace_if_smaller(contender);
+        } else if let Some(step) = complementary_narrow_step {
+            step.finish(None);
         }
     }
 
@@ -3456,12 +3566,57 @@ fn build_narrow_source_candidate(
     expired: &mut SearchStop<'_>,
     refinement_stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
-    // Keep individual and cumulative pruning together in this source-ordered
-    // sibling. Their choices are not interchangeable with source max: a local
-    // win can alter alignment and the adjacent-merge prices of later blocks.
-    // Removing the individual phase lost complete endpoints on multi-block
-    // streams even when source max ran concurrently.
-    let Some(plans) = plan_source_no_split_route(source.blocks, 0, options, &mut *expired) else {
+    let individual_prune = !cumulative_no_split_has_priority(source.blocks);
+    build_narrow_source_candidate_with_policy(
+        source,
+        options,
+        individual_prune,
+        expired,
+        refinement_stop,
+    )
+}
+
+fn build_complementary_narrow_source_candidate(
+    source: CandidateInput<'_>,
+    options: &Options,
+    expired: &mut SearchStop<'_>,
+    refinement_stop: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    let individual_prune = cumulative_no_split_has_priority(source.blocks);
+    build_narrow_source_candidate_with_policy(
+        source,
+        options,
+        individual_prune,
+        expired,
+        refinement_stop,
+    )
+}
+
+fn cumulative_no_split_has_priority(blocks: &[ParsedBlock]) -> bool {
+    let nonempty_blocks = blocks
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    cumulative_no_split_count_has_priority(nonempty_blocks)
+}
+
+fn cumulative_no_split_count_has_priority(nonempty_blocks: usize) -> bool {
+    nonempty_blocks >= CUMULATIVE_NO_SPLIT_MIN_SOURCE_BLOCKS
+}
+
+fn build_narrow_source_candidate_with_policy(
+    source: CandidateInput<'_>,
+    options: &Options,
+    individual_prune: bool,
+    expired: &mut SearchStop<'_>,
+    refinement_stop: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    let plans = if individual_prune {
+        plan_source_individual_no_split_route(source.blocks, 0, options, &mut *expired)
+    } else {
+        plan_source_no_split_route(source.blocks, 0, options, &mut *expired)
+    };
+    let Some(plans) = plans else {
         return Ok(None);
     };
     let mut candidate =
@@ -3476,7 +3631,11 @@ fn build_narrow_source_candidate(
         )?;
         candidate.replace_if_smaller(refined);
     }
-    Ok(Some(candidate.named("No-split source")))
+    Ok(Some(candidate.named(if individual_prune {
+        "Individual no-split source"
+    } else {
+        "No-split source"
+    })))
 }
 
 /// Whether emitting a route changed block boundaries or token spellings.
@@ -3591,22 +3750,17 @@ fn changed_parent_no_split_should_continue(
 
 /// Decide whether a completed no-split result owns the next dependent step.
 ///
-/// Equal-scoring siblings do not dominate it: their distinct encodings can
-/// still lead to differently ordered endpoints. A strictly better completed
-/// sibling does dominate the scheduling signal, while the original candidate
-/// remains retained regardless of whether this optional continuation runs.
+/// Encoded score alone cannot dominate this dependency: even a smaller sibling
+/// may have a different token/tree topology, while a tied second no-split pass
+/// can expose a better terminal tree fixed point. The completed source and all
+/// sibling candidates remain retained regardless of whether this continuation
+/// improves.
 fn changed_narrow_parent_should_continue(
     exposes_new_parent: bool,
     narrow: &Candidate,
     source: CandidateInput<'_>,
-    competitors: &[Option<&Candidate>],
 ) -> bool {
-    exposes_new_parent
-        && narrow.is_strictly_smaller_than_source(source)
-        && competitors
-            .iter()
-            .flatten()
-            .all(|other| !other.is_strictly_smaller_than(narrow))
+    exposes_new_parent && narrow.is_strictly_smaller_than_source(source)
 }
 
 /// Finish a small deft4j-derived seed with Columbo's structural split floor.
@@ -3984,14 +4138,14 @@ fn refine_with_bounded_depth_tree_floor(
     Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("Bounded-depth tree floor")))
 }
 
-/// Finish one exact mixed-depth tree probe after the hard search boundary.
+/// Finish the exact mixed-depth tree floor after the hard search boundary.
 ///
-/// Payload/header search is independent of token count once frequencies are
-/// known, so one dynamic block has a fixed Deflate-alphabet frontier. Choose
-/// the largest transmitted dynamic block, price that complete frontier, and
-/// emit at most one bounded stream sibling. One-MiB compressed/decoded limits
-/// and the existing 128-block narrow-list bound cap reparse and emission work;
-/// no file family or measured corpus band participates in admission.
+/// Payload/header search has a fixed Deflate-alphabet frontier per dynamic
+/// block once frequencies are known. Price every block so reaching the hard
+/// boundary a few milliseconds earlier or later cannot change which terminal
+/// floor quiet, Verbose, or Visual mode receives. One-MiB compressed/decoded
+/// limits and the existing 128-block narrow-list bound cap total work; no file
+/// family or measured corpus band participates in admission.
 fn refine_with_bounded_depth_tree_rescue(
     candidate: &Candidate,
     options: &Options,
@@ -4007,16 +4161,13 @@ fn refine_with_bounded_depth_tree_rescue(
     if stream.blocks.len() > NARROW_SOURCE_LIST_MAX_BLOCKS {
         return Ok(None);
     }
-    let Some(priority_block) = stream
+    if !stream
         .blocks
         .iter()
-        .enumerate()
-        .filter(|(_, block)| block.source_type == SourceBlockType::Dynamic)
-        .max_by_key(|(_, block)| block.original.map_or(0, |original| original.len))
-        .map(|(index, _)| index)
-    else {
+        .any(|block| block.source_type == SourceBlockType::Dynamic)
+    {
         return Ok(None);
-    };
+    }
 
     let mut plans = Vec::new();
     if plans.try_reserve_exact(stream.blocks.len()).is_err() {
@@ -4025,11 +4176,11 @@ fn refine_with_bounded_depth_tree_rescue(
     let mut alignment = 0_u8;
     let mut improved = false;
     let mut never_expires = SearchStop::never();
-    for (block_index, block) in stream.blocks.iter().enumerate() {
+    for block in &stream.blocks {
         let Some(original) = reusable_original_bits(block, alignment, options.strict) else {
             return Ok(None);
         };
-        let bounded = (block_index == priority_block)
+        let bounded = (block.source_type == SourceBlockType::Dynamic)
             .then(|| {
                 plan_bounded_depth_tree_candidate(
                     &block.tokens,
@@ -5215,7 +5366,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_narrow_parent_continues_only_while_nondominated() {
+    fn changed_narrow_parent_continues_after_a_source_improvement() {
         let compressed = [0_u8; 12];
         let source = CandidateInput {
             compressed: &compressed,
@@ -5229,35 +5380,25 @@ mod tests {
             },
         };
         let narrow = comparison_candidate(10, 80, 1);
-        let weaker = comparison_candidate(11, 81, 2);
-        let tied = comparison_candidate(10, 80, 3);
-        let better = comparison_candidate(9, 79, 4);
 
-        assert!(changed_narrow_parent_should_continue(
-            true,
-            &narrow,
-            source,
-            &[Some(&weaker), Some(&tied)],
-        ));
+        assert!(changed_narrow_parent_should_continue(true, &narrow, source));
         assert!(!changed_narrow_parent_should_continue(
-            false,
-            &narrow,
-            source,
-            &[Some(&weaker)],
-        ));
-        assert!(!changed_narrow_parent_should_continue(
-            true,
-            &narrow,
-            source,
-            &[Some(&better)],
+            false, &narrow, source
         ));
 
         let unchanged = comparison_candidate(12, 90, 5);
         assert!(!changed_narrow_parent_should_continue(
-            true,
-            &unchanged,
-            source,
-            &[],
+            true, &unchanged, source
+        ));
+    }
+
+    #[test]
+    fn no_split_policy_prioritizes_cumulative_work_for_long_lists() {
+        assert!(!cumulative_no_split_count_has_priority(0));
+        assert!(!cumulative_no_split_count_has_priority(3));
+        assert!(cumulative_no_split_count_has_priority(4));
+        assert!(cumulative_no_split_count_has_priority(
+            NARROW_SOURCE_LIST_MAX_BLOCKS,
         ));
     }
 
