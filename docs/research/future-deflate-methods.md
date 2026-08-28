@@ -104,6 +104,20 @@ their shortest paths factor into the per-match graphs already implemented.
 Additional value requires joint header-aware selection across alternate paths,
 which the bounded composition route supplies.
 
+## zRecompress follow-up
+
+zRecompress 2.12 was recovered from the
+[SourceForge release](https://sourceforge.net/projects/nikkhokkho/files/zRecompress/)
+and verified at SHA-256
+`0096edf8cf130040275456f3c286d8ce11b68f946bda98e479f8c27445201b85`.
+Its active Deflate path is an old 7-Zip encoder. Two concepts were evaluated
+independently; no upstream implementation code was imported.
+
+| Concept | Decision | Evidence |
+| --- | --- | --- |
+| Non-strict equal-height Huffman heap | Reject | The comparison selects the right child when frequency and height are equal, but also stops a repaired item above an equal child. A deterministic oracle confirmed that this asymmetry produces trees outside Columbo's existing families: 583/2,000 sampled 19-symbol histograms, 421/1,000 30-symbol histograms, and 98/100 286-symbol histograms were absent from the ordinary family set. Novelty did not become compression value. Naive central-planner placement produced 0 wins, 4 losses, and 21.8% more wall time across 228 PngSuite reference comparisons because it redirected later search. An isolated exact-priced terminal sibling then produced 0 wins and 0 losses across the same 228 comparisons; paired time was 44.321 versus 44.076 seconds, which is noise. Keep the rule out until a diagnosed miss identifies its exact tree. |
+| Smallest zlib window advertisement | Retain as wrapper normalization | RFC 1950 defines CINFO as `log2(window size) - 8`. Columbo now derives it from the largest distance recorded when the final emitted bytes are reparsed for identity validation, recomputes FCHECK, and separately validates the source against its original advertised window. Boundaries from 256 bytes through 32 KiB are tested. A standalone native benchmark oracle independently parses every Deflate token in IDAT, fdAT, zTXt, compressed iTXt, iCCP, and top-level zlib output streams. It requires exact minimality only when Columbo saved file bytes or tied bytes while saving meaningful Deflate bits; copied originals are not submitted to that oracle. All PNG sources, references, and outputs still receive full `pngcheck -q` conformance validation. This normalization cannot itself reduce file bytes because the header remains two bytes. On `XYB.icc.zlib`, Default makes no file saving and therefore copies the original header unchanged; a 352-byte Max output that saves one byte advertises the exact 512-byte `18 d3` window required by its maximum distance of 292. |
+
 ## Retained size methods
 
 | Method | Production bound | Evidence |
@@ -188,6 +202,7 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Fixed 32-bit writer drain | Literal emission 62.24 → 52.42 ms, about 15.8%; match emission 147.33 → 115.72 ms, about 21.5% | Independent bit-vector oracle covers widths 0–32, alignment, direct bytes, drain boundaries, and partial tails in both writer modes |
 | Route-local header kernel cache | Neutral short Max control: 3.99 → 4.01 s | Exact length/policy key, collision verification, 512-entry cap, independent payload pricing |
 | Separable bounded-frontier payload scoring | Five Default controls were output-identical; two frozen-baseline totals were 11.13 and 10.58 s, versus 10.52 s retained | Literal and distance sums exactly reconstruct the prior payload score. Increasing-payload order is an admissible lower-bound traversal; only payloads already no better than a complete incumbent skip header construction |
+| Brotli-shaped entropy-state boundary scout | A three-regime, 2,100-literal raw stream reached the same byte-identical 2,400-bit fixed point in one replay instead of three; six-run release medians were 617 → 180 ms, about 70.8%. Twelve representative PNG/GZIP/ZIP controls were output-identical; paired Max time ratios were 0.996–1.005 | Exhaustive small-path oracle; deterministic transition and 16-cut-cap tests; deadline/stored/small-input gates; strict exact-boundary improvement test; both end-to-end raw outputs independently decompressed to the original bytes |
 
 ## Rejected or deferred experiments
 
@@ -302,6 +317,7 @@ recompression and container transforms that would change Columbo's scope.
 | [Google Zopfli](https://github.com/google/zopfli) and fork network | Repeat-code masks; RLE-friendly pseudo-frequencies; equal-weight package-merge choice; alternate header/count/split policies and hot paths in KrzYmod, FrKay, fhanau/JayXon, MegaByte, ImageOptim, and maintained ports | Masks and smoothing were already covered. Package-before-leaf equality is newly retained through Columbo's independent package-list builder and exact full/restricted-depth pricing. Exact header RLE, equal-frequency assignments, stored/fixed/dynamic selection, deadlines, and boundary routes cover the other existing-token dimensions. Optimal parsing, match discovery, PNG pixel transforms, and repeated recompression remain out of scope |
 | [QVXLabs Zopfli](https://github.com/QVXLabs/zopfli) | Fixed-point costs, reusable match caches, packed DP state, tree-preprocessing reuse, histogram shortcuts, and scaled iterations | Parsing work depends on fresh LZ77 matches. Applicable reuse is already covered by Columbo's persistent tokens, cached exact header kernels, canonical plan cache, deduplicated tree families, and scratch ownership |
 | [libdeflate](https://github.com/ebiggers/libdeflate) | Match cache and minimum-cost parse, feedback passes, all-literals fallback, fixed-tree small-block pricing, fast tables/copies/bit I/O | All-literals and useful portable execution themes are implemented; remaining ratio methods require new matches; remaining hardware checksum/CPU dispatch work lacks a significant Columbo hotspot |
+| [Google Brotli](https://github.com/google/brotli) | High-quality block splitting learns a bounded family of entropy-code states and assigns the complete symbol stream while charging state changes | The search shape is retained as a Max-only Deflate boundary scout over existing tokens. It contributes only bounded cut anchors; Columbo's exact residue-aware graph remains the acceptance authority. Brotli context maps, transforms, and new LZ parsing do not transfer to the existing-token contract |
 | [7-Zip](https://github.com/ip7z/7zip) | Token-count-selected payload-tree depth; compact code-length decoder; 10/6-bit payload decode roots; recursive splitting; priced optimal parsing and match finding | Restricted depths are generalized into a complete feasible terminal frontier; the compact decoder and 10/6 roots are retained independently. Existing Columbo boundaries cover the in-scope split dimension. Fresh match discovery and optimal LZ parsing remain outside scope |
 | [AdvanceCOMP](https://github.com/amadvance/advancecomp) | Recompression | Outside existing-token scope |
 | [ECT](https://github.com/fhanau/Efficient-Compression-Tool) | Modified zlib/Zopfli recompression; newer Brotli fixed-point count smoothing beside classic Zopfli smoothing; exact comparison across reduced maximum payload-tree depths; coarse-to-fine block splitting; short-match literal replacement | Both smoothing families are retained independently in one compact terminal tree floor, with the raw reduced-depth dimension covered by Max depth-10/depth-9 pairs and the complete feasible terminal frontier. Columbo already has broader header-RLE masks, match-to-literal feedback, adaptive/exact-histogram splitting, bounded reseat/escape routes, and parallel range pricing. Fresh match discovery, recompression, PNG pixel transforms, and JPEG work remain outside scope |
@@ -314,7 +330,7 @@ recompression and container transforms that would change Columbo's scope.
 | [`header.rs`](../../src/deflate/header.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE, finished-tree moves |
 | [`huffman.rs`](../../src/deflate/huffman.rs) | Length-limited builders, pseudo-frequencies, decode tables |
 | [`search.rs`](../../src/deflate/search.rs) | Same-distance, match-family, proven-submatch, feedback, and composition searches |
-| [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, boundary graph, reseat, forced split, range caches |
+| [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, entropy-state scout, boundary graph, reseat, forced split, range caches |
 | [`block.rs`](../../src/deflate/block.rs) | Exact representation selection and canonical plan cache |
 | [`bitstream.rs`](../../src/deflate/bitstream.rs) | Safe bit reader/writer and exact-source copying |
 | [`parse.rs`](../../src/deflate/parse.rs) | Validating persistent token/plain model and resource accounting |

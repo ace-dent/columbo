@@ -31,6 +31,7 @@ use super::block::{
 };
 use super::deft4j::plan_source_block;
 use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
+use super::huffman::make_lengths_deflopt_heap_into;
 use super::model::{
     canonical_length_encoding, count_frequencies, token_extra_bits, DynamicPlan, OriginalBits,
     ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
@@ -99,6 +100,20 @@ const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
 const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
 const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
 const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
+// Brotli's high-quality block splitter assigns a complete symbol stream to a
+// small set of learned entropy-code states, charging every state transition.
+// Columbo uses that search shape only to discover token-boundary anchors; its
+// existing exact boundary graph still prices and accepts every emitted block.
+const ENTROPY_SCOUT_MIN_TOKENS: usize = ADAPTIVE_SPLIT_MIN_TOKENS;
+const ENTROPY_SCOUT_MAX_TOKENS: usize = MAX_MERGED_TOKENS;
+const ENTROPY_SCOUT_TOKENS_PER_PROTOTYPE: usize = 512;
+const ENTROPY_SCOUT_MAX_PROTOTYPES: usize = 8;
+const ENTROPY_SCOUT_SEED_TOKENS: usize = 256;
+const ENTROPY_SCOUT_REFINEMENT_ROUNDS: usize = 2;
+const ENTROPY_SCOUT_SWITCH_BITS: u64 = 128;
+const ENTROPY_SCOUT_SCORE_RADIUS: usize = 64;
+const ENTROPY_SCOUT_MIN_EDGE_TOKENS: usize = 16;
+const ENTROPY_SCOUT_MAX_CUTS: usize = 16;
 // Forced lookahead may add one block to an already-selected comparison floor.
 // Keeping the parent at seven blocks preserves the existing eight-block
 // structural and boundary-reseat ceiling.
@@ -704,7 +719,18 @@ fn plan_global_boundary_graph(
         "source blocks",
     );
     let composite = Composite::new(blocks)?;
-    let cuts = choose_cuts(&composite, options.exhaustive, allow_regroup)?;
+    let mut cuts = choose_cuts(&composite, options.exhaustive, allow_regroup)?;
+    if options.exhaustive && cuts.len() < MAX_BOUNDARY_DP_CUTS && !stop.reached() {
+        progress.activity("Scouting entropy-state boundaries");
+        if let Some(scouted) = entropy_state_boundary_cuts(&composite, options.strict, stop) {
+            for cut in scouted {
+                if push_optional_cut(&mut cuts, &composite, cut).is_none() {
+                    break;
+                }
+            }
+            cuts.sort_unstable_by_key(|cut| cut.plain);
+        }
+    }
     if cuts.len() <= 2 {
         return None;
     }
@@ -3941,6 +3967,367 @@ struct Cut {
     plain: usize,
 }
 
+#[derive(Clone)]
+struct EntropyScoutHistogram {
+    literal: [u32; 286],
+    distance: [u32; 30],
+    token_count: usize,
+}
+
+impl EntropyScoutHistogram {
+    fn zero() -> Self {
+        Self {
+            literal: [0; 286],
+            distance: [0; 30],
+            token_count: 0,
+        }
+    }
+
+    fn add_token(&mut self, token: Token) {
+        match token {
+            Token::Literal(value) => self.literal[usize::from(value)] += 1,
+            Token::Match {
+                length_symbol,
+                distance_symbol,
+                ..
+            } => {
+                self.literal[usize::from(length_symbol)] += 1;
+                self.distance[usize::from(distance_symbol)] += 1;
+            }
+        }
+        self.token_count += 1;
+    }
+}
+
+struct EntropyScoutCode {
+    literal_lengths: [u8; 286],
+    distance_lengths: [u8; 30],
+    unseen_literal_bits: u8,
+    unseen_distance_bits: u8,
+}
+
+impl EntropyScoutCode {
+    fn from_histogram(histogram: &EntropyScoutHistogram, strict: bool) -> Self {
+        let mut literal_frequencies = histogram.literal;
+        literal_frequencies[256] += 1;
+        complete_scout_alphabet(&mut literal_frequencies, strict);
+        let mut distance_frequencies = histogram.distance;
+        if distance_frequencies.iter().all(|&frequency| frequency == 0) {
+            distance_frequencies[0] = 1;
+        }
+        complete_scout_alphabet(&mut distance_frequencies, strict);
+
+        let mut literal_lengths = [0; 286];
+        let mut distance_lengths = [0; 30];
+        make_lengths_deflopt_heap_into(&literal_frequencies, &mut literal_lengths, 15, 0);
+        make_lengths_deflopt_heap_into(&distance_frequencies, &mut distance_lengths, 15, 0);
+
+        Self {
+            literal_lengths,
+            distance_lengths,
+            unseen_literal_bits: unseen_symbol_bits(&literal_frequencies),
+            unseen_distance_bits: unseen_symbol_bits(&distance_frequencies),
+        }
+    }
+
+    fn token_bits(&self, token: Token) -> u64 {
+        match token {
+            Token::Literal(value) => u64::from(code_or_unseen(
+                &self.literal_lengths,
+                usize::from(value),
+                self.unseen_literal_bits,
+            )),
+            Token::Match {
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } => {
+                u64::from(code_or_unseen(
+                    &self.literal_lengths,
+                    usize::from(length_symbol),
+                    self.unseen_literal_bits,
+                )) + u64::from(code_or_unseen(
+                    &self.distance_lengths,
+                    usize::from(distance_symbol),
+                    self.unseen_distance_bits,
+                )) + u64::from(length_extra_bits)
+                    + u64::from(distance_extra_bits)
+            }
+        }
+    }
+}
+
+fn complete_scout_alphabet<const N: usize>(frequencies: &mut [u32; N], strict: bool) {
+    if !strict
+        || frequencies
+            .iter()
+            .filter(|&&frequency| frequency != 0)
+            .count()
+            >= 2
+    {
+        return;
+    }
+    if let Some(frequency) = frequencies.iter_mut().find(|frequency| **frequency == 0) {
+        *frequency = 1;
+    }
+}
+
+fn unseen_symbol_bits<const N: usize>(frequencies: &[u32; N]) -> u8 {
+    let total = frequencies
+        .iter()
+        .fold(0_u64, |sum, &frequency| sum + u64::from(frequency));
+    let rounded_log = if total <= 1 {
+        0
+    } else {
+        u64::BITS - (total - 1).leading_zeros()
+    };
+    (rounded_log + 2).min(u32::from(u8::MAX)) as u8
+}
+
+fn code_or_unseen(lengths: &[u8], symbol: usize, unseen: u8) -> u8 {
+    lengths
+        .get(symbol)
+        .copied()
+        .filter(|&length| length != 0)
+        .unwrap_or(unseen)
+}
+
+/// Discover several interacting block-boundary anchors with a learned
+/// entropy-state path.
+///
+/// Google Brotli's high-quality splitter initializes and refines a bounded set
+/// of entropy codes, then uses a shortest path with a block-switch charge to
+/// label the complete symbol stream. This independent Deflate adaptation uses
+/// paired literal/length and distance code costs over already-proven tokens.
+/// It returns token boundaries only; Columbo's exact boundary graph remains
+/// the sole acceptance test and retains its complete pre-scout candidate.
+fn entropy_state_boundary_cuts(
+    composite: &Composite<'_>,
+    strict: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<Cut>> {
+    let token_count = composite.tokens.len();
+    if !(ENTROPY_SCOUT_MIN_TOKENS..=ENTROPY_SCOUT_MAX_TOKENS).contains(&token_count)
+        || composite.plain.len() < 128
+        || composite
+            .sources
+            .iter()
+            .any(|source| source.source_type == SourceBlockType::Stored)
+        || stop.reached()
+    {
+        return None;
+    }
+
+    let prototype_count =
+        (token_count / ENTROPY_SCOUT_TOKENS_PER_PROTOTYPE).clamp(2, ENTROPY_SCOUT_MAX_PROTOTYPES);
+    let mut histograms = seed_entropy_scout_histograms(&composite.tokens, prototype_count)?;
+    for _ in 0..ENTROPY_SCOUT_REFINEMENT_ROUNDS {
+        let codes: Vec<_> = histograms
+            .iter()
+            .map(|histogram| EntropyScoutCode::from_histogram(histogram, strict))
+            .collect();
+        let assigned =
+            assign_entropy_states(&composite.tokens, &codes, ENTROPY_SCOUT_SWITCH_BITS, stop)?;
+        let refined = rebuild_entropy_scout_histograms(&composite.tokens, &assigned, &histograms)?;
+        histograms = refined;
+    }
+
+    let codes: Vec<_> = histograms
+        .iter()
+        .map(|histogram| EntropyScoutCode::from_histogram(histogram, strict))
+        .collect();
+    let final_states =
+        assign_entropy_states(&composite.tokens, &codes, ENTROPY_SCOUT_SWITCH_BITS, stop)?;
+    ranked_entropy_state_cuts(composite, &codes, &final_states)
+}
+
+fn seed_entropy_scout_histograms(
+    tokens: &[Token],
+    prototype_count: usize,
+) -> Option<Vec<EntropyScoutHistogram>> {
+    if !(2..=ENTROPY_SCOUT_MAX_PROTOTYPES).contains(&prototype_count) {
+        return None;
+    }
+    let seed_tokens = ENTROPY_SCOUT_SEED_TOKENS.min(tokens.len() / prototype_count);
+    if seed_tokens == 0 {
+        return None;
+    }
+    let mut histograms = Vec::new();
+    histograms.try_reserve_exact(prototype_count).ok()?;
+    for prototype in 0..prototype_count {
+        let center = tokens
+            .len()
+            .checked_mul(prototype.checked_mul(2)?.checked_add(1)?)?
+            / prototype_count.checked_mul(2)?;
+        let start = center
+            .saturating_sub(seed_tokens / 2)
+            .min(tokens.len().saturating_sub(seed_tokens));
+        let mut histogram = EntropyScoutHistogram::zero();
+        for &token in &tokens[start..start + seed_tokens] {
+            histogram.add_token(token);
+        }
+        histograms.push(histogram);
+    }
+    Some(histograms)
+}
+
+fn rebuild_entropy_scout_histograms(
+    tokens: &[Token],
+    states: &[u8],
+    previous: &[EntropyScoutHistogram],
+) -> Option<Vec<EntropyScoutHistogram>> {
+    if tokens.len() != states.len() || previous.is_empty() {
+        return None;
+    }
+    let mut histograms = Vec::new();
+    histograms.try_reserve_exact(previous.len()).ok()?;
+    histograms.resize_with(previous.len(), EntropyScoutHistogram::zero);
+    for (&token, &state) in tokens.iter().zip(states) {
+        histograms.get_mut(usize::from(state))?.add_token(token);
+    }
+    for (histogram, old) in histograms.iter_mut().zip(previous) {
+        if histogram.token_count == 0 {
+            *histogram = old.clone();
+        }
+    }
+    Some(histograms)
+}
+
+fn assign_entropy_states(
+    tokens: &[Token],
+    codes: &[EntropyScoutCode],
+    switch_bits: u64,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<u8>> {
+    let state_count = codes.len();
+    if tokens.is_empty() || !(2..=ENTROPY_SCOUT_MAX_PROTOTYPES).contains(&state_count) {
+        return None;
+    }
+    let mut back = Vec::<[u8; ENTROPY_SCOUT_MAX_PROTOTYPES]>::new();
+    back.try_reserve_exact(tokens.len()).ok()?;
+    let mut previous = [u64::MAX; ENTROPY_SCOUT_MAX_PROTOTYPES];
+    for state in 0..state_count {
+        previous[state] = codes[state].token_bits(tokens[0]);
+    }
+    back.push(std::array::from_fn(|state| state as u8));
+
+    for (position, &token) in tokens.iter().enumerate().skip(1) {
+        if position % RANGE_HISTOGRAM_INTERVAL == 0 && stop.reached() {
+            return None;
+        }
+        let mut ranked = [(u64::MAX, usize::MAX); 2];
+        for (state, &cost) in previous[..state_count].iter().enumerate() {
+            let candidate = (cost, state);
+            if candidate < ranked[0] {
+                ranked[1] = ranked[0];
+                ranked[0] = candidate;
+            } else if candidate < ranked[1] {
+                ranked[1] = candidate;
+            }
+        }
+
+        let mut current = [u64::MAX; ENTROPY_SCOUT_MAX_PROTOTYPES];
+        let mut predecessors = [0_u8; ENTROPY_SCOUT_MAX_PROTOTYPES];
+        for state in 0..state_count {
+            let switch_from = if ranked[0].1 == state {
+                ranked[1]
+            } else {
+                ranked[0]
+            };
+            let switch_cost = switch_from.0.checked_add(switch_bits)?;
+            let (base, predecessor) = if switch_cost < previous[state] {
+                (switch_cost, switch_from.1)
+            } else {
+                (previous[state], state)
+            };
+            current[state] = base.checked_add(codes[state].token_bits(token))?;
+            predecessors[state] = predecessor.try_into().ok()?;
+        }
+        let floor = *current[..state_count].iter().min()?;
+        for cost in &mut current[..state_count] {
+            *cost -= floor;
+        }
+        previous = current;
+        back.push(predecessors);
+    }
+    if stop.reached() {
+        return None;
+    }
+
+    let mut final_state = (0..state_count).min_by_key(|&state| (previous[state], state))?;
+    let mut states = Vec::new();
+    states.try_reserve_exact(tokens.len()).ok()?;
+    states.resize(tokens.len(), 0_u8);
+    *states.last_mut()? = final_state.try_into().ok()?;
+    for position in (1..tokens.len()).rev() {
+        final_state = usize::from(back[position][final_state]);
+        states[position - 1] = final_state.try_into().ok()?;
+    }
+    Some(states)
+}
+
+fn ranked_entropy_state_cuts(
+    composite: &Composite<'_>,
+    codes: &[EntropyScoutCode],
+    states: &[u8],
+) -> Option<Vec<Cut>> {
+    if states.len() != composite.tokens.len() {
+        return None;
+    }
+    let mut transitions = Vec::<(u64, usize)>::new();
+    transitions
+        .try_reserve_exact(states.len().saturating_sub(1))
+        .ok()?;
+    for boundary in 1..states.len() {
+        let left_state = usize::from(states[boundary - 1]);
+        let right_state = usize::from(states[boundary]);
+        if left_state == right_state
+            || boundary < ENTROPY_SCOUT_MIN_EDGE_TOKENS
+            || states.len() - boundary < ENTROPY_SCOUT_MIN_EDGE_TOKENS
+        {
+            continue;
+        }
+        let left_code = codes.get(left_state)?;
+        let right_code = codes.get(right_state)?;
+        let left_start = boundary.saturating_sub(ENTROPY_SCOUT_SCORE_RADIUS);
+        let right_end = boundary
+            .checked_add(ENTROPY_SCOUT_SCORE_RADIUS)?
+            .min(states.len());
+        let mut score = 0_u64;
+        for &token in &composite.tokens[left_start..boundary] {
+            score = score.checked_add(
+                right_code
+                    .token_bits(token)
+                    .saturating_sub(left_code.token_bits(token)),
+            )?;
+        }
+        for &token in &composite.tokens[boundary..right_end] {
+            score = score.checked_add(
+                left_code
+                    .token_bits(token)
+                    .saturating_sub(right_code.token_bits(token)),
+            )?;
+        }
+        if score != 0 {
+            transitions.push((score, boundary));
+        }
+    }
+    transitions
+        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    transitions.truncate(ENTROPY_SCOUT_MAX_CUTS);
+    transitions.sort_unstable_by_key(|&(_, boundary)| boundary);
+
+    let mut cuts = Vec::new();
+    cuts.try_reserve_exact(transitions.len()).ok()?;
+    for (_, token) in transitions {
+        let plain = *composite.token_plain_offsets.get(token)?;
+        cuts.push(Cut { token, plain });
+    }
+    Some(cuts)
+}
+
 /// Append one source-proven match fragment without searching for a distance.
 fn append_proven_match_fragment(
     output: &mut Vec<Token>,
@@ -5751,6 +6138,189 @@ mod tests {
             fallback.extra_bits,
             token_extra_bits(&composite.tokens[257..699])
         );
+    }
+
+    #[test]
+    fn entropy_state_assignment_matches_an_exhaustive_oracle() {
+        let left_tokens = [Token::Literal(b'a'); 32];
+        let right_tokens = [Token::Literal(b'b'); 32];
+        let mut left = EntropyScoutHistogram::zero();
+        let mut right = EntropyScoutHistogram::zero();
+        for token in left_tokens {
+            left.add_token(token);
+        }
+        for token in right_tokens {
+            right.add_token(token);
+        }
+        let codes = [
+            EntropyScoutCode::from_histogram(&left, true),
+            EntropyScoutCode::from_histogram(&right, true),
+        ];
+        let tokens = [
+            Token::Literal(b'a'),
+            Token::Literal(b'a'),
+            Token::Literal(b'b'),
+            Token::Literal(b'b'),
+            Token::Literal(b'a'),
+        ];
+        let switch_bits = 2;
+        let states =
+            assign_entropy_states(&tokens, &codes, switch_bits, &mut SearchStop::never()).unwrap();
+        let path_cost = |states: &[u8]| {
+            let payload: u64 = tokens
+                .iter()
+                .zip(states)
+                .map(|(&token, &state)| codes[usize::from(state)].token_bits(token))
+                .sum();
+            let switches = states.windows(2).filter(|pair| pair[0] != pair[1]).count() as u64;
+            payload + switches * switch_bits
+        };
+        let oracle = (0_u8..1 << tokens.len())
+            .map(|mask| {
+                let candidate: Vec<_> = (0..tokens.len())
+                    .map(|position| (mask >> position) & 1)
+                    .collect();
+                path_cost(&candidate)
+            })
+            .min()
+            .unwrap();
+
+        assert_eq!(path_cost(&states), oracle);
+    }
+
+    #[test]
+    fn entropy_state_scout_finds_multiple_off_grid_transitions_deterministically() {
+        let mut bytes = vec![b'a'; 700];
+        bytes.extend(std::iter::repeat(b'b').take(700));
+        bytes.extend(std::iter::repeat(b'c').take(700));
+        let block = literal_block(&bytes, SourceBlockType::Dynamic);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+
+        let first = entropy_state_boundary_cuts(&composite, true, &mut SearchStop::never())
+            .expect("the learned states expose both literal transitions");
+        let second = entropy_state_boundary_cuts(&composite, true, &mut SearchStop::never())
+            .expect("the scout is deterministic");
+
+        assert_eq!(first, second);
+        assert!(first.contains(&Cut {
+            token: 700,
+            plain: 700,
+        }));
+        assert!(first.contains(&Cut {
+            token: 1_400,
+            plain: 1_400,
+        }));
+    }
+
+    #[test]
+    fn entropy_state_scout_is_bounded_and_skips_ineligible_work() {
+        let small = literal_block(&vec![b'a'; 512], SourceBlockType::Dynamic);
+        let small_blocks = [small];
+        let small_composite = Composite::new(&small_blocks).unwrap();
+        assert!(
+            entropy_state_boundary_cuts(&small_composite, true, &mut SearchStop::never(),)
+                .is_none()
+        );
+
+        let stored = literal_block(&vec![b'a'; 1_024], SourceBlockType::Stored);
+        let stored_blocks = [stored];
+        let stored_composite = Composite::new(&stored_blocks).unwrap();
+        assert!(
+            entropy_state_boundary_cuts(&stored_composite, true, &mut SearchStop::never(),)
+                .is_none()
+        );
+
+        let eligible = literal_block(&vec![b'a'; 1_024], SourceBlockType::Dynamic);
+        let eligible_blocks = [eligible];
+        let eligible_composite = Composite::new(&eligible_blocks).unwrap();
+        assert!(
+            entropy_state_boundary_cuts(&eligible_composite, true, &mut SearchStop::always(),)
+                .is_none()
+        );
+
+        let mut bytes = Vec::new();
+        for chunk in 0..40 {
+            bytes.extend(std::iter::repeat(if chunk % 2 == 0 { b'a' } else { b'b' }).take(32));
+        }
+        let block = literal_block(&bytes, SourceBlockType::Dynamic);
+        let blocks = [block];
+        let composite = Composite::new(&blocks).unwrap();
+        let mut left = EntropyScoutHistogram::zero();
+        let mut right = EntropyScoutHistogram::zero();
+        for _ in 0..32 {
+            left.add_token(Token::Literal(b'a'));
+            right.add_token(Token::Literal(b'b'));
+        }
+        let codes = [
+            EntropyScoutCode::from_histogram(&left, true),
+            EntropyScoutCode::from_histogram(&right, true),
+        ];
+        let states: Vec<_> = (0..bytes.len())
+            .map(|position| (position / 32 % 2) as u8)
+            .collect();
+        let cuts = ranked_entropy_state_cuts(&composite, &codes, &states).unwrap();
+        assert_eq!(cuts.len(), ENTROPY_SCOUT_MAX_CUTS);
+        assert!(cuts.windows(2).all(|pair| pair[0].plain < pair[1].plain));
+    }
+
+    #[test]
+    fn entropy_state_anchors_can_only_improve_the_exact_boundary_graph() {
+        let mut bytes = vec![b'a'; 700];
+        bytes.extend(std::iter::repeat(b'b').take(700));
+        bytes.extend(std::iter::repeat(b'c').take(700));
+        let blocks = [literal_block(&bytes, SourceBlockType::Dynamic)];
+        let composite = Composite::new(&blocks).unwrap();
+        let options = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        let legacy_cuts = choose_cuts(&composite, true, true).unwrap();
+        let mut augmented_cuts = legacy_cuts.clone();
+        for cut in entropy_state_boundary_cuts(&composite, true, &mut SearchStop::never()).unwrap()
+        {
+            push_optional_cut(&mut augmented_cuts, &composite, cut).unwrap();
+        }
+        augmented_cuts.sort_unstable_by_key(|cut| cut.plain);
+
+        let mut legacy_cache = CanonicalPlanCache::new();
+        let legacy = boundary_dp(
+            &blocks,
+            &composite,
+            &legacy_cuts,
+            0,
+            &options,
+            true,
+            &mut legacy_cache,
+            &mut SearchStop::never(),
+            None,
+        )
+        .unwrap();
+        let mut augmented_cache = CanonicalPlanCache::new();
+        let augmented = boundary_dp(
+            &blocks,
+            &composite,
+            &augmented_cuts,
+            0,
+            &options,
+            true,
+            &mut augmented_cache,
+            &mut SearchStop::never(),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            total_bits(&augmented) < total_bits(&legacy),
+            "the learned off-grid anchors should improve {} legacy bits, got {}",
+            total_bits(&legacy),
+            total_bits(&augmented)
+        );
+        let decoded: Vec<_> = augmented
+            .iter()
+            .flat_map(|plan| plan.plain.iter().copied())
+            .collect();
+        assert_eq!(decoded, bytes);
     }
 
     #[test]
