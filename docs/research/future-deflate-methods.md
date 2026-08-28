@@ -92,7 +92,7 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 
 | Area | Implemented coverage | Reopen condition |
 | --- | --- | --- |
-| Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison | A format-specific diagnosed miss |
+| Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison; smallest sufficient zlib CINFO derived from emitted distances | A format-specific diagnosed miss |
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
 | Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |

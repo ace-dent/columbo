@@ -1978,6 +1978,29 @@ mod tests {
     }
 
     #[test]
+    fn no_gain_does_not_write_a_zlib_header_only_change() {
+        // Optimizing this empty stream can lower CINFO from 32 KiB to 256
+        // bytes, but its Deflate payload cannot save bytes or meaningful bits.
+        // An explicit destination must therefore receive the original bytes.
+        let source = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let directory = unique_test_directory();
+        let input = directory.join("input.zlib");
+        let output = directory.join("output.zlib");
+        fs::write(&input, source).unwrap();
+
+        execute(Command {
+            format: Format::Zlib,
+            options: Options::default(),
+            inputs: vec![input],
+            destination: Destination::Explicit(output.clone()),
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(output).unwrap(), source);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn equal_byte_output_with_a_one_bit_gain_replaces_in_place() {
         let source = [
             0x75, 0xc0, 0x41, 0x0d, 0x00, 0x00, 0x0c, 0x03, 0x21, 0x6d, 0xf8, 0x37, 0xb5, 0x7f,

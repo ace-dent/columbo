@@ -8,7 +8,7 @@ use columbo::{optimize, ErrorKind, Format, Options, MAX_EXPANSION_RATIO};
 
 const EMPTY_RAW: &[u8] = &[0x03, 0x00];
 const EMPTY_ZLIB: &[u8] = &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
-const MAXIMUM_FLEVEL_EMPTY_ZLIB: &[u8] = &[0x78, 0xda, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
+const NORMALIZED_EMPTY_ZLIB: &[u8] = &[0x08, 0xd7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
 // One stored byte followed by an empty final fixed block. Its 0x78, 0x01
 // prefix is also a valid RFC 1950 header, making byte-only detection ambiguous.
 const ZLIB_LIKE_RAW: &[u8] = &[0x78, 0x01, 0x00, 0xfe, 0xff, b'x', 0x03, 0x00];
@@ -23,7 +23,7 @@ fn auto_detection_and_explicit_modes_agree() {
     let explicit = optimize(EMPTY_ZLIB, Format::Zlib, &options).unwrap();
 
     assert_eq!(automatic, explicit);
-    assert_eq!(automatic.data, MAXIMUM_FLEVEL_EMPTY_ZLIB);
+    assert_eq!(automatic.data, NORMALIZED_EMPTY_ZLIB);
 }
 
 #[test]
@@ -88,7 +88,7 @@ fn reusable_options_are_safe_across_threads() {
         .collect();
 
     for worker in workers {
-        assert_eq!(worker.join().unwrap().data, MAXIMUM_FLEVEL_EMPTY_ZLIB);
+        assert_eq!(worker.join().unwrap().data, NORMALIZED_EMPTY_ZLIB);
     }
 }
 

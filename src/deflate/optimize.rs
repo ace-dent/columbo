@@ -136,6 +136,8 @@ pub(crate) struct RawOptimization {
     pub(crate) data: Vec<u8>,
     pub(crate) consumed: usize,
     pub(crate) info: RawInfo,
+    /// Largest backward distance actually emitted in `data`.
+    pub(crate) output_max_distance: u16,
     pub(crate) timed_out: bool,
 }
 
@@ -1823,6 +1825,18 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     } else {
         candidate.data.len()
     };
+    let output_max_distance = if keep_original {
+        parsed.max_distance
+    } else if let Some(max_distance) = candidate.output_max_distance {
+        max_distance
+    } else {
+        // A known-losing child normally avoids a redundant validation parse,
+        // but an outer route can still select its bytes over an older source.
+        // Validate that uncommon final selection now and retain the metric
+        // from the exact bytes that the container will wrap.
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity)?.max_distance
+    };
+    debug_assert!(output_max_distance <= parsed.max_distance);
     let timed_out = default_floor != DefaultFloor::MandatoryComplete && deadline.was_triggered();
     progress.blocks(final_report);
     progress.finish(
@@ -1862,6 +1876,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
             source_block_count: parsed.source_block_count,
             source_empty_block_count: parsed.source_empty_block_count,
         },
+        output_max_distance,
         timed_out,
     })
 }
@@ -2065,6 +2080,8 @@ struct StreamIdentity {
 struct Candidate {
     data: Vec<u8>,
     bits: u64,
+    /// Exact maximum distance from validation of these emitted bytes.
+    output_max_distance: Option<u16>,
     plans: Vec<PlannedBlock>,
     block_report: Option<BlockReport>,
     route: &'static str,
@@ -3056,6 +3073,7 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
     Ok(Candidate {
         data,
         bits: source.meaningful_bits,
+        output_max_distance: None,
         plans: Vec::new(),
         block_report: None,
         route: "Normal floor",
@@ -4817,6 +4835,7 @@ fn build_candidate_from_plans_with_progress(
     // planning round. Each accepted round must improve the complete stream,
     // so this cannot oscillate even before the explicit cap is reached.
     let mut data_is_validated = false;
+    let mut output_max_distance = None;
     let mut max_planner_is_stable = false;
     for round in 1..=replay_limit {
         if initial_loses && !options.strict {
@@ -4839,6 +4858,7 @@ fn build_candidate_from_plans_with_progress(
         });
         let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
         data_is_validated = true;
+        output_max_distance = Some(replayed.max_distance);
 
         let replay_plans = match replay_planner {
             ReplayPlanner::Full => match progress {
@@ -4927,6 +4947,7 @@ fn build_candidate_from_plans_with_progress(
         // The accepted rewrite has not itself been parsed yet. The next loop
         // iteration or the final check below must validate this new stream.
         data_is_validated = false;
+        output_max_distance = None;
     }
 
     // The last accepted replay is not necessarily followed by another loop
@@ -4935,13 +4956,15 @@ fn build_candidate_from_plans_with_progress(
     // stream is skipped because the caller will retain the already-validated
     // source bytes instead.
     if (!initial_loses || options.strict) && !data_is_validated {
-        parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
+        let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
+        output_max_distance = Some(replayed.max_distance);
     }
 
     let block_report = capture_planned_block_report(&plans, reports_enabled(options));
     Ok(Candidate {
         data,
         bits,
+        output_max_distance,
         plans,
         block_report,
         route: if options.exhaustive {
@@ -4967,6 +4990,7 @@ fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Can
     Ok(Candidate {
         data,
         bits: source.meaningful_bits,
+        output_max_distance: None,
         plans: Vec::new(),
         block_report: None,
         route: "Original source",
@@ -5188,6 +5212,7 @@ mod tests {
         Candidate {
             data: vec![marker; bytes],
             bits,
+            output_max_distance: None,
             plans: Vec::new(),
             block_report: None,
             route: "test",
@@ -5278,6 +5303,7 @@ mod tests {
         let candidate = Candidate {
             data,
             bits,
+            output_max_distance: Some(combined.max_distance),
             plans: Vec::new(),
             block_report: None,
             route: "test",
@@ -5312,6 +5338,7 @@ mod tests {
         let candidate = Candidate {
             data,
             bits,
+            output_max_distance: Some(combined.max_distance),
             plans: Vec::new(),
             block_report: None,
             route: "test",
@@ -5458,6 +5485,8 @@ mod tests {
             ..Options::default()
         };
         let first = optimize_raw(input, &options).unwrap();
+        let reparsed_first = parse_stream(&first.data, 86).unwrap();
+        assert_eq!(first.output_max_distance, reparsed_first.max_distance);
         // Later additive structural routes may beat the recovered 325-bit
         // fixed point, but must never lose it.
         assert!(first.info.deflate_bits <= 325);
@@ -5486,6 +5515,8 @@ mod tests {
             ..zero_budget_max
         };
         let maximum = optimize_raw(input, &max_options).unwrap();
+        let reparsed_maximum = parse_stream(&maximum.data, 86).unwrap();
+        assert_eq!(maximum.output_max_distance, reparsed_maximum.max_distance);
         assert!(maximum.info.deflate_bits <= first.info.deflate_bits);
         let repeated_max = optimize_raw(&maximum.data, &max_options).unwrap();
         assert_eq!(repeated_max.data, maximum.data);

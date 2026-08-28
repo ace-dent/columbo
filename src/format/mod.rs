@@ -424,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_detects_every_rfc_1950_window_and_advertises_maximum_level() {
+    fn auto_detects_every_rfc_1950_window_and_emits_the_smallest_safe_window() {
         for cinfo in 0..=7 {
             for flevel in 0..=3 {
                 let mut input = zlib_header(cinfo, flevel, false).to_vec();
@@ -432,10 +432,7 @@ mod tests {
                 input.extend_from_slice(&1_u32.to_be_bytes()); // Adler-32("").
 
                 let optimized = optimize(&input, Format::Auto, &Options::default()).unwrap();
-                assert_eq!(
-                    optimized.data[0], input[0],
-                    "CINFO={cinfo}, FLEVEL={flevel}"
-                );
+                assert_eq!(optimized.data[0], 0x08, "CINFO={cinfo}, FLEVEL={flevel}");
                 assert_eq!(optimized.data[1] >> 6, 3, "CINFO={cinfo}, FLEVEL={flevel}");
                 assert_eq!(
                     optimized.data[2..],

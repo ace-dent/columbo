@@ -82,9 +82,9 @@ pub(super) fn optimize_embedded(
     }
 
     // A zlib stream is exactly: two-byte header, raw Deflate data, Adler-32.
-    // The checksum and window/method byte remain unchanged. FLEVEL is only an
-    // encoder-effort hint, so rewritten streams advertise Columbo's maximum
-    // optimization effort while retaining a valid FCHECK value.
+    // FLEVEL is only an encoder-effort hint, so rewritten streams advertise
+    // Columbo's maximum optimization effort. CINFO records the smallest RFC
+    // 1950 window that can decode the emitted distances.
     let raw_input = &input[2..input.len() - 4];
     let mut raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
 
@@ -130,7 +130,7 @@ pub(super) fn optimize_embedded(
         .checked_add(6)
         .ok_or_else(|| Error::new("zlib output is too large"))?;
     let mut data = try_vec_with_capacity(output_size, OUTPUT_ALLOCATION_ERROR)?;
-    data.extend_from_slice(&maximum_compression_header(input[0]));
+    data.extend_from_slice(&optimized_header(input[0], raw.output_max_distance));
     data.extend_from_slice(&raw.data);
     data.extend_from_slice(&input[input.len() - 4..]);
 
@@ -139,7 +139,8 @@ pub(super) fn optimize_embedded(
     if data.len() > input.len() && !options.strict {
         data.clear();
         try_append_bytes(&mut data, input, OUTPUT_ALLOCATION_ERROR)?;
-        data[..2].copy_from_slice(&maximum_compression_header(input[0]));
+        raw.output_max_distance = raw.info.max_distance;
+        data[..2].copy_from_slice(&optimized_header(input[0], raw.output_max_distance));
         raw.info.deflate_bits = raw.info.source_deflate_bits;
     }
 
@@ -150,14 +151,18 @@ pub(super) fn optimize_embedded(
     })
 }
 
-/// Preserve CM/CINFO while advertising RFC 1950's maximum compression level.
+/// Advertise the smallest sufficient RFC 1950 window and maximum effort.
 ///
 /// FCHECK occupies the low five bits of FLG and makes the two-byte header a
 /// multiple of 31. FDICT is clear because dictionary-backed streams are
 /// rejected before this helper is reached.
-fn maximum_compression_header(cmf: u8) -> [u8; 2] {
+fn optimized_header(cmf: u8, max_distance: u16) -> [u8; 2] {
     const MAXIMUM_FLEVEL: u8 = 0b11 << 6;
 
+    let required = u32::from(max_distance).max(1).next_power_of_two();
+    let window_bits = required.ilog2().max(8);
+    let cinfo = (window_bits - 8) as u8;
+    let cmf = (cinfo << 4) | (cmf & 0x0f);
     let unchecked = (u16::from(cmf) << 8) | u16::from(MAXIMUM_FLEVEL);
     let fcheck = (31 - unchecked % 31) % 31;
     [cmf, MAXIMUM_FLEVEL | fcheck as u8]
@@ -258,21 +263,62 @@ mod tests {
     }
 
     #[test]
+    fn output_window_normalization_does_not_hide_an_invalid_source_window() {
+        let mut input =
+            include_bytes!("../../tests/fixtures/zlib/oxipng-zlib/XYB.icc.zlib").to_vec();
+        let source_cmf = input[0];
+        input[..2].copy_from_slice(&optimized_header(source_cmf, 0));
+        let error = optimize(
+            &input,
+            &Options {
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "zlib Deflate distance exceeds advertised window"
+        );
+    }
+
+    #[test]
     fn rejects_too_short_stream() {
         let error = optimize(&[0x78, 0x9c], &Options::default()).unwrap_err();
         assert_eq!(error.message(), "zlib stream too small");
     }
 
     #[test]
-    fn valid_empty_stream_advertises_maximum_compression() {
+    fn valid_empty_stream_advertises_smallest_window_and_maximum_compression() {
         // Empty fixed-Huffman Deflate stream followed by Adler-32("").
         let input = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
         let result = optimize(&input, &Options::default()).unwrap();
-        assert_eq!(&result.data[..2], &[0x78, 0xda]);
+        assert_eq!(&result.data[..2], &[0x08, 0xd7]);
         assert_eq!(&result.data[2..], &input[2..]);
         assert!(has_rfc1950_header(&result.data));
         assert_eq!(result.data[1] >> 6, 3);
         assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn window_header_tracks_every_distance_boundary() {
+        for (distance, expected_cinfo) in [
+            (0, 0),
+            (1, 0),
+            (256, 0),
+            (257, 1),
+            (512, 1),
+            (513, 2),
+            (16_384, 6),
+            (16_385, 7),
+            (32_768, 7),
+        ] {
+            let header = optimized_header(0x78, distance);
+            assert_eq!(header[0] >> 4, expected_cinfo, "distance={distance}");
+            assert_eq!(header[0] & 0x0f, 8, "distance={distance}");
+            assert_eq!(header[1] >> 6, 3, "distance={distance}");
+            assert_eq!(u16::from_be_bytes(header) % 31, 0, "distance={distance}");
+        }
     }
 
     #[test]
