@@ -40,13 +40,16 @@ pub struct Optimization {
     ///
     /// A shorter file saves eight bits per removed byte. When the file byte
     /// length is unchanged, this instead reports the reduction in aggregate
-    /// meaningful Deflate bits across every optimized stream. A value of zero
-    /// means the selected bytes must not replace an existing file solely for
-    /// compression: the output is equal-sized without a Deflate-bit win, or
-    /// it is larger.
+    /// meaningful compressed-payload bits across every optimized stream. For
+    /// Deflate this excludes final-byte padding; a ZIP member whose terminal
+    /// representation changes to Store is charged its decoded payload bits.
+    /// A value of zero means there was no physical compression saving. Call
+    /// [`Optimization::should_replace`] to also account for a mandatory,
+    /// equal-sized wrapper normalization.
     pub bits_saved: u64,
     /// Whether search reached its deadline.
     pub timed_out: bool,
+    rewrite_required: bool,
 }
 
 impl Optimization {
@@ -67,7 +70,22 @@ impl Optimization {
             data,
             bits_saved,
             timed_out,
+            rewrite_required: false,
         }
+    }
+
+    /// Whether the selected bytes should replace the source representation.
+    ///
+    /// This is normally equivalent to `bits_saved != 0`. It is also true for
+    /// a mandatory equal-sized wrapper normalization, such as changing a
+    /// four-byte ZIP member from Deflate to Store when neither method can use
+    /// fewer physical payload bytes.
+    pub fn should_replace(&self) -> bool {
+        self.bits_saved != 0 || self.rewrite_required
+    }
+
+    pub(crate) fn require_rewrite(&mut self) {
+        self.rewrite_required = true;
     }
 }
 
@@ -102,15 +120,23 @@ mod robustness_tests {
     fn write_savings_are_byte_first_then_meaningful_bits() {
         let shorter = Optimization::from_metrics(2, vec![0], 7, 99, false);
         assert_eq!(shorter.bits_saved, 8);
+        assert!(shorter.should_replace());
 
         let bit_only = Optimization::from_metrics(2, vec![0; 2], 7, 6, false);
         assert_eq!(bit_only.bits_saved, 1);
 
         let tied = Optimization::from_metrics(2, vec![0; 2], 7, 7, false);
         assert_eq!(tied.bits_saved, 0);
+        assert!(!tied.should_replace());
 
         let larger = Optimization::from_metrics(2, vec![0; 3], 99, 1, false);
         assert_eq!(larger.bits_saved, 0);
+        assert!(!larger.should_replace());
+
+        let mut normalized = Optimization::from_metrics(2, vec![1; 2], 7, 7, false);
+        normalized.require_rewrite();
+        assert_eq!(normalized.bits_saved, 0);
+        assert!(normalized.should_replace());
     }
 
     #[test]

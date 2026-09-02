@@ -88,6 +88,7 @@ struct ReportCoordinator {
     mode: ProgressMode,
     next_stream_id: usize,
     sealed_streams: BTreeSet<usize>,
+    zip_store_changes: Vec<ZipStoreProgress>,
     total_streams: usize,
 }
 
@@ -101,6 +102,7 @@ impl Default for ReportCoordinator {
             mode: ProgressMode::Disabled,
             next_stream_id: 1,
             sealed_streams: BTreeSet::new(),
+            zip_store_changes: Vec::new(),
             total_streams: 0,
         }
     }
@@ -116,6 +118,7 @@ impl ReportCoordinator {
         self.mode = mode;
         self.next_stream_id = 1;
         self.sealed_streams.clear();
+        self.zip_store_changes.clear();
         self.total_streams = total_streams;
     }
 
@@ -187,6 +190,14 @@ impl ReportCoordinator {
     }
 }
 
+/// One final ZIP wrapper conversion selected after all Deflate work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ZipStoreProgress {
+    pub(crate) stream_id: usize,
+    pub(crate) deflate_bytes: u32,
+    pub(crate) stored_bytes: u32,
+}
+
 fn with_report_coordinator<T>(operation: impl FnOnce(&mut ReportCoordinator) -> T) -> T {
     let coordinator = REPORT_COORDINATOR.get_or_init(|| Mutex::new(ReportCoordinator::default()));
     let mut coordinator = coordinator
@@ -217,6 +228,21 @@ pub(crate) fn complete_stream_producer(id: usize, duplicates: &[usize], producer
 pub(crate) fn complete_all_stream_producers(producer: u8) {
     with_report_coordinator(|coordinator| coordinator.complete_all(producer));
     emit_ready_streams();
+}
+
+/// Retain only the Store conversions belonging to the selected ZIP lineage.
+///
+/// Max may build several complete archive candidates. The wrapper calls this
+/// once, after selecting the winner, so reporting never attributes a method
+/// change from a discarded lineage to the final file.
+pub(crate) fn zip_store_changes(options: &Options, changes: &[ZipStoreProgress]) {
+    if changes.is_empty() || !ProgressMode::for_options(options).enabled() {
+        return;
+    }
+    with_report_coordinator(|coordinator| {
+        coordinator.zip_store_changes.clear();
+        coordinator.zip_store_changes.extend_from_slice(changes);
+    });
 }
 
 fn emit_ready_streams() {
@@ -1466,14 +1492,54 @@ pub(crate) fn finish_file(options: &Options) {
     if !mode.enabled() {
         return;
     }
-    with_report_coordinator(ReportCoordinator::finish);
+    let store_changes = with_report_coordinator(|coordinator| {
+        coordinator.finish();
+        std::mem::take(&mut coordinator.zip_store_changes)
+    });
     stop_report_spinner();
     emit_ready_streams();
     match mode {
-        ProgressMode::Visual => visual::finish_file(),
-        ProgressMode::Verbose => verbose::flush(),
+        ProgressMode::Visual => {
+            visual::finish_file();
+            let _ = write_zip_store_changes(&mut io::stderr().lock(), &store_changes);
+        }
+        ProgressMode::Verbose => {
+            verbose::flush();
+            let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
+        }
         ProgressMode::Disabled => {}
     }
+}
+
+fn write_zip_store_changes(output: &mut dyn Write, changes: &[ZipStoreProgress]) -> io::Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    writeln!(output)?;
+    writeln!(
+        output,
+        "ZIP method changes  {} {}",
+        changes.len(),
+        plural(changes.len(), "entry", "entries")
+    )?;
+    for change in changes {
+        let saved = change.deflate_bytes - change.stored_bytes;
+        let tenths = (u64::from(saved) * 1_000 + u64::from(change.deflate_bytes) / 2)
+            / u64::from(change.deflate_bytes);
+        writeln!(
+            output,
+            "  S{} Final wrapper · Deflate {} bytes → Store {} {} · saved {} {} ({}.{:01}%)",
+            change.stream_id,
+            change.deflate_bytes,
+            change.stored_bytes,
+            plural(change.stored_bytes as usize, "byte", "bytes"),
+            saved,
+            plural(saved as usize, "byte", "bytes"),
+            tenths / 10,
+            tenths % 10,
+        )?;
+    }
+    output.flush()
 }
 
 fn write_format_summary(
@@ -1614,6 +1680,39 @@ mod tests {
         assert_eq!(
             String::from_utf8(summary).unwrap(),
             "Format   ZIP\nDeflate streams  3\n"
+        );
+    }
+
+    #[test]
+    fn verbose_and_visual_share_selected_zip_store_reporting() {
+        let mut report = Vec::new();
+        write_zip_store_changes(
+            &mut report,
+            &[
+                ZipStoreProgress {
+                    stream_id: 2,
+                    deflate_bytes: 50,
+                    stored_bytes: 45,
+                },
+                ZipStoreProgress {
+                    stream_id: 7,
+                    deflate_bytes: 6,
+                    stored_bytes: 1,
+                },
+                ZipStoreProgress {
+                    stream_id: 9,
+                    deflate_bytes: 4,
+                    stored_bytes: 4,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(report).unwrap(),
+            "\nZIP method changes  3 entries\n\
+             \x20 S2 Final wrapper · Deflate 50 bytes → Store 45 bytes · saved 5 bytes (10.0%)\n\
+             \x20 S7 Final wrapper · Deflate 6 bytes → Store 1 byte · saved 5 bytes (83.3%)\n\
+             \x20 S9 Final wrapper · Deflate 4 bytes → Store 4 bytes · saved 0 bytes (0.0%)\n"
         );
     }
 

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 
 use crate::checksum::crc32_update;
-use crate::deflate::{optimize_raw_prefix_with_floor_and_grace, DefaultFloor};
+use crate::deflate::{
+    decoded_bytes_for_storage, optimize_raw_prefix_with_floor_and_grace, DefaultFloor,
+};
+use crate::progress::ZipStoreProgress;
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
 use std::thread;
@@ -22,6 +25,8 @@ const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
 const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate ZIP output";
 const MODEL_ALLOCATION_ERROR: &str = "could not allocate ZIP entry model";
 const LOCAL_ALLOCATION_ERROR: &str = "could not allocate ZIP local entry";
+const STORE_MIN_SAVINGS_PERCENT: u64 = 10;
+const ALWAYS_STORE_MAX_BYTES: u32 = 4;
 
 // Max keeps an exact Default archive as a quality floor while exploring a
 // separate direct-Max archive. The direct branch treats its validated source
@@ -42,6 +47,8 @@ struct ZipOptimization {
     data: Vec<u8>,
     source_deflate_bits: u64,
     output_deflate_bits: u64,
+    store_changes: Vec<ZipStoreProgress>,
+    forced_store_change: bool,
     timed_out: bool,
 }
 
@@ -54,13 +61,17 @@ impl ZipOptimization {
     }
 
     fn into_public(self, source_bytes: usize) -> Optimization {
-        Optimization::from_metrics(
+        let mut optimization = Optimization::from_metrics(
             source_bytes,
             self.data,
             self.source_deflate_bits,
             self.output_deflate_bits,
             self.timed_out,
-        )
+        );
+        if self.forced_store_change {
+            optimization.require_rewrite();
+        }
+        optimization
     }
 }
 
@@ -176,7 +187,7 @@ pub(super) fn stream_count(parsed: &ParsedZip) -> usize {
     parsed
         .entries
         .iter()
-        .filter(|entry| entry_is_optimizable(entry))
+        .filter(|entry| entry_is_deflate_stream(entry))
         .count()
 }
 
@@ -253,21 +264,24 @@ pub(super) fn optimize_preflight(
     options: &Options,
     parsed: &ParsedZip,
 ) -> Result<Optimization> {
-    let optimized = if !options.exhaustive {
+    let has_deflate_jobs = parsed.entries.iter().any(entry_is_optimizable);
+    let optimized = if !options.exhaustive || !has_deflate_jobs {
         configure_stream_producers(options, &[ZIP_NORMAL_PRODUCER]);
-        optimize_once(
+        let optimized = optimize_once(
             input,
             options,
             DefaultFloor::Complete,
             ParallelMemberPolicy::UniformWorkOnly,
             ZIP_NORMAL_PRODUCER,
             parsed,
-        )
+        )?;
+        finalize_store_fallback(optimized, options)
     } else if parallel_max_archive_is_bounded(input, parsed) {
         optimize_max_parallel(input, options, parsed)
     } else {
         optimize_max_sequential(input, options, parsed)
     }?;
+    crate::progress::zip_store_changes(options, &optimized.store_changes);
     Ok(optimized.into_public(input.len()))
 }
 
@@ -304,14 +318,15 @@ fn optimize_max_parallel(
             .name("columbo-zip-direct-max".into())
             .spawn_scoped(scope, || {
                 crate::progress::with_route_lineage("direct max", || {
-                    optimize_once(
+                    let direct = optimize_once(
                         input,
                         options,
                         DefaultFloor::Established,
                         ParallelMemberPolicy::UniformWorkOnly,
                         ZIP_DIRECT_MAX_PRODUCER,
                         parsed,
-                    )
+                    )?;
+                    finalize_store_fallback(direct, options)
                 })
             });
 
@@ -397,14 +412,15 @@ fn optimize_max_sequential(
     let mut direct_options = options.clone();
     direct_options.timeout = direct_allowance;
     let mut direct = crate::progress::with_route_lineage("direct max", || {
-        optimize_once(
+        let direct = optimize_once(
             input,
             &direct_options,
             DefaultFloor::Established,
             ParallelMemberPolicy::UniformWorkOnly,
             ZIP_DIRECT_MAX_PRODUCER,
             parsed,
-        )
+        )?;
+        finalize_store_fallback(direct, &direct_options)
     })?;
     direct.timed_out = started.elapsed() >= options.timeout;
     let refined = crate::progress::with_route_lineage("refined default", || {
@@ -430,7 +446,7 @@ fn refine_complete_floor(
         if options.verbose || options.visual {
             crate::progress::complete_all_stream_producers(ZIP_REFINED_DEFAULT_PRODUCER);
         }
-        return Ok(floor);
+        return finalize_store_fallback(floor, options);
     }
 
     let mut max_options = options.clone();
@@ -440,7 +456,7 @@ fn refine_complete_floor(
         max_options.strip_metadata,
         max_options.max_decoded_bytes,
     )?;
-    let mut refined = optimize_once(
+    let refined = optimize_once(
         &floor.data,
         &max_options,
         DefaultFloor::Shared,
@@ -448,6 +464,8 @@ fn refine_complete_floor(
         ZIP_REFINED_DEFAULT_PRODUCER,
         &refined_parsed,
     )?;
+    let mut refined = finalize_store_fallback(refined, &max_options)?;
+    floor = finalize_store_fallback(floor, options)?;
     if !refined.strictly_dominates(&floor) {
         floor.timed_out |= refined.timed_out;
         return Ok(floor);
@@ -542,17 +560,13 @@ fn optimize_once(
 ) -> Result<ZipOptimization> {
     let deadline = SearchDeadline::new(options);
     let eocd_offset = parsed.eocd_offset;
-    let eocd = input
-        .get(eocd_offset..eocd_offset + 22)
-        .ok_or_else(|| Error::new("truncated ZIP end of central directory"))?;
-
     let central_offset = parsed.central_offset;
     let mut entries = parsed.entries.clone();
     let mut next_stream_id = 1_usize;
     let stream_ids: Vec<Option<usize>> = entries
         .iter()
         .map(|entry| {
-            if entry_is_optimizable(entry) {
+            if entry_is_deflate_stream(entry) {
                 let id = next_stream_id;
                 next_stream_id = next_stream_id.saturating_add(1);
                 Some(id)
@@ -639,12 +653,54 @@ fn optimize_once(
     let mut output_deflate_bits =
         output_deflate_bits.ok_or_else(|| Error::new("ZIP Deflate bit count is too large"))?;
 
+    let mut output = rebuild_archive(
+        input,
+        options,
+        eocd_offset,
+        central_offset,
+        &mut entries,
+        &physical_order,
+    )?;
+
+    if output.len() > input.len() && !options.strict {
+        output.clear();
+        try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
+        output_deflate_bits = source_deflate_bits;
+    }
+
+    Ok(ZipOptimization {
+        data: output,
+        source_deflate_bits,
+        output_deflate_bits,
+        store_changes: Vec::new(),
+        forced_store_change: false,
+        timed_out,
+    })
+}
+
+/// Rebuild one classic archive from completed local-entry candidates.
+///
+/// Keeping this byte-only phase separate lets the terminal Store comparison
+/// reuse exactly the same prefix, padding, central-directory, and metadata
+/// rules as ordinary Deflate optimization.
+fn rebuild_archive(
+    input: &[u8],
+    options: &Options,
+    eocd_offset: usize,
+    central_offset: usize,
+    entries: &mut [Entry],
+    physical_order: &[usize],
+) -> Result<Vec<u8>> {
+    let eocd = input
+        .get(eocd_offset..eocd_offset + 22)
+        .ok_or_else(|| Error::new("truncated ZIP end of central directory"))?;
+
     // Local records need not appear in central-directory order. Rewrite them
     // by physical offset so self-extracting prefixes and inter-record padding
     // remain byte-for-byte intact.
     let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
     let mut cursor = 0_usize;
-    for index in physical_order {
+    for &index in physical_order {
         let entry = &mut entries[index];
         if entry.local_offset_before < cursor {
             return Err(Error::new("overlapping ZIP local entries"));
@@ -676,7 +732,7 @@ fn optimize_once(
 
     let new_central_offset = output.len();
     let mut written_entries = 0_u16;
-    for entry in &entries {
+    for entry in entries.iter() {
         if entry.skip {
             continue;
         }
@@ -685,6 +741,7 @@ fn optimize_once(
         let source = &input[entry.central_offset..entry.central_offset + entry.central_size];
         let mut record = try_copy_bytes(source, OUTPUT_ALLOCATION_ERROR)?;
         put_le16(&mut record, 8, output_flags(entry));
+        put_le16(&mut record, 10, entry.method);
         put_le32(&mut record, 20, entry.compressed_size_after);
         put_le32(&mut record, 42, local_offset);
 
@@ -731,19 +788,160 @@ fn optimize_once(
         put_le16(&mut new_eocd, 20, 0);
     }
     try_append_bytes(&mut output, &new_eocd, OUTPUT_ALLOCATION_ERROR)?;
+    Ok(output)
+}
 
-    if output.len() > input.len() && !options.strict {
-        output.clear();
-        try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
-        output_deflate_bits = source_deflate_bits;
+/// Apply ZIP's container-level Store alternatives after a complete archive
+/// lineage has exhausted its admitted Deflate work.
+///
+/// Raw, zlib, GZIP, and PNG have no equivalent wrapper choice: their supported
+/// payload syntax requires Deflate. Raw planning already compares RFC 1951
+/// stored blocks with fixed and dynamic blocks internally. Classic ZIP alone
+/// can replace an entire method-8 payload with method 0 while preserving the
+/// decoded member bytes.
+fn finalize_store_fallback(
+    mut optimized: ZipOptimization,
+    options: &Options,
+) -> Result<ZipOptimization> {
+    let rebuilt = {
+        let input = optimized.data.as_slice();
+        // Wrapper stripping and normalization have already happened. Parse
+        // this selected lineage without introducing another metadata policy.
+        let parsed = preflight(input, false, options.max_decoded_bytes)?;
+        let mut entries = parsed.entries.clone();
+        let report_store_changes = options.verbose || options.visual;
+        let stream_ids: Vec<Option<usize>> = if report_store_changes {
+            let mut next_stream_id = 1_usize;
+            entries
+                .iter()
+                .map(|entry| {
+                    if entry_is_deflate_stream(entry) {
+                        let id = next_stream_id;
+                        next_stream_id = next_stream_id.saturating_add(1);
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut store_changes = if report_store_changes {
+            try_vec_with_capacity(entries.len(), "could not allocate ZIP Store report")?
+        } else {
+            Vec::new()
+        };
+        let mut output_deflate_bits = optimized.output_deflate_bits;
+        let mut changed = false;
+        let mut forced_store_change = optimized.forced_store_change;
+
+        for &index in &parsed.physical_order {
+            let entry = &mut entries[index];
+            let layout = local_entry_layout(input, parsed.central_offset, entry)?;
+            let position = entry.local_offset_before;
+            entry.local = try_copy_bytes(
+                &input[position..position + layout.total_size],
+                LOCAL_ALLOCATION_ERROR,
+            )?;
+
+            // Deflate needs at least one final block and an end marker, so it
+            // cannot occupy fewer physical bytes than Store for a decoded
+            // payload of at most four bytes. This deterministic route applies
+            // in both modes and supersedes Max's percentage threshold. Larger
+            // streams retain Deflate unless Max's terminal comparison saves
+            // at least 10% of the optimized payload bytes; header and
+            // descriptor savings do not count toward that threshold.
+            let always_store = entry.uncompressed_size <= ALWAYS_STORE_MAX_BYTES;
+            if entry.method != 8
+                || entry.flags & FLAG_ENCRYPTED != 0
+                || (!always_store
+                    && (!options.exhaustive
+                        || !store_saves_at_least_ten_percent(
+                            entry.uncompressed_size,
+                            entry.compressed_size_before,
+                        )))
+            {
+                continue;
+            }
+
+            let raw = &input[layout.data_offset..layout.data_end];
+            let (decoded, deflate_bits, crc32) =
+                decoded_bytes_for_storage(raw, u64::from(entry.uncompressed_size))?;
+            if decoded.len() != entry.uncompressed_size as usize || crc32 != entry.crc32 {
+                return Err(Error::internal(
+                    "terminal ZIP Store candidate changed member identity",
+                ));
+            }
+            let store_bits = u64::from(entry.uncompressed_size) * 8;
+            debug_assert!(always_store || store_bits < deflate_bits);
+
+            let local_size = layout
+                .prefix_size
+                .checked_add(decoded.len())
+                .ok_or_else(|| Error::new("ZIP local entry too large"))?;
+            let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION_ERROR)?;
+            local.extend_from_slice(&input[position..position + layout.prefix_size]);
+            put_le16(&mut local, 6, entry.flags & !FLAG_DATA_DESCRIPTOR);
+            put_le16(&mut local, 8, 0);
+            put_le32(&mut local, 14, entry.crc32);
+            put_le32(&mut local, 18, entry.uncompressed_size);
+            put_le32(&mut local, 22, entry.uncompressed_size);
+            local.extend_from_slice(&decoded);
+
+            output_deflate_bits = output_deflate_bits
+                .checked_sub(deflate_bits)
+                .and_then(|bits| bits.checked_add(store_bits))
+                .ok_or_else(|| Error::internal("ZIP payload bit count is inconsistent"))?;
+            entry.local = local;
+            entry.method = 0;
+            entry.flags &= !FLAG_DATA_DESCRIPTOR;
+            entry.compressed_size_after = entry.uncompressed_size;
+            forced_store_change |= always_store;
+            if report_store_changes {
+                store_changes.push(ZipStoreProgress {
+                    stream_id: stream_ids[index].ok_or_else(|| {
+                        Error::internal("ZIP Store report lost its stream identity")
+                    })?,
+                    deflate_bytes: entry.compressed_size_before,
+                    stored_bytes: entry.uncompressed_size,
+                });
+            }
+            changed = true;
+        }
+
+        if changed {
+            let data = rebuild_archive(
+                input,
+                options,
+                parsed.eocd_offset,
+                parsed.central_offset,
+                &mut entries,
+                &parsed.physical_order,
+            )?;
+            Some((
+                data,
+                output_deflate_bits,
+                store_changes,
+                forced_store_change,
+            ))
+        } else {
+            None
+        }
+    };
+
+    if let Some((data, output_deflate_bits, store_changes, forced_store_change)) = rebuilt {
+        optimized.data = data;
+        optimized.output_deflate_bits = output_deflate_bits;
+        optimized.store_changes = store_changes;
+        optimized.forced_store_change = forced_store_change;
     }
+    Ok(optimized)
+}
 
-    Ok(ZipOptimization {
-        data: output,
-        source_deflate_bits,
-        output_deflate_bits,
-        timed_out,
-    })
+fn store_saves_at_least_ten_percent(stored_bytes: u32, deflate_bytes: u32) -> bool {
+    let saved = deflate_bytes.saturating_sub(stored_bytes);
+    saved != 0 && u64::from(saved) * 100 >= u64::from(deflate_bytes) * STORE_MIN_SAVINGS_PERCENT
 }
 
 #[derive(Clone, Copy)]
@@ -1158,6 +1356,10 @@ fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>>
 }
 
 fn entry_is_optimizable(entry: &Entry) -> bool {
+    entry_is_deflate_stream(entry) && entry.uncompressed_size > ALWAYS_STORE_MAX_BYTES
+}
+
+fn entry_is_deflate_stream(entry: &Entry) -> bool {
     entry.method == 8 && entry.flags & FLAG_ENCRYPTED == 0 && entry.compressed_size_before != 0
 }
 
@@ -1391,6 +1593,28 @@ fn build_local_entry(
                 "ZIP stored member CRC or size mismatch",
             ));
         }
+    } else if entry.method == 8 && entry.uncompressed_size <= ALWAYS_STORE_MAX_BYTES {
+        // No valid Deflate representation can be physically smaller than a
+        // zero-to-four-byte Store payload. Validate the stream and retain its
+        // exact source bytes only until the wrapper's mandatory Store pass;
+        // do not admit it to any Deflate optimization route.
+        let (decoded, deflate_bits, crc32) =
+            decoded_bytes_for_storage(source_payload, u64::from(entry.uncompressed_size)).map_err(
+                |error| match error.kind() {
+                    ErrorKind::ResourceLimit => {
+                        Error::resource_limit("ZIP member expands beyond its declared size")
+                    }
+                    ErrorKind::ComplexityLimit | ErrorKind::Internal => error,
+                    _ => Error::new("invalid ZIP deflate member"),
+                },
+            )?;
+        if decoded.len() != entry.uncompressed_size as usize || crc32 != entry.crc32 {
+            return Err(Error::integrity_mismatch(
+                "ZIP deflate member CRC or size mismatch",
+            ));
+        }
+        entry.source_deflate_bits = deflate_bits;
+        entry.output_deflate_bits = deflate_bits;
     } else if entry.method == 8 {
         let raw = optimize_raw_prefix_with_floor_and_grace(
             source_payload,
@@ -1601,7 +1825,11 @@ mod tests {
             crc32: 0,
             compressed_size_before: compressed_size,
             compressed_size_after: compressed_size,
-            uncompressed_size: 0,
+            uncompressed_size: if method == 8 {
+                compressed_size.max(ALWAYS_STORE_MAX_BYTES + 1)
+            } else {
+                0
+            },
             method,
             flags: 0,
             skip: false,
@@ -1744,7 +1972,7 @@ mod tests {
     }
 
     fn uniform_archive_with_reverse_central_order(entry_count: usize) -> Vec<u8> {
-        archive_with_reverse_central_order(&vec![b"x".as_slice(); entry_count])
+        archive_with_reverse_central_order(&vec![b"xxxxxx".as_slice(); entry_count])
     }
 
     fn archive_entry_names(input: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
@@ -1802,6 +2030,20 @@ mod tests {
     }
 
     #[test]
+    fn tiny_deflate_streams_are_counted_but_not_optimization_jobs() {
+        for decoded_size in 0..=ALWAYS_STORE_MAX_BYTES {
+            let mut entry = ordering_entry(8, 8, decoded_size as usize);
+            entry.uncompressed_size = decoded_size;
+            assert!(entry_is_deflate_stream(&entry));
+            assert!(!entry_is_optimizable(&entry));
+        }
+
+        let mut entry = ordering_entry(8, 8, 5);
+        entry.uncompressed_size = ALWAYS_STORE_MAX_BYTES + 1;
+        assert!(entry_is_optimizable(&entry));
+    }
+
+    #[test]
     fn parallel_optimization_preserves_local_and_central_order() {
         let input = uniform_archive_with_reverse_central_order(8);
         let source_order = archive_entry_names(&input);
@@ -1846,7 +2088,8 @@ mod tests {
 
     #[test]
     fn detailed_reporting_keeps_bounded_default_floor_parallelism_enabled() {
-        let input = archive_with_reverse_central_order(&[b"x", b"a longer independent member"]);
+        let input =
+            archive_with_reverse_central_order(&[b"several", b"a longer independent member"]);
         let parsed = preflight(&input, false, u64::MAX).unwrap();
         assert!(parallel_max_archive_is_bounded(&input, &parsed));
 
@@ -2051,15 +2294,191 @@ mod tests {
     }
 
     #[test]
-    fn optimizes_a_deflated_member_without_recompressing_it() {
+    fn default_always_stores_a_tiny_deflate_member() {
         // One-byte stored Deflate block containing "x".
         let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
         let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, false, false);
         assert_eq!(deflate_stream_count(&input).unwrap(), 1);
         let result = optimize(&input, &Options::default()).unwrap();
 
-        assert!(result.data.len() <= input.len());
-        optimize(&result.data, &Options::default()).unwrap();
+        assert_eq!(result.data.len(), input.len() - 5);
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+        assert_eq!(parsed.entries[0].method, 0);
+        assert_eq!(parsed.entries[0].compressed_size_before, 1);
+        assert!(result.should_replace());
+    }
+
+    #[test]
+    fn default_preserves_larger_deflate_members() {
+        let decoded = b"abcde";
+        let deflate = [0x01, 0x05, 0x00, 0xfa, 0xff, b'a', b'b', b'c', b'd', b'e'];
+        let input = single_entry_archive(
+            8,
+            &deflate,
+            crc32_update(0, decoded),
+            decoded.len() as u32,
+            false,
+            false,
+        );
+        let result = optimize(&input, &Options::default()).unwrap();
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+
+        assert_eq!(parsed.entries[0].method, 8);
+    }
+
+    #[test]
+    fn zero_through_four_byte_members_always_use_store_in_both_modes() {
+        for decoded_size in 0..=ALWAYS_STORE_MAX_BYTES as usize {
+            let decoded = &b"abcd"[..decoded_size];
+            let length = decoded_size as u16;
+            let mut deflate = vec![0x01];
+            deflate.extend_from_slice(&length.to_le_bytes());
+            deflate.extend_from_slice(&(!length).to_le_bytes());
+            deflate.extend_from_slice(decoded);
+            let input = single_entry_archive(
+                8,
+                &deflate,
+                crc32_update(0, decoded),
+                decoded_size as u32,
+                false,
+                false,
+            );
+
+            for exhaustive in [false, true] {
+                let result = optimize(
+                    &input,
+                    &Options {
+                        exhaustive,
+                        timeout: Duration::ZERO,
+                        ..Options::default()
+                    },
+                )
+                .unwrap();
+                let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+                assert_eq!(parsed.entries[0].method, 0, "size={decoded_size}");
+                assert_eq!(
+                    parsed.entries[0].compressed_size_before, decoded_size as u32,
+                    "size={decoded_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equal_sized_four_byte_store_normalization_is_recommended() {
+        // One literal plus an overlapping three-byte match encodes "AAAA" in
+        // 30 meaningful bits and four physical Deflate bytes. Store ties the
+        // physical payload size, so the wrapper rule—not a claimed saving—
+        // makes this rewrite mandatory.
+        let deflate = [0x73, 0x04, 0x02, 0x00];
+        let decoded = b"AAAA";
+        let input = single_entry_archive(
+            8,
+            &deflate,
+            crc32_update(0, decoded),
+            decoded.len() as u32,
+            false,
+            false,
+        );
+        let result = optimize(&input, &Options::default()).unwrap();
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+
+        assert_eq!(result.data.len(), input.len());
+        assert_eq!(result.bits_saved, 0);
+        assert!(result.should_replace());
+        assert_eq!(parsed.entries[0].method, 0);
+    }
+
+    #[test]
+    fn terminal_store_runs_after_a_zero_budget_max_floor() {
+        let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, true, false);
+        let result = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(result.timed_out);
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+        let entry = &parsed.entries[0];
+        assert_eq!(entry.method, 0);
+        assert_eq!(entry.flags & FLAG_DATA_DESCRIPTOR, 0);
+        assert_eq!(entry.compressed_size_before, 1);
+        let layout = local_entry_layout(&result.data, parsed.central_offset, entry).unwrap();
+        assert_eq!(&result.data[layout.data_offset..layout.data_end], b"x");
+    }
+
+    #[test]
+    fn terminal_store_does_not_replace_a_smaller_deflate_payload() {
+        // Raw Deflate for one hundred "A" bytes. Its match remains much
+        // smaller than the one-hundred-byte Store representation.
+        let deflate = [0x73, 0x74, 0xa4, 0x3d, 0x00, 0x00];
+        let decoded = [b'A'; 100];
+        let input = single_entry_archive(
+            8,
+            &deflate,
+            crc32_update(0, &decoded),
+            decoded.len() as u32,
+            false,
+            false,
+        );
+        let result = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+
+        assert_eq!(parsed.entries[0].method, 8);
+        assert!(parsed.entries[0].compressed_size_before < decoded.len() as u32);
+    }
+
+    #[test]
+    fn store_requires_at_least_ten_percent_of_payload_bytes_saved() {
+        assert!(store_saves_at_least_ten_percent(90, 100));
+        assert!(store_saves_at_least_ten_percent(9, 10));
+        assert!(!store_saves_at_least_ten_percent(91, 100));
+        assert!(!store_saves_at_least_ten_percent(10, 10));
+        assert!(!store_saves_at_least_ten_percent(10, 9));
+    }
+
+    #[test]
+    fn max_preserves_deflate_below_the_store_threshold() {
+        let decoded: Vec<u8> = (0..46).collect();
+        let length = decoded.len() as u16;
+        let mut deflate = vec![0x01];
+        deflate.extend_from_slice(&length.to_le_bytes());
+        deflate.extend_from_slice(&(!length).to_le_bytes());
+        deflate.extend_from_slice(&decoded);
+        let input = single_entry_archive(
+            8,
+            &deflate,
+            crc32_update(0, &decoded),
+            decoded.len() as u32,
+            false,
+            false,
+        );
+        let result = optimize(
+            &input,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let parsed = preflight(&result.data, false, u64::MAX).unwrap();
+
+        assert_eq!(parsed.entries[0].method, 8);
     }
 
     #[test]
@@ -2102,9 +2521,10 @@ mod tests {
     #[test]
     fn local_member_slice_is_reclaimed_without_a_file_timeout() {
         let deflate = [
-            0x00, 0x01, 0x00, 0xfe, 0xff, b'x', 0x01, 0x01, 0x00, 0xfe, 0xff, b'y',
+            0x00, 0x03, 0x00, 0xfc, 0xff, b'a', b'b', b'c', 0x01, 0x03, 0x00, 0xfc, 0xff, b'd',
+            b'e', b'f',
         ];
-        let input = single_entry_archive(8, &deflate, crc32_update(0, b"xy"), 2, false, false);
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"abcdef"), 6, false, false);
         let eocd_offset = find_end_of_central_directory(&input).unwrap();
         let eocd = &input[eocd_offset..eocd_offset + 22];
         let central_offset = le32(eocd, 16) as usize;
@@ -2193,12 +2613,20 @@ mod tests {
             data: vec![0; 10],
             source_deflate_bits: 120,
             output_deflate_bits: 100,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         let bit_winner = ZipOptimization {
             data: vec![1; 10],
             source_deflate_bits: 120,
             output_deflate_bits: 99,
+            store_changes: vec![ZipStoreProgress {
+                stream_id: 1,
+                deflate_bytes: 10,
+                stored_bytes: 8,
+            }],
+            forced_store_change: false,
             timed_out: true,
         };
         let selected = best_complete_optimization(
@@ -2206,17 +2634,22 @@ mod tests {
                 data: floor.data.clone(),
                 source_deflate_bits: floor.source_deflate_bits,
                 output_deflate_bits: floor.output_deflate_bits,
+                store_changes: floor.store_changes.clone(),
+                forced_store_change: floor.forced_store_change,
                 timed_out: floor.timed_out,
             },
             bit_winner,
         );
         assert_eq!(selected.data, vec![1; 10]);
+        assert_eq!(selected.store_changes.len(), 1);
         assert!(selected.timed_out);
 
         let byte_only_winner = ZipOptimization {
             data: vec![2; 9],
             source_deflate_bits: 120,
             output_deflate_bits: 101,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         let selected = best_complete_optimization(floor, byte_only_winner);
@@ -2226,12 +2659,16 @@ mod tests {
             data: vec![0; 10],
             source_deflate_bits: 120,
             output_deflate_bits: 100,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         let dominating = ZipOptimization {
             data: vec![2; 9],
             source_deflate_bits: 120,
             output_deflate_bits: 90,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         let selected = best_complete_optimization(floor, dominating);
@@ -2240,8 +2677,8 @@ mod tests {
 
     #[test]
     fn parallel_max_archive_requires_bounded_work() {
-        let deflate = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
-        let input = single_entry_archive(8, &deflate, crc32_update(0, b"x"), 1, false, false);
+        let deflate = [0x01, 0x05, 0x00, 0xfa, 0xff, b'a', b'b', b'c', b'd', b'e'];
+        let input = single_entry_archive(8, &deflate, crc32_update(0, b"abcde"), 5, false, false);
         let parsed = preflight(&input, false, u64::MAX).unwrap();
         assert!(parallel_max_archive_is_bounded(&input, &parsed));
 
@@ -2325,6 +2762,8 @@ mod tests {
             data: vec![0; 8],
             source_deflate_bits: 100,
             output_deflate_bits: 90,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         assert_eq!(shorter.into_public(10).bits_saved, 16);
@@ -2333,6 +2772,8 @@ mod tests {
             data: vec![0; 10],
             source_deflate_bits: 100,
             output_deflate_bits: 92,
+            store_changes: Vec::new(),
+            forced_store_change: false,
             timed_out: false,
         };
         assert_eq!(equal.into_public(10).bits_saved, 8);

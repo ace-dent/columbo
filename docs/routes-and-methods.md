@@ -78,11 +78,23 @@ flowchart TD
 ```
 
 Candidate ordering is strict and stable: fewer output bytes wins; at equal byte
-length, fewer meaningful Deflate bits wins; an exact tie retains the earlier
-candidate. Therefore a same-byte result that saves **one meaningful bit** is a
-real win, and the CLI will write it unless `--dry-run` is used. A padding-only
-change outside the meaningful Deflate bit count is not reported as a saving and
-does not replace a file solely for compression.
+length, fewer meaningful compressed-payload bits wins; an exact tie retains the
+earlier candidate. For Deflate this is the complete stream through EOB without
+final-byte padding. Therefore a same-byte Deflate result that saves **one
+meaningful bit** is a real win, and the CLI will write it unless `--dry-run` is
+used. A padding-only change outside that meaningful count is not reported as a
+saving and does not replace a file solely for compression.
+
+ZIP has one explicit wrapper-policy exception. An unencrypted method-8 member
+whose decoded length is zero through four bytes always becomes method 0 in
+Default and Max. No valid Deflate stream can use fewer physical payload bytes
+at those lengths, so the member bypasses every Deflate optimization route. A
+four-byte Deflate payload can tie Store in physical bytes while using fewer
+meaningful bits; the CLI still writes this mandatory normalization but reports
+no compression saving. For larger members, only Max may choose method 0, and
+only when Store is at least 10% smaller in payload bytes than the final
+optimized Deflate stream. Stored payloads cost exactly eight meaningful bits
+per byte in aggregate ZIP result ordering.
 
 For raw Deflate candidate selection, relaxed mode retains the original unless a
 generated stream wins under that ordering. A wrapper can still be rebuilt for a
@@ -142,7 +154,7 @@ flowchart TD
     POLICY -- "Raw or zlib" --> COMPLETE
     POLICY -- "GZIP" --> SHARED
     POLICY -- "PNG / APNG" --> PPNGROUTES["PNG substreams"]
-    POLICY -- "ZIP" --> ZMAX
+    POLICY -- "ZIP" --> ZTINY
     PRAW --> COMPLETE["Complete floor policy"]
     PZL --> COMPLETE
     PGZ --> SHARED["Default: Shared floor<br/>Max: SharedExact floor per serial member"]
@@ -158,15 +170,21 @@ flowchart TD
     PMULTI -- "Max · ≤8 MiB compressed<br/>≤64 MiB decoded · 2+ CPUs" --> PFILE["Race complete Default APNG<br/>against full-budget original-source Max"]
     PFILE --> PPAR["Max: up to 8 fixed worker lanes<br/>ApngMax floor per image stream"]
     PMULTI -- "Max · outside race bounds" --> SHAREDPNG["ApngMax floor per serial image job"]
-    PZIP --> ZMAX{"--max"}
-    ZMAX -- "No" --> ZDEFAULT["Complete default archive pass<br/>uniform members may use worker lanes"]
-    ZMAX -- "Yes" --> ZBOUND{"At least 1 Deflate member; nonuniform archive ≤8 MiB<br/>optimizable decoded work ≤64 MiB"}
+    PZIP --> ZTINY["Validate 0–4-byte Deflate members<br/>exclude them from optimization jobs"]
+    ZTINY --> ZMAX{"--max"}
+    ZMAX -- "No" --> ZDEFAULT["Complete single archive pass<br/>uniform members may use worker lanes"]
+    ZMAX -- "Yes" --> ZJOBS{"Any Deflate job over 4 decoded bytes"}
+    ZJOBS -- "No" --> ZDEFAULT
+    ZJOBS -- "Yes" --> ZBOUND{"Nonuniform archive ≤8 MiB<br/>optimizable decoded work ≤64 MiB"}
     ZBOUND -- "Yes" --> ZRACE["Complete Default archive + Established-source Max<br/>in parallel; 2+ bounded Default members may use worker lanes"]
     ZRACE --> ZREFINE["Refine completed Default archive<br/>and require byte+bit dominance"]
+    ZREFINE --> ZSTORE["Terminal Store pass<br/>0–4 bytes always · larger Max members require ≥10%"]
     ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · complete Default archive<br/>uniform members may use worker lanes"]
     ZPHASE1 --> ZTIME{"Time remains"}
-    ZTIME -- "No" --> ZWIN["Return phase-1 floor"]
+    ZTIME -- "No" --> ZSTORE
     ZTIME -- "Yes" --> ZPHASE2["🔴 Phase 2 · refine finished archive<br/>Shared floors and actual remainder"]
+    ZPHASE2 --> ZSTORE
+    ZDEFAULT --> ZSTORE
 
 ```
 
@@ -208,8 +226,8 @@ until the complete file finishes.
 | PNG decoded-equivalent frame reuse | After serial job optimization, checksum/size groups are decoded and byte-compared before the best compressed spelling is reused. Retained comparison data is capped at 32 MiB and comparison work at 64 MiB. | 🟡 |
 | PNG unsafe ancillary fallback | If an unknown ancillary chunk is unsafe to copy and `--strip` does not remove it, Columbo validates every image stream and then preserves the complete source PNG. Metadata syntax was parsed and any completed metadata probe was validated, but an unprobed metadata payload is not definitively decoded on this early return. | 🟢 |
 | PNG invalid-exporter repair | A color-type-6 RGBA PNG may carry one known indexed-conversion vestige: a non-empty, palette-sized `tRNS` after a valid suggested `PLTE` and before image data. PNG forbids `tRNS` for RGBA, so Columbo accepts only that structural signature and omits the chunk from every output. Bytes after `IEND` are outside the PNG datastream and are likewise discarded. Other invalid `tRNS` shapes remain errors; rewrite-sensitive unknown ancillary data also prevents this repair unless stripping is requested. | 🟢 |
-| ZIP member scheduling | Unencrypted, nonempty method-8 entries are optimization jobs; unencrypted stored entries are validated but not Deflate-optimized, and encrypted entries are preserved without payload decoding. Default is largest-first and Max is small-first. Ordinary work uses up to eight balanced worker slices when at least eight optimizable members are similarly distributed, input is ≤8 MiB, and decoded work is ≤64 MiB. During a bounded nonuniform Max archive race, the mandatory Default sibling may use the same lanes for any set of at least two independent members; the direct Max sibling retains its normal schedule. Each exhaustive worker budgets only its own serial slice. After either the parallel or serial initial pass, locally yielded members receive weighted reclaim passes from the actual file remainder; byte length then meaningful Deflate bits select the retained result. Reconstruction emits local records in original physical order and central records in original directory order. | 🟡–🔴 |
-| ZIP max archive lineages | An archive with at least one optimizable member races its complete Default archive against direct original-source Max when member work is nonuniform, input is ≤8 MiB, and total optimizable decoded work is ≤64 MiB. The direct branch uses the validated source as `Established`, so it does not rebuild the ordinary floor owned by the Default branch. With two or more members, bounded Default-member lanes complete that mandatory sibling sooner and leave the actual remainder for its distinct refinement. Larger or uniformly distributed archives avoid two simultaneous archive models: they complete Default, give original-source Max half of the actual remainder, then refine the completed floor with whatever time remains. Thus memory scheduling does not make the source deft4j basin permanently unreachable. Stored-only archives have no Deflate optimization jobs. A Max archive replaces its retained Default archive only when file bytes and aggregate meaningful Deflate bits are both no worse. | 🔴 |
+| ZIP member scheduling | Every unencrypted method-8 entry is validated. Entries with decoded length zero through four bytes are not Deflate optimization jobs: neither mode admits them to the raw planner, and the terminal wrapper pass always changes them to method 0. If these are the only Deflate entries, Max skips its direct and refinement archive lineages. Unencrypted method-8 entries over four decoded bytes are optimization jobs; unencrypted stored entries are validated but not Deflate-optimized, and encrypted entries are preserved without payload decoding. Default is largest-first and Max is small-first. Ordinary work uses up to eight balanced worker slices when at least eight optimizable members are similarly distributed, input is ≤8 MiB, and decoded work is ≤64 MiB. During a bounded nonuniform Max archive race, the mandatory Default sibling may use the same lanes for any set of at least two independent members; the direct Max sibling retains its normal schedule. Each exhaustive worker budgets only its own serial slice. After either the parallel or serial initial pass, locally yielded members receive weighted reclaim passes from the actual file remainder; byte length then meaningful Deflate bits select the retained result. Default preserves method 8 only for members over four bytes. After a complete Max archive lineage has exhausted its admitted Deflate work, the wrapper may also change a larger final method-8 payload to method 0 when Store is at least 10% smaller in payload bytes; header and descriptor savings do not count toward that threshold. Both ZIP headers are updated. Verbose and Visual identify every selected Deflate-to-Store change by stream and report its exact payload sizes and percentage saving, including a possible zero-saving four-byte normalization. Raw Deflate already prices stored blocks internally; zlib, GZIP, and PNG provide no equivalent container-level uncompressed method. Reconstruction emits local records in original physical order and central records in original directory order. | 🟡–🔴 |
+| ZIP max archive lineages | An archive with at least one optimization job over four decoded bytes races its complete Default archive against direct original-source Max when member work is nonuniform, input is ≤8 MiB, and total optimizable decoded work is ≤64 MiB. The direct branch uses the validated source as `Established`, so it does not rebuild the ordinary floor owned by the Default branch. With two or more members, bounded Default-member lanes complete that mandatory sibling sooner and leave the actual remainder for its distinct refinement. Larger or uniformly distributed archives avoid two simultaneous archive models: they complete Default, give original-source Max half of the actual remainder, then refine the completed floor with whatever time remains. Thus memory scheduling does not make the source deft4j basin permanently unreachable. Stored-only and tiny-Deflate-only archives have no Deflate optimization jobs and use one archive pass in either mode. A Max archive replaces its retained Default archive only when file bytes and aggregate meaningful Deflate bits are both no worse. | 🔴 |
 
 ### Raw-stream route tree
 

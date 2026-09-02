@@ -321,7 +321,7 @@ fn execute_file(
     let write_started = detailed.then(Instant::now);
     let output_action = match command.destination.output_path(input_path) {
         None => OutputAction::DryRun,
-        Some(output) if optimized.bits_saved != 0 => {
+        Some(output) if optimized.should_replace() => {
             let written = if overwrites_input {
                 write_file_if_unchanged(output, &input, &optimized.data)
             } else {
@@ -428,6 +428,15 @@ fn print_quiet_result(
             output,
             "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (dry run; no output written)"
         ),
+        OutputAction::WrittenOptimized(_)
+            if input_bytes == optimized_bytes && optimized.bits_saved == 0 =>
+        {
+            writeln!(
+                output,
+                "{input_name:?} {input_bytes} -> {optimized_bytes} bytes \
+                 (representation normalized; no size saving)"
+            )
+        }
         OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => writeln!(
             output,
             "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
@@ -1432,6 +1441,33 @@ mod tests {
     }
 
     #[test]
+    fn default_result_describes_equal_sized_wrapper_normalization() {
+        let mut result = Vec::new();
+        let input = InputReport {
+            path: Path::new("input.zip"),
+            index: 0,
+            count: 1,
+            bytes: 100,
+        };
+        let optimized = OptimizationReport {
+            bytes: 100,
+            bits_saved: 0,
+        };
+        print_quiet_result(
+            &mut result,
+            &input,
+            &OutputAction::WrittenOptimized(PathBuf::from("input.zip")),
+            &optimized,
+        )
+        .unwrap();
+
+        assert_eq!(
+            String::from_utf8(result).unwrap(),
+            "\"input.zip\" 100 -> 100 bytes (representation normalized; no size saving)\n"
+        );
+    }
+
+    #[test]
     fn verbose_and_visual_share_the_detailed_result_renderer() {
         let input = InputReport {
             path: Path::new("directory/abc.file"),
@@ -2026,6 +2062,35 @@ mod tests {
     }
 
     #[test]
+    fn equal_byte_tiny_zip_normalization_replaces_in_place() {
+        let source = four_byte_deflate_zip();
+        let directory = unique_test_directory();
+        let input = directory.join("input.zip");
+        fs::write(&input, &source).unwrap();
+
+        execute(Command {
+            format: Format::Zip,
+            options: Options::default(),
+            inputs: vec![input.clone()],
+            destination: Destination::InPlace,
+        })
+        .unwrap();
+
+        let output = fs::read(&input).unwrap();
+        assert_eq!(output.len(), source.len());
+        assert_eq!(u16::from_le_bytes(output[8..10].try_into().unwrap()), 0);
+        let central = output
+            .windows(4)
+            .position(|bytes| bytes == 0x0201_4b50_u32.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            u16::from_le_bytes(output[central + 10..central + 12].try_into().unwrap()),
+            0
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn padding_only_rewrite_without_a_meaningful_saving_does_not_replace_in_place() {
         let source = [0x03, 0xfc];
         let optimized = optimize(&source, Format::Raw, &Options::default()).unwrap();
@@ -2177,6 +2242,53 @@ mod tests {
             }
         }
         panic!("could not create a unique test directory");
+    }
+
+    fn four_byte_deflate_zip() -> Vec<u8> {
+        let name = b"a";
+        let payload = [0x73, 0x04, 0x02, 0x00]; // "AAAA" in 30 meaningful bits.
+        let crc32 = 0x9b0d_08f1_u32;
+        let mut output = Vec::new();
+
+        output.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+        output.extend_from_slice(&20_u16.to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output.extend_from_slice(&8_u16.to_le_bytes());
+        output.extend_from_slice(&[0; 4]);
+        output.extend_from_slice(&crc32.to_le_bytes());
+        output.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        output.extend_from_slice(&4_u32.to_le_bytes());
+        output.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output.extend_from_slice(name);
+        output.extend_from_slice(&payload);
+
+        let central_offset = output.len() as u32;
+        output.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+        output.extend_from_slice(&20_u16.to_le_bytes());
+        output.extend_from_slice(&20_u16.to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output.extend_from_slice(&8_u16.to_le_bytes());
+        output.extend_from_slice(&[0; 4]);
+        output.extend_from_slice(&crc32.to_le_bytes());
+        output.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        output.extend_from_slice(&4_u32.to_le_bytes());
+        output.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output.extend_from_slice(&[0; 8]);
+        output.extend_from_slice(&0_u32.to_le_bytes());
+        output.extend_from_slice(name);
+        let central_size = output.len() as u32 - central_offset;
+
+        output.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+        output.extend_from_slice(&[0; 4]);
+        output.extend_from_slice(&1_u16.to_le_bytes());
+        output.extend_from_slice(&1_u16.to_le_bytes());
+        output.extend_from_slice(&central_size.to_le_bytes());
+        output.extend_from_slice(&central_offset.to_le_bytes());
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        output
     }
 
     fn parsed_options<const N: usize>(arguments: [&str; N]) -> Options {

@@ -17,5 +17,7 @@ pub(crate) use optimize::{
     optimize_raw_prefix_with_floor_and_grace, raw_source_benefits_from_early_max_lineage,
     DefaultFloor, RawInfo, RawOptimization,
 };
-pub(crate) use parse::{decoded_bytes_for_comparison, raw_stream_decodes_to};
+pub(crate) use parse::{
+    decoded_bytes_for_comparison, decoded_bytes_for_storage, raw_stream_decodes_to,
+};
 pub(crate) use stop::timeout_grace;

@@ -637,6 +637,41 @@ pub(crate) fn decoded_bytes_for_comparison(
     (decoded.len() == decoded_size).then_some(decoded)
 }
 
+/// Materialize one complete raw stream for a container-level stored
+/// representation.
+///
+/// ZIP uses this both to validate streams whose zero-to-four-byte decoded
+/// payload bypasses Deflate optimization and to build a final method-0
+/// alternative. The parser performs the identity check and supplies both the
+/// exact meaningful-bit cost being challenged and the decoded payload needed
+/// by method 0.
+pub(crate) fn decoded_bytes_for_storage(
+    input: &[u8],
+    decoded_limit: u64,
+) -> Result<(Vec<u8>, u64, u32)> {
+    let parsed = parse_stream(input, decoded_limit)?;
+    if parsed.consumed != input.len() {
+        return Err(Error::internal(
+            "optimized Deflate storage candidate has trailing data",
+        ));
+    }
+    let decoded_size = usize::try_from(parsed.decoded_size)
+        .map_err(|_| Error::resource_limit("decoded Deflate payload is too large"))?;
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(decoded_size)
+        .map_err(|_| Error::internal("could not allocate stored Deflate payload"))?;
+    for block in parsed.blocks {
+        decoded.extend_from_slice(&block.plain);
+    }
+    if decoded.len() != decoded_size {
+        return Err(Error::internal(
+            "optimized Deflate storage candidate changed decoded size",
+        ));
+    }
+    Ok((decoded, parsed.meaningful_bits, parsed.crc32))
+}
+
 /// Compare a raw stream with exact decoded bytes without allocating a second
 /// complete decoded buffer.
 pub(crate) fn raw_stream_decodes_to(input: &[u8], decoded_limit: u64, expected: &[u8]) -> bool {
