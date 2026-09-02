@@ -85,6 +85,12 @@ const PROVEN_COMPOSITION_MAX_SPELLINGS: usize = 4;
 const PROVEN_COMPOSITION_BEAM_WIDTH: usize = 16;
 const PROVEN_COMPOSITION_PAYLOAD_WINDOW: i64 = 24;
 const PROVEN_COMPOSITION_EXACT_LIMIT: usize = 32;
+// The adaptive sibling exact-prices at most fifteen forward/reverse prefixes
+// in its first round. A second round is admitted only after a strict win and
+// shares this overall cap, so no-gain compact blocks pay for one bounded pass.
+const PROVEN_CLOSED_LOOP_MAX_PLAIN: usize = 1_024;
+const PROVEN_CLOSED_LOOP_ROUNDS: usize = 2;
+const PROVEN_CLOSED_LOOP_EXACT_LIMIT: usize = 24;
 // These source-tree probes are part of the deadline-independent compact floor.
 // Keep only a small, ranked set so a many-frame container cannot spend its
 // shared budget rebuilding every nearly identical local candidate.
@@ -834,38 +840,7 @@ pub(crate) fn improve_plan_with_header_aware_proven_composition(
     if !(2..=PROVEN_COMPOSITION_MAX_SOURCE_MATCHES).contains(&source_matches) {
         return best;
     }
-    let (literal_lengths, distance_lengths) = proven_submatch_seed_lengths(block, &best);
-    let (literal_frequencies, _) = count_frequencies(&source);
-    let Some(targets) = select_proven_submatch_targets(
-        &source,
-        block.plain.len(),
-        &block.source_splits,
-        &literal_frequencies,
-        &literal_lengths,
-        true,
-        true,
-        stop,
-    ) else {
-        return best;
-    };
-    let Some(payload_rewrites) = build_proven_submatch_rewrites(
-        &targets,
-        &block.plain,
-        &literal_lengths,
-        &distance_lengths,
-        ProvenSubmatchRestriction::None,
-        stop,
-    ) else {
-        return best;
-    };
-    let Some(symbol_free_rewrites) = build_proven_submatch_rewrites(
-        &targets,
-        &block.plain,
-        &literal_lengths,
-        &distance_lengths,
-        ProvenSubmatchRestriction::SourceSymbol,
-        stop,
-    ) else {
+    let Some(menus) = build_current_proven_composition_menus(block, &source, &best, stop) else {
         return best;
     };
     let mut priced_candidates = Vec::new();
@@ -880,15 +855,21 @@ pub(crate) fn improve_plan_with_header_aware_proven_composition(
         &source,
         alignment,
         options,
-        &targets,
-        &payload_rewrites,
-        &symbol_free_rewrites,
-        &literal_lengths,
-        &distance_lengths,
+        &menus,
         &mut priced_candidates,
         stop,
         &mut best,
     );
+    if block.plain.len() <= PROVEN_CLOSED_LOOP_MAX_PLAIN && block.source_splits.is_empty() {
+        consider_closed_loop_proven_composition(
+            block,
+            alignment,
+            options,
+            &mut priced_candidates,
+            stop,
+            &mut best,
+        );
+    }
     best
 }
 
@@ -993,17 +974,21 @@ struct ProvenCompositionState {
     rewrite_count: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProvenCompositionMove {
+    menu_index: usize,
+    choice: u8,
+}
+
+type ProvenCompositionStateKey = (i64, i64, usize, usize, [u8; PROVEN_COMPOSITION_MAX_TARGETS]);
+
 #[allow(clippy::too_many_arguments)]
 fn consider_header_aware_proven_composition(
     block: &ParsedBlock,
     source: &[Token],
     alignment: u8,
     options: &Options,
-    targets: &[ProvenSubmatchTarget],
-    payload_rewrites: &[ProvenSubmatchRewrite],
-    symbol_free_rewrites: &[ProvenSubmatchRewrite],
-    literal_lengths: &[u8],
-    distance_lengths: &[u8],
+    menus: &[ProvenCompositionMenu],
     priced_candidates: &mut Vec<Arc<Vec<Token>>>,
     stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
@@ -1018,16 +1003,6 @@ fn consider_header_aware_proven_composition(
         return;
     }
 
-    let Some(menus) = build_proven_composition_menus(
-        block,
-        targets,
-        payload_rewrites,
-        symbol_free_rewrites,
-        literal_lengths,
-        distance_lengths,
-    ) else {
-        return;
-    };
     if menus.len() < 2 {
         return;
     }
@@ -1125,7 +1100,7 @@ fn consider_header_aware_proven_composition(
         if stop.reached() {
             break;
         }
-        let Some(tokens) = apply_proven_composition_state(source, block.plain.len(), &menus, state)
+        let Some(tokens) = apply_proven_composition_state(source, block.plain.len(), menus, state)
         else {
             continue;
         };
@@ -1145,6 +1120,373 @@ fn consider_header_aware_proven_composition(
             best,
         );
     }
+}
+
+fn build_current_proven_composition_menus(
+    block: &ParsedBlock,
+    source: &[Token],
+    best: &PlannedBlock,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<ProvenCompositionMenu>> {
+    let (literal_lengths, distance_lengths) = proven_submatch_seed_lengths(block, best);
+    let (literal_frequencies, _) = count_frequencies(source);
+    let targets = select_proven_submatch_targets(
+        source,
+        block.plain.len(),
+        &block.source_splits,
+        &literal_frequencies,
+        &literal_lengths,
+        true,
+        true,
+        stop,
+    )?;
+    let payload_rewrites = build_proven_submatch_rewrites(
+        &targets,
+        &block.plain,
+        &literal_lengths,
+        &distance_lengths,
+        ProvenSubmatchRestriction::None,
+        stop,
+    )?;
+    let symbol_free_rewrites = build_proven_submatch_rewrites(
+        &targets,
+        &block.plain,
+        &literal_lengths,
+        &distance_lengths,
+        ProvenSubmatchRestriction::SourceSymbol,
+        stop,
+    )?;
+    build_proven_composition_menus(
+        block,
+        &targets,
+        &payload_rewrites,
+        &symbol_free_rewrites,
+        &literal_lengths,
+        &distance_lengths,
+    )
+}
+
+/// Re-rank the compact proven-spelling menu after every strict exact win.
+///
+/// The search shape is independently adapted from Guetzli's closed loop: rank
+/// local changes under the current global model, exact-price change batches,
+/// then sweep backwards from the aggressive endpoint. Columbo never relaxes
+/// decoded identity, and this additive sibling can replace its completed
+/// incumbent only on a strict complete-block bit win.
+#[allow(clippy::too_many_arguments)]
+fn consider_closed_loop_proven_composition(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    stop: &mut SearchStop<'_>,
+    best: &mut PlannedBlock,
+) {
+    // This route buys its observed marginal win on tiny Huffman-sensitive
+    // blocks. Keeping it in that regime prevents its exact-pricing probes from
+    // displacing later Max work under a shared container deadline.
+    if block.plain.len() > PROVEN_CLOSED_LOOP_MAX_PLAIN || !block.source_splits.is_empty() {
+        return;
+    }
+    let mut exact_prices = 0_usize;
+    for _ in 0..PROVEN_CLOSED_LOOP_ROUNDS {
+        if stop.reached() || exact_prices == PROVEN_CLOSED_LOOP_EXACT_LIMIT {
+            break;
+        }
+        let source = Arc::clone(&best.tokens);
+        let source_matches = source
+            .iter()
+            .filter(|token| matches!(token, Token::Match { .. }))
+            .count();
+        if source.len() > PROVEN_COMPOSITION_MAX_TOKENS
+            || !(3..=PROVEN_COMPOSITION_MAX_SOURCE_MATCHES).contains(&source_matches)
+        {
+            break;
+        }
+        let Some(menus) = build_current_proven_composition_menus(block, &source, best, stop) else {
+            break;
+        };
+        if menus.len() < 3 {
+            break;
+        }
+        let Some((mut aggressive_state, moves)) =
+            ranked_forward_proven_composition_moves(&source, &menus)
+        else {
+            break;
+        };
+        if moves.len() < 3 {
+            break;
+        }
+
+        let incumbent_bits = best.bits;
+        let mut round_best: Option<PlannedBlock> = None;
+        let mut aggressive_lengths = None;
+        for (index, &movement) in moves.iter().enumerate() {
+            if stop.reached() || exact_prices == PROVEN_CLOSED_LOOP_EXACT_LIMIT {
+                break;
+            }
+            if !apply_proven_composition_move(&mut aggressive_state, &menus, movement, true) {
+                return;
+            }
+            let is_aggressive_endpoint = index + 1 == moves.len();
+            let Some(candidate) = price_proven_composition_state(
+                block,
+                &source,
+                alignment,
+                options,
+                &menus,
+                &aggressive_state,
+                priced_candidates,
+                is_aggressive_endpoint,
+                stop,
+            ) else {
+                continue;
+            };
+            exact_prices += 1;
+            if is_aggressive_endpoint {
+                aggressive_lengths = plan_lengths(&candidate);
+            }
+            if candidate.bits < incumbent_bits
+                && round_best
+                    .as_ref()
+                    .map_or(true, |selected| candidate.bits < selected.bits)
+            {
+                round_best = Some(candidate);
+            }
+        }
+
+        if let Some((literal_lengths, distance_lengths)) = aggressive_lengths {
+            if exact_prices < PROVEN_CLOSED_LOOP_EXACT_LIMIT && !stop.reached() {
+                let Some(reverse_moves) = ranked_reverse_proven_composition_moves(
+                    &menus,
+                    &moves,
+                    &aggressive_state,
+                    &literal_lengths,
+                    &distance_lengths,
+                ) else {
+                    return;
+                };
+                let mut repaired_state = aggressive_state;
+                for (index, movement) in reverse_moves.into_iter().enumerate() {
+                    // Undoing every move reproduces the completed source.
+                    if index + 1 == moves.len()
+                        || stop.reached()
+                        || exact_prices == PROVEN_CLOSED_LOOP_EXACT_LIMIT
+                    {
+                        break;
+                    }
+                    if !apply_proven_composition_move(&mut repaired_state, &menus, movement, false)
+                    {
+                        return;
+                    }
+                    let Some(candidate) = price_proven_composition_state(
+                        block,
+                        &source,
+                        alignment,
+                        options,
+                        &menus,
+                        &repaired_state,
+                        priced_candidates,
+                        false,
+                        stop,
+                    ) else {
+                        continue;
+                    };
+                    exact_prices += 1;
+                    if candidate.bits < incumbent_bits
+                        && round_best
+                            .as_ref()
+                            .map_or(true, |selected| candidate.bits < selected.bits)
+                    {
+                        round_best = Some(candidate);
+                    }
+                }
+            }
+        }
+
+        let Some(winner) = round_best else {
+            break;
+        };
+        *best = winner;
+    }
+}
+
+fn proven_composition_root(source: &[Token]) -> ProvenCompositionState {
+    let (literal_frequencies, distance_frequencies) = count_frequencies(source);
+    ProvenCompositionState {
+        literal_frequencies,
+        distance_frequencies,
+        extra_bits: token_extra_bits(source),
+        estimated_delta: 0,
+        choices: [0; PROVEN_COMPOSITION_MAX_TARGETS],
+        rewrite_count: 0,
+    }
+}
+
+fn ranked_forward_proven_composition_moves(
+    source: &[Token],
+    menus: &[ProvenCompositionMenu],
+) -> Option<(ProvenCompositionState, Vec<ProvenCompositionMove>)> {
+    let root = proven_composition_root(source);
+    let mut ranked = Vec::new();
+    ranked.try_reserve_exact(menus.len()).ok()?;
+    for (menu_index, menu) in menus.iter().enumerate() {
+        let mut selected: Option<(ProvenCompositionStateKey, ProvenCompositionMove)> = None;
+        for alternative_index in 0..menu.alternatives.len() {
+            let choice = u8::try_from(alternative_index.checked_add(1)?).ok()?;
+            let movement = ProvenCompositionMove { menu_index, choice };
+            let mut candidate = root.clone();
+            if !apply_proven_composition_move(&mut candidate, menus, movement, true) {
+                return None;
+            }
+            let key = proven_composition_state_key(
+                &candidate,
+                &root.literal_frequencies,
+                &root.distance_frequencies,
+            );
+            if selected
+                .as_ref()
+                .map_or(true, |(best_key, _)| key < *best_key)
+            {
+                selected = Some((key, movement));
+            }
+        }
+        if let Some(selected) = selected {
+            ranked.push(selected);
+        }
+    }
+    ranked.sort_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
+    Some((
+        root,
+        ranked.into_iter().map(|(_, movement)| movement).collect(),
+    ))
+}
+
+fn ranked_reverse_proven_composition_moves(
+    menus: &[ProvenCompositionMenu],
+    moves: &[ProvenCompositionMove],
+    aggressive: &ProvenCompositionState,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> Option<Vec<ProvenCompositionMove>> {
+    let mut ranked = Vec::new();
+    ranked.try_reserve_exact(moves.len()).ok()?;
+    for &movement in moves {
+        let menu = menus.get(movement.menu_index)?;
+        let alternative = menu
+            .alternatives
+            .get(usize::from(movement.choice).checked_sub(1)?)?;
+        let source_bits =
+            estimated_match_token_bits(menu.source, literal_lengths, distance_lengths)?;
+        let replacement_bits =
+            estimated_tokens_bits(&alternative.replacement, literal_lengths, distance_lengths)?;
+        let mut candidate = aggressive.clone();
+        if !apply_proven_composition_move(&mut candidate, menus, movement, false) {
+            return None;
+        }
+        candidate.estimated_delta = i64::try_from(source_bits)
+            .ok()?
+            .checked_sub(i64::try_from(replacement_bits).ok()?)?;
+        let key = proven_composition_state_key(
+            &candidate,
+            &aggressive.literal_frequencies,
+            &aggressive.distance_frequencies,
+        );
+        ranked.push((key, movement));
+    }
+    ranked.sort_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
+    Some(ranked.into_iter().map(|(_, movement)| movement).collect())
+}
+
+fn apply_proven_composition_move(
+    state: &mut ProvenCompositionState,
+    menus: &[ProvenCompositionMenu],
+    movement: ProvenCompositionMove,
+    forward: bool,
+) -> bool {
+    let Some(menu) = menus.get(movement.menu_index) else {
+        return false;
+    };
+    let Some(choice_index) = usize::from(movement.choice).checked_sub(1) else {
+        return false;
+    };
+    let Some(alternative) = menu.alternatives.get(choice_index) else {
+        return false;
+    };
+    let Some(&current_choice) = state.choices.get(movement.menu_index) else {
+        return false;
+    };
+    if (forward && current_choice != 0) || (!forward && current_choice != movement.choice) {
+        return false;
+    }
+
+    let mut updated = state.clone();
+    if forward {
+        updated.choices[movement.menu_index] = movement.choice;
+        updated.rewrite_count = updated.rewrite_count.saturating_add(1);
+        let Some(delta) = updated
+            .estimated_delta
+            .checked_sub(alternative.estimated_saving)
+        else {
+            return false;
+        };
+        updated.estimated_delta = delta;
+        if !apply_proven_composition_spelling_delta(
+            &mut updated,
+            std::slice::from_ref(&menu.source),
+            &alternative.replacement,
+        ) {
+            return false;
+        }
+    } else {
+        updated.choices[movement.menu_index] = 0;
+        let Some(rewrite_count) = updated.rewrite_count.checked_sub(1) else {
+            return false;
+        };
+        updated.rewrite_count = rewrite_count;
+        let Some(delta) = updated
+            .estimated_delta
+            .checked_add(alternative.estimated_saving)
+        else {
+            return false;
+        };
+        updated.estimated_delta = delta;
+        if !apply_proven_composition_spelling_delta(
+            &mut updated,
+            &alternative.replacement,
+            std::slice::from_ref(&menu.source),
+        ) {
+            return false;
+        }
+    }
+    *state = updated;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn price_proven_composition_state(
+    block: &ParsedBlock,
+    source: &[Token],
+    alignment: u8,
+    options: &Options,
+    menus: &[ProvenCompositionMenu],
+    state: &ProvenCompositionState,
+    priced_candidates: &mut Vec<Arc<Vec<Token>>>,
+    force_price: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<PlannedBlock> {
+    let tokens = apply_proven_composition_state(source, block.plain.len(), menus, state)?;
+    let duplicate = priced_candidates
+        .iter()
+        .any(|candidate| candidate.as_slice() == tokens.as_slice());
+    if duplicate && !force_price {
+        return None;
+    }
+    let candidate = plan_tokens(block, tokens, alignment, options, stop)?;
+    if !duplicate && priced_candidates.try_reserve(1).is_ok() {
+        priced_candidates.push(Arc::clone(&candidate.tokens));
+    }
+    Some(candidate)
 }
 
 fn build_proven_composition_menus(
@@ -1259,15 +1601,25 @@ fn apply_proven_composition_frequency_delta(
     source: Token,
     replacement: &[Token],
 ) -> bool {
-    if !adjust_proven_composition_token_frequency(
-        &mut state.literal_frequencies,
-        &mut state.distance_frequencies,
-        source,
-        false,
-    ) {
-        return false;
+    apply_proven_composition_spelling_delta(state, std::slice::from_ref(&source), replacement)
+}
+
+fn apply_proven_composition_spelling_delta(
+    state: &mut ProvenCompositionState,
+    removed: &[Token],
+    added: &[Token],
+) -> bool {
+    for &token in removed {
+        if !adjust_proven_composition_token_frequency(
+            &mut state.literal_frequencies,
+            &mut state.distance_frequencies,
+            token,
+            false,
+        ) {
+            return false;
+        }
     }
-    for &token in replacement {
+    for &token in added {
         if !adjust_proven_composition_token_frequency(
             &mut state.literal_frequencies,
             &mut state.distance_frequencies,
@@ -1277,12 +1629,12 @@ fn apply_proven_composition_frequency_delta(
             return false;
         }
     }
-    let source_extra = token_extra_bits(std::slice::from_ref(&source));
-    let replacement_extra = token_extra_bits(replacement);
+    let removed_extra = token_extra_bits(removed);
+    let added_extra = token_extra_bits(added);
     let Some(extra_bits) = state
         .extra_bits
-        .checked_sub(source_extra)
-        .and_then(|bits| bits.checked_add(replacement_extra))
+        .checked_sub(removed_extra)
+        .and_then(|bits| bits.checked_add(added_extra))
     else {
         return false;
     };
@@ -4967,6 +5319,124 @@ mod tests {
             state.distance_frequencies
         );
         assert_eq!(token_extra_bits(&materialized), state.extra_bits);
+    }
+
+    #[test]
+    fn proven_composition_forward_and_reverse_moves_restore_the_exact_state() {
+        let source_match = test_match(6, 6, 4, 1, 1);
+        let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        source.extend([source_match, source_match, source_match]);
+        let decoded = b"abcdefabcdefabcdefabcdef";
+        let literal_replacement: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        let menus: Vec<_> = (0..3)
+            .map(|index| {
+                let token_index = 6 + index;
+                ProvenCompositionMenu {
+                    token_index,
+                    source: source_match,
+                    alternatives: vec![ProvenSubmatchRewrite {
+                        token_index,
+                        replacement: literal_replacement.clone(),
+                        estimated_saving: index as i64 - 1,
+                        rank: ProvenSubmatchRank {
+                            highest: true,
+                            rare: true,
+                            near_boundary: false,
+                            transition: true,
+                            expensive: false,
+                            code_bits: 4,
+                            frequency: 3,
+                            token_index,
+                        },
+                    }],
+                }
+            })
+            .collect();
+
+        let (root, moves) = ranked_forward_proven_composition_moves(&source, &menus)
+            .expect("the three independent moves are rankable");
+        assert_eq!(moves.len(), 3);
+        let mut aggressive = root.clone();
+        for &movement in &moves {
+            assert!(apply_proven_composition_move(
+                &mut aggressive,
+                &menus,
+                movement,
+                true,
+            ));
+        }
+        let materialized =
+            apply_proven_composition_state(&source, decoded.len(), &menus, &aggressive)
+                .expect("the aggressive endpoint materializes");
+        assert_eq!(
+            decode_test_tokens(&materialized).as_deref(),
+            Some(decoded.as_slice())
+        );
+        assert_eq!(
+            count_frequencies(&materialized).0,
+            aggressive.literal_frequencies
+        );
+        assert_eq!(
+            count_frequencies(&materialized).1,
+            aggressive.distance_frequencies
+        );
+        assert_eq!(token_extra_bits(&materialized), aggressive.extra_bits);
+
+        let (literal_lengths, distance_lengths) = fixed_lengths();
+        let reverse = ranked_reverse_proven_composition_moves(
+            &menus,
+            &moves,
+            &aggressive,
+            &literal_lengths,
+            &distance_lengths,
+        )
+        .expect("the aggressive endpoint has a reverse ranking");
+        assert_eq!(reverse.len(), moves.len());
+        let mut repaired = aggressive;
+        for movement in reverse {
+            assert!(apply_proven_composition_move(
+                &mut repaired,
+                &menus,
+                movement,
+                false,
+            ));
+        }
+        assert_eq!(repaired.literal_frequencies, root.literal_frequencies);
+        assert_eq!(repaired.distance_frequencies, root.distance_frequencies);
+        assert_eq!(repaired.extra_bits, root.extra_bits);
+        assert_eq!(repaired.estimated_delta, root.estimated_delta);
+        assert_eq!(repaired.choices, root.choices);
+        assert_eq!(repaired.rewrite_count, root.rewrite_count);
+    }
+
+    #[test]
+    fn closed_loop_proven_composition_retains_a_complete_strict_incumbent() {
+        let source_match = test_match(6, 6, 4, 1, 1);
+        let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
+        source.extend([source_match, source_match, source_match]);
+        let plain = decode_test_tokens(&source).expect("the source token stream is valid");
+        let block = short_family_test_block(source.clone(), plain);
+        let mut incumbent = PlannedBlock {
+            tokens: source.clone().into(),
+            plain: block.plain.clone(),
+            representation: Representation::Fixed,
+            bits: 0,
+            source_type: SourceBlockType::Fixed,
+        };
+        let options = Options {
+            exhaustive: true,
+            ..Options::default()
+        };
+        consider_closed_loop_proven_composition(
+            &block,
+            0,
+            &options,
+            &mut Vec::new(),
+            &mut SearchStop::never(),
+            &mut incumbent,
+        );
+        assert_eq!(incumbent.bits, 0);
+        assert_eq!(incumbent.tokens.as_slice(), source);
     }
 
     #[test]

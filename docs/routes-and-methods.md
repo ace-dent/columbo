@@ -522,6 +522,17 @@ rewritten parent has at most 8,000 tokens and 2–128 matches. Every emitted mat
 still uses its original proven distance, and the earlier complete M3 floor wins
 every exact tie.
 
+For an unsplit source block of at most 1,024 decoded bytes, Max adds a second
+🔴 closed-loop composition sibling. It ranks one best alternate spelling per
+menu under the current global frequency state, exact-prices cumulative forward
+prefixes, then ranks a reverse repair sweep using the aggressive endpoint's
+exact Huffman lengths. A strict exact winner becomes the next round's source;
+without one, the route stops after the first pass. At least three menus are
+required, and two rounds share a hard ceiling of 24 complete block prices.
+This search is additive: the completed static composition parent remains the
+incumbent, decoded identity is preserved, and exact complete-block bits decide
+every replacement.
+
 ## Boundary polishing inside proven matches
 
 🔴 A selected decoded cut may fall inside an existing match. Columbo retains
@@ -733,6 +744,7 @@ the internal scheduler described here.
 | Preflighted all-literals endpoint | Ordinary planning explicitly compares replacing every existing match by its known decoded literals. A one-tree estimate rejects distant candidates; dense blocks up to 80,000 decoded bytes and sparse-match blocks up to 1,000,000 bytes receive complete fixed/dynamic pricing. The expanded token vector is allocated only for a strict complete-block win. | 🟡 | all-literals comparison inspired by **libdeflate**; independent **Columbo** bounds, preflight, integration, and exact acceptance |
 | Proven-submatch resegmentation | Searches literal/match paths wholly inside an already-proved match at its original distance. | 🔴 | **Columbo** |
 | Header-aware proven-spelling composition | Max-only within compact M3: combines up to eight match menus in a 16-state frequency beam, deduplicates exact literal/distance frequencies plus match-extra bits, and exact-prices only multi-match combinations. | 🔴 | **Columbo** |
+| Adaptive closed-loop proven composition | On one unsplit source block of at most 1,024 decoded bytes, ranks forward spelling prefixes under the current global frequency state, reverse-repairs from the exact aggressive table, and reranks only after a strict win. At least three menus are required; two rounds share at most 24 complete prices and the completed static parent remains independent. | 🔴 | Closed-loop local/global search shape identified in **Google Guetzli**; independent existing-token **Columbo** ranking, reverse repair, gates, exact pricing, and acceptance |
 | Independent proven endpoint | Replays proven resegmentation after the ordinary candidate rather than allowing a local spelling to hide another fixed point. | 🔴 | **Columbo** |
 | Match-preserving and integrated proven feedback | Adds the compact D1/D2/M3 state orders as independent complete candidates. | 🟡 | **Columbo** |
 | Terminal tree tightening | Applies bounded feedback trees and one strictly improving existing-match-to-literal replay to eligible final Huffman blocks. | 🟡 | DeflOpt-inspired primitive; **Columbo** scheduling |
