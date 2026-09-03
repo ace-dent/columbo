@@ -17,7 +17,6 @@
 
 use std::array;
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -43,6 +42,7 @@ type StateId = usize;
 /// payload under one ceiling so many blocks cannot multiply memory use.
 const MAX_DEFT4J_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
 const MAX_DEFT4J_ARENA_BYTES: usize = MAX_DEFT4J_ROUTE_BYTES;
+const DEFT4J_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn token_payload_bytes(token_count: usize) -> Option<usize> {
     token_count.checked_mul(size_of::<Token>())
@@ -563,20 +563,82 @@ impl Deft4jQueue {
 }
 
 fn state_hash(token_hash: u64, literal_lengths: &[u8; 286], distance_lengths: &[u8; 30]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    token_hash.hash(&mut hasher);
-    literal_lengths.hash(&mut hasher);
-    distance_lengths.hash(&mut hasher);
-    hasher.finish()
+    // This fingerprint only selects a candidate state. `state_matches` verifies
+    // both complete alphabets and every token before the queue reuses it, so a
+    // keyed, cryptographic-strength hasher adds cost without adding safety.
+    let mut fingerprint = DEFT4J_FINGERPRINT_OFFSET;
+    mix_deft4j_fingerprint(&mut fingerprint, token_hash);
+    mix_length_fingerprint(&mut fingerprint, literal_lengths);
+    mix_length_fingerprint(&mut fingerprint, distance_lengths);
+    fingerprint
 }
 
 fn token_hash(tokens: &[Token]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    tokens.len().hash(&mut hasher);
-    for token in tokens {
-        token.hash(&mut hasher);
+    let mut fingerprint = begin_token_fingerprint(tokens.len());
+    for &token in tokens {
+        mix_token_fingerprint(&mut fingerprint, token);
     }
-    hasher.finish()
+    fingerprint
+}
+
+#[inline]
+fn begin_token_fingerprint(token_count: usize) -> u64 {
+    let mut fingerprint = DEFT4J_FINGERPRINT_OFFSET;
+    mix_deft4j_fingerprint(&mut fingerprint, token_count as u64);
+    fingerprint
+}
+
+#[inline]
+fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
+    match token {
+        Token::Literal(value) => {
+            mix_deft4j_fingerprint(fingerprint, u64::from(value));
+        }
+        Token::Match {
+            length,
+            distance,
+            length_symbol,
+            distance_symbol,
+            length_extra,
+            distance_extra,
+            length_extra_bits,
+            distance_extra_bits,
+        } => {
+            mix_deft4j_fingerprint(
+                fingerprint,
+                1_u64 << 63
+                    | u64::from(length)
+                    | (u64::from(distance) << 16)
+                    | (u64::from(length_symbol) << 32)
+                    | (u64::from(distance_symbol) << 48)
+                    | (u64::from(length_extra_bits) << 56),
+            );
+            mix_deft4j_fingerprint(
+                fingerprint,
+                u64::from(length_extra)
+                    | (u64::from(distance_extra) << 16)
+                    | (u64::from(distance_extra_bits) << 32),
+            );
+        }
+    }
+}
+
+fn mix_length_fingerprint(fingerprint: &mut u64, lengths: &[u8]) {
+    mix_deft4j_fingerprint(fingerprint, lengths.len() as u64);
+    for chunk in lengths.chunks(8) {
+        let mut packed = 0_u64;
+        for (shift, &length) in chunk.iter().enumerate() {
+            packed |= u64::from(length) << (shift * 8);
+        }
+        mix_deft4j_fingerprint(fingerprint, packed);
+    }
+}
+
+#[inline]
+fn mix_deft4j_fingerprint(fingerprint: &mut u64, value: u64) {
+    *fingerprint ^= value;
+    *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    *fingerprint ^= *fingerprint >> 32;
 }
 
 fn state_matches(
@@ -805,8 +867,7 @@ fn expand_marked(
     let mut literal_frequencies = [0_u32; 286];
     let mut distance_frequencies = [0_u32; 30];
     let mut extra_bits = 0_u64;
-    let mut hasher = DefaultHasher::new();
-    output_count.hash(&mut hasher);
+    let mut token_hash = begin_token_fingerprint(output_count);
     let mut offset = 0_usize;
     for (&token, &mark) in tokens.iter().zip(marks) {
         let end = offset.checked_add(token.decoded_len())?;
@@ -814,13 +875,13 @@ fn expand_marked(
         if mark != 0 {
             for &byte in decoded {
                 let literal = Token::Literal(byte);
-                literal.hash(&mut hasher);
+                mix_token_fingerprint(&mut token_hash, literal);
                 literal_frequencies[usize::from(byte)] =
                     literal_frequencies[usize::from(byte)].checked_add(1)?;
                 output.push(literal);
             }
         } else {
-            token.hash(&mut hasher);
+            mix_token_fingerprint(&mut token_hash, token);
             match token {
                 Token::Literal(byte) => {
                     literal_frequencies[usize::from(byte)] =
@@ -849,7 +910,7 @@ fn expand_marked(
     literal_frequencies[256] = literal_frequencies[256].checked_add(1)?;
     Some(ExpandedState {
         tokens: Arc::new(output),
-        token_hash: hasher.finish(),
+        token_hash,
         literal_frequencies,
         distance_frequencies,
         extra_bits,
@@ -1438,7 +1499,7 @@ impl WorkingBlock {
                 // every cache/reference owned by this block has been dropped.
                 budget.reserve(new_token_bytes)?;
             }
-            if adopt_plan(&mut self.block, &outcome.plan).is_none() {
+            if adopt_plan(&mut self.block, &outcome.plan, replaces_tokens).is_none() {
                 if replaces_tokens {
                     let _ = budget.release(new_token_bytes);
                 }
@@ -1477,10 +1538,18 @@ impl WorkingBlock {
     }
 }
 
-fn adopt_plan(block: &mut ParsedBlock, plan: &PlannedBlock) -> Option<()> {
-    block.tokens = Arc::clone(&plan.tokens);
-    block.plain = Arc::clone(&plan.plain);
-    block.recount_frequencies();
+fn adopt_plan(block: &mut ParsedBlock, plan: &PlannedBlock, replaces_tokens: bool) -> Option<()> {
+    debug_assert_eq!(replaces_tokens, !Arc::ptr_eq(&block.tokens, &plan.tokens));
+    if replaces_tokens {
+        block.tokens = Arc::clone(&plan.tokens);
+        block.recount_frequencies();
+    }
+    // Representation-only fixed-point wins retain the exact payload buffers,
+    // so their already-counted frequencies remain valid. Avoid rescanning the
+    // block or cycling either Arc's reference count on every such adoption.
+    if !Arc::ptr_eq(&block.plain, &plan.plain) {
+        block.plain = Arc::clone(&plan.plain);
+    }
     block.original = None;
     match &plan.representation {
         Representation::Original(_) => return Some(()),
@@ -1988,6 +2057,20 @@ mod tests {
         let marks = [1];
         let one_byte_short = token_payload_bytes(3).unwrap() - 1;
         assert!(expand_marked(&block.tokens, &block.plain, &marks, one_byte_short).is_none());
+    }
+
+    #[test]
+    fn expanded_state_fingerprint_matches_a_complete_token_scan() {
+        let block = costly_match_block();
+        let expanded = expand_marked(
+            &block.tokens,
+            &block.plain,
+            &[1],
+            token_payload_bytes(3).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(expanded.token_hash, token_hash(&expanded.tokens));
     }
 
     #[test]

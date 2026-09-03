@@ -191,6 +191,16 @@ impl ParsedBlock {
         self.distance_frequencies = distance;
     }
 
+    /// Adopt a planned token spelling, rebuilding its histograms only when
+    /// the immutable token buffer actually changed.
+    pub(crate) fn replace_tokens(&mut self, tokens: Arc<Vec<Token>>) {
+        if Arc::ptr_eq(&self.tokens, &tokens) {
+            return;
+        }
+        self.tokens = tokens;
+        self.recount_frequencies();
+    }
+
     /// Copy mutable block metadata while sharing the immutable token/plain
     /// payloads. This is used only by optional preparation and grouping paths.
     pub(crate) fn try_clone_shared(&self) -> Option<Self> {

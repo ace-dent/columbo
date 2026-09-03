@@ -1736,6 +1736,7 @@ enum HeapTie {
     Order,
 }
 
+#[inline]
 fn heap_node_less(nodes: &[Node], a: usize, b: usize, tie: HeapTie) -> bool {
     if nodes[a].frequency != nodes[b].frequency {
         return nodes[a].frequency < nodes[b].frequency;
@@ -1748,21 +1749,23 @@ fn heap_node_less(nodes: &[Node], a: usize, b: usize, tie: HeapTie) -> bool {
 }
 
 fn heap_sift_down(nodes: &[Node], heap: &mut [usize], start: usize, tie: HeapTie) {
+    let node = heap[start];
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
-            return;
+            break;
         }
         if child + 1 < heap.len() && heap_node_less(nodes, heap[child + 1], heap[child], tie) {
             child += 1;
         }
-        if !heap_node_less(nodes, heap[child], heap[root], tie) {
-            return;
+        if !heap_node_less(nodes, heap[child], node, tie) {
+            break;
         }
-        heap.swap(root, child);
+        heap[root] = heap[child];
         root = child;
     }
+    heap[root] = node;
 }
 
 fn heapify_frequency_only(nodes: &[Node], heap: &mut [usize]) {
@@ -2228,6 +2231,56 @@ mod tests {
                 assert_eq!(length, 0);
             } else {
                 assert_ne!(length, 0);
+            }
+        }
+    }
+
+    fn swapping_heap_sift_down(nodes: &[Node], heap: &mut [usize], start: usize, tie: HeapTie) {
+        let mut root = start;
+        loop {
+            let mut child = root * 2 + 1;
+            if child >= heap.len() {
+                return;
+            }
+            if child + 1 < heap.len() && heap_node_less(nodes, heap[child + 1], heap[child], tie) {
+                child += 1;
+            }
+            if !heap_node_less(nodes, heap[child], heap[root], tie) {
+                return;
+            }
+            heap.swap(root, child);
+            root = child;
+        }
+    }
+
+    #[test]
+    fn hole_heap_sift_matches_the_swapping_reference() {
+        let mut nodes = Vec::new();
+        for index in 0..64 {
+            let mut node = Node::leaf(((index * 17 + 5) % 13) as u32, index, 63 - index);
+            node.height = (index * 7 + 3) % 11;
+            nodes.push(node);
+        }
+
+        for len in 1..=nodes.len() {
+            for seed in 0..4_u64 {
+                let mut heap = (0..len).collect::<Vec<_>>();
+                let mut random = seed + len as u64;
+                for index in (1..len).rev() {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    heap.swap(index, random as usize % (index + 1));
+                }
+                for start in 0..len {
+                    for tie in [HeapTie::FrequencyOnly, HeapTie::Height, HeapTie::Order] {
+                        let mut expected = heap.clone();
+                        let mut actual = heap.clone();
+                        swapping_heap_sift_down(&nodes, &mut expected, start, tie);
+                        heap_sift_down(&nodes, &mut actual, start, tie);
+                        assert_eq!(actual, expected);
+                    }
+                }
             }
         }
     }

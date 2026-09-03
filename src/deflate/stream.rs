@@ -996,8 +996,7 @@ fn plan_selected_huffman_merge_floor(
             let merged_plan =
                 plan_block_with_floor_cached(&merged, alignment, &floor_options, false, plan_cache);
             if merged_plan.bits < separate_bits {
-                merged.tokens = merged_plan.tokens.clone();
-                merged.recount_frequencies();
+                merged.replace_tokens(merged_plan.tokens.clone());
                 pending_block = merged;
                 pending_plan = merged_plan;
                 continue;
@@ -2272,8 +2271,7 @@ fn greedy_huffman_blocklist(
                     let mut merged = merged;
                     // Carry a strict intermediate token winner into the next
                     // adjacent comparison, matching Columbo's original C list.
-                    merged.tokens = merged_plan.tokens.clone();
-                    merged.recount_frequencies();
+                    merged.replace_tokens(merged_plan.tokens.clone());
                     pending = PendingBlock::Owned(merged);
                     pending_cache = Some((alignment, merged_plan));
                     continue;
@@ -2423,14 +2421,12 @@ fn bounded_huffman_grouping(
             if plan.bits > predicted {
                 return None;
             }
-            winner.tokens = plan.tokens;
-            winner.recount_frequencies();
+            winner.replace_tokens(plan.tokens);
             grouped.push(winner);
             start = end;
         } else {
             let mut single = blocks[start].try_clone_shared()?;
-            single.tokens = source_plans[start].tokens.clone();
-            single.recount_frequencies();
+            single.replace_tokens(source_plans[start].tokens.clone());
             grouped.push(single);
             start += 1;
         }
@@ -2998,8 +2994,7 @@ fn sequential_plan_with_source_search(
             // Carry a winning single-block token replay into the next adjacent
             // merge, just as the original Columbo C pending-block loop does.
             if winner.len() == 1 {
-                merged.tokens = winner[0].tokens.clone();
-                merged.recount_frequencies();
+                merged.replace_tokens(winner[0].tokens.clone());
             }
             pending = PendingBlock::Owned(merged);
             pending_cache = Some((alignment, winner));
@@ -5347,6 +5342,27 @@ fn shared_dynamic_plan(
 /// Preparation and collection are optional planning routes, so an allocation
 /// failure simply leaves the blocks separate. All length/frequency arithmetic
 /// and reservations are completed before the model itself is changed.
+fn try_combine_frequencies(
+    left_literal: &[u32; 286],
+    left_distance: &[u32; 30],
+    right_literal: &[u32; 286],
+    right_distance: &[u32; 30],
+) -> Option<([u32; 286], [u32; 30])> {
+    let mut literal = *left_literal;
+    for (combined, &right) in literal.iter_mut().zip(right_literal) {
+        *combined = combined.checked_add(right)?;
+    }
+    // Each source histogram includes an end-of-block symbol, while the joined
+    // block emits only one.
+    literal[256] = literal[256].checked_sub(1)?;
+
+    let mut distance = *left_distance;
+    for (combined, &right) in distance.iter_mut().zip(right_distance) {
+        *combined = combined.checked_add(right)?;
+    }
+    Some((literal, distance))
+}
+
 fn try_append_parsed_block(left: &mut ParsedBlock, right: &ParsedBlock) -> bool {
     debug_assert!(left.source_splits.windows(2).all(|pair| pair[0] < pair[1]));
     debug_assert!(right.source_splits.windows(2).all(|pair| pair[0] < pair[1]));
@@ -5373,32 +5389,16 @@ fn try_append_parsed_block(left: &mut ParsedBlock, right: &ParsedBlock) -> bool 
         return false;
     }
 
-    // A merged block keeps the left EOB and adds only the right payload
-    // symbols. Computing this before mutation also makes overflow a clean
-    // reason to abandon the optional merge.
-    let mut literal_frequencies = left.literal_frequencies;
-    let mut distance_frequencies = left.distance_frequencies;
-    for &token in right.tokens.iter() {
-        let frequency = match token {
-            Token::Literal(value) => &mut literal_frequencies[usize::from(value)],
-            Token::Match {
-                length_symbol,
-                distance_symbol,
-                ..
-            } => {
-                let distance = &mut distance_frequencies[usize::from(distance_symbol)];
-                let Some(updated) = distance.checked_add(1) else {
-                    return false;
-                };
-                *distance = updated;
-                &mut literal_frequencies[usize::from(length_symbol)]
-            }
-        };
-        let Some(updated) = frequency.checked_add(1) else {
-            return false;
-        };
-        *frequency = updated;
-    }
+    // Combine the authoritative per-block histograms instead of rescanning
+    // the right token buffer immediately before copying it.
+    let Some((literal_frequencies, distance_frequencies)) = try_combine_frequencies(
+        &left.literal_frequencies,
+        &left.distance_frequencies,
+        &right.literal_frequencies,
+        &right.distance_frequencies,
+    ) else {
+        return false;
+    };
 
     let additional_tokens = token_len - left.tokens.len();
     let additional_plain = plain_len - left.plain.len();
@@ -5485,9 +5485,14 @@ fn try_concat_shared<T: Clone>(left: &[T], right: &[T]) -> Option<Arc<Vec<T>>> {
 }
 
 fn try_merge_parsed_blocks(left: &ParsedBlock, right: &ParsedBlock) -> Option<ParsedBlock> {
+    let (literal_frequencies, distance_frequencies) = try_combine_frequencies(
+        &left.literal_frequencies,
+        &left.distance_frequencies,
+        &right.literal_frequencies,
+        &right.distance_frequencies,
+    )?;
     let tokens = try_concat_shared(&left.tokens, &right.tokens)?;
     let plain = try_concat_shared(&left.plain, &right.plain)?;
-    let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
 
     let add_boundary = usize::from(!left.plain.is_empty() && !right.plain.is_empty());
     let split_count = left
@@ -7508,5 +7513,21 @@ mod tests {
         let merged = try_merge_parsed_blocks(&left, &right).unwrap();
         assert!(merged.original_dynamic.is_some());
         assert_eq!(merged.plain.as_slice(), b"leftright");
+    }
+
+    #[test]
+    fn combined_histograms_match_the_joined_token_stream() {
+        let left = literal_block(b"left", SourceBlockType::Dynamic);
+        let right = short_match_block();
+
+        let merged = try_merge_parsed_blocks(&left, &right).unwrap();
+        let expected = count_frequencies(&merged.tokens);
+        assert_eq!(merged.literal_frequencies, expected.0);
+        assert_eq!(merged.distance_frequencies, expected.1);
+
+        let mut appended = left;
+        assert!(try_append_parsed_block(&mut appended, &right));
+        assert_eq!(appended.literal_frequencies, expected.0);
+        assert_eq!(appended.distance_frequencies, expected.1);
     }
 }

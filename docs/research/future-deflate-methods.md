@@ -63,6 +63,9 @@ when one of the following exists:
   (26.02 `HEAD`) verified 25 August 2026.
 - Turtledeflate classifications are pinned separately in
   [`turtledeflate-methods.md`](./turtledeflate-methods.md).
+- A profile-driven runtime follow-up on 2 September 2026 sampled a symbolized
+  Max run, audited every production frequency recount, and rechecked the
+  resulting deterministic and deadline-bounded paths against the prior binary.
 
 ## Scope and invariants
 
@@ -97,7 +100,16 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
 | Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
 | Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback | A real header requiring a retained alternate RLE histogram |
-| Runtime | Canonical plan and header caches; range and edge reuse; bounded fingerprints; parser/decode/emission hot paths | Measured duplicate work or a new profile hotspot |
+| Runtime | Canonical plan and header caches; range and edge reuse; exact-verified bounded fingerprints; pointer-aware token adoption; fixed-size merge-histogram composition; parser/decode/emission and Huffman-heap hot paths | Measured duplicate work or a new profile hotspot |
+
+After the runtime changes, a second 5-second sample contained no SipHash
+stacks and only 47/3,732 top-of-stack samples in `count_frequencies`. The
+remaining dominant work was the DeflOpt-compatible heap, complete dynamic
+header planning, and their distinct tree-family candidates. The heap's
+avoidable writes were removed; the candidate breadth itself remains
+intentional because each completed tree can produce a different exact byte/bit
+result. Earlier cache instrumentation found only one reusable frequency plan
+among hundreds, so this review does not suppress or approximate that work.
 
 Existing match intervals do not overlap. Under one fixed Huffman cost model,
 their shortest paths factor into the per-match graphs already implemented.
@@ -240,6 +252,9 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Two-literal emission packing | Synthetic literals about 29% faster; all-match control about 2.8% slower; real streams neutral to about 1% faster; eligibility fallback slowed them 5–7% | Remove traversal complexity |
 | Parser-owned match scratch | 59.20 → 59.04 ms | Noise; compiler already removes material initialization cost |
 | Drain all 4–7 complete writer bytes | Literals 52.42 → 60.23 ms; matches 115.72 → 128.68 ms | Keep fixed four-byte drain |
+| deft4j keyed state hashing | SipHash occupied 404/3,687 sampled main-thread stacks (11.0%) even though hashes only selected an exact-verified state lookup. A compact incremental word fingerprint removed the hotspot; expanded-state fingerprints match a complete token scan, and paired Max runs retained the same 78,808-byte / 630,459-bit winner | Retain the fast fingerprint and complete state verification |
+| Merge/adoption frequency recounts | Block joins already owned authoritative histograms but rescanned copied token buffers; representation-only plan adoption also recounted an unchanged shared token buffer. Fixed-size checked histogram addition and pointer-aware adoption remove both scans. The complete 480-test release suite passed, including direct joined-histogram equivalence. A ten-case historical regression guard produced the same six deadline-floor misses, exact byte/bit deltas, and 22 attempts with both candidate and saved baseline | Retain the derived-state reuse |
+| DeflOpt/order heap swapping | The tree builder was the largest sampled CPU site and swapped the descending candidate at every heap level. An equivalent hole sift moves children upward and writes the candidate once. Huffman-family tests and paired normal/Max outputs were unchanged; whole-file normal timing remained within noise (3.27–3.30 s candidate versus 3.28 s baseline user time) | Retain the lower-write sift; do not widen tree search from the saved time |
 
 Stored blocks already use an aligned input slice, bulk decoded-byte copy, and
 bulk history update. Columbo must still materialize one literal token and its
