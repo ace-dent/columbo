@@ -12,7 +12,6 @@ use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
 use super::block::{emit_block, plan_block, reusable_original_bits};
-use super::deft4j::plan_source_blocks;
 use super::header::{
     balanced_tree_opportunities, plan_bounded_depth_tree_candidate,
     plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths,
@@ -28,6 +27,7 @@ use super::search::{
     plan_block_with_integrated_proven_search, rewrite_258_symbols, same_distance_opportunities,
     PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
+use super::source_recode::plan_source_blocks;
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
 use super::stream::{
     fragmented_collect_seed, plan_columbo_floor_seeded_bounded_grouping,

@@ -22,7 +22,7 @@ The routing ground truth lives primarily in:
 | Token transformations and proven-submatch search | `src/deflate/search.rs` |
 | Representation selection and route-local plan cache | `src/deflate/block.rs` |
 | Huffman construction and dynamic-header search | `src/deflate/huffman.rs`, `header.rs` |
-| deft4j-derived source route | `src/deflate/deft4j.rs` |
+| Source-ordered recode route (deft4j-derived) | `src/deflate/source_recode.rs` |
 
 Thresholds below are implementation work bounds, not Deflate format limits.
 Parser validity checks and the configurable input/decoded safety limits still

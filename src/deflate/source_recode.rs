@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Source-ordered deft4j beta-17 candidate optimization.
+//! Source-ordered block recoding and candidate optimization.
 //!
 //! deft4j does not rank a generic beam of promising token streams. It walks a
 //! named, insertion-ordered graph of block objects carrying both tokens and
@@ -40,9 +40,9 @@ type StateId = usize;
 /// deft4j-derived route shares that source model but can materialize expanded
 /// token states and merged payloads. Columbo keeps every additional live
 /// payload under one ceiling so many blocks cannot multiply memory use.
-const MAX_DEFT4J_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
-const MAX_DEFT4J_ARENA_BYTES: usize = MAX_DEFT4J_ROUTE_BYTES;
-const DEFT4J_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const MAX_SOURCE_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
+const MAX_SOURCE_ARENA_BYTES: usize = MAX_SOURCE_ROUTE_BYTES;
+const SOURCE_STATE_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn token_payload_bytes(token_count: usize) -> Option<usize> {
     token_count.checked_mul(size_of::<Token>())
@@ -54,12 +54,12 @@ fn token_payload_bytes(token_count: usize) -> Option<usize> {
 /// blocks share those `Arc`s. Expanded token vectors and merged token/plain
 /// buffers are charged before allocation and remain charged until the owning
 /// working block is replaced or discarded.
-struct Deft4jRouteBudget {
+struct SourceRouteBudget {
     limit_bytes: usize,
     live_bytes: usize,
 }
 
-impl Deft4jRouteBudget {
+impl SourceRouteBudget {
     fn new(limit_bytes: usize) -> Self {
         Self {
             limit_bytes,
@@ -153,7 +153,7 @@ enum LeastFamilyMemo {
     Scored(LeastFamilyChoices),
 }
 
-struct Deft4jState {
+struct RecodeState {
     tokens: Arc<Vec<Token>>,
     /// Content hash shared by every table-only state for this token vector.
     /// Keeping it beside the `Arc` avoids hashing a 16K-token image block for
@@ -204,8 +204,8 @@ struct PendingState {
 /// hashing, while `LinkedHashMap` preserves their insertion order. Columbo
 /// hashes equivalent token/table content to avoid duplicate work while
 /// preserving first-insertion order.
-struct Deft4jQueue {
-    states: Vec<Deft4jState>,
+struct SourceStateQueue {
+    states: Vec<RecodeState>,
     /// A hash maps to the first state with that fingerprint. A vanishingly
     /// unlikely collision falls back to a full scan, retaining correctness
     /// without allocating a second `Vec` for every hash bucket.
@@ -215,13 +215,13 @@ struct Deft4jQueue {
     saturated: bool,
 }
 
-impl Deft4jQueue {
+impl SourceStateQueue {
     fn new(limit_bytes: usize) -> Self {
         Self {
             states: Vec::new(),
             first_by_hash: HashMap::new(),
             accounted_bytes: 0,
-            limit_bytes: limit_bytes.min(MAX_DEFT4J_ARENA_BYTES),
+            limit_bytes: limit_bytes.min(MAX_SOURCE_ARENA_BYTES),
             saturated: false,
         }
     }
@@ -270,7 +270,7 @@ impl Deft4jQueue {
         // while retaining an explicit peak-memory ceiling. Charge hash-table
         // overhead conservatively along with each inline state and payload.
         let index_bytes = size_of::<(u64, StateId)>().checked_mul(4)?;
-        let added = size_of::<Deft4jState>()
+        let added = size_of::<RecodeState>()
             .checked_add(index_bytes)?
             .checked_add(payload_bytes)?;
         let new_total = self.accounted_bytes.checked_add(added)?;
@@ -282,7 +282,7 @@ impl Deft4jQueue {
         self.states.try_reserve(1).ok()?;
         self.first_by_hash.try_reserve(1).ok()?;
         let index = self.states.len();
-        self.states.push(Deft4jState {
+        self.states.push(RecodeState {
             tokens,
             token_hash,
             literal_lengths,
@@ -341,7 +341,7 @@ impl Deft4jQueue {
         let extra_bits = state.extra_bits;
         let depth = state.depth.checked_add(1)?;
         let (literal_lengths, distance_lengths) =
-            columbo_deft4j_lengths(&literal_frequencies, &distance_frequencies)?;
+            source_recode_lengths(&literal_frequencies, &distance_frequencies)?;
         let result = self.push(PendingState {
             tokens,
             token_hash,
@@ -385,7 +385,7 @@ impl Deft4jQueue {
         // remaining arena cannot hold even those fixed costs.
         let expansion_budget = self
             .remaining_bytes()
-            .checked_sub(size_of::<Deft4jState>())?;
+            .checked_sub(size_of::<RecodeState>())?;
         if self.states[source].tokens.len() > expansion_budget {
             return None;
         }
@@ -475,7 +475,7 @@ impl Deft4jQueue {
         source: StateId,
         plain: &[u8],
         kind: TransformKind,
-        rebuild_deft4j_lengths: bool,
+        rebuild_source_lengths: bool,
     ) -> Option<TransformMemo> {
         if let Some(result) = self.states[source].transforms[kind.index()] {
             return Some(result);
@@ -484,7 +484,7 @@ impl Deft4jQueue {
         let include_equal = matches!(kind, TransformKind::Pruned);
         let transform_budget = self
             .remaining_bytes()
-            .checked_sub(size_of::<Deft4jState>())?;
+            .checked_sub(size_of::<RecodeState>())?;
         let marks = mark_cost_expansions(
             &state.tokens,
             plain,
@@ -494,7 +494,7 @@ impl Deft4jQueue {
             transform_budget,
         )?;
         let changed = marks.iter().any(|&mark| mark != 0);
-        if !changed && !rebuild_deft4j_lengths {
+        if !changed && !rebuild_source_lengths {
             let memo = TransformMemo {
                 state: source,
                 changed: false,
@@ -536,8 +536,8 @@ impl Deft4jQueue {
         // the byte-per-token marks before building deft4j tables or inserting
         // the state so they do not overlap those later allocations.
         drop(marks);
-        let (literal_lengths, distance_lengths) = if rebuild_deft4j_lengths {
-            columbo_deft4j_lengths(&literal_frequencies, &distance_frequencies)?
+        let (literal_lengths, distance_lengths) = if rebuild_source_lengths {
+            source_recode_lengths(&literal_frequencies, &distance_frequencies)?
         } else {
             (state.literal_lengths, state.distance_lengths)
         };
@@ -566,8 +566,8 @@ fn state_hash(token_hash: u64, literal_lengths: &[u8; 286], distance_lengths: &[
     // This fingerprint only selects a candidate state. `state_matches` verifies
     // both complete alphabets and every token before the queue reuses it, so a
     // keyed, cryptographic-strength hasher adds cost without adding safety.
-    let mut fingerprint = DEFT4J_FINGERPRINT_OFFSET;
-    mix_deft4j_fingerprint(&mut fingerprint, token_hash);
+    let mut fingerprint = SOURCE_STATE_FINGERPRINT_OFFSET;
+    mix_state_fingerprint(&mut fingerprint, token_hash);
     mix_length_fingerprint(&mut fingerprint, literal_lengths);
     mix_length_fingerprint(&mut fingerprint, distance_lengths);
     fingerprint
@@ -583,8 +583,8 @@ fn token_hash(tokens: &[Token]) -> u64 {
 
 #[inline]
 fn begin_token_fingerprint(token_count: usize) -> u64 {
-    let mut fingerprint = DEFT4J_FINGERPRINT_OFFSET;
-    mix_deft4j_fingerprint(&mut fingerprint, token_count as u64);
+    let mut fingerprint = SOURCE_STATE_FINGERPRINT_OFFSET;
+    mix_state_fingerprint(&mut fingerprint, token_count as u64);
     fingerprint
 }
 
@@ -592,7 +592,7 @@ fn begin_token_fingerprint(token_count: usize) -> u64 {
 fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
     match token {
         Token::Literal(value) => {
-            mix_deft4j_fingerprint(fingerprint, u64::from(value));
+            mix_state_fingerprint(fingerprint, u64::from(value));
         }
         Token::Match {
             length,
@@ -604,7 +604,7 @@ fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
             length_extra_bits,
             distance_extra_bits,
         } => {
-            mix_deft4j_fingerprint(
+            mix_state_fingerprint(
                 fingerprint,
                 1_u64 << 63
                     | u64::from(length)
@@ -613,7 +613,7 @@ fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
                     | (u64::from(distance_symbol) << 48)
                     | (u64::from(length_extra_bits) << 56),
             );
-            mix_deft4j_fingerprint(
+            mix_state_fingerprint(
                 fingerprint,
                 u64::from(length_extra)
                     | (u64::from(distance_extra) << 16)
@@ -624,25 +624,25 @@ fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
 }
 
 fn mix_length_fingerprint(fingerprint: &mut u64, lengths: &[u8]) {
-    mix_deft4j_fingerprint(fingerprint, lengths.len() as u64);
+    mix_state_fingerprint(fingerprint, lengths.len() as u64);
     for chunk in lengths.chunks(8) {
         let mut packed = 0_u64;
         for (shift, &length) in chunk.iter().enumerate() {
             packed |= u64::from(length) << (shift * 8);
         }
-        mix_deft4j_fingerprint(fingerprint, packed);
+        mix_state_fingerprint(fingerprint, packed);
     }
 }
 
 #[inline]
-fn mix_deft4j_fingerprint(fingerprint: &mut u64, value: u64) {
+fn mix_state_fingerprint(fingerprint: &mut u64, value: u64) {
     *fingerprint ^= value;
     *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
     *fingerprint ^= *fingerprint >> 32;
 }
 
 fn state_matches(
-    state: &Deft4jState,
+    state: &RecodeState,
     tokens: &Arc<Vec<Token>>,
     literal_lengths: &[u8; 286],
     distance_lengths: &[u8; 30],
@@ -658,7 +658,7 @@ fn state_matches(
 /// beta-17 payload caller bypasses that path for zero or one used distance
 /// symbol; retaining the original Columbo C implementation's two-leaf spelling
 /// is a deliberate size-preserving extension rather than deft4j parity.
-fn columbo_deft4j_lengths(
+fn source_recode_lengths(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
 ) -> Option<([u8; 286], [u8; 30])> {
@@ -917,19 +917,19 @@ fn expand_marked(
     })
 }
 
-struct Deft4jBest {
+struct SourceRecodeBest {
     plan: PlannedBlock,
     improved: bool,
 }
 
-struct Deft4jPipeline {
-    queue: Deft4jQueue,
+struct SourceRecodePipeline {
+    queue: SourceStateQueue,
     plain: Arc<Vec<u8>>,
     strict: bool,
 }
 
-impl Deft4jPipeline {
-    fn submit(&mut self, state: StateId, best: &mut Deft4jBest) {
+impl SourceRecodePipeline {
+    fn submit(&mut self, state: StateId, best: &mut SourceRecodeBest) {
         let Some(candidate) = self
             .queue
             .score(state, ScoreKind::CompleteHeader, self.strict)
@@ -990,7 +990,7 @@ impl Deft4jPipeline {
     fn add_optimized_recoded(
         &mut self,
         source: StateId,
-        best: &mut Deft4jBest,
+        best: &mut SourceRecodeBest,
         stop: &mut SearchStop<'_>,
     ) -> bool {
         let Some(strict) = self.queue.transform_strict(source, &self.plain) else {
@@ -1038,7 +1038,7 @@ impl Deft4jPipeline {
     fn run_optimizations(
         &mut self,
         source: StateId,
-        best: &mut Deft4jBest,
+        best: &mut SourceRecodeBest,
         stop: &mut SearchStop<'_>,
     ) -> bool {
         if !self.add_optimized_recoded(source, best, stop) {
@@ -1065,7 +1065,7 @@ impl Deft4jPipeline {
     fn run_multi(
         &mut self,
         source: StateId,
-        best: &mut Deft4jBest,
+        best: &mut SourceRecodeBest,
         stop: &mut SearchStop<'_>,
     ) -> bool {
         self.submit(source, best);
@@ -1110,7 +1110,12 @@ impl Deft4jPipeline {
         true
     }
 
-    fn run_ordered(&mut self, base: StateId, best: &mut Deft4jBest, stop: &mut SearchStop<'_>) {
+    fn run_ordered(
+        &mut self,
+        base: StateId,
+        best: &mut SourceRecodeBest,
+        stop: &mut SearchStop<'_>,
+    ) {
         if !self.run_multi(base, best, stop) || stop.reached() || self.queue.saturated {
             return;
         }
@@ -1147,7 +1152,7 @@ fn plan_source_block_once(
     available_bytes: usize,
     stop: &mut SearchStop<'_>,
 ) -> BlockOutcome {
-    let mut best = Deft4jBest {
+    let mut best = SourceRecodeBest {
         plan: initial_plan(block, alignment, options),
         improved: false,
     };
@@ -1237,7 +1242,7 @@ fn plan_source_block_once(
                 .as_ref()
                 .and_then(dynamic_length_arrays)
         } else {
-            columbo_deft4j_lengths(&block.literal_frequencies, &block.distance_frequencies)
+            source_recode_lengths(&block.literal_frequencies, &block.distance_frequencies)
         };
         if let Some((literal_lengths, distance_lengths)) = seed {
             // Both ordered seeds keep the source token stream. Hash it once;
@@ -1245,8 +1250,8 @@ fn plan_source_block_once(
             // Their token extra-bit total is likewise identical.
             let source_token_hash = token_hash(&block.tokens);
             let source_extra_bits = token_extra_bits(&block.tokens);
-            let mut pipeline = Deft4jPipeline {
-                queue: Deft4jQueue::new(queue_limit),
+            let mut pipeline = SourceRecodePipeline {
+                queue: SourceStateQueue::new(queue_limit),
                 plain: Arc::clone(&block.plain),
                 strict: options.strict,
             };
@@ -1470,7 +1475,7 @@ impl WorkingBlock {
         &mut self,
         alignment: u8,
         options: &Options,
-        budget: &mut Deft4jRouteBudget,
+        budget: &mut SourceRouteBudget,
         stop: &mut SearchStop<'_>,
     ) -> Option<u64> {
         let slot = usize::from(alignment & 7);
@@ -1523,7 +1528,7 @@ impl WorkingBlock {
         &mut self,
         alignment: u8,
         options: &Options,
-        budget: &mut Deft4jRouteBudget,
+        budget: &mut SourceRouteBudget,
         stop: &mut SearchStop<'_>,
     ) -> Option<PlannedBlock> {
         let slot = usize::from(alignment & 7);
@@ -1591,7 +1596,7 @@ pub(crate) fn plan_source_blocks(
         source,
         start_alignment,
         options,
-        MAX_DEFT4J_ROUTE_BYTES,
+        MAX_SOURCE_ROUTE_BYTES,
         stop,
     )
 }
@@ -1610,7 +1615,7 @@ pub(crate) fn plan_source_block(
     options: &Options,
     stop: &mut SearchStop<'_>,
 ) -> Option<PlannedBlock> {
-    Some(plan_source_block_once(source, alignment, options, MAX_DEFT4J_ROUTE_BYTES, stop).plan)
+    Some(plan_source_block_once(source, alignment, options, MAX_SOURCE_ROUTE_BYTES, stop).plan)
 }
 
 fn plan_source_blocks_with_budget(
@@ -1620,7 +1625,7 @@ fn plan_source_blocks_with_budget(
     budget_bytes: usize,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
-    let mut budget = Deft4jRouteBudget::new(budget_bytes.min(MAX_DEFT4J_ROUTE_BYTES));
+    let mut budget = SourceRouteBudget::new(budget_bytes.min(MAX_SOURCE_ROUTE_BYTES));
     // Once source-list admission is no longer capped at an arbitrary block
     // count, charge the shallow working copies themselves. Their shared token
     // and plain payloads remain owned by the parser; inline block metadata and
@@ -1919,7 +1924,7 @@ mod tests {
         }
     }
 
-    fn push_fixed_state(queue: &mut Deft4jQueue, tokens: Arc<Vec<Token>>) -> StateId {
+    fn push_fixed_state(queue: &mut SourceStateQueue, tokens: Arc<Vec<Token>>) -> StateId {
         let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
         let (literal_lengths, distance_lengths) = fixed_lengths();
         queue
@@ -2000,7 +2005,7 @@ mod tests {
             false
         };
         let mut stop = SearchStop::callback(&mut deadline);
-        let mut budget = Deft4jRouteBudget::new(MAX_DEFT4J_ROUTE_BYTES);
+        let mut budget = SourceRouteBudget::new(MAX_SOURCE_ROUTE_BYTES);
         let first = block
             .plan(3, &Options::default(), &mut budget, &mut stop)
             .unwrap();
@@ -2092,11 +2097,10 @@ mod tests {
     fn queue_identity_includes_huffman_tables() {
         let block = literal_block(b"same tokens", SourceBlockType::Fixed);
         let (first_literal, first_distance) =
-            columbo_deft4j_lengths(&block.literal_frequencies, &block.distance_frequencies)
-                .unwrap();
+            source_recode_lengths(&block.literal_frequencies, &block.distance_frequencies).unwrap();
         let mut second_literal = first_literal;
         second_literal[0] = second_literal[0].saturating_add(1);
-        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+        let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
         let first = queue
             .push(PendingState {
                 tokens: Arc::clone(&block.tokens),
@@ -2131,7 +2135,7 @@ mod tests {
         let tokens = Arc::new(vec![Token::Literal(b'a')]);
         let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
         let (_, distance_lengths) = fixed_lengths();
-        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+        let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
 
         for index in 0_u32..=4_096 {
             let mut literal_lengths = [0_u8; 286];
@@ -2185,7 +2189,7 @@ mod tests {
     #[test]
     fn queue_identity_keeps_shared_pointer_and_content_fallbacks() {
         let block = literal_block(b"identity", SourceBlockType::Fixed);
-        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+        let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
         let first = push_fixed_state(&mut queue, Arc::clone(&block.tokens));
 
         // The common table-only path shares the allocation. A separately
@@ -2221,7 +2225,7 @@ mod tests {
     #[test]
     fn identical_least_family_routes_share_the_transformed_state() {
         let block = costly_match_block();
-        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+        let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
         let base = push_fixed_state(&mut queue, Arc::clone(&block.tokens));
 
         let least_expensive = queue.transform_least(base, &block.plain, false).unwrap();
@@ -2255,7 +2259,7 @@ mod tests {
             match_token(4, 258, 0),
         ]);
         let plain = b"aaaaaabbbb";
-        let mut queue = Deft4jQueue::new(MAX_DEFT4J_ARENA_BYTES);
+        let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
         let base = push_fixed_state(&mut queue, Arc::clone(&tokens));
 
         let least_expensive = queue.transform_least(base, plain, false).unwrap();

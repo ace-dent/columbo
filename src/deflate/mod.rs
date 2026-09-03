@@ -2,13 +2,13 @@
 
 mod bitstream;
 mod block;
-pub(crate) mod deft4j;
 mod header;
 mod huffman;
 mod model;
 mod optimize;
 mod parse;
 mod search;
+pub(crate) mod source_recode;
 mod stop;
 pub(crate) mod stream;
 

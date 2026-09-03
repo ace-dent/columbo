@@ -16,7 +16,7 @@
 //! candidate acceptance, and timed routing. Max mode also contains Columbo's
 //! independent, speed-bounded implementation of a coarse boundary-search
 //! concept described by Turtledeflate. The deft4j-derived greedy merge lives
-//! in `deft4j`.
+//! in `source_recode`.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -29,7 +29,6 @@ use super::block::{
     lookup_block_cached, plan_block, plan_block_cached, plan_reusable_block,
     reusable_original_bits, stored_block_bits, CanonicalPlanCache, ReusableBlockPlan,
 };
-use super::deft4j::plan_source_block;
 use super::header::{estimate_boundary_block_bits, score_existing_dynamic};
 use super::huffman::make_lengths_deflopt_heap_into;
 use super::model::{
@@ -46,6 +45,7 @@ use super::search::{
     same_distance_opportunities, score_short_family_frequencies, tighten_terminal_plan,
     try_clone_planned_block, ShortFamilyStats,
 };
+use super::source_recode::plan_source_block;
 use super::stop::SearchStop;
 
 // The original Columbo C implementation tries its default long-merge route in
