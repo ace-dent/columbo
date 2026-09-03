@@ -1736,6 +1736,18 @@ enum HeapTie {
     Order,
 }
 
+/// Reusable storage for DeflOpt-compatible heap tree construction.
+///
+/// Dynamic-header feedback builds many trees over the same nineteen-symbol
+/// alphabet. Keeping its temporary nodes, heap, and overflow order here avoids
+/// three allocator round trips per variant without retaining any tree state.
+#[derive(Default)]
+pub(crate) struct DefloptHeapScratch {
+    nodes: Vec<Node>,
+    heap: Vec<usize>,
+    leaf_order: Vec<usize>,
+}
+
 #[inline]
 fn heap_node_less(nodes: &[Node], a: usize, b: usize, tie: HeapTie) -> bool {
     if nodes[a].frequency != nodes[b].frequency {
@@ -1775,6 +1787,7 @@ fn heapify_frequency_only(nodes: &[Node], heap: &mut [usize]) {
 }
 
 /// Build the candidate produced by DeflOpt's frequency/height heap.
+#[cfg(test)]
 pub(crate) fn make_lengths_deflopt_heap(
     frequencies: &[u32],
     max_bits: u8,
@@ -1791,7 +1804,24 @@ pub(crate) fn make_lengths_deflopt_heap_into(
     max_bits: u8,
     variant: u32,
 ) {
-    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false);
+    make_lengths_variant_heap_inner(
+        frequencies,
+        lengths,
+        max_bits,
+        variant,
+        false,
+        &mut DefloptHeapScratch::default(),
+    );
+}
+
+pub(crate) fn make_lengths_deflopt_heap_into_with_scratch(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    variant: u32,
+    scratch: &mut DefloptHeapScratch,
+) {
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false, scratch);
 }
 
 /// Build Columbo's legacy order-key heap extension.
@@ -1800,19 +1830,38 @@ pub(crate) fn make_lengths_deflopt_heap_into(
 /// frequency ties by subtree height, whereas the original Columbo C
 /// implementation retained this earlier order-key interpretation as an
 /// additive candidate.
-pub(crate) fn make_lengths_order_heap(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
+#[cfg(test)]
+fn make_lengths_order_heap(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_order_heap_into(frequencies, &mut lengths, max_bits, variant);
     lengths
 }
 
-pub(crate) fn make_lengths_order_heap_into(
+#[cfg(test)]
+fn make_lengths_order_heap_into(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
 ) {
-    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true);
+    make_lengths_variant_heap_inner(
+        frequencies,
+        lengths,
+        max_bits,
+        variant,
+        true,
+        &mut DefloptHeapScratch::default(),
+    );
+}
+
+pub(crate) fn make_lengths_order_heap_into_with_scratch(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    variant: u32,
+    scratch: &mut DefloptHeapScratch,
+) {
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true, scratch);
 }
 
 fn make_lengths_variant_heap_inner(
@@ -1821,12 +1870,21 @@ fn make_lengths_variant_heap_inner(
     max_bits: u8,
     variant: u32,
     use_order_tie: bool,
+    scratch: &mut DefloptHeapScratch,
 ) {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
-    let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
-    let mut heap = Vec::with_capacity(frequencies.len());
+    let DefloptHeapScratch {
+        nodes,
+        heap,
+        leaf_order,
+    } = scratch;
+    nodes.clear();
+    heap.clear();
+    leaf_order.clear();
+    nodes.reserve(frequencies.len().saturating_mul(2));
+    heap.reserve(frequencies.len());
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
             heap.push(nodes.len());
@@ -1843,9 +1901,26 @@ fn make_lengths_variant_heap_inner(
         _ => {}
     }
 
-    let mut leaf_order = vec![0_usize; leaf_count];
+    leaf_order.resize(leaf_count, 0);
     let mut leaf_order_position = leaf_count;
-    heapify_frequency_only(&nodes, &mut heap);
+    heapify_frequency_only(nodes, heap);
+
+    // Variant bits select one policy for each repair and do not change during
+    // construction. Resolve them once instead of at every merged node.
+    let first_tie = if variant & 2 != 0 {
+        HeapTie::FrequencyOnly
+    } else if use_order_tie {
+        HeapTie::Order
+    } else {
+        HeapTie::Height
+    };
+    let second_tie = if variant & 1 != 0 {
+        HeapTie::FrequencyOnly
+    } else if use_order_tie {
+        HeapTie::Order
+    } else {
+        HeapTie::Height
+    };
 
     while heap.len() > 1 {
         let left = heap[0];
@@ -1857,14 +1932,7 @@ fn make_lengths_variant_heap_inner(
         heap[0] = last;
 
         // Variant bit 1 controls repair after removing the first child.
-        let first_tie = if variant & 2 != 0 {
-            HeapTie::FrequencyOnly
-        } else if use_order_tie {
-            HeapTie::Order
-        } else {
-            HeapTie::Height
-        };
-        heap_sift_down(&nodes, &mut heap, 0, first_tie);
+        heap_sift_down(nodes, heap, 0, first_tie);
 
         let right = heap[0];
         if nodes[right].symbol.is_some() {
@@ -1883,22 +1951,15 @@ fn make_lengths_variant_heap_inner(
         heap[0] = index;
 
         // Variant bit 0 independently controls repair after parent insertion.
-        let second_tie = if variant & 1 != 0 {
-            HeapTie::FrequencyOnly
-        } else if use_order_tie {
-            HeapTie::Order
-        } else {
-            HeapTie::Height
-        };
-        heap_sift_down(&nodes, &mut heap, 0, second_tie);
+        heap_sift_down(nodes, heap, 0, second_tie);
     }
 
     debug_assert_eq!(leaf_order_position, 0);
-    let max_depth = assign_depths(&nodes, heap[0], 0, lengths);
+    let max_depth = assign_depths(nodes, heap[0], 0, lengths);
     if max_depth <= usize::from(max_bits) {
         return;
     }
-    repair_deflopt_overflow(&nodes, &leaf_order, lengths, max_bits, max_depth);
+    repair_deflopt_overflow(nodes, leaf_order, lengths, max_bits, max_depth);
 }
 
 fn repair_deflopt_overflow(
@@ -2830,5 +2891,40 @@ mod tests {
             output,
             make_lengths_columbo_defluff_limited(&frequencies, 4, 0)[..]
         );
+    }
+
+    #[test]
+    fn reused_deflopt_heap_scratch_matches_standalone_builds() {
+        let fixtures: &[&[u32]] = &[
+            &[4, 1, 9, 2, 2, 0],
+            &[10, 10, 10, 10, 3, 3, 1, 0, 0],
+            &[1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 0, 0, 0],
+        ];
+        let mut scratch = DefloptHeapScratch::default();
+
+        for &frequencies in fixtures {
+            for variant in 0..4 {
+                let expected = make_lengths_deflopt_heap(frequencies, 7, variant);
+                let mut actual = vec![0; frequencies.len()];
+                make_lengths_deflopt_heap_into_with_scratch(
+                    frequencies,
+                    &mut actual,
+                    7,
+                    variant,
+                    &mut scratch,
+                );
+                assert_eq!(actual, expected);
+
+                let expected = make_lengths_order_heap(frequencies, 7, variant);
+                make_lengths_order_heap_into_with_scratch(
+                    frequencies,
+                    &mut actual,
+                    7,
+                    variant,
+                    &mut scratch,
+                );
+                assert_eq!(actual, expected);
+            }
+        }
     }
 }

@@ -10,12 +10,12 @@ use super::huffman::{
     code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
     make_brotli_rle_pseudofrequencies, make_columbo_rle_pseudofrequencies, make_lengths,
     make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
-    make_lengths_deflopt_heap, make_lengths_deflopt_heap_into, make_lengths_defluff_exact,
+    make_lengths_deflopt_heap_into_with_scratch, make_lengths_defluff_exact,
     make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
-    make_lengths_deft4j_java_heap_into, make_lengths_into, make_lengths_order_heap,
-    make_lengths_order_heap_into, make_lengths_zopfli_package_from,
-    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, FIXED_DISTANCE_CODE_LENGTHS,
-    FIXED_LITERAL_CODE_LENGTHS,
+    make_lengths_deft4j_java_heap_into, make_lengths_into,
+    make_lengths_order_heap_into_with_scratch, make_lengths_zopfli_package_from,
+    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, DefloptHeapScratch,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
@@ -1040,23 +1040,34 @@ fn ensure_distance_symbols(frequencies: &mut [u32; 30], strict: bool) {
 }
 
 fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<Vec<u8>> {
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::with_capacity(if exhaustive { 16 } else { 8 });
+    let mut heap_scratch = DefloptHeapScratch::default();
     // Family order is observable because equal complete plans retain the
     // earlier candidate. The original Columbo C selector combines the mapped
     // DeflOpt heap with Columbo's legacy order-key heap. Broader Columbo and
     // exact Defluff families belong to max or terminal feedback routes.
     // Keeping that separation caps the ordinary cross product at 64 pairs.
     for variant in 0..4 {
-        push_unique(
-            &mut candidates,
-            make_lengths_deflopt_heap(frequencies, max_bits, variant),
+        let mut lengths = vec![0_u8; frequencies.len()];
+        make_lengths_deflopt_heap_into_with_scratch(
+            frequencies,
+            &mut lengths,
+            max_bits,
+            variant,
+            &mut heap_scratch,
         );
+        push_unique(&mut candidates, lengths);
     }
     for variant in 0..4 {
-        push_unique(
-            &mut candidates,
-            make_lengths_order_heap(frequencies, max_bits, variant),
+        let mut lengths = vec![0_u8; frequencies.len()];
+        make_lengths_order_heap_into_with_scratch(
+            frequencies,
+            &mut lengths,
+            max_bits,
+            variant,
+            &mut heap_scratch,
         );
+        push_unique(&mut candidates, lengths);
     }
 
     if exhaustive {
@@ -1610,8 +1621,21 @@ pub(crate) fn estimate_boundary_block_bits(
 
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
-    make_lengths_deflopt_heap_into(&build_literal_frequencies, &mut literal_lengths, 15, 0);
-    make_lengths_deflopt_heap_into(&build_distance_frequencies, &mut distance_lengths, 15, 0);
+    let mut heap_scratch = DefloptHeapScratch::default();
+    make_lengths_deflopt_heap_into_with_scratch(
+        &build_literal_frequencies,
+        &mut literal_lengths,
+        15,
+        0,
+        &mut heap_scratch,
+    );
+    make_lengths_deflopt_heap_into_with_scratch(
+        &build_distance_frequencies,
+        &mut distance_lengths,
+        15,
+        0,
+        &mut heap_scratch,
+    );
     let data_bits = token_bits_from_frequencies(
         literal_frequencies,
         distance_frequencies,
@@ -1619,7 +1643,12 @@ pub(crate) fn estimate_boundary_block_bits(
         &distance_lengths,
         extra_bits,
     )?;
-    let dynamic_bits = greedy_dynamic_header_bits(&literal_lengths, &distance_lengths, data_bits)?;
+    let dynamic_bits = greedy_dynamic_header_bits(
+        &literal_lengths,
+        &distance_lengths,
+        data_bits,
+        &mut heap_scratch,
+    )?;
 
     let fixed_bits = token_bits_from_frequencies(
         literal_frequencies,
@@ -1637,6 +1666,7 @@ fn greedy_dynamic_header_bits(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     data_bits: u64,
+    heap_scratch: &mut DefloptHeapScratch,
 ) -> Option<u64> {
     let hlit = trim_literal(literal_lengths);
     let hdist = trim_distance(distance_lengths);
@@ -1652,7 +1682,13 @@ fn greedy_dynamic_header_bits(
     let rle = greedy_rle(&concatenated[..concatenated_len], false, false, false);
     let code_length_frequencies = rle_frequencies(&rle);
     let mut code_length_lengths = [0_u8; 19];
-    make_lengths_deflopt_heap_into(&code_length_frequencies, &mut code_length_lengths, 7, 0);
+    make_lengths_deflopt_heap_into_with_scratch(
+        &code_length_frequencies,
+        &mut code_length_lengths,
+        7,
+        0,
+        heap_scratch,
+    );
     huffman_code_lengths_are_valid(&code_length_lengths).then_some(())?;
     if !code_length_tree_shape_is_valid(&code_length_lengths) {
         return None;
@@ -2102,6 +2138,12 @@ fn plan_for_trimmed_lengths(
     )
 }
 
+#[derive(Default)]
+struct HeaderPlanSearch {
+    heap_scratch: DefloptHeapScratch,
+    best: Option<DynamicPlan>,
+}
+
 fn plan_for_trimmed_lengths_uncached(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
@@ -2114,22 +2156,28 @@ fn plan_for_trimmed_lengths_uncached(
     {
         return None;
     }
-    let mut decoded_lengths = Vec::with_capacity(literal_lengths.len() + distance_lengths.len());
-    decoded_lengths.extend_from_slice(literal_lengths);
-    decoded_lengths.extend_from_slice(distance_lengths);
-    let mut best: Option<DynamicPlan> = None;
-    for rle in rle_seed_candidates(&decoded_lengths, rle_mask) {
+    let decoded_length_count = literal_lengths.len().checked_add(distance_lengths.len())?;
+    if decoded_length_count > MAX_DYNAMIC_CODE_LENGTH_COUNT {
+        return None;
+    }
+    let mut decoded_length_storage = [0_u8; MAX_DYNAMIC_CODE_LENGTH_COUNT];
+    decoded_length_storage[..literal_lengths.len()].copy_from_slice(literal_lengths);
+    decoded_length_storage[literal_lengths.len()..decoded_length_count]
+        .copy_from_slice(distance_lengths);
+    let decoded_lengths = &decoded_length_storage[..decoded_length_count];
+    let mut search = HeaderPlanSearch::default();
+    for rle in rle_seed_candidates(decoded_lengths, rle_mask) {
         consider_rle(
             data_bits,
             literal_lengths,
             distance_lengths,
-            &decoded_lengths,
+            decoded_lengths,
             rle,
             exhaustive,
-            &mut best,
+            &mut search,
         );
     }
-    best
+    search.best
 }
 
 #[derive(Default)]
@@ -2398,7 +2446,7 @@ fn consider_rle(
     decoded_lengths: &[u8],
     initial_rle: Vec<RleToken>,
     exhaustive: bool,
-    best: &mut Option<DynamicPlan>,
+    search: &mut HeaderPlanSearch,
 ) {
     // Each seed is consumed by exactly one feedback lineage. Taking ownership
     // reuses its allocation through all four passes instead of cloning every
@@ -2420,7 +2468,7 @@ fn consider_rle(
             &rle,
             &frequencies,
             variant as u32,
-            best,
+            search,
         );
     }
 
@@ -2428,16 +2476,25 @@ fn consider_rle(
     // route. Its numeric bound is inspired by Defluff, but Defluff always emits
     // its fourth pass and neither stops early nor retains earlier winners.
     let passes = 4;
+    // Reuse this tiny candidate arena across feedback passes. Every candidate
+    // is an inline array, so clearing it releases no state needed by a plan.
+    let candidate_capacity = if exhaustive { 18 } else { 6 };
+    let mut code_length_candidates = Vec::with_capacity(candidate_capacity);
     for pass in 0..passes {
         let variants = 4;
         // The code-length alphabet is always exactly nineteen symbols. Store
         // its candidates inline so each builder does not allocate a Vec only
         // for the result to be copied into DynamicPlan's fixed-size array.
-        let candidate_capacity = if exhaustive { 18 } else { 6 };
-        let mut code_length_candidates = Vec::with_capacity(candidate_capacity);
+        code_length_candidates.clear();
         for variant in 0..variants {
             let mut order_lengths = [0_u8; 19];
-            make_lengths_order_heap_into(&frequencies, &mut order_lengths, 7, variant);
+            make_lengths_order_heap_into_with_scratch(
+                &frequencies,
+                &mut order_lengths,
+                7,
+                variant,
+                &mut search.heap_scratch,
+            );
             push_unique(&mut code_length_candidates, order_lengths);
             // The deft4j tree's PriorityQueue-compatible heap is expensive
             // across the full data alphabets, but the code-length alphabet has
@@ -2452,7 +2509,7 @@ fn consider_rle(
                     distance_lengths,
                     &rle,
                     &deft4j_lengths,
-                    best,
+                    &mut search.best,
                 );
                 push_unique(&mut code_length_candidates, deft4j_lengths);
                 // This is Columbo's generic code-length tree with Defluff's
@@ -2477,7 +2534,13 @@ fn consider_rle(
                     }
                 } else {
                     let mut deflopt_lengths = [0_u8; 19];
-                    make_lengths_deflopt_heap_into(&frequencies, &mut deflopt_lengths, 7, variant);
+                    make_lengths_deflopt_heap_into_with_scratch(
+                        &frequencies,
+                        &mut deflopt_lengths,
+                        7,
+                        variant,
+                        &mut search.heap_scratch,
+                    );
                     push_unique(&mut code_length_candidates, deflopt_lengths);
                 }
                 let mut columbo_lengths = [0_u8; 19];
@@ -2492,7 +2555,7 @@ fn consider_rle(
 
         let mut feedback_tree = None;
         let mut feedback_cost = INF;
-        for code_length_lengths in code_length_candidates {
+        for code_length_lengths in code_length_candidates.iter().copied() {
             if !code_length_tree_shape_is_valid(&code_length_lengths) {
                 continue;
             }
@@ -2509,7 +2572,7 @@ fn consider_rle(
                     &rle,
                     &frequencies,
                     code_length_lengths,
-                    best,
+                    &mut search.best,
                 )
                 .is_some();
             if valid_header {
@@ -2533,7 +2596,7 @@ fn consider_rle(
                             &rle,
                             &frequencies,
                             reordered,
-                            best,
+                            &mut search.best,
                         );
                     }
                 }
@@ -2650,7 +2713,7 @@ fn consider_columbo_deflopt_local_rewrite(
     initial_rle: &[RleToken],
     initial_frequencies: &[u32; 19],
     variant: u32,
-    best: &mut Option<DynamicPlan>,
+    search: &mut HeaderPlanSearch,
 ) -> Option<[u8; 19]> {
     // Score the seed by reference. Allocate only if the local rewrite finds a
     // genuinely different next state; four variants otherwise cloned this
@@ -2663,7 +2726,13 @@ fn consider_columbo_deflopt_local_rewrite(
     loop {
         let rle = rewritten_rle.as_deref().unwrap_or(initial_rle);
         let mut code_length_lengths = [0_u8; 19];
-        make_lengths_deflopt_heap_into(&frequencies, &mut code_length_lengths, 7, variant);
+        make_lengths_deflopt_heap_into_with_scratch(
+            &frequencies,
+            &mut code_length_lengths,
+            7,
+            variant,
+            &mut search.heap_scratch,
+        );
         if !code_length_tree_shape_is_valid(&code_length_lengths) {
             return initial_tree;
         }
@@ -2675,7 +2744,7 @@ fn consider_columbo_deflopt_local_rewrite(
             rle,
             &frequencies,
             code_length_lengths,
-            best,
+            &mut search.best,
         ) else {
             return initial_tree;
         };
@@ -2694,7 +2763,7 @@ fn consider_columbo_deflopt_local_rewrite(
                 rle,
                 &frequencies,
                 reordered,
-                best,
+                &mut search.best,
             );
         }
 
@@ -2720,7 +2789,7 @@ fn consider_columbo_deflopt_local_rewrite(
             &rewritten,
             &rewritten_frequencies,
             code_length_lengths,
-            best,
+            &mut search.best,
         );
 
         rewritten_rle = Some(rewritten);
@@ -4231,7 +4300,7 @@ mod tests {
             .copied()
             .map(|symbol| RleToken { symbol, extra: 0 })
             .collect();
-        let mut best = None;
+        let mut search = HeaderPlanSearch::default();
         consider_rle(
             4_496,
             &lengths[..286],
@@ -4239,10 +4308,10 @@ mod tests {
             &lengths,
             rle,
             false,
-            &mut best,
+            &mut search,
         );
 
-        let best = best.unwrap();
+        let best = search.best.unwrap();
         assert_eq!(
             best.code_length_lengths,
             [1, 6, 0, 7, 7, 6, 6, 4, 4, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0]

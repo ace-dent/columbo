@@ -26,9 +26,12 @@ use super::header::{
     best_dynamic_plan_cached, estimate_boundary_block_bits, plan_for_explicit_lengths,
     plan_for_explicit_lengths_with_cost, token_bits_from_frequencies, HeaderPlanCache,
 };
+#[cfg(test)]
+use super::huffman::make_lengths_deflopt_heap;
 use super::huffman::{
-    make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap, make_lengths_defluff_exact,
-    make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap_into_with_scratch,
+    make_lengths_defluff_exact, make_lengths_deft4j_java_heap, DefloptHeapScratch,
+    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     canonical_length_encoding, count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan,
@@ -3032,6 +3035,9 @@ pub(crate) fn score_short_family_frequencies(
     let mut distance = *distance_frequencies;
     let mut remaining_extra_bits = extra_bits;
     let mut best = None;
+    let mut literal_lengths = [0_u8; 286];
+    let mut distance_lengths = [0_u8; 30];
+    let mut heap_scratch = DefloptHeapScratch::default();
 
     // Stage zero prices the unchanged grouped token stream. Each later stage
     // cumulatively expands one more exact short-length symbol, matching the
@@ -3060,8 +3066,20 @@ pub(crate) fn score_short_family_frequencies(
         let mut build_distance = distance;
         ensure_floor_distance_symbols(&mut build_distance, min_distance_codes);
         for variant in 0..4 {
-            let literal_lengths = make_lengths_deflopt_heap(&literal, 15, variant);
-            let distance_lengths = make_lengths_deflopt_heap(&build_distance, 15, variant);
+            make_lengths_deflopt_heap_into_with_scratch(
+                &literal,
+                &mut literal_lengths,
+                15,
+                variant,
+                &mut heap_scratch,
+            );
+            make_lengths_deflopt_heap_into_with_scratch(
+                &build_distance,
+                &mut distance_lengths,
+                15,
+                variant,
+                &mut heap_scratch,
+            );
             let Some(data_bits) = token_bits_from_frequencies(
                 &literal,
                 &distance,
@@ -3096,12 +3114,30 @@ fn consider_short_family_tokens(
     let (literal_frequencies, mut distance_frequencies) = count_frequencies(&tokens);
     ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     let mut best_dynamic = None;
+    let mut literal_lengths = [0_u8; 286];
+    let mut distance_lengths = [0_u8; 30];
+    let mut heap_scratch = DefloptHeapScratch::default();
     for variant in 0..4 {
-        let literal = make_lengths_deflopt_heap(&literal_frequencies, 15, variant);
-        let distance = make_lengths_deflopt_heap(&distance_frequencies, 15, variant);
-        let Some(dynamic) =
-            plan_for_explicit_lengths(&tokens, &literal, &distance, options.exhaustive)
-        else {
+        make_lengths_deflopt_heap_into_with_scratch(
+            &literal_frequencies,
+            &mut literal_lengths,
+            15,
+            variant,
+            &mut heap_scratch,
+        );
+        make_lengths_deflopt_heap_into_with_scratch(
+            &distance_frequencies,
+            &mut distance_lengths,
+            15,
+            variant,
+            &mut heap_scratch,
+        );
+        let Some(dynamic) = plan_for_explicit_lengths(
+            &tokens,
+            &literal_lengths,
+            &distance_lengths,
+            options.exhaustive,
+        ) else {
             continue;
         };
         if best_dynamic
