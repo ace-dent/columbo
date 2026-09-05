@@ -69,8 +69,15 @@ const NARROW_SOURCE_MAX_COMPRESSED: usize = 1_024 * 1_024;
 // seven structural prices per block and never starts another token search.
 const COMPACT_SPLIT_FLOOR_MAX_COMPRESSED: usize = 16 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_DECODED: u64 = 128 * 1024;
+const TERMINAL_SOURCE_SPLIT_MAX_DECODED: u64 = 256 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_BLOCKS: usize = 4;
 const COMPACT_SPLIT_FLOOR_MAX_TOKENS: usize = 16 * 1024;
+// A large one-block source beam competes with the completed PNG floor for the
+// same cache and memory bandwidth. Start both only when independent
+// same-distance repartitions are common enough to justify that competition:
+// one opportunity per sixteen source tokens keeps prospective structural work
+// proportional to the token graph that must be searched.
+const DENSE_REPARTITION_TOKENS_PER_RUN: usize = 16;
 // The original Columbo C quad-lengthening move is a bounded one-block header
 // floor. Its upper model limits avoid turning it into another general search;
 // no corpus-derived lower size or token threshold is needed.
@@ -98,6 +105,11 @@ const COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS: usize = 2_048;
 const COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS: usize = 4_000;
 const COMPACT_SINGLE_SOURCE_ROUTE_MIN_TOKENS: usize =
     COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS * 5 / 8;
+// A source graph whose tokens each cover almost a full Deflate match on
+// average has little literal/alphabet work for every decoded byte. Within the
+// existing 4,000-token single-route bound, 224 bytes (7/8 of 256) provides a
+// rounded, format-independent definition of that cheap long-match topology.
+const NEAR_MAX_MATCH_MEAN_DECODED_PER_TOKEN: u64 = 7 * 32;
 const DEFLATE_MAX_STORED_BLOCK_PLAIN: u64 = 65_535;
 // Parallel routes shorten a container's wall-clock search without making its
 // peak memory proportional to every individually valid route budget. Larger
@@ -183,6 +195,10 @@ impl DefaultFloor {
 
     fn uses_bounded_png_routes(self) -> bool {
         matches!(self, Self::CompleteThenBounded)
+    }
+
+    fn owns_terminal_stream_time(self) -> bool {
+        matches!(self, Self::Complete | Self::CompleteThenBounded)
     }
 }
 
@@ -540,7 +556,11 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 let run_deft4j = deft4j_eligible && deadline.can_start_route();
                 let run_source_max = parallel_routes
                     && png_policy == BoundedPngMaxPolicy::FloorExpansion
-                    && bounded_parallel_source_max_work_class(source);
+                    && if default_floor.uses_bounded_png_routes() {
+                        complete_png_parallel_source_max_work_class(source)
+                    } else {
+                        bounded_parallel_source_max_work_class(source)
+                    };
                 let run_proven_feedback = run_source_max && compact_proven_feedback_eligible;
                 build_bounded_phase_candidates(
                     source,
@@ -1597,6 +1617,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         candidate.replace_if_smaller(fragmented);
     }
 
+    let mut deferred_source_max_split_parent = None;
     if options.exhaustive {
         // The encoded floor is all we need for comparison. Releasing its
         // copied tokens before max search keeps peak memory predictable.
@@ -1624,6 +1645,24 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
             }
         };
         if let Some(mut max_candidate) = source_max {
+            // Preserve only a compact encoded parent for deferred structural
+            // finalization. Running that work here can consume live time from
+            // later Max siblings; postponing it keeps the established route
+            // schedule unchanged. The exact-parent check avoids repeating a
+            // split lineage already completed during the bounded phase.
+            if default_floor.owns_terminal_stream_time()
+                && max_candidate.data.len() <= COMPACT_SPLIT_FLOOR_MAX_COMPRESSED
+                && !compact_split_parent_is_completed(
+                    &max_candidate,
+                    completed_compact_split_parent.as_deref(),
+                )
+            {
+                let mut parent = max_candidate.clone();
+                parent.plans.clear();
+                parent.block_report = None;
+                deferred_source_max_split_parent = Some(parent);
+            }
+
             // A locally smaller proven-feedback endpoint can hide the bounded
             // balanced-tree header win reachable from source max. Finish that
             // cheap
@@ -1788,6 +1827,34 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // quality floor cannot redirect Max into a different rewritten-seed basin.
     if let Some(complete_default) = complete_default_candidate {
         candidate.replace_if_smaller(complete_default);
+    }
+
+    // Source max can finish on a different block/tree endpoint from the
+    // deft4j-derived parent priced earlier. Immediate encoded size does not
+    // dominate that dependency: one child split can give locally distinct
+    // payload regimes separate trees. Price this saved compact parent only
+    // after all ordinary timed routes have finished. The `_until` variant uses
+    // any remaining allowance or its deterministic one-block hard-deadline
+    // rescue, while the incumbent remains available on failure or non-win.
+    if let Some(parent) = deferred_source_max_split_parent {
+        let split_step = progress.start("Columbo source-max compact split floor");
+        let split = refine_with_terminal_source_split_floor_until(
+            &parent,
+            options,
+            decoded_limit,
+            identity,
+            &mut deadline.hard_stop(),
+        )?;
+        split_step.finish(split.as_ref().map(|split| {
+            candidate_progress(
+                split,
+                source.meaningful_bits,
+                split.is_strictly_smaller_than_source(source),
+            )
+        }));
+        if let Some(split) = split {
+            candidate.replace_if_smaller(split);
+        }
     }
 
     // Default runs these floors inside `improve_default_floor_with_feedback`
@@ -2303,12 +2370,13 @@ fn compact_source_has_bounded_integrated_proven_feedback(source: CandidateInput<
 ///
 /// This uses the compact structural route's existing compressed/decoded work
 /// bounds. In that class, overlapping original-source max with floor-seeded
-/// max has a small predictable memory cost. One-block inputs use the ordinary
-/// aggregate bound. A short multi-block list is also safe when its total
-/// decoded work stays within that bound per non-empty source block, the
-/// complete token graph stays compact, and multiple proved repartitions
-/// justify starting source max before the dependent deft4j refinement. Larger
-/// streams retain the sequential schedule.
+/// max has a small predictable memory and cache-bandwidth cost. One-block
+/// inputs use the ordinary aggregate bound. A short multi-block list is also
+/// safe when its total decoded work stays within that bound per non-empty
+/// source block, the complete token graph stays compact, and multiple proved
+/// repartitions justify starting source max before the dependent deft4j
+/// refinement. Larger streams retain the sequential schedule so two
+/// range-materializing beams do not starve the stronger completed floor.
 fn compact_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
     if source.compressed.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED {
         return false;
@@ -2343,6 +2411,57 @@ fn compact_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
 fn bounded_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
     compact_complementary_source_max_is_cheap(source)
         || compact_parallel_source_max_work_class(source)
+}
+
+/// Whether a source-root beam should overlap an already completed PNG floor.
+///
+/// A single large decoded block makes both beams materialize and price many of
+/// the same payload ranges. Let the stronger completed-floor lineage own that
+/// cache/memory bandwidth unless the source graph either has dense independent
+/// repartitions or consists almost entirely of long matches. The latter keeps
+/// range pricing cheap because few tokens and literal symbols represent each
+/// decoded region. Very small token graphs are also cheap enough to overlap,
+/// while shared multi-stream policies retain
+/// [`bounded_parallel_source_max_work_class`] so one member cannot remove
+/// another member's independent source route.
+fn complete_png_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
+    let nonempty_blocks = source
+        .blocks
+        .iter()
+        .filter(|block| !block.plain.is_empty())
+        .count();
+    if nonempty_blocks != 1 || source.identity.decoded_size <= COMPACT_SPLIT_FLOOR_MAX_DECODED {
+        return bounded_parallel_source_max_work_class(source);
+    }
+
+    let Some(token_count) = source_token_count(source) else {
+        return false;
+    };
+    if token_count <= COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS {
+        return true;
+    }
+
+    source.compressed.len() <= COMPACT_SPLIT_FLOOR_MAX_COMPRESSED
+        && token_count <= COMPACT_SPLIT_FLOOR_MAX_TOKENS
+        && (dense_repartition_graph_justifies_parallel_source_max(
+            token_count,
+            same_distance_opportunities(source.blocks).repartition_runs,
+        ) || near_max_match_source_graph_is_cheap(source.identity.decoded_size, token_count))
+}
+
+fn dense_repartition_graph_justifies_parallel_source_max(
+    token_count: usize,
+    repartition_runs: usize,
+) -> bool {
+    repartition_runs.saturating_mul(DENSE_REPARTITION_TOKENS_PER_RUN) >= token_count
+}
+
+fn near_max_match_source_graph_is_cheap(decoded_size: u64, token_count: usize) -> bool {
+    token_count <= COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS
+        && u64::try_from(token_count)
+            .ok()
+            .and_then(|tokens| tokens.checked_mul(NEAR_MAX_MATCH_MEAN_DECODED_PER_TOKEN))
+            .is_some_and(|minimum_decoded| decoded_size >= minimum_decoded)
 }
 
 fn compact_complementary_source_max_is_cheap(source: CandidateInput<'_>) -> bool {
@@ -3800,6 +3919,22 @@ fn prepare_compact_source_split_seed(
     decoded_limit: u64,
     identity: StreamIdentity,
 ) -> Result<Option<CompactSplitSeed>> {
+    prepare_compact_source_split_seed_with_limits(
+        candidate,
+        decoded_limit,
+        identity,
+        2,
+        COMPACT_SPLIT_FLOOR_MAX_DECODED,
+    )
+}
+
+fn prepare_compact_source_split_seed_with_limits(
+    candidate: &Candidate,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    minimum_blocks: usize,
+    maximum_decoded: u64,
+) -> Result<Option<CompactSplitSeed>> {
     if candidate.data.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED {
         return Ok(None);
     }
@@ -3809,7 +3944,12 @@ fn prepare_compact_source_split_seed(
         .map_err(|_| Error::new("could not allocate compact route seed"))?;
     data.extend_from_slice(&candidate.data);
     let stream = parse_validated_rewrite(&data, decoded_limit, identity)?;
-    if !compact_source_split_floor_eligible(identity.decoded_size, &stream.blocks) {
+    if !compact_source_split_floor_eligible_with_limits(
+        identity.decoded_size,
+        &stream.blocks,
+        minimum_blocks,
+        maximum_decoded,
+    ) {
         return Ok(None);
     }
     Ok(Some(CompactSplitSeed {
@@ -3978,9 +4118,57 @@ fn refine_with_compact_source_split_floor_until(
     )
 }
 
+/// Finish a compact source-max parent after ordinary timed routes complete.
+///
+/// Unlike the earlier deft4j-derived floor, this terminal dependency admits a
+/// single parent block: splitting that block is how a second payload regime is
+/// discovered. The separate 256-KiB decoded cap remains a small fixed memory
+/// bound while covering compact token graphs whose long matches expand beyond
+/// the early route's 128-KiB scheduling class.
+fn refine_with_terminal_source_split_floor_until(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    expired: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    let Some(seed) = prepare_compact_source_split_seed_with_limits(
+        candidate,
+        decoded_limit,
+        identity,
+        1,
+        TERMINAL_SOURCE_SPLIT_MAX_DECODED,
+    )?
+    else {
+        return Ok(None);
+    };
+    build_prepared_compact_source_split_floor_until(
+        &seed,
+        options,
+        decoded_limit,
+        identity,
+        expired,
+    )
+}
+
+#[cfg(test)]
 fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]) -> bool {
-    if decoded_size > COMPACT_SPLIT_FLOOR_MAX_DECODED
-        || !(2..=COMPACT_SPLIT_FLOOR_MAX_BLOCKS).contains(&blocks.len())
+    compact_source_split_floor_eligible_with_limits(
+        decoded_size,
+        blocks,
+        2,
+        COMPACT_SPLIT_FLOOR_MAX_DECODED,
+    )
+}
+
+fn compact_source_split_floor_eligible_with_limits(
+    decoded_size: u64,
+    blocks: &[ParsedBlock],
+    minimum_blocks: usize,
+    maximum_decoded: u64,
+) -> bool {
+    if decoded_size > maximum_decoded
+        || !(minimum_blocks..=COMPACT_SPLIT_FLOOR_MAX_BLOCKS).contains(&blocks.len())
         || blocks
             .iter()
             .any(|block| block.plain.is_empty() || block.source_type == SourceBlockType::Stored)
@@ -6352,6 +6540,18 @@ mod tests {
             parsed.decoded_size,
             &parsed.blocks[..1]
         ));
+        assert!(compact_source_split_floor_eligible_with_limits(
+            parsed.blocks[0].plain.len() as u64,
+            &parsed.blocks[..1],
+            1,
+            TERMINAL_SOURCE_SPLIT_MAX_DECODED,
+        ));
+        assert!(!compact_source_split_floor_eligible_with_limits(
+            TERMINAL_SOURCE_SPLIT_MAX_DECODED + 1,
+            &parsed.blocks[..1],
+            1,
+            TERMINAL_SOURCE_SPLIT_MAX_DECODED,
+        ));
 
         let mut stored = parsed.blocks.clone();
         stored[0].source_type = SourceBlockType::Stored;
@@ -6933,6 +7133,43 @@ mod tests {
 
     #[test]
     fn compact_max_scheduling_follows_dependency_topology() {
+        assert!(dense_repartition_graph_justifies_parallel_source_max(
+            DENSE_REPARTITION_TOKENS_PER_RUN,
+            1,
+        ));
+        assert!(!dense_repartition_graph_justifies_parallel_source_max(
+            DENSE_REPARTITION_TOKENS_PER_RUN + 1,
+            1,
+        ));
+        assert!(near_max_match_source_graph_is_cheap(
+            NEAR_MAX_MATCH_MEAN_DECODED_PER_TOKEN
+                * u64::try_from(COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS).unwrap(),
+            COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS,
+        ));
+        assert!(!near_max_match_source_graph_is_cheap(
+            NEAR_MAX_MATCH_MEAN_DECODED_PER_TOKEN
+                * u64::try_from(COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS).unwrap()
+                - 1,
+            COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS,
+        ));
+        assert!(!near_max_match_source_graph_is_cheap(
+            u64::MAX,
+            COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS + 1,
+        ));
+
+        assert!(DefaultFloor::Complete.owns_terminal_stream_time());
+        assert!(DefaultFloor::CompleteThenBounded.owns_terminal_stream_time());
+        for shared in [
+            DefaultFloor::Shared,
+            DefaultFloor::SharedExact,
+            DefaultFloor::ApngDefault,
+            DefaultFloor::ApngMax,
+            DefaultFloor::Established,
+            DefaultFloor::MandatoryComplete,
+        ] {
+            assert!(!shared.owns_terminal_stream_time());
+        }
+
         let block = ParsedBlock {
             tokens: Arc::new(vec![Token::Literal(0)]),
             plain: Arc::new(vec![0]),
@@ -6962,6 +7199,9 @@ mod tests {
         assert!(compact_parallel_source_max_work_class(one_block_source));
         assert!(compact_complementary_source_max_is_cheap(one_block_source));
         assert!(bounded_parallel_source_max_work_class(one_block_source));
+        assert!(complete_png_parallel_source_max_work_class(
+            one_block_source
+        ));
         assert!(!compact_dependent_deft4j_work_class(one_block_source));
 
         let two_blocks = [block.clone(), block];
@@ -6975,6 +7215,9 @@ mod tests {
         assert!(!compact_parallel_source_max_work_class(two_block_source));
         assert!(compact_complementary_source_max_is_cheap(two_block_source));
         assert!(bounded_parallel_source_max_work_class(two_block_source));
+        assert!(complete_png_parallel_source_max_work_class(
+            two_block_source
+        ));
         assert!(compact_dependent_deft4j_work_class(two_block_source));
         assert!(!repartition_graph_covers_source_blocks(&two_blocks, 1));
         assert!(repartition_graph_covers_source_blocks(&two_blocks, 2));
@@ -6996,6 +7239,83 @@ mod tests {
         };
         assert!(!compact_complementary_source_max_is_cheap(
             large_token_source
+        ));
+        let large_decoded_source = CandidateInput {
+            identity: StreamIdentity {
+                decoded_size: COMPACT_SPLIT_FLOOR_MAX_DECODED + 1,
+                ..identity
+            },
+            ..large_token_source
+        };
+        assert!(!compact_parallel_source_max_work_class(
+            large_decoded_source
+        ));
+        assert!(!bounded_parallel_source_max_work_class(
+            large_decoded_source
+        ));
+        assert!(!complete_png_parallel_source_max_work_class(
+            large_decoded_source
+        ));
+
+        let repartition_match = Token::Match {
+            length: 130,
+            distance: 1,
+            length_symbol: 281,
+            distance_symbol: 0,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 5,
+            distance_extra_bits: 0,
+        };
+        let mut repartition_tokens = vec![Token::Literal(0); 2_049];
+        repartition_tokens.extend([
+            repartition_match,
+            repartition_match,
+            Token::Literal(0),
+            repartition_match,
+            repartition_match,
+        ]);
+        let repartition_block = ParsedBlock {
+            tokens: Arc::new(repartition_tokens),
+            ..large_token_blocks[0].clone()
+        };
+        let repartition_blocks = [repartition_block];
+        let large_decoded_repartition_source = CandidateInput {
+            blocks: &repartition_blocks,
+            ..large_decoded_source
+        };
+        assert!(compact_parallel_source_max_work_class(
+            large_decoded_repartition_source
+        ));
+        assert!(bounded_parallel_source_max_work_class(
+            large_decoded_repartition_source
+        ));
+        assert!(!complete_png_parallel_source_max_work_class(
+            large_decoded_repartition_source
+        ));
+
+        let mut dense_repartition_tokens = Vec::with_capacity(2_100);
+        for _ in 0..700 {
+            dense_repartition_tokens.extend([
+                repartition_match,
+                repartition_match,
+                Token::Literal(0),
+            ]);
+        }
+        let dense_repartition_block = ParsedBlock {
+            tokens: Arc::new(dense_repartition_tokens),
+            ..large_token_blocks[0].clone()
+        };
+        let dense_repartition_blocks = [dense_repartition_block];
+        let dense_repartition_source = CandidateInput {
+            blocks: &dense_repartition_blocks,
+            ..large_decoded_source
+        };
+        assert!(compact_parallel_source_max_work_class(
+            dense_repartition_source
+        ));
+        assert!(complete_png_parallel_source_max_work_class(
+            dense_repartition_source
         ));
         assert!(!compact_single_source_route_work_class(large_token_source));
         assert!(repartition_graph_covers_source_blocks(
