@@ -7,6 +7,7 @@ mod huffman;
 mod model;
 mod optimize;
 mod parse;
+mod restore;
 mod search;
 pub(crate) mod source_recode;
 mod stop;

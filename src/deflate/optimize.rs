@@ -21,6 +21,9 @@ use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
 };
 use super::parse::{parse_stream, parsed_model_bytes};
+use super::restore::{
+    plan_original_match_restoration, MAX_RESTORATION_BLOCKS, MAX_RESTORATION_BYTES,
+};
 use super::search::{
     compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
@@ -1871,6 +1874,22 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         )?;
     }
 
+    // Restore source-certified choices only after the established lineages
+    // finish. The same terminal pass is included in Max's mandatory Default
+    // endpoint, without changing the historical seed used by its searches.
+    let restoration_work = if default_floor == DefaultFloor::MandatoryComplete {
+        DefaultFloorWork::Mandatory
+    } else {
+        DefaultFloorWork::Timed(&deadline)
+    };
+    candidate = improve_with_original_match_restoration(
+        source,
+        options,
+        restoration_work,
+        progress,
+        candidate,
+    )?;
+
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
         parsed.meaningful_bits
@@ -3416,6 +3435,82 @@ fn improve_with_terminal_tree_floors(
     Ok(candidate)
 }
 
+/// Keep restoration separate from tree closure: earlier losing topologies may
+/// receive tree closure before search is over, but this new token spelling is
+/// a terminal candidate and must not redirect their existing descendants.
+fn improve_with_original_match_restoration(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    if !floor_work.can_start_route()
+        || source.identity.decoded_size > MAX_RESTORATION_BYTES as u64
+        || source.compressed.len() > MAX_RESTORATION_BYTES
+        || candidate.data.len() > MAX_RESTORATION_BYTES
+        || source.blocks.len() > MAX_RESTORATION_BLOCKS
+        || candidate.data == source.compressed
+    {
+        return Ok(candidate);
+    }
+    let step = progress.start("Original-match restoration");
+    let restored = refine_with_original_match_restoration(
+        source,
+        &candidate,
+        options,
+        &mut floor_work.stop(),
+    )?;
+    step.finish(restored.as_ref().map(|restored| {
+        candidate_progress(
+            restored,
+            source.meaningful_bits,
+            restored.is_strictly_smaller_than_source(source),
+        )
+    }));
+    if let Some(restored) = restored {
+        candidate.replace_if_smaller(restored);
+    }
+    Ok(candidate)
+}
+
+fn refine_with_original_match_restoration(
+    original: CandidateInput<'_>,
+    candidate: &Candidate,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    if stop.reached() {
+        return Ok(None);
+    }
+    let selected =
+        parse_validated_rewrite(&candidate.data, original.decoded_limit, original.identity)?;
+    // Parsing discards redundant empty blocks. This pass keeps the parent's
+    // exact header/block layout, so leave such normalization to existing routes.
+    if selected.source_block_count != selected.blocks.len() {
+        return Ok(None);
+    }
+    let Some(plans) =
+        plan_original_match_restoration(original.blocks, &selected.blocks, options.strict, stop)
+    else {
+        return Ok(None);
+    };
+    let source = rewritten_input(
+        candidate,
+        &selected,
+        original.decoded_limit,
+        original.identity,
+    );
+    // Zero replays preserves the exact payload trees and header spelling. The
+    // existing builder validates emitted bytes and records their actual max
+    // distance for wrappers; a restored match can exceed the parent's distance.
+    let restored =
+        build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
+    Ok(restored
+        .is_strictly_smaller_than(candidate)
+        .then(|| restored.named("Original-match restoration")))
+}
+
 /// Establish the exact ordinary result before starting single-PNG max routes.
 ///
 /// The benchmark grants max the measured Default time plus additional search
@@ -3449,6 +3544,13 @@ fn build_complete_default_floor_candidate(
         DefaultFloorWork::Mandatory,
         progress,
         candidate,
+    )?;
+    let complete = improve_with_original_match_restoration(
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        complete,
     )?;
     Ok(CompleteDefaultFloor { max_seed, complete })
 }
@@ -5365,6 +5467,118 @@ mod tests {
     use crate::deflate::bitstream::BitWriter;
     use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
     use crate::deflate::model::Token;
+
+    #[test]
+    fn original_match_restoration_improves_a_completed_max_fixed_point() {
+        // Recorded Max endpoint of f00n0g08: another complete Max invocation
+        // retained these exact 1,740 bits. Keep the parent fixed to isolate
+        // original-proof restoration without running a long timed search.
+        const MAX_PARENT: &[u8] = &[
+            0x62, 0xa8, 0x6f, 0xef, 0x9b, 0x36, 0x77, 0xc9, 0xea, 0x4d, 0x3b, 0xf6, 0x1d, 0x39,
+            0x79, 0xee, 0xf2, 0x8d, 0x3b, 0x0f, 0x9f, 0xbc, 0x78, 0xfd, 0xee, 0xe3, 0x97, 0x6f,
+            0x3f, 0x7e, 0xfd, 0xfe, 0xf3, 0xf7, 0xdf, 0x3f, 0x40, 0xa1, 0x74, 0xa0, 0x81, 0x40,
+            0x14, 0x44, 0x01, 0xf4, 0x54, 0x49, 0x22, 0x21, 0x22, 0x84, 0x20, 0x04, 0x41, 0x20,
+            0x08, 0x04, 0x04, 0x02, 0x02, 0x02, 0x02, 0x04, 0xf4, 0x29, 0xfd, 0x6e, 0xd9, 0xdd,
+            0x98, 0xf7, 0x0a, 0x03, 0xc0, 0x61, 0xee, 0xdc, 0x99, 0xb7, 0x67, 0x22, 0x3c, 0x12,
+            0xe1, 0x9e, 0x08, 0xb7, 0x44, 0xb8, 0x26, 0xc2, 0x25, 0x11, 0xce, 0x89, 0x70, 0x2a,
+            0x05, 0x50, 0x09, 0xc7, 0x42, 0x00, 0xb5, 0x70, 0x08, 0x81, 0x66, 0x4a, 0x2d, 0xec,
+            0x43, 0xd0, 0xe5, 0xa0, 0xc8, 0x61, 0x17, 0x82, 0x36, 0x29, 0x8a, 0xa4, 0xb6, 0x21,
+            0x68, 0x92, 0x42, 0xb1, 0x8b, 0x4d, 0x08, 0xcd, 0xe5, 0x40, 0xb1, 0xad, 0x75, 0x08,
+            0x9a, 0x1c, 0x5e, 0x14, 0x7d, 0x58, 0x85, 0xe0, 0x8e, 0x66, 0xdb, 0xa2, 0x31, 0xcb,
+            0x10, 0xa0, 0x99, 0xa2, 0xe8, 0xd4, 0x22, 0x04, 0x74, 0x7d, 0x14, 0xad, 0x9b, 0x87,
+            0x40, 0xd5, 0x47, 0x2b, 0xcc, 0x42, 0x50, 0xf5, 0xd1, 0x09, 0xd3, 0x10, 0x3a, 0xa1,
+            0xeb, 0xe3, 0x2b, 0x4c, 0x6a, 0x01, 0xca, 0xeb, 0x1b, 0xff, 0x8b, 0xea, 0x3f, 0x8c,
+            0x2a, 0x71, 0x38, 0x9e, 0x7e, 0x3e, 0xc8, 0x30, 0x11, 0x06, 0x89, 0xd0, 0x4f, 0x84,
+            0x5e, 0x22, 0x64, 0x42, 0x26, 0x64, 0xe2, 0x03,
+        ];
+        let raw = png_raw_deflate(include_bytes!(
+            "../../tests/fixtures/png/PngSuite/f00n0g08.png"
+        ));
+        let original = parse_stream(&raw, 1 << 20).unwrap();
+        let selected = parse_stream(MAX_PARENT, 1 << 20).unwrap();
+        let identity = StreamIdentity {
+            decoded_size: original.decoded_size,
+            crc32: original.crc32,
+            adler32: original.adler32,
+        };
+        let source = CandidateInput {
+            compressed: &raw,
+            blocks: &original.blocks,
+            meaningful_bits: original.meaningful_bits,
+            decoded_limit: 1 << 20,
+            identity,
+        };
+        let parent = Candidate {
+            data: MAX_PARENT.to_vec(),
+            bits: selected.meaningful_bits,
+            output_max_distance: Some(selected.max_distance),
+            plans: Vec::new(),
+            block_report: None,
+            route: "test Max endpoint",
+            max_planner_is_stable: true,
+        };
+        assert_eq!(parent.bits, 1740);
+        let mut writer = BitWriter::default();
+        writer.write(2, 3).unwrap(); // Non-final fixed block.
+        writer.write(0, 7).unwrap(); // Its empty payload's EOB.
+        writer.write_bits_from(MAX_PARENT, 0, parent.bits).unwrap();
+        let padded_parent = Candidate {
+            data: writer.into_bytes(),
+            bits: parent.bits + 10,
+            ..parent.clone()
+        };
+        // The parser removes this empty block from its model. Restoration
+        // must not silently drop an unrelated header while rebuilding plans.
+        assert!(refine_with_original_match_restoration(
+            source,
+            &padded_parent,
+            &Options::default(),
+            &mut SearchStop::never(),
+        )
+        .unwrap()
+        .is_none());
+        for strict in [false, true] {
+            let options = Options {
+                strict,
+                ..Options::default()
+            };
+            let restored = refine_with_original_match_restoration(
+                source,
+                &parent,
+                &options,
+                &mut SearchStop::never(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(restored.bits, 1737);
+            assert_eq!(restored.data.len(), 218);
+            let output = parse_validated_rewrite(&restored.data, 1 << 20, identity).unwrap();
+            assert_eq!(restored.output_max_distance, Some(output.max_distance));
+            assert!(output.max_distance <= original.max_distance);
+            assert_eq!(output.blocks.len(), selected.blocks.len());
+            for (a, b) in selected.blocks.iter().zip(&output.blocks) {
+                assert_eq!(a.source_type, b.source_type);
+                assert_eq!(a.original_dynamic, b.original_dynamic);
+            }
+            let selected_source = rewritten_input(&parent, &selected, 1 << 20, identity);
+            assert!(refine_with_original_match_restoration(
+                selected_source,
+                &parent,
+                &options,
+                &mut SearchStop::never(),
+            )
+            .unwrap()
+            .is_none());
+            assert!(refine_with_original_match_restoration(
+                source,
+                &parent,
+                &options,
+                &mut SearchStop::always(),
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
 
     const FEEDBACK_RAW: &[u8] = &[
         0x25, 0xc0, 0x01, 0x01, 0xc0, 0x30, 0x0c, 0xc3, 0x30, 0x6c, 0xb5, 0x9b, 0xf0, 0x87, 0xf4,

@@ -160,3 +160,37 @@ fn rle_smoothed_tree_frontier_retains_the_classic_zopfli_win() {
     assert!(optimized.data.len() <= 1_608);
     assert!(optimized.bits_saved >= 25 * 8);
 }
+
+#[test]
+fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
+    let source = include_bytes!("fixtures/png/PngSuite/f00n0g08.png");
+    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
+    // The completed pre-restoration endpoint occupied 297 bytes. Restoring
+    // the original 18-byte match at distance 34 saves its next physical byte.
+    assert!(ordinary.data.len() <= 296);
+    for (verbose, visual) in [(true, false), (false, true)] {
+        let reported = optimize(
+            source,
+            Format::Png,
+            &Options {
+                verbose,
+                visual,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reported, ordinary);
+    }
+    let max = optimize(
+        source,
+        Format::Png,
+        &Options {
+            exhaustive: true,
+            timeout: std::time::Duration::ZERO,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(max.data.len() <= ordinary.data.len());
+    assert!(max.bits_saved >= ordinary.bits_saved);
+}
