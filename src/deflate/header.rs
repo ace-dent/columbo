@@ -2271,6 +2271,156 @@ fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken
     candidates
 }
 
+// A terminal sibling may spend a small payload tax to make the length list
+// easier to describe. Do not relax the ordinary greedy swap guard: changing
+// those intermediate winners would redirect existing search descendants.
+const MAX_SWAP_PAYLOAD_TAX: i64 = 18;
+const MAX_TAXED_SWAPS_PER_ALPHABET: usize = 32;
+
+/// Exact change in adjacent transitions, including the LL/DD seam. Only the
+/// four edges touching the swapped positions can change; adjacent swaps share
+/// an edge, which must be counted once.
+fn swap_transitions_removed(lengths: &[u8], a: usize, b: usize) -> i64 {
+    let edges = [a, a + 1, b, b + 1];
+    let swapped = |i| {
+        if i == a {
+            lengths[b]
+        } else if i == b {
+            lengths[a]
+        } else {
+            lengths[i]
+        }
+    };
+    let mut removed = 0;
+    for (index, &end) in edges.iter().enumerate() {
+        if end == 0 || end >= lengths.len() || edges[..index].contains(&end) {
+            continue;
+        }
+        removed += i64::from(lengths[end - 1] != lengths[end])
+            - i64::from(swapped(end - 1) != swapped(end));
+    }
+    removed
+}
+
+/// Keep a small deterministic menu. Transition reduction is a search heuristic,
+/// not a lower bound; only the complete header price can establish a saving.
+fn payload_taxed_swap_proposals(
+    lengths: &[u8],
+    offset: usize,
+    frequencies: &[u32],
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<(i64, i64, usize, usize)>> {
+    let count = frequencies.len().min(lengths.len().checked_sub(offset)?);
+    let mut proposals = Vec::new();
+    proposals
+        .try_reserve_exact(MAX_TAXED_SWAPS_PER_ALPHABET + 1)
+        .ok()?;
+    for a in 0..count {
+        if stop.reached() {
+            return None;
+        }
+        let length_a = lengths[offset + a];
+        if length_a == 0 {
+            continue;
+        }
+        for b in a + 1..count {
+            let length_b = lengths[offset + b];
+            if length_b == 0 || length_a == length_b {
+                continue;
+            }
+            let tax = length_swap_delta(frequencies[a], frequencies[b], length_a, length_b);
+            if !(1..=MAX_SWAP_PAYLOAD_TAX).contains(&tax) {
+                continue;
+            }
+            let removed = swap_transitions_removed(lengths, offset + a, offset + b);
+            if removed <= 0 {
+                continue;
+            }
+            let proposal = (tax - 3 * removed, tax, a, b);
+            let at = proposals.binary_search(&proposal).unwrap_or_else(|at| at);
+            if at < MAX_TAXED_SWAPS_PER_ALPHABET {
+                proposals.insert(at, proposal);
+                proposals.truncate(MAX_TAXED_SWAPS_PER_ALPHABET);
+            }
+        }
+    }
+    Some(proposals)
+}
+
+/// Reprice the unchanged tree and bounded, positive-payload permutations of
+/// each alphabet. Every proposal is a sibling of the same parent. Nonzero
+/// length swaps preserve support, maximum depth and the complete Kraft sum;
+/// the distance frequency slice excludes reserved symbols 30 and 31.
+pub(crate) fn plan_payload_header_tradeoff(
+    block: &super::model::ParsedBlock,
+    strict: bool,
+    prices_left: &mut usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    if *prices_left == 0 || stop.reached() {
+        return None;
+    }
+    let original = block.original_dynamic.as_ref()?;
+    if strict && !original.has_strictly_compatible_huffman_codes() {
+        return None;
+    }
+    let literal = &original.literal_lengths[..trim_literal(&original.literal_lengths)];
+    let distance = &original.distance_lengths[..trim_distance(&original.distance_lengths)];
+    let data_bits = token_bits(&block.tokens, literal, distance)?;
+    let original_bits = dynamic_bits(data_bits, original)?;
+    let mut best = None;
+    let mut best_bits = original_bits;
+    *prices_left -= 1;
+    if let Some(plan) = plan_for_trimmed_lengths_uncached(literal, distance, data_bits, true, 0xff)
+    {
+        if plan.bits < best_bits && (!strict || plan.has_strictly_compatible_huffman_codes()) {
+            best_bits = plan.bits;
+            best = Some(plan);
+        }
+    }
+    let mut lengths = [0_u8; MAX_DYNAMIC_CODE_LENGTH_COUNT];
+    let count = literal.len().checked_add(distance.len())?;
+    let lengths = lengths.get_mut(..count)?;
+    lengths[..literal.len()].copy_from_slice(literal);
+    lengths[literal.len()..].copy_from_slice(distance);
+    for (offset, frequencies) in [
+        (0, &block.literal_frequencies[..literal.len()]),
+        (literal.len(), block.distance_frequencies.as_slice()),
+    ] {
+        if *prices_left == 0 || stop.reached() {
+            break;
+        }
+        let Some(proposals) = payload_taxed_swap_proposals(lengths, offset, frequencies, stop)
+        else {
+            break;
+        };
+        for (_, tax, a, b) in proposals {
+            if *prices_left == 0 || stop.reached() {
+                break;
+            }
+            lengths.swap(offset + a, offset + b);
+            *prices_left -= 1;
+            let plan = plan_for_trimmed_lengths_uncached(
+                &lengths[..literal.len()],
+                &lengths[literal.len()..],
+                data_bits.checked_add(tax as u64)?,
+                true,
+                0xff,
+            );
+            lengths.swap(offset + a, offset + b);
+            if let Some(plan) = plan {
+                if plan.bits < best_bits
+                    && (!strict || plan.has_strictly_compatible_huffman_codes())
+                {
+                    best_bits = plan.bits;
+                    best = Some(plan);
+                }
+            }
+        }
+    }
+    best
+}
+
 fn length_swap_delta(frequency_a: u32, frequency_b: u32, length_a: u8, length_b: u8) -> i64 {
     let frequency_a = i64::from(frequency_a);
     let frequency_b = i64::from(frequency_b);
@@ -3341,8 +3491,118 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 }
 
 #[cfg(test)]
+pub(crate) fn payload_tradeoff_test_block() -> super::model::ParsedBlock {
+    // A small literal-only witness: spending three payload bits saves four
+    // header bits even after full repricing of the unchanged tree.
+    let counts = [14, 6, 9, 7, 13, 8, 3, 13, 15, 5, 2, 4, 1, 3, 10, 3];
+    let plain: Vec<u8> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(symbol, &count)| std::iter::repeat(symbol as u8).take(count))
+        .collect();
+    let tokens: Vec<Token> = plain.iter().copied().map(Token::Literal).collect();
+    let (literal_frequencies, distance_frequencies) = super::model::count_frequencies(&tokens);
+    let literal_lengths = make_lengths(&literal_frequencies, 15, 0);
+    let dynamic = plan_for_explicit_lengths(&tokens, &literal_lengths, &[1, 1], true).unwrap();
+    super::model::ParsedBlock {
+        tokens: tokens.into(),
+        plain: plain.into(),
+        literal_frequencies,
+        distance_frequencies,
+        original_literal_lengths: None,
+        original_distance_lengths: None,
+        original_dynamic: Some(dynamic),
+        original: None,
+        source_splits: Vec::new(),
+        source_type: super::model::SourceBlockType::Dynamic,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_payload_swap_saves_more_in_the_header() {
+        let block = payload_tradeoff_test_block();
+        let parent = block.original_dynamic.as_ref().unwrap();
+        let mut budget = 1024;
+        let result =
+            plan_payload_header_tradeoff(&block, true, &mut budget, &mut SearchStop::never())
+                .unwrap();
+        let payload = |plan: &DynamicPlan| {
+            token_bits(&block.tokens, &plan.literal_lengths, &plan.distance_lengths).unwrap()
+        };
+        assert_eq!((parent.bits, payload(parent)), (582, 441));
+        assert_eq!((result.bits, payload(&result)), (581, 444));
+        assert!(result.has_strictly_compatible_huffman_codes());
+        assert_eq!(parent.distance_lengths, result.distance_lengths);
+        let mut old_lengths = parent.literal_lengths.clone();
+        let mut new_lengths = result.literal_lengths.clone();
+        old_lengths.sort_unstable();
+        new_lengths.sort_unstable();
+        assert_eq!(old_lengths, new_lengths);
+        for (old, new) in parent.literal_lengths.iter().zip(&result.literal_lengths) {
+            assert_eq!(*old == 0, *new == 0);
+        }
+    }
+
+    #[test]
+    fn payload_swap_search_respects_stop_and_shared_price_budget() {
+        let block = payload_tradeoff_test_block();
+        assert!(
+            plan_payload_header_tradeoff(&block, true, &mut 0, &mut SearchStop::never()).is_none()
+        );
+        assert!(
+            plan_payload_header_tradeoff(&block, true, &mut 1024, &mut SearchStop::always())
+                .is_none()
+        );
+        // One price permits only the unchanged-tree control. Its fully priced
+        // parent already ties, so no speculative permutation may escape.
+        let mut budget = 1;
+        assert!(
+            plan_payload_header_tradeoff(&block, true, &mut budget, &mut SearchStop::never())
+                .is_none()
+        );
+        assert_eq!(budget, 0);
+        let mut polls = 0;
+        let mut callback = || {
+            polls += 1;
+            polls > 4
+        };
+        assert!(plan_payload_header_tradeoff(
+            &block,
+            true,
+            &mut 1024,
+            &mut SearchStop::callback(&mut callback)
+        )
+        .is_none());
+        assert!(polls > 4);
+    }
+
+    #[test]
+    fn local_swap_transition_delta_matches_full_sequence_oracle() {
+        // Exhaustive short sequences include zero/nonzero runs, adjacent
+        // swaps, endpoints and positions on either side of an alphabet seam.
+        for mut code in 0..3_usize.pow(6) {
+            let mut lengths = [0_u8; 6];
+            for length in &mut lengths {
+                *length = (code % 3) as u8;
+                code /= 3;
+            }
+            let transitions = |v: &[u8]| v.windows(2).filter(|p| p[0] != p[1]).count() as i64;
+            for a in 0..lengths.len() {
+                for b in a + 1..lengths.len() {
+                    let mut swapped = lengths;
+                    swapped.swap(a, b);
+                    assert_eq!(
+                        swap_transitions_removed(&lengths, a, b),
+                        transitions(&lengths) - transitions(&swapped)
+                    );
+                }
+            }
+        }
+    }
 
     /// Produce a dense, irregular frequency table without carrying a large
     /// opaque array literal in the regression test below.

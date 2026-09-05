@@ -11,10 +11,10 @@ use crate::progress::{
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
-use super::block::{emit_block, plan_block, reusable_original_bits};
+use super::block::{emit_block, plan_block, reusable_original_bits, stored_block_bits};
 use super::header::{
     balanced_tree_opportunities, plan_bounded_depth_tree_candidate,
-    plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths,
+    plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths, plan_payload_header_tradeoff,
     plan_rle_smoothed_tree_candidate, BalancedTreeOpportunities,
 };
 use super::model::{
@@ -45,6 +45,12 @@ use super::stream::{
 // settle their boundaries and tables. Every round below must strictly improve
 // the complete stream, so the extra slot cannot oscillate or grow the output.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
+// Bound terminal header work even inside the mandatory Default comparison
+// floor. Each pass admits at most 32 swaps per alphabet and 1,024 full
+// header prices per stream; the parent remains independent of this final spelling search.
+const PAYLOAD_TRADEOFF_MAX_BYTES: usize = 128 * 1024;
+const PAYLOAD_TRADEOFF_MAX_BLOCKS: usize = 128;
+const PAYLOAD_TRADEOFF_MAX_PRICES: usize = 1024;
 // Max uses the sentinel below to resolve a proof-derived replay ceiling after
 // its initial candidate is emitted. For an L-byte stream there are only 8L
 // possible (byte length, meaningful-bit residue) scores no worse than it, and
@@ -1890,6 +1896,14 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         candidate,
     )?;
 
+    candidate = improve_with_payload_header_tradeoff(
+        source,
+        options,
+        restoration_work,
+        progress,
+        candidate,
+    )?;
+
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
         parsed.meaningful_bits
@@ -3511,6 +3525,115 @@ fn refine_with_original_match_restoration(
         .then(|| restored.named("Original-match restoration")))
 }
 
+/// This changes only final code lengths and their RLE spelling. Keep it after
+/// restoration and outside all existing token/tree feedback lineages.
+fn improve_with_payload_header_tradeoff(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    if !floor_work.can_start_route()
+        || candidate.data.len() > PAYLOAD_TRADEOFF_MAX_BYTES
+        || source.identity.decoded_size > PAYLOAD_TRADEOFF_MAX_BYTES as u64
+    {
+        return Ok(candidate);
+    }
+    let step = progress.start("Payload/header tradeoff");
+    let tradeoff = refine_with_payload_header_tradeoff(
+        &candidate,
+        options,
+        source.decoded_limit,
+        source.identity,
+        &mut floor_work.stop(),
+    )?;
+    step.finish(tradeoff.as_ref().map(|tradeoff| {
+        candidate_progress(
+            tradeoff,
+            source.meaningful_bits,
+            tradeoff.is_strictly_smaller_than_source(source),
+        )
+    }));
+    if let Some(tradeoff) = tradeoff {
+        candidate.replace_if_smaller(tradeoff);
+    }
+    Ok(candidate)
+}
+
+fn refine_with_payload_header_tradeoff(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+    stop: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    if stop.reached()
+        || candidate.data.len() > PAYLOAD_TRADEOFF_MAX_BYTES
+        || identity.decoded_size > PAYLOAD_TRADEOFF_MAX_BYTES as u64
+    {
+        return Ok(None);
+    }
+    let selected = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    // The parser discards redundant empty blocks. Preserve the parent's block
+    // layout here and leave empty-block normalization to established routes.
+    if selected.source_block_count != selected.blocks.len()
+        || selected.blocks.len() > PAYLOAD_TRADEOFF_MAX_BLOCKS
+    {
+        return Ok(None);
+    }
+    let mut plans = Vec::new();
+    if plans.try_reserve_exact(selected.blocks.len()).is_err() {
+        return Ok(None);
+    }
+    let mut prices_left = PAYLOAD_TRADEOFF_MAX_PRICES;
+    let mut bits = 0_u64;
+    let mut changed = false;
+    for block in &selected.blocks {
+        let alignment = (bits % 8) as u8;
+        let (representation, block_bits) = if let Some(plan) =
+            plan_payload_header_tradeoff(block, options.strict, &mut prices_left, stop)
+        {
+            changed = true;
+            let cost = plan.bits;
+            (Representation::Dynamic(plan), cost)
+        } else if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
+            (Representation::Original(original), original.len)
+        } else if block.source_type == SourceBlockType::Stored {
+            // Earlier header savings can shift the next stored block. Regenerate
+            // its padding and price the actual new alignment before selection.
+            (
+                Representation::Stored,
+                stored_block_bits(alignment, block.plain.len()),
+            )
+        } else {
+            return Ok(None);
+        };
+        let Some(next_bits) = bits.checked_add(block_bits) else {
+            return Ok(None);
+        };
+        bits = next_bits;
+        plans.push(PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            representation,
+            bits: block_bits,
+            source_type: block.source_type,
+        });
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let source = rewritten_input(candidate, &selected, decoded_limit, identity);
+    // Zero replays holds every token and distance fixed. The common builder
+    // validates the emitted stream and records its actual wrapper window needs.
+    let tradeoff =
+        build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
+    Ok(tradeoff
+        .is_strictly_smaller_than(candidate)
+        .then(|| tradeoff.named("Payload/header tradeoff")))
+}
+
 /// Establish the exact ordinary result before starting single-PNG max routes.
 ///
 /// The benchmark grants max the measured Default time plus additional search
@@ -3546,6 +3669,13 @@ fn build_complete_default_floor_candidate(
         candidate,
     )?;
     let complete = improve_with_original_match_restoration(
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        complete,
+    )?;
+    let complete = improve_with_payload_header_tradeoff(
         source,
         &floor_options,
         DefaultFloorWork::Mandatory,
@@ -5467,6 +5597,207 @@ mod tests {
     use crate::deflate::bitstream::BitWriter;
     use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
     use crate::deflate::model::Token;
+
+    #[test]
+    fn payload_tradeoff_preserves_tokens_and_prices_stored_alignment() {
+        let block = super::super::header::payload_tradeoff_test_block();
+        let dynamic = block.original_dynamic.as_ref().unwrap();
+        for prefix_literals in 1..=8 {
+            let mut writer = BitWriter::default();
+            let prefix = PlannedBlock {
+                tokens: vec![Token::Literal(200); prefix_literals].into(),
+                plain: vec![200; prefix_literals].into(),
+                representation: Representation::Fixed,
+                bits: 10 + 9 * prefix_literals as u64,
+                source_type: SourceBlockType::Fixed,
+            };
+            emit_block(&mut writer, &[], &prefix, false).unwrap();
+            let middle = PlannedBlock {
+                tokens: block.tokens.clone(),
+                plain: block.plain.clone(),
+                representation: Representation::Dynamic(dynamic.clone()),
+                bits: dynamic.bits,
+                source_type: SourceBlockType::Dynamic,
+            };
+            emit_block(&mut writer, &[], &middle, false).unwrap();
+            let stored = PlannedBlock {
+                tokens: Vec::new().into(),
+                plain: vec![b'X'; 9].into(),
+                representation: Representation::Stored,
+                bits: stored_block_bits((writer.bit_position() % 8) as u8, 9),
+                source_type: SourceBlockType::Stored,
+            };
+            emit_block(&mut writer, &[], &stored, true).unwrap();
+            let data = writer.into_bytes();
+            let parsed = parse_stream(&data, 1024).unwrap();
+            let identity = StreamIdentity {
+                decoded_size: parsed.decoded_size,
+                crc32: parsed.crc32,
+                adler32: parsed.adler32,
+            };
+            let parent = Candidate {
+                data,
+                bits: parsed.meaningful_bits,
+                output_max_distance: Some(parsed.max_distance),
+                plans: Vec::new(),
+                block_report: None,
+                route: "test parent",
+                max_planner_is_stable: false,
+            };
+            for strict in [false, true] {
+                let options = Options {
+                    strict,
+                    ..Options::default()
+                };
+                let result = refine_with_payload_header_tradeoff(
+                    &parent,
+                    &options,
+                    1024,
+                    identity,
+                    &mut SearchStop::never(),
+                )
+                .unwrap();
+                // Only one starting alignment turns the one-bit header saving
+                // into a complete byte. At the other seven, padding absorbs it
+                // and strict whole-stream selection must keep the parent.
+                assert_eq!(result.is_some(), prefix_literals == 6);
+                if let Some(result) = result {
+                    assert_eq!(parent.data.len() - result.data.len(), 1);
+                    assert_eq!(parent.bits - result.bits, 8);
+                    let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
+                    assert_eq!(result.output_max_distance, Some(check.max_distance));
+                    assert_eq!(check.blocks.len(), parsed.blocks.len());
+                    for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
+                        assert_eq!(a.tokens, b.tokens);
+                        assert_eq!(a.plain, b.plain);
+                        assert_eq!(a.source_type, b.source_type);
+                        if let Some(plan) = &a.original_dynamic {
+                            assert!(plan.has_strictly_compatible_huffman_codes());
+                        }
+                    }
+                }
+                assert!(refine_with_payload_header_tradeoff(
+                    &parent,
+                    &options,
+                    1024,
+                    identity,
+                    &mut SearchStop::always(),
+                )
+                .unwrap()
+                .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
+        // f04n0g08's completed Max endpoint. Freezing the parent isolates the
+        // new header move without a long search or deadline-dependent result.
+        let raw = [
+            0x85, 0xd1, 0x0d, 0x06, 0x02, 0x30, 0x18, 0xc6, 0xf1, 0xff, 0xb6, 0x77, 0x5b, 0x67,
+            0xea, 0x0c, 0xe9, 0x0c, 0xd1, 0x01, 0x02, 0x22, 0xd0, 0x0d, 0x22, 0xe8, 0x04, 0xd1,
+            0x2d, 0xba, 0x56, 0xdf, 0x2d, 0x84, 0xb6, 0xbd, 0xed, 0x03, 0xe3, 0x9d, 0x9f, 0xe7,
+            0xd9, 0x4c, 0xb6, 0x93, 0x38, 0x89, 0x31, 0xc6, 0x10, 0x82, 0xf7, 0xde, 0x8b, 0x77,
+            0xe2, 0x9c, 0x73, 0xd6, 0x5a, 0x63, 0x8c, 0xc1, 0xc8, 0x85, 0xd6, 0xb2, 0x80, 0x49,
+            0x72, 0x6b, 0x82, 0xaf, 0x90, 0x6b, 0x1b, 0x60, 0x81, 0x5e, 0x02, 0xd8, 0x11, 0xc0,
+            0x8e, 0x00, 0x56, 0xee, 0x7d, 0xa0, 0x12, 0xe6, 0x9c, 0x2b, 0xa0, 0x12, 0xaa, 0x03,
+            0x79, 0x14, 0xe3, 0x52, 0x83, 0x3a, 0xe1, 0x58, 0x75, 0x96, 0x09, 0x1b, 0xa8, 0x5f,
+            0x55, 0x55, 0xb0, 0x53, 0xe0, 0x99, 0x0d, 0x7b, 0x1d, 0x50, 0x27, 0xac, 0xd5, 0xd7,
+            0xe4, 0x09, 0x27, 0xb8, 0xc1, 0x86, 0x43, 0xb3, 0x82, 0xc5, 0x15, 0xa0, 0x48, 0x91,
+            0x57, 0x3e, 0xdd, 0xb2, 0xfd, 0x2f, 0x38, 0x01, 0xb0, 0x61, 0xd7, 0xaa, 0x28, 0x93,
+            0xbe, 0xe0, 0xfd, 0x13, 0x53, 0x1f, 0x62, 0x88, 0x27, 0x56, 0x31, 0xbb, 0x85, 0xbc,
+            0x50, 0x19, 0xe5, 0x25, 0xdf, 0x28, 0x71, 0xab, 0x41, 0x29, 0x66, 0x41, 0x03, 0xdd,
+            0x92, 0x81, 0x34, 0x10, 0x92, 0xe8, 0x0b, 0x49, 0xf4, 0x85, 0x24, 0xfa, 0x42, 0x18,
+            0x08, 0x61, 0x20, 0x3e,
+        ];
+        let parsed = parse_stream(&raw, 1 << 20).unwrap();
+        let identity = StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        };
+        let parent = Candidate {
+            data: raw.to_vec(),
+            bits: parsed.meaningful_bits,
+            output_max_distance: Some(parsed.max_distance),
+            plans: Vec::new(),
+            block_report: None,
+            route: "completed Max parent",
+            max_planner_is_stable: true,
+        };
+        assert_eq!(parent.bits, 1600);
+        let result = refine_with_payload_header_tradeoff(
+            &parent,
+            &Options {
+                exhaustive: true,
+                ..Options::default()
+            },
+            1 << 20,
+            identity,
+            &mut SearchStop::never(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((result.data.len(), result.bits), (200, 1597));
+        let checked = parse_validated_rewrite(&result.data, 1 << 20, identity).unwrap();
+        assert_eq!(checked.blocks.len(), parsed.blocks.len());
+        for (a, b) in checked.blocks.iter().zip(&parsed.blocks) {
+            assert_eq!(a.tokens, b.tokens);
+            assert!(a
+                .original_dynamic
+                .as_ref()
+                .unwrap()
+                .has_strictly_compatible_huffman_codes());
+        }
+    }
+
+    #[test]
+    fn payload_tradeoff_leaves_discarded_empty_blocks_to_other_routes() {
+        let block = super::super::header::payload_tradeoff_test_block();
+        let dynamic = block.original_dynamic.as_ref().unwrap();
+        let mut writer = BitWriter::default();
+        writer.write(2, 3).unwrap();
+        writer.write(0, 7).unwrap(); // Redundant empty fixed block.
+        emit_block(
+            &mut writer,
+            &[],
+            &PlannedBlock {
+                tokens: block.tokens.clone(),
+                plain: block.plain.clone(),
+                representation: Representation::Dynamic(dynamic.clone()),
+                bits: dynamic.bits,
+                source_type: SourceBlockType::Dynamic,
+            },
+            true,
+        )
+        .unwrap();
+        let data = writer.into_bytes();
+        let parsed = parse_stream(&data, 1024).unwrap();
+        assert_ne!(parsed.blocks.len(), parsed.source_block_count);
+        let identity = StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        };
+        let parent = Candidate {
+            data,
+            bits: parsed.meaningful_bits,
+            output_max_distance: Some(parsed.max_distance),
+            plans: Vec::new(),
+            block_report: None,
+            route: "empty-block parent",
+            max_planner_is_stable: false,
+        };
+        assert!(refine_with_payload_header_tradeoff(
+            &parent,
+            &Options::default(),
+            1024,
+            identity,
+            &mut SearchStop::never()
+        )
+        .unwrap()
+        .is_none());
+    }
 
     #[test]
     fn original_match_restoration_improves_a_completed_max_fixed_point() {

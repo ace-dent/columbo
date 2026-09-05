@@ -194,3 +194,24 @@ fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
     assert!(max.data.len() <= ordinary.data.len());
     assert!(max.bits_saved >= ordinary.bits_saved);
 }
+
+#[test]
+fn payload_header_tradeoff_reaches_png_and_the_mandatory_max_floor() {
+    let source = include_bytes!("fixtures/png/PngSuite/basi4a16.png");
+    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
+    // The completed parent was 2,827 bytes. A seven-bit payload tax removes
+    // eighteen header bits, saving eleven meaningful bits and one file byte.
+    assert!(ordinary.data.len() <= 2_826);
+    let max = optimize(
+        source,
+        Format::Png,
+        &Options {
+            exhaustive: true,
+            timeout: std::time::Duration::ZERO,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(max.data.len() <= ordinary.data.len());
+    assert!(max.bits_saved >= ordinary.bits_saved);
+}
