@@ -7,6 +7,7 @@ use crate::deflate::{
 use crate::progress::ZipStoreProgress;
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
+use std::borrow::Cow;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -581,7 +582,7 @@ fn optimize_once(
     // optimizing any payload. A hostile central directory may otherwise point
     // many entries at the same large local record, multiplying work and owned
     // buffers before the reconstruction loop finally notices the overlap.
-    let physical_order = parsed.physical_order.clone();
+    let physical_order = &parsed.physical_order;
 
     // Search order is independent of archive layout. In normal mode the
     // original Columbo C implementation gives the largest Deflate member first
@@ -659,7 +660,7 @@ fn optimize_once(
         eocd_offset,
         central_offset,
         &mut entries,
-        &physical_order,
+        physical_order,
     )?;
 
     if output.len() > input.len() && !options.strict {
@@ -808,7 +809,7 @@ fn finalize_store_fallback(
         // Wrapper stripping and normalization have already happened. Parse
         // this selected lineage without introducing another metadata policy.
         let parsed = preflight(input, false, options.max_decoded_bytes)?;
-        let mut entries = parsed.entries.clone();
+        let mut entries = parsed.entries;
         let report_store_changes = options.verbose || options.visual;
         let stream_ids: Vec<Option<usize>> = if report_store_changes {
             let mut next_stream_id = 1_usize;
@@ -838,13 +839,6 @@ fn finalize_store_fallback(
 
         for &index in &parsed.physical_order {
             let entry = &mut entries[index];
-            let layout = local_entry_layout(input, parsed.central_offset, entry)?;
-            let position = entry.local_offset_before;
-            entry.local = try_copy_bytes(
-                &input[position..position + layout.total_size],
-                LOCAL_ALLOCATION_ERROR,
-            )?;
-
             // Deflate needs at least one final block and an end marker, so it
             // cannot occupy fewer physical bytes than Store for a decoded
             // payload of at most four bytes. This deterministic route applies
@@ -865,6 +859,8 @@ fn finalize_store_fallback(
                 continue;
             }
 
+            let layout = local_entry_layout(input, parsed.central_offset, entry)?;
+            let position = entry.local_offset_before;
             let raw = &input[layout.data_offset..layout.data_end];
             let (decoded, deflate_bits, crc32) =
                 decoded_bytes_for_storage(raw, u64::from(entry.uncompressed_size))?;
@@ -911,6 +907,18 @@ fn finalize_store_fallback(
         }
 
         if changed {
+            // Preflight already validated every local range. Copy unchanged
+            // records only when a Store replacement requires reconstruction;
+            // the usual no-change case needs no payload staging at all.
+            for entry in &mut entries {
+                if entry.local.is_empty() {
+                    let start = entry.local_offset_before;
+                    entry.local = try_copy_bytes(
+                        &input[start..start + entry.local_size_before],
+                        LOCAL_ALLOCATION_ERROR,
+                    )?;
+                }
+            }
             let data = rebuild_archive(
                 input,
                 options,
@@ -1582,7 +1590,7 @@ fn build_local_entry(
     }
 
     let source_payload = &input[data_offset..data_end];
-    let mut payload = try_copy_bytes(source_payload, LOCAL_ALLOCATION_ERROR)?;
+    let mut payload = Cow::Borrowed(source_payload);
     let mut timed_out = false;
 
     if entry.method == 0 {
@@ -1645,7 +1653,7 @@ fn build_local_entry(
             entry.compressed_size_after = u32::try_from(raw.data.len())
                 .map_err(|_| Error::new("ZIP local entry too large"))?;
             entry.output_deflate_bits = raw.info.deflate_bits;
-            payload = raw.data;
+            payload = Cow::Owned(raw.data);
         }
     }
 
@@ -2387,6 +2395,66 @@ mod tests {
         assert_eq!(result.bits_saved, 0);
         assert!(result.should_replace());
         assert_eq!(parsed.entries[0].method, 0);
+    }
+
+    #[test]
+    fn terminal_store_keeps_unchanged_records_in_physical_order() {
+        let input = archive_with_reverse_central_order(&[b"x", b"unchanged member", b"yz"]);
+        let parsed = preflight(&input, false, u64::MAX).unwrap();
+        let retained = &parsed.entries[1];
+        let retained_local = input[retained.local_offset_before
+            ..retained.local_offset_before + retained.local_size_before]
+            .to_vec();
+        let source_bits = parsed
+            .entries
+            .iter()
+            .map(|entry| {
+                let layout = local_entry_layout(&input, parsed.central_offset, entry).unwrap();
+                decoded_bytes_for_storage(
+                    &input[layout.data_offset..layout.data_end],
+                    u64::from(entry.uncompressed_size),
+                )
+                .unwrap()
+                .1
+            })
+            .sum();
+        let optimized = finalize_store_fallback(
+            ZipOptimization {
+                data: input.clone(),
+                source_deflate_bits: source_bits,
+                output_deflate_bits: source_bits,
+                store_changes: Vec::new(),
+                forced_store_change: false,
+                timed_out: false,
+            },
+            &Options::default(),
+        )
+        .unwrap();
+        let rebuilt = preflight(&optimized.data, false, u64::MAX).unwrap();
+        assert_eq!(
+            archive_entry_names(&optimized.data),
+            archive_entry_names(&input)
+        );
+        assert_eq!(
+            rebuilt
+                .entries
+                .iter()
+                .map(|entry| entry.method)
+                .collect::<Vec<_>>(),
+            [0, 8, 0]
+        );
+        let retained = &rebuilt.entries[1];
+        assert_eq!(
+            &optimized.data[retained.local_offset_before
+                ..retained.local_offset_before + retained.local_size_before],
+            retained_local,
+        );
+
+        // The second pass has no eligible Deflate members and returns the
+        // existing archive buffer, including its completed Store results.
+        let pointer = optimized.data.as_ptr();
+        let again = finalize_store_fallback(optimized, &Options::default()).unwrap();
+        assert_eq!(again.data.as_ptr(), pointer);
     }
 
     #[test]

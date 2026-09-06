@@ -2,7 +2,7 @@
 
 //! Dynamic-header construction and exact bit accounting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[cfg(test)]
 use super::huffman::Huffman;
@@ -3434,14 +3434,40 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 
     let mut best = vec![INF; lengths.len() + 1];
     let mut step = vec![None; lengths.len()];
-    let mut run_lengths = vec![1_usize; lengths.len()];
-    for index in (0..lengths.len().saturating_sub(1)).rev() {
-        if lengths[index] == lengths[index + 1] {
-            run_lengths[index] = run_lengths[index + 1] + 1;
-        }
-    }
+    let mut run = 0;
+    let mut zero_repeats = VecDeque::<usize>::new();
     best[lengths.len()] = 0;
     for index in (0..lengths.len()).rev() {
+        if index + 1 < lengths.len() && lengths[index] == lengths[index + 1] {
+            run += 1;
+        } else {
+            run = 1;
+            zero_repeats.clear();
+        }
+
+        // Symbol 18 charges the same bits for every repeat from 11 to 138.
+        // Keep the cheapest suffix in that sliding window instead of scanning
+        // up to 128 suffixes again at each zero. Each end enters and leaves
+        // the deque at most once. Newer ends are smaller, so removing equal
+        // costs retains the historical preference for the shortest repeat.
+        let zero_repeat = if lengths[index] == 0 && costs[18] != 0 && run >= 11 {
+            let first_end = index + 11;
+            let last_end = index + run.min(138);
+            while zero_repeats.front().is_some_and(|&end| end > last_end) {
+                zero_repeats.pop_front();
+            }
+            while zero_repeats
+                .back()
+                .is_some_and(|&end| best[end] >= best[first_end])
+            {
+                zero_repeats.pop_back();
+            }
+            zero_repeats.push_back(first_end);
+            zero_repeats.front().map(|&end| end - index)
+        } else {
+            None
+        };
+
         let mut consider = |count: usize, symbol: u8, extra: u8| {
             let code = costs[usize::from(symbol)];
             if code == 0 || index + count > lengths.len() {
@@ -3464,15 +3490,15 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 
         consider(1, lengths[index], 0);
         if index > 0 && lengths[index] == lengths[index - 1] {
-            for count in 3..=run_lengths[index].min(6) {
+            for count in 3..=run.min(6) {
                 consider(count, 16, (count - 3) as u8);
             }
         }
         if lengths[index] == 0 {
-            for count in 3..=run_lengths[index].min(10) {
+            for count in 3..=run.min(10) {
                 consider(count, 17, (count - 3) as u8);
             }
-            for count in 11..=run_lengths[index].min(138) {
+            if let Some(count) = zero_repeat {
                 consider(count, 18, (count - 11) as u8);
             }
         }
@@ -4103,6 +4129,79 @@ mod tests {
                 shortest_rle(&long_zero_run, costs),
                 exhaustive_shortest_rle(&long_zero_run, costs),
             );
+        }
+    }
+
+    // Deliberately scan every legal edge and retain whole suffix spellings.
+    // This slow oracle shares no sliding-window state with the production DP.
+    fn scanned_shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
+        let mut suffixes = vec![None; lengths.len() + 1];
+        suffixes[lengths.len()] = Some((0_u64, Vec::<RleToken>::new()));
+        for start in (0..lengths.len()).rev() {
+            let run = lengths[start..]
+                .iter()
+                .take_while(|&&value| value == lengths[start])
+                .count();
+            let mut edges = vec![(1, lengths[start], 0)];
+            for (symbol, minimum, maximum, allowed) in [
+                (16, 3, 6, start > 0 && lengths[start - 1] == lengths[start]),
+                (17, 3, 10, lengths[start] == 0),
+                (18, 11, 138, lengths[start] == 0),
+            ] {
+                if allowed {
+                    edges.extend(
+                        (minimum..=run.min(maximum))
+                            .map(|count| (count, symbol, (count - minimum) as u8)),
+                    );
+                }
+            }
+            for (count, symbol, extra) in edges {
+                if costs[usize::from(symbol)] == 0 {
+                    continue;
+                }
+                let Some((suffix_cost, suffix)) = &suffixes[start + count] else {
+                    continue;
+                };
+                let cost =
+                    suffix_cost + u64::from(costs[usize::from(symbol)]) + rle_extra_bits(symbol);
+                if suffixes[start]
+                    .as_ref()
+                    .map_or(true, |(best, _)| cost < *best)
+                {
+                    let mut path = vec![RleToken { symbol, extra }];
+                    path.extend_from_slice(suffix);
+                    suffixes[start] = Some((cost, path));
+                }
+            }
+        }
+        suffixes[0].take().map(|(_, path)| path)
+    }
+
+    #[test]
+    fn shortest_rle_preserves_long_run_windows_missing_codes_and_ties() {
+        let mut state = 0x736f_6d65_7073_6575_u64;
+        for n in [0, 3, 6, 10, 11, 12, 137, 138, 139, 276, 277, 318] {
+            let mut separated = vec![0; n / 2];
+            separated.extend([3; 7]);
+            separated.resize(n, 0);
+            for sequence in [vec![0; n], vec![3; n], separated] {
+                for case in 0..24 {
+                    let mut costs = [1; 19];
+                    if case != 0 {
+                        for cost in &mut costs {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            *cost = (state % 8) as u8;
+                        }
+                    }
+                    assert_eq!(
+                        shortest_rle(&sequence, &costs),
+                        scanned_shortest_rle(&sequence, &costs),
+                        "sequence {sequence:?}, costs {costs:?}",
+                    );
+                }
+            }
         }
     }
 

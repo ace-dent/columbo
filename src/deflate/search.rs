@@ -2067,6 +2067,27 @@ fn solve_proven_submatch(
         return None;
     }
 
+    // Every submatch retains the source distance and uses the same trees.
+    // Build and price each length once; the DP only adds its suffix cost.
+    let mut matches = [None; 259];
+    for (length, slot) in matches
+        .iter_mut()
+        .enumerate()
+        .take(decoded.len() + 1)
+        .skip(3)
+    {
+        let token = repacked_match(source, length as u16)?;
+        let Token::Match { length_symbol, .. } = token else {
+            return None;
+        };
+        if forbidden_length_symbol != Some(length_symbol) {
+            *slot = Some((
+                token,
+                estimated_match_token_bits(token, literal_lengths, distance_lengths)?,
+            ));
+        }
+    }
+
     let mut costs = [u64::MAX; 259];
     let mut choices = [ProvenSubmatchChoice::End; 259];
     costs[decoded.len()] = 0;
@@ -2090,22 +2111,21 @@ fn solve_proven_submatch(
             best_choice = ProvenSubmatchChoice::Literal(decoded[start]);
         }
 
-        for match_length in 3..=decoded.len() - start {
+        for (match_length, entry) in matches
+            .iter()
+            .enumerate()
+            .take(decoded.len() - start + 1)
+            .skip(3)
+        {
             visited_edges = visited_edges.checked_add(1)?;
             if visited_edges & 31 == 0 && stop.reached() {
                 return None;
             }
-            let match_length: u16 = match_length.try_into().ok()?;
-            let token = repacked_match(source, match_length)?;
-            let Token::Match { length_symbol, .. } = token else {
-                return None;
-            };
-            if forbidden_length_symbol == Some(length_symbol) {
+            let Some((token, match_cost)) = *entry else {
                 continue;
-            }
-            let end = start.checked_add(usize::from(match_length))?;
-            let candidate = estimated_match_token_bits(token, literal_lengths, distance_lengths)?
-                .checked_add(costs[end])?;
+            };
+            let end = start + match_length;
+            let candidate = match_cost.checked_add(costs[end])?;
             if candidate < best_cost {
                 best_cost = candidate;
                 best_choice = ProvenSubmatchChoice::Match(token);
@@ -4946,6 +4966,65 @@ mod tests {
         }
         assert!(canonical_length_encoding(2).is_none());
         assert!(canonical_length_encoding(259).is_none());
+    }
+
+    #[test]
+    fn proven_submatch_prices_match_exhaustive_spellings() {
+        fn enumerate(plain: &[u8], prefix: &mut Vec<Token>, all: &mut Vec<Vec<Token>>) {
+            if plain.is_empty() {
+                all.push(prefix.clone());
+                return;
+            }
+            prefix.push(Token::Literal(plain[0]));
+            enumerate(&plain[1..], prefix, all);
+            prefix.pop();
+            for length in 3..=plain.len() {
+                prefix.push(test_match(length as u16, 6, 4, 1, 1));
+                enumerate(&plain[length..], prefix, all);
+                prefix.pop();
+            }
+        }
+
+        for length in 3..=10 {
+            let decoded = &b"abcdefabcd"[..length];
+            let source = test_match(length as u16, 6, 4, 1, 1);
+            // Source wins a whole-span tie; other paths retain literal-first,
+            // then ascending match-length order at each position.
+            let mut spellings = vec![vec![source]];
+            enumerate(decoded, &mut Vec::new(), &mut spellings);
+            for profile in 0..32 {
+                let mut literal = [0; 286];
+                for (symbol, bits) in literal.iter_mut().enumerate() {
+                    *bits = ((profile + symbol * symbol) % 16) as u8;
+                }
+                let distances = [1; 30];
+                for forbidden in [None, Some(257), Some(254 + length as u16)] {
+                    let expected = spellings
+                        .iter()
+                        .filter(|tokens| {
+                            !tokens.iter().any(|token| {
+                                matches!(token, Token::Match { length_symbol, .. }
+                                    if Some(*length_symbol) == forbidden)
+                            })
+                        })
+                        .min_by_key(|tokens| estimated_tokens_bits(tokens, &literal, &distances))
+                        .unwrap();
+                    let selected = solve_proven_submatch(
+                        source,
+                        decoded,
+                        &literal,
+                        &distances,
+                        forbidden,
+                        &mut SearchStop::never(),
+                    )
+                    .unwrap_or_else(|| vec![source]);
+                    assert_eq!(
+                        &selected, expected,
+                        "length {length}, profile {profile}, forbidden {forbidden:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
