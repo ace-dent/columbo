@@ -215,3 +215,22 @@ fn payload_header_tradeoff_reaches_png_and_the_mandatory_max_floor() {
     assert!(max.data.len() <= ordinary.data.len());
     assert!(max.bits_saved >= ordinary.bits_saved);
 }
+
+#[test]
+fn literal_span_reaches_png_output_and_the_mandatory_max_floor() {
+    let source = include_bytes!("fixtures/png/PngSuite/basi0g04.png");
+    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
+    let max = optimize(
+        source,
+        Format::Png,
+        &Options {
+            exhaustive: true,
+            timeout: std::time::Duration::ZERO,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    // With no optional time, the complete PNG Default floor must include its
+    // final advertised-span spelling, even when the physical byte count ties.
+    assert_eq!(max.data, ordinary.data);
+}

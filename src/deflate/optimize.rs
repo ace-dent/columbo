@@ -14,8 +14,8 @@ use super::bitstream::BitWriter;
 use super::block::{emit_block, plan_block, reusable_original_bits, stored_block_bits};
 use super::header::{
     balanced_tree_opportunities, plan_bounded_depth_tree_candidate,
-    plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths, plan_payload_header_tradeoff,
-    plan_rle_smoothed_tree_candidate, BalancedTreeOpportunities,
+    plan_columbo_balanced_tree_candidate, plan_for_explicit_lengths, plan_literal_span,
+    plan_payload_header_tradeoff, plan_rle_smoothed_tree_candidate, BalancedTreeOpportunities,
 };
 use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
@@ -46,11 +46,11 @@ use super::stream::{
 // the complete stream, so the extra slot cannot oscillate or grow the output.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
 // Bound terminal header work even inside the mandatory Default comparison
-// floor. Each pass admits at most 32 swaps per alphabet and 1,024 full
-// header prices per stream; the parent remains independent of this final spelling search.
-const PAYLOAD_TRADEOFF_MAX_BYTES: usize = 128 * 1024;
-const PAYLOAD_TRADEOFF_MAX_BLOCKS: usize = 128;
-const PAYLOAD_TRADEOFF_MAX_PRICES: usize = 1024;
+// floor. Each pass admits at most 1,024 full header prices per stream; the
+// parent remains independent of both code-length and advertised-span search.
+const TERMINAL_HEADER_MAX_BYTES: usize = 128 * 1024;
+const TERMINAL_HEADER_MAX_BLOCKS: usize = 128;
+const TERMINAL_HEADER_MAX_PRICES: usize = 1024;
 // Max uses the sentinel below to resolve a proof-derived replay ceiling after
 // its initial candidate is emitted. For an L-byte stream there are only 8L
 // possible (byte length, meaningful-bit residue) scores no worse than it, and
@@ -1896,7 +1896,17 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         candidate,
     )?;
 
-    candidate = improve_with_payload_header_tradeoff(
+    candidate = improve_with_terminal_header_search(
+        TerminalHeaderSearch::PayloadTradeoff,
+        source,
+        options,
+        restoration_work,
+        progress,
+        candidate,
+    )?;
+
+    candidate = improve_with_terminal_header_search(
+        TerminalHeaderSearch::LiteralSpan,
         source,
         options,
         restoration_work,
@@ -3525,9 +3535,39 @@ fn refine_with_original_match_restoration(
         .then(|| restored.named("Original-match restoration")))
 }
 
-/// This changes only final code lengths and their RLE spelling. Keep it after
-/// restoration and outside all existing token/tree feedback lineages.
-fn improve_with_payload_header_tradeoff(
+#[derive(Clone, Copy)]
+enum TerminalHeaderSearch {
+    PayloadTradeoff,
+    LiteralSpan,
+}
+
+impl TerminalHeaderSearch {
+    fn name(self) -> &'static str {
+        match self {
+            Self::PayloadTradeoff => "Payload/header tradeoff",
+            Self::LiteralSpan => "Literal/length span",
+        }
+    }
+
+    fn plan(
+        self,
+        block: &ParsedBlock,
+        strict: bool,
+        prices_left: &mut usize,
+        stop: &mut SearchStop<'_>,
+    ) -> Option<super::model::DynamicPlan> {
+        match self {
+            Self::PayloadTradeoff => plan_payload_header_tradeoff(block, strict, prices_left, stop),
+            Self::LiteralSpan => plan_literal_span(block, strict, prices_left, stop),
+        }
+    }
+}
+
+/// Both final header searches preserve tokens and boundaries. Keep the
+/// complete payload-tradeoff parent before changing its advertised span;
+/// neither new spelling redirects the established search lineages.
+fn improve_with_terminal_header_search(
+    search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
     options: &Options,
     floor_work: DefaultFloorWork<'_>,
@@ -3535,33 +3575,35 @@ fn improve_with_payload_header_tradeoff(
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     if !floor_work.can_start_route()
-        || candidate.data.len() > PAYLOAD_TRADEOFF_MAX_BYTES
-        || source.identity.decoded_size > PAYLOAD_TRADEOFF_MAX_BYTES as u64
+        || candidate.data.len() > TERMINAL_HEADER_MAX_BYTES
+        || source.identity.decoded_size > TERMINAL_HEADER_MAX_BYTES as u64
     {
         return Ok(candidate);
     }
-    let step = progress.start("Payload/header tradeoff");
-    let tradeoff = refine_with_payload_header_tradeoff(
+    let step = progress.start(search.name());
+    let refined = refine_with_terminal_header_search(
+        search,
         &candidate,
         options,
         source.decoded_limit,
         source.identity,
         &mut floor_work.stop(),
     )?;
-    step.finish(tradeoff.as_ref().map(|tradeoff| {
+    step.finish(refined.as_ref().map(|refined| {
         candidate_progress(
-            tradeoff,
+            refined,
             source.meaningful_bits,
-            tradeoff.is_strictly_smaller_than_source(source),
+            refined.is_strictly_smaller_than_source(source),
         )
     }));
-    if let Some(tradeoff) = tradeoff {
-        candidate.replace_if_smaller(tradeoff);
+    if let Some(refined) = refined {
+        candidate.replace_if_smaller(refined);
     }
     Ok(candidate)
 }
 
-fn refine_with_payload_header_tradeoff(
+fn refine_with_terminal_header_search(
+    search: TerminalHeaderSearch,
     candidate: &Candidate,
     options: &Options,
     decoded_limit: u64,
@@ -3569,8 +3611,8 @@ fn refine_with_payload_header_tradeoff(
     stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
     if stop.reached()
-        || candidate.data.len() > PAYLOAD_TRADEOFF_MAX_BYTES
-        || identity.decoded_size > PAYLOAD_TRADEOFF_MAX_BYTES as u64
+        || candidate.data.len() > TERMINAL_HEADER_MAX_BYTES
+        || identity.decoded_size > TERMINAL_HEADER_MAX_BYTES as u64
     {
         return Ok(None);
     }
@@ -3578,7 +3620,7 @@ fn refine_with_payload_header_tradeoff(
     // The parser discards redundant empty blocks. Preserve the parent's block
     // layout here and leave empty-block normalization to established routes.
     if selected.source_block_count != selected.blocks.len()
-        || selected.blocks.len() > PAYLOAD_TRADEOFF_MAX_BLOCKS
+        || selected.blocks.len() > TERMINAL_HEADER_MAX_BLOCKS
     {
         return Ok(None);
     }
@@ -3586,13 +3628,13 @@ fn refine_with_payload_header_tradeoff(
     if plans.try_reserve_exact(selected.blocks.len()).is_err() {
         return Ok(None);
     }
-    let mut prices_left = PAYLOAD_TRADEOFF_MAX_PRICES;
+    let mut prices_left = TERMINAL_HEADER_MAX_PRICES;
     let mut bits = 0_u64;
     let mut changed = false;
     for block in &selected.blocks {
         let alignment = (bits % 8) as u8;
         let (representation, block_bits) = if let Some(plan) =
-            plan_payload_header_tradeoff(block, options.strict, &mut prices_left, stop)
+            search.plan(block, options.strict, &mut prices_left, stop)
         {
             changed = true;
             let cost = plan.bits;
@@ -3627,11 +3669,10 @@ fn refine_with_payload_header_tradeoff(
     let source = rewritten_input(candidate, &selected, decoded_limit, identity);
     // Zero replays holds every token and distance fixed. The common builder
     // validates the emitted stream and records its actual wrapper window needs.
-    let tradeoff =
-        build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
-    Ok(tradeoff
+    let refined = build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
+    Ok(refined
         .is_strictly_smaller_than(candidate)
-        .then(|| tradeoff.named("Payload/header tradeoff")))
+        .then(|| refined.named(search.name())))
 }
 
 /// Establish the exact ordinary result before starting single-PNG max routes.
@@ -3675,7 +3716,16 @@ fn build_complete_default_floor_candidate(
         progress,
         complete,
     )?;
-    let complete = improve_with_payload_header_tradeoff(
+    let complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::PayloadTradeoff,
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        complete,
+    )?;
+    let complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::LiteralSpan,
         source,
         &floor_options,
         DefaultFloorWork::Mandatory,
@@ -5599,94 +5649,119 @@ mod tests {
     use crate::deflate::model::Token;
 
     #[test]
-    fn payload_tradeoff_preserves_tokens_and_prices_stored_alignment() {
-        let block = super::super::header::payload_tradeoff_test_block();
-        let dynamic = block.original_dynamic.as_ref().unwrap();
-        for prefix_literals in 1..=8 {
-            let mut writer = BitWriter::default();
-            let prefix = PlannedBlock {
-                tokens: vec![Token::Literal(200); prefix_literals].into(),
-                plain: vec![200; prefix_literals].into(),
-                representation: Representation::Fixed,
-                bits: 10 + 9 * prefix_literals as u64,
-                source_type: SourceBlockType::Fixed,
-            };
-            emit_block(&mut writer, &[], &prefix, false).unwrap();
-            let middle = PlannedBlock {
-                tokens: block.tokens.clone(),
-                plain: block.plain.clone(),
-                representation: Representation::Dynamic(dynamic.clone()),
-                bits: dynamic.bits,
-                source_type: SourceBlockType::Dynamic,
-            };
-            emit_block(&mut writer, &[], &middle, false).unwrap();
-            let stored = PlannedBlock {
-                tokens: Vec::new().into(),
-                plain: vec![b'X'; 9].into(),
-                representation: Representation::Stored,
-                bits: stored_block_bits((writer.bit_position() % 8) as u8, 9),
-                source_type: SourceBlockType::Stored,
-            };
-            emit_block(&mut writer, &[], &stored, true).unwrap();
-            let data = writer.into_bytes();
-            let parsed = parse_stream(&data, 1024).unwrap();
-            let identity = StreamIdentity {
-                decoded_size: parsed.decoded_size,
-                crc32: parsed.crc32,
-                adler32: parsed.adler32,
-            };
-            let parent = Candidate {
-                data,
-                bits: parsed.meaningful_bits,
-                output_max_distance: Some(parsed.max_distance),
-                plans: Vec::new(),
-                block_report: None,
-                route: "test parent",
-                max_planner_is_stable: false,
-            };
-            for strict in [false, true] {
-                let options = Options {
-                    strict,
-                    ..Options::default()
+    fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
+        for (search, block) in [
+            (
+                TerminalHeaderSearch::PayloadTradeoff,
+                super::super::header::payload_tradeoff_test_block(),
+            ),
+            (
+                TerminalHeaderSearch::LiteralSpan,
+                super::super::header::literal_span_test_block(),
+            ),
+        ] {
+            let dynamic = block.original_dynamic.as_ref().unwrap();
+            for prefix_literals in 1..=8 {
+                let mut writer = BitWriter::default();
+                let prefix = PlannedBlock {
+                    tokens: vec![Token::Literal(200); prefix_literals].into(),
+                    plain: vec![200; prefix_literals].into(),
+                    representation: Representation::Fixed,
+                    bits: 10 + 9 * prefix_literals as u64,
+                    source_type: SourceBlockType::Fixed,
                 };
-                let result = refine_with_payload_header_tradeoff(
-                    &parent,
-                    &options,
-                    1024,
-                    identity,
-                    &mut SearchStop::never(),
-                )
-                .unwrap();
-                // Only one starting alignment turns the one-bit header saving
-                // into a complete byte. At the other seven, padding absorbs it
-                // and strict whole-stream selection must keep the parent.
-                assert_eq!(result.is_some(), prefix_literals == 6);
-                if let Some(result) = result {
-                    assert_eq!(parent.data.len() - result.data.len(), 1);
-                    assert_eq!(parent.bits - result.bits, 8);
-                    let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
-                    assert_eq!(result.output_max_distance, Some(check.max_distance));
-                    assert_eq!(check.blocks.len(), parsed.blocks.len());
-                    for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
-                        assert_eq!(a.tokens, b.tokens);
-                        assert_eq!(a.plain, b.plain);
-                        assert_eq!(a.source_type, b.source_type);
-                        if let Some(plan) = &a.original_dynamic {
-                            assert!(plan.has_strictly_compatible_huffman_codes());
+                emit_block(&mut writer, &[], &prefix, false).unwrap();
+                let middle = PlannedBlock {
+                    tokens: block.tokens.clone(),
+                    plain: block.plain.clone(),
+                    representation: Representation::Dynamic(dynamic.clone()),
+                    bits: dynamic.bits,
+                    source_type: SourceBlockType::Dynamic,
+                };
+                emit_block(&mut writer, &[], &middle, false).unwrap();
+                let stored = PlannedBlock {
+                    tokens: Vec::new().into(),
+                    plain: vec![b'X'; 9].into(),
+                    representation: Representation::Stored,
+                    bits: stored_block_bits((writer.bit_position() % 8) as u8, 9),
+                    source_type: SourceBlockType::Stored,
+                };
+                emit_block(&mut writer, &[], &stored, true).unwrap();
+                let data = writer.into_bytes();
+                let parsed = parse_stream(&data, 1024).unwrap();
+                let identity = StreamIdentity {
+                    decoded_size: parsed.decoded_size,
+                    crc32: parsed.crc32,
+                    adler32: parsed.adler32,
+                };
+                let parent = Candidate {
+                    data,
+                    bits: parsed.meaningful_bits,
+                    output_max_distance: Some(parsed.max_distance),
+                    plans: Vec::new(),
+                    block_report: None,
+                    route: "test parent",
+                    max_planner_is_stable: false,
+                };
+                for strict in [false, true] {
+                    let options = Options {
+                        strict,
+                        ..Options::default()
+                    };
+                    let result = refine_with_terminal_header_search(
+                        search,
+                        &parent,
+                        &options,
+                        1024,
+                        identity,
+                        &mut SearchStop::never(),
+                    )
+                    .unwrap();
+                    // Only one starting alignment turns the one-bit header saving
+                    // into a complete byte. At the other seven, padding absorbs it
+                    // and strict whole-stream selection must keep the parent.
+                    assert_eq!(result.is_some(), prefix_literals == 6);
+                    if let Some(result) = result {
+                        assert_eq!(parent.data.len() - result.data.len(), 1);
+                        assert_eq!(parent.bits - result.bits, 8);
+                        let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
+                        assert_eq!(result.output_max_distance, Some(check.max_distance));
+                        assert_eq!(check.blocks.len(), parsed.blocks.len());
+                        for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
+                            assert_eq!(a.tokens, b.tokens);
+                            assert_eq!(a.plain, b.plain);
+                            assert_eq!(a.source_type, b.source_type);
+                            if let Some(plan) = &a.original_dynamic {
+                                assert!(plan.has_strictly_compatible_huffman_codes());
+                            }
                         }
                     }
+                    assert!(refine_with_terminal_header_search(
+                        search,
+                        &parent,
+                        &options,
+                        1024,
+                        identity,
+                        &mut SearchStop::always(),
+                    )
+                    .unwrap()
+                    .is_none());
                 }
-                assert!(refine_with_payload_header_tradeoff(
-                    &parent,
-                    &options,
-                    1024,
-                    identity,
-                    &mut SearchStop::always(),
-                )
-                .unwrap()
-                .is_none());
             }
         }
+    }
+
+    #[test]
+    fn literal_span_reaches_the_final_stream_and_png_header() {
+        let source = include_bytes!("../../tests/fixtures/png/PngSuite/basi0g04.png");
+        let result = crate::optimize(source, crate::Format::Png, &Options::default()).unwrap();
+        let raw = png_raw_deflate(&result.data);
+        let parsed = parse_stream(&raw, 1024).unwrap();
+        assert_eq!(parsed.meaningful_bits, 1293);
+        assert_eq!(
+            parsed.blocks[0].original_dynamic.as_ref().unwrap().hlit,
+            277
+        );
     }
 
     #[test]
@@ -5726,7 +5801,8 @@ mod tests {
             max_planner_is_stable: true,
         };
         assert_eq!(parent.bits, 1600);
-        let result = refine_with_payload_header_tradeoff(
+        let result = refine_with_terminal_header_search(
+            TerminalHeaderSearch::PayloadTradeoff,
             &parent,
             &Options {
                 exhaustive: true,
@@ -5788,7 +5864,8 @@ mod tests {
             route: "empty-block parent",
             max_planner_is_stable: false,
         };
-        assert!(refine_with_payload_header_tradeoff(
+        assert!(refine_with_terminal_header_search(
+            TerminalHeaderSearch::PayloadTradeoff,
             &parent,
             &Options::default(),
             1024,

@@ -2421,6 +2421,56 @@ pub(crate) fn plan_payload_header_tradeoff(
     best
 }
 
+/// Advertise unused literal/length symbols to change the zero run at the
+/// LL/DD seam. Zero lengths consume no code space and change no codeword.
+/// Search every legal span, preserving the parent's distance span and all
+/// nonzero lengths. Full header feedback matters: the existing CL tree alone
+/// can miss a gain, even when only one zero is inserted.
+pub(crate) fn plan_literal_span(
+    block: &super::model::ParsedBlock,
+    strict: bool,
+    prices_left: &mut usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    if *prices_left == 0 || stop.reached() {
+        return None;
+    }
+    let original = block.original_dynamic.as_ref()?;
+    if strict && !original.has_strictly_compatible_huffman_codes() {
+        return None;
+    }
+    let minimum = trim_literal(&original.literal_lengths);
+    let mut literal = [0_u8; 286];
+    if minimum >= literal.len() {
+        return None;
+    }
+    literal[..minimum].copy_from_slice(&original.literal_lengths[..minimum]);
+    let distance = &original.distance_lengths;
+    let data_bits = token_bits(&block.tokens, &literal[..minimum], distance)?;
+    let mut best_bits = dynamic_bits(data_bits, original)?;
+    let mut best = None;
+    for span in minimum..=literal.len() {
+        if *prices_left == 0 || stop.reached() {
+            break;
+        }
+        if span == original.hlit {
+            continue;
+        }
+        *prices_left -= 1;
+        // This pricer uses the supplied spans verbatim. Calling the ordinary
+        // explicit-length wrapper here would trim away the zero padding.
+        if let Some(plan) =
+            plan_for_trimmed_lengths_uncached(&literal[..span], distance, data_bits, true, 0xff)
+        {
+            if plan.bits < best_bits && (!strict || plan.has_strictly_compatible_huffman_codes()) {
+                best_bits = plan.bits;
+                best = Some(plan);
+            }
+        }
+    }
+    best
+}
+
 fn length_swap_delta(frequency_a: u32, frequency_b: u32, length_a: u8, length_b: u8) -> i64 {
     let frequency_a = i64::from(frequency_a);
     let frequency_b = i64::from(frequency_b);
@@ -3517,6 +3567,29 @@ fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
 }
 
 #[cfg(test)]
+pub(crate) fn literal_span_test_block() -> super::model::ParsedBlock {
+    // Completed Default basi0g04 parent. Its unchanged payload codes need
+    // HLIT=269, but advertising eight unused lengths saves one header bit.
+    let raw = [
+        0x65, 0x8e, 0x61, 0x11, 0x40, 0x00, 0x0c, 0x85, 0x1f, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00,
+        0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x80, 0x08, 0x44, 0x90,
+        0x81, 0x3b, 0xbb, 0x73, 0xbb, 0xfd, 0xd8, 0xbd, 0xbd, 0x6f, 0xbb, 0xbd, 0x41, 0x0d, 0x61,
+        0xe7, 0x08, 0x5b, 0xe4, 0x33, 0x8c, 0x04, 0x5e, 0x85, 0x64, 0x40, 0xb5, 0x41, 0x77, 0xe3,
+        0x12, 0x6f, 0xf5, 0x78, 0x6b, 0xc5, 0x5b, 0x17, 0x14, 0x2b, 0xc8, 0xbe, 0xc1, 0xdb, 0x34,
+        0xdf, 0xf4, 0x6d, 0xa6, 0x6f, 0xe5, 0x6d, 0x8e, 0x6f, 0x0f, 0x9a, 0xe9, 0xf8, 0x51, 0x5a,
+        0x80, 0xb4, 0x06, 0x69, 0x07, 0xd2, 0x11, 0xa4, 0x0b, 0x48, 0x77, 0x90, 0x9e, 0x20, 0xbd,
+        0xff, 0x3b, 0xf2, 0xa0, 0xbc, 0x2c, 0x23, 0x64, 0x96, 0x0c, 0x95, 0xe9, 0xf2, 0x8d, 0xff,
+        0x1f, 0x68, 0x9a, 0x69, 0x3a, 0x8e, 0xef, 0x47, 0x51, 0x9a, 0x16, 0x85, 0x04, 0xdc, 0xd6,
+        0xb5, 0x04, 0xdc, 0x76, 0x9d, 0x04, 0xdc, 0x8e, 0xa3, 0x04, 0xdc, 0x2e, 0x8b, 0x04, 0xdc,
+        0xee, 0xbb, 0x04, 0xdc, 0x9e, 0xa7, 0x04, 0xdc, 0xde, 0xb7, 0x00, 0x0f,
+    ];
+    super::parse::parse_stream(&raw, 1024)
+        .unwrap()
+        .blocks
+        .remove(0)
+}
+
+#[cfg(test)]
 pub(crate) fn payload_tradeoff_test_block() -> super::model::ParsedBlock {
     // A small literal-only witness: spending three payload bits saves four
     // header bits even after full repricing of the unchanged tree.
@@ -3547,6 +3620,151 @@ pub(crate) fn payload_tradeoff_test_block() -> super::model::ParsedBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_span_padding_saves_a_bit_without_changing_payload_codes() {
+        let block = literal_span_test_block();
+        let parent = block.original_dynamic.as_ref().unwrap();
+        let result = plan_literal_span(&block, true, &mut 1024, &mut SearchStop::never()).unwrap();
+        assert_eq!(parent.hlit, 269);
+        assert_eq!((result.hlit, result.bits), (277, 1293));
+        assert_eq!(block.original.unwrap().len, 1294);
+        assert_eq!(
+            &result.literal_lengths[..parent.hlit],
+            parent.literal_lengths
+        );
+        assert!(result.literal_lengths[parent.hlit..]
+            .iter()
+            .all(|&n| n == 0));
+        assert_eq!(result.distance_lengths, parent.distance_lengths);
+        assert!(result.has_strictly_compatible_huffman_codes());
+        let data_bits = token_bits(
+            &block.tokens,
+            &parent.literal_lengths,
+            &parent.distance_lengths,
+        )
+        .unwrap();
+        assert_eq!(
+            token_bits(
+                &block.tokens,
+                &result.literal_lengths,
+                &result.distance_lengths
+            ),
+            Some(data_bits)
+        );
+        let control = plan_for_trimmed_lengths_uncached(
+            &parent.literal_lengths,
+            &parent.distance_lengths,
+            data_bits,
+            true,
+            0xff,
+        )
+        .unwrap();
+        assert_eq!(control.bits, 1294);
+        // Longer zero runs alone are not sufficient: finding this saving also
+        // requires a different code-length tree. A fixed-CL shortcut misses it.
+        let lengths: Vec<_> = result
+            .literal_lengths
+            .iter()
+            .chain(&result.distance_lengths)
+            .copied()
+            .collect();
+        if let Some(rle) = shortest_rle(&lengths, &parent.code_length_lengths) {
+            let mut frozen = result.clone();
+            frozen.code_length_lengths = parent.code_length_lengths;
+            frozen.hclen = parent.hclen;
+            frozen.rle = rle;
+            assert!(dynamic_bits(data_bits, &frozen).unwrap() >= 1294);
+        }
+    }
+
+    #[test]
+    fn literal_span_search_covers_shorter_and_longer_advertised_counts() {
+        let base = literal_span_test_block();
+        let original = base.original_dynamic.as_ref().unwrap();
+        let data_bits = token_bits(
+            &base.tokens,
+            &original.literal_lengths,
+            &original.distance_lengths,
+        )
+        .unwrap();
+        for advertised in [269, 275, 286] {
+            let mut block = base.clone();
+            let mut literal = original.literal_lengths.clone();
+            literal.resize(advertised, 0);
+            let mut distance = original.distance_lengths.clone();
+            distance.resize(32, 0); // Keep even a non-minimal distance span fixed.
+            let parent =
+                plan_for_trimmed_lengths_uncached(&literal, &distance, data_bits, true, 0xff)
+                    .unwrap();
+            let parent_bits = parent.bits;
+            block.original_dynamic = Some(parent);
+            let mut oracle = parent_bits;
+            literal.resize(286, 0);
+            for count in 269..=286 {
+                oracle = oracle.min(
+                    plan_for_trimmed_lengths_uncached(
+                        &literal[..count],
+                        &distance,
+                        data_bits,
+                        true,
+                        0xff,
+                    )
+                    .unwrap()
+                    .bits,
+                );
+            }
+            let result = plan_literal_span(&block, true, &mut 1024, &mut SearchStop::never());
+            assert_eq!(result.as_ref().map_or(parent_bits, |p| p.bits), oracle);
+            if let Some(result) = result {
+                assert_eq!(result.distance_lengths, distance);
+                assert_eq!(&result.literal_lengths[..269], original.literal_lengths);
+                assert!(result.has_strictly_compatible_huffman_codes());
+            }
+        }
+    }
+
+    #[test]
+    fn literal_span_search_respects_limits_and_retains_finished_prices() {
+        let block = literal_span_test_block();
+        assert!(plan_literal_span(&block, true, &mut 0, &mut SearchStop::never()).is_none());
+        assert!(plan_literal_span(&block, true, &mut 1024, &mut SearchStop::always()).is_none());
+        let mut one = 1;
+        assert!(plan_literal_span(&block, true, &mut one, &mut SearchStop::never()).is_none());
+        assert_eq!(one, 0);
+        // The first eight prices reach HLIT=277. Exhaustion retains that
+        // complete winner without admitting any later span.
+        let mut eight = 8;
+        let result = plan_literal_span(&block, true, &mut eight, &mut SearchStop::never()).unwrap();
+        assert_eq!((result.hlit, result.bits, eight), (277, 1293, 0));
+        let mut polls = 0;
+        let mut stop = || {
+            polls += 1;
+            polls > 10
+        };
+        let result = plan_literal_span(
+            &block,
+            true,
+            &mut 1024,
+            &mut SearchStop::callback(&mut stop),
+        )
+        .unwrap();
+        assert_eq!((result.hlit, result.bits), (277, 1293));
+        // A used symbol 285 leaves no legal larger count. Keep all payload
+        // trees complete so this exercises the format bound, not rejection.
+        let mut full = block.clone();
+        let mut literal = [0_u8; 286];
+        literal[0] = 1;
+        literal[256] = 2;
+        literal[285] = 2;
+        full.tokens = vec![Token::Literal(0)].into();
+        full.recount_frequencies();
+        full.original_dynamic =
+            Some(plan_for_explicit_lengths(&full.tokens, &literal, &[1, 1], true).unwrap());
+        let mut budget = 1024;
+        assert!(plan_literal_span(&full, true, &mut budget, &mut SearchStop::never()).is_none());
+        assert_eq!(budget, 1024);
+    }
 
     #[test]
     fn positive_payload_swap_saves_more_in_the_header() {
