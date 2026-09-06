@@ -140,7 +140,7 @@ This can propose a cheap tree description that no payload-frequency seed would g
 
 ### Difference from the earlier joint-tree DP
 
-The earlier proposal fixes the tokens and one code-length price model, then chooses data-tree lengths and RLE. This formulation treats the compressed header itself as the search object and lets the certified token spelling change with it. The code-length tree, advertised spans, repeat program, data trees, and payload path can all vary within the admitted search family.
+The earlier fixed-token joint-tree proposal is now [implemented and validated](joint-tree-rle-validation.md): it fixes the tokens and one code-length price model, then chooses data-tree lengths and RLE. This formulation treats the compressed header itself as the search object and lets the certified token spelling change with it. The code-length tree, advertised spans, repeat program, data trees, and payload path can all vary within the admitted search family.
 
 ### Finite, bounded search
 

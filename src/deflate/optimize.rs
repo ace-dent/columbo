@@ -46,8 +46,8 @@ use super::stream::{
 // the complete stream, so the extra slot cannot oscillate or grow the output.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
 // Bound terminal header work even inside the mandatory Default comparison
-// floor. Each pass admits at most 1,024 full header prices per stream; the
-// parent remains independent of both code-length and advertised-span search.
+// floor. The swap/span passes admit at most 1,024 full header prices each;
+// joint tree/RLE search has its own shared operation and scratch bounds.
 const TERMINAL_HEADER_MAX_BYTES: usize = 128 * 1024;
 const TERMINAL_HEADER_MAX_BLOCKS: usize = 128;
 const TERMINAL_HEADER_MAX_PRICES: usize = 1024;
@@ -1913,6 +1913,14 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         progress,
         candidate,
     )?;
+    candidate = improve_with_terminal_header_search(
+        TerminalHeaderSearch::JointTreeRle,
+        source,
+        options,
+        restoration_work,
+        progress,
+        candidate,
+    )?;
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
@@ -3539,6 +3547,7 @@ fn refine_with_original_match_restoration(
 enum TerminalHeaderSearch {
     PayloadTradeoff,
     LiteralSpan,
+    JointTreeRle,
 }
 
 impl TerminalHeaderSearch {
@@ -3546,6 +3555,7 @@ impl TerminalHeaderSearch {
         match self {
             Self::PayloadTradeoff => "Payload/header tradeoff",
             Self::LiteralSpan => "Literal/length span",
+            Self::JointTreeRle => "Joint tree/RLE",
         }
     }
 
@@ -3554,18 +3564,19 @@ impl TerminalHeaderSearch {
         block: &ParsedBlock,
         strict: bool,
         prices_left: &mut usize,
+        joint_budget: &mut super::joint::JointBudget,
         stop: &mut SearchStop<'_>,
     ) -> Option<super::model::DynamicPlan> {
         match self {
             Self::PayloadTradeoff => plan_payload_header_tradeoff(block, strict, prices_left, stop),
             Self::LiteralSpan => plan_literal_span(block, strict, prices_left, stop),
+            Self::JointTreeRle => super::joint::plan_joint_tree_rle(block, joint_budget, stop),
         }
     }
 }
 
-/// Both final header searches preserve tokens and boundaries. Keep the
-/// complete payload-tradeoff parent before changing its advertised span;
-/// neither new spelling redirects the established search lineages.
+/// Final header searches preserve tokens and boundaries. Each complete parent
+/// remains independent, without redirecting the established search lineages.
 fn improve_with_terminal_header_search(
     search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
@@ -3629,13 +3640,18 @@ fn refine_with_terminal_header_search(
         return Ok(None);
     }
     let mut prices_left = TERMINAL_HEADER_MAX_PRICES;
+    let mut joint_budget = super::joint::JointBudget::new();
     let mut bits = 0_u64;
     let mut changed = false;
     for block in &selected.blocks {
         let alignment = (bits % 8) as u8;
-        let (representation, block_bits) = if let Some(plan) =
-            search.plan(block, options.strict, &mut prices_left, stop)
-        {
+        let (representation, block_bits) = if let Some(plan) = search.plan(
+            block,
+            options.strict,
+            &mut prices_left,
+            &mut joint_budget,
+            stop,
+        ) {
             changed = true;
             let cost = plan.bits;
             (Representation::Dynamic(plan), cost)
@@ -3726,6 +3742,14 @@ fn build_complete_default_floor_candidate(
     )?;
     let complete = improve_with_terminal_header_search(
         TerminalHeaderSearch::LiteralSpan,
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        complete,
+    )?;
+    let complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::JointTreeRle,
         source,
         &floor_options,
         DefaultFloorWork::Mandatory,
@@ -5650,15 +5674,22 @@ mod tests {
 
     #[test]
     fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
-        for (search, block) in [
+        let mut joint_block = super::super::header::literal_span_test_block();
+        joint_block.original_dynamic = Some(
+            plan_literal_span(&joint_block, true, &mut 1024, &mut SearchStop::never()).unwrap(),
+        );
+        for (search, block, saving) in [
             (
                 TerminalHeaderSearch::PayloadTradeoff,
                 super::super::header::payload_tradeoff_test_block(),
+                1,
             ),
             (
                 TerminalHeaderSearch::LiteralSpan,
                 super::super::header::literal_span_test_block(),
+                1,
             ),
+            (TerminalHeaderSearch::JointTreeRle, joint_block, 7),
         ] {
             let dynamic = block.original_dynamic.as_ref().unwrap();
             for prefix_literals in 1..=8 {
@@ -5717,13 +5748,17 @@ mod tests {
                         &mut SearchStop::never(),
                     )
                     .unwrap();
-                    // Only one starting alignment turns the one-bit header saving
-                    // into a complete byte. At the other seven, padding absorbs it
-                    // and strict whole-stream selection must keep the parent.
-                    assert_eq!(result.is_some(), prefix_literals == 6);
+                    // Stored padding can absorb a header saving. Check all
+                    // eight incoming alignments against byte rounding at LEN.
+                    let before = 10
+                        + 9 * prefix_literals as u64
+                        + parsed.blocks[1].original.unwrap().len
+                        + 3;
+                    let bytes_saved = before.div_ceil(8) - (before - saving).div_ceil(8);
+                    assert_eq!(result.is_some(), bytes_saved != 0);
                     if let Some(result) = result {
-                        assert_eq!(parent.data.len() - result.data.len(), 1);
-                        assert_eq!(parent.bits - result.bits, 8);
+                        assert_eq!((parent.data.len() - result.data.len()) as u64, bytes_saved);
+                        assert_eq!(parent.bits - result.bits, 8 * bytes_saved);
                         let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
                         assert_eq!(result.output_max_distance, Some(check.max_distance));
                         assert_eq!(check.blocks.len(), parsed.blocks.len());
@@ -5752,12 +5787,12 @@ mod tests {
     }
 
     #[test]
-    fn literal_span_reaches_the_final_stream_and_png_header() {
+    fn joint_tree_rle_reaches_the_final_stream_and_png_header() {
         let source = include_bytes!("../../tests/fixtures/png/PngSuite/basi0g04.png");
         let result = crate::optimize(source, crate::Format::Png, &Options::default()).unwrap();
         let raw = png_raw_deflate(&result.data);
         let parsed = parse_stream(&raw, 1024).unwrap();
-        assert_eq!(parsed.meaningful_bits, 1293);
+        assert_eq!(parsed.meaningful_bits, 1286);
         assert_eq!(
             parsed.blocks[0].original_dynamic.as_ref().unwrap().hlit,
             277

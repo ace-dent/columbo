@@ -2144,6 +2144,20 @@ struct HeaderPlanSearch {
     best: Option<DynamicPlan>,
 }
 
+/// Fully reprice a legal advertised alphabet span, including trailing zeros.
+/// Joint tree/header search holds these counts fixed while choosing lengths.
+pub(crate) fn plan_for_advertised_lengths(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+) -> Option<DynamicPlan> {
+    if !(257..=286).contains(&literal_lengths.len()) || !(1..=32).contains(&distance_lengths.len())
+    {
+        return None;
+    }
+    plan_for_trimmed_lengths_uncached(literal_lengths, distance_lengths, data_bits, true, 0xff)
+}
+
 fn plan_for_trimmed_lengths_uncached(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
@@ -3475,7 +3489,7 @@ fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
 }
 
 /// Find the cheapest valid RLE stream under a fixed code-length tree.
-fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
+pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
     #[derive(Clone, Copy)]
     struct Step {
         next: usize,

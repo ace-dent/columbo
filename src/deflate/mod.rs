@@ -4,6 +4,7 @@ mod bitstream;
 mod block;
 mod header;
 mod huffman;
+mod joint;
 mod model;
 mod optimize;
 mod parse;

@@ -2,7 +2,23 @@
 
 # Existing-stream Deflate optimization research
 
-Status: **complete for currently known in-scope methods**.
+Status: **upstream audit complete; diagnosed in-scope misses have reopened local research**.
+
+Follow-up, 5 September 2026: [new byte-saving research](new-byte-saving-methods.md)
+identifies positive-payload code-length swaps and advertised literal-span search
+with reproducible gains on completed Default raw streams. These reopen the
+absent-tree/header-state conditions below. Positive-payload swaps are now
+[implemented and validated](payload-header-tradeoff-validation.md); advertised
+literal-span search is also [implemented and validated](literal-span-validation.md).
+Joint payload-tree/RLE search is now [implemented and validated](joint-tree-rle-validation.md),
+with bounded-depth exact search under one fixed CL tree and measured additional
+savings beyond the completed span pass.
+The follow-up distinguishes untested proposals from production methods.
+Further validation of [permanent original-match proofs](permanent-match-proofs-validation.md)
+now identifies a reproducible absent token choice, including a completed Max
+replay fixed-point witness. The bounded fixed-tree restoration pass is now
+implemented; its production bounds are recorded in
+[the route catalogue](../routes-and-methods.md#route-gate-reference).
 
 This is a technical decision record for optimizing an existing Deflate stream
 without finding new LZ77 matches. Detailed production behavior is catalogued in
@@ -98,8 +114,8 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Containers | PNG/APNG, GZIP, ZIP, and zlib reconstruction; metadata handling; duplicate-frame reuse; exact candidate comparison; smallest sufficient zlib CINFO derived from emitted distances | A format-specific diagnosed miss |
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
-| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing | A concrete absent near-optimal tree shape |
-| Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback | A real header requiring a retained alternate RLE histogram |
+| Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing; terminal positive-payload length swaps | A concrete absent near-optimal tree shape |
+| Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback; terminal advertised literal-span search; joint payload-tree/RLE DP under one fixed CL tree at depth ≤9 | A real header requiring a retained alternate RLE histogram |
 | Runtime | Canonical plan and header caches; range and edge reuse; exact-verified bounded fingerprints; pointer-aware token adoption; fixed-size merge-histogram composition; parser/decode/emission and Huffman-heap hot paths | Measured duplicate work or a new profile hotspot |
 
 After the runtime changes, a second 5-second sample contained no SipHash
