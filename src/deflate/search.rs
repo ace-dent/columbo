@@ -2052,6 +2052,30 @@ fn solve_proven_submatch(
     forbidden_length_symbol: Option<u16>,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<Token>> {
+    let forbidden = forbidden_length_symbol
+        .filter(|symbol| (257..=285).contains(symbol))
+        .map_or(0, |symbol| 1 << (symbol - 257));
+    solve_proven_submatch_avoiding(
+        source,
+        decoded,
+        literal_lengths,
+        distance_lengths,
+        forbidden,
+        stop,
+    )
+}
+
+/// Choose the cheapest spelling inside one existing match while excluding
+/// every length symbol in a set. Bit zero names symbol 257. All submatches
+/// retain the source distance and stay inside its decoded interval.
+pub(super) fn solve_proven_submatch_avoiding(
+    source: Token,
+    decoded: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    forbidden_length_symbols: u32,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<Token>> {
     let Token::Match {
         length,
         length_symbol,
@@ -2080,7 +2104,7 @@ fn solve_proven_submatch(
         let Token::Match { length_symbol, .. } = token else {
             return None;
         };
-        if forbidden_length_symbol != Some(length_symbol) {
+        if forbidden_length_symbols & (1 << (length_symbol - 257)) == 0 {
             *slot = Some((
                 token,
                 estimated_match_token_bits(token, literal_lengths, distance_lengths)?,
@@ -2099,7 +2123,7 @@ fn solve_proven_submatch(
 
         // Retain the exact source token as the first whole-span edge. Strict
         // comparisons below preserve it on an estimated-cost tie.
-        if start == 0 && forbidden_length_symbol != Some(length_symbol) {
+        if start == 0 && forbidden_length_symbols & (1 << (length_symbol - 257)) == 0 {
             best_cost = estimated_match_token_bits(source, literal_lengths, distance_lengths)?;
             best_choice = ProvenSubmatchChoice::Match(source);
         }
@@ -4324,7 +4348,10 @@ fn plan_tokens(
 /// Build the owned block needed to price one optional token transformation.
 /// Large vectors and source metadata are copied fallibly; exact original bits
 /// are cleared because they describe the pre-transformation token stream.
-fn try_transformed_block(source: &ParsedBlock, tokens: Vec<Token>) -> Option<ParsedBlock> {
+pub(super) fn try_transformed_block(
+    source: &ParsedBlock,
+    tokens: Vec<Token>,
+) -> Option<ParsedBlock> {
     if parsed_model_bytes(source.plain.len(), tokens.len(), 1)? > MAX_TOKEN_CANDIDATE_BYTES {
         return None;
     }
@@ -5021,6 +5048,67 @@ mod tests {
                     assert_eq!(
                         &selected, expected,
                         "length {length}, profile {profile}, forbidden {forbidden:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forbidden_symbol_sets_match_exhaustive_spellings() {
+        fn enumerate(plain: &[u8], prefix: &mut Vec<Token>, all: &mut Vec<Vec<Token>>) {
+            if plain.is_empty() {
+                all.push(prefix.clone());
+                return;
+            }
+            prefix.push(Token::Literal(plain[0]));
+            enumerate(&plain[1..], prefix, all);
+            prefix.pop();
+            for length in 3..=plain.len() {
+                prefix.push(test_match(length as u16, 6, 4, 1, 1));
+                enumerate(&plain[length..], prefix, all);
+                prefix.pop();
+            }
+        }
+
+        for length in 3..=10 {
+            let decoded = &b"abcdefabcd"[..length];
+            let source = test_match(length as u16, 6, 4, 1, 1);
+            let mut spellings = vec![vec![source]];
+            enumerate(decoded, &mut Vec::new(), &mut spellings);
+            for profile in 0..8 {
+                let mut literal = [0; 286];
+                for (symbol, bits) in literal.iter_mut().enumerate() {
+                    *bits = ((3 * profile + symbol * symbol) % 16) as u8;
+                }
+                let distances = [1; 30];
+                // Enumerate every subset of length symbols that can occur in
+                // these short intervals, including disjoint and complete bans.
+                for forbidden in 0..(1_u32 << (length - 2)) {
+                    let expected = spellings
+                        .iter()
+                        .filter(|tokens| {
+                            tokens.iter().all(|token| match token {
+                                Token::Match { length_symbol, .. } => {
+                                    forbidden & (1 << (length_symbol - 257)) == 0
+                                }
+                                Token::Literal(_) => true,
+                            })
+                        })
+                        .min_by_key(|tokens| estimated_tokens_bits(tokens, &literal, &distances))
+                        .unwrap();
+                    let actual = solve_proven_submatch_avoiding(
+                        source,
+                        decoded,
+                        &literal,
+                        &distances,
+                        forbidden,
+                        &mut SearchStop::never(),
+                    )
+                    .unwrap_or_else(|| vec![source]);
+                    assert_eq!(
+                        &actual, expected,
+                        "length={length}, profile={profile}, ban={forbidden}"
                     );
                 }
             }

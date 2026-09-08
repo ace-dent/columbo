@@ -497,11 +497,13 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
                 complete_default_candidate = Some(floors.complete);
                 floors.max_seed
             }
-            // APNG Default deliberately uses one initial planner per
-            // image. Completing Max's existing replay-bounded seed is
-            // already a superset of that work and avoids adding the
-            // standalone feedback family to every animation frame.
+            // APNG's initial planner and terminal transformations define its
+            // exact Default endpoint. A replay-bounded seed is a different
+            // lineage; a smaller seed does not dominate its terminal children.
             DefaultFloor::ApngMax => {
+                complete_default_candidate = Some(build_complete_apng_default_floor_candidate(
+                    source, options, progress,
+                )?);
                 build_bounded_floor_candidate(source, options, &mut SearchStop::never())?
             }
             _ => build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?,
@@ -1992,6 +1994,14 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     )?;
     candidate = improve_with_terminal_header_search(
         TerminalHeaderSearch::JointTreeRle,
+        source,
+        options,
+        restoration_work,
+        progress,
+        candidate,
+    )?;
+    candidate = improve_with_terminal_header_search(
+        TerminalHeaderSearch::SymbolSets,
         source,
         options,
         restoration_work,
@@ -3625,6 +3635,13 @@ enum TerminalHeaderSearch {
     PayloadTradeoff,
     LiteralSpan,
     JointTreeRle,
+    SymbolSets,
+}
+
+struct TerminalSearchBudget {
+    header_prices: usize,
+    joint: super::joint::JointBudget,
+    symbols: super::symbol_set::SymbolSetBudget,
 }
 
 impl TerminalHeaderSearch {
@@ -3633,26 +3650,47 @@ impl TerminalHeaderSearch {
             Self::PayloadTradeoff => "Payload/header tradeoff",
             Self::LiteralSpan => "Literal/length span",
             Self::JointTreeRle => "Joint tree/RLE",
+            Self::SymbolSets => "Symbol set removal",
         }
     }
 
     fn plan(
         self,
         block: &ParsedBlock,
-        strict: bool,
-        prices_left: &mut usize,
-        joint_budget: &mut super::joint::JointBudget,
+        alignment: u8,
+        options: &Options,
+        budget: &mut TerminalSearchBudget,
         stop: &mut SearchStop<'_>,
-    ) -> Option<super::model::DynamicPlan> {
-        match self {
-            Self::PayloadTradeoff => plan_payload_header_tradeoff(block, strict, prices_left, stop),
-            Self::LiteralSpan => plan_literal_span(block, strict, prices_left, stop),
-            Self::JointTreeRle => super::joint::plan_joint_tree_rle(block, joint_budget, stop),
-        }
+    ) -> Option<PlannedBlock> {
+        let dynamic = match self {
+            Self::PayloadTradeoff => {
+                plan_payload_header_tradeoff(block, options.strict, &mut budget.header_prices, stop)
+            }
+            Self::LiteralSpan => {
+                plan_literal_span(block, options.strict, &mut budget.header_prices, stop)
+            }
+            Self::JointTreeRle => super::joint::plan_joint_tree_rle(block, &mut budget.joint, stop),
+            Self::SymbolSets => {
+                return super::symbol_set::plan_symbol_sets(
+                    block,
+                    alignment,
+                    options,
+                    &mut budget.symbols,
+                    stop,
+                )
+            }
+        }?;
+        Some(PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            bits: dynamic.bits,
+            representation: Representation::Dynamic(dynamic),
+            source_type: block.source_type,
+        })
     }
 }
 
-/// Final header searches preserve tokens and boundaries. Each complete parent
+/// Header-driven terminal searches preserve block boundaries. Each complete parent
 /// remains independent, without redirecting the established search lineages.
 fn improve_with_terminal_header_search(
     search: TerminalHeaderSearch,
@@ -3716,52 +3754,53 @@ fn refine_with_terminal_header_search(
     if plans.try_reserve_exact(selected.blocks.len()).is_err() {
         return Ok(None);
     }
-    let mut prices_left = TERMINAL_HEADER_MAX_PRICES;
-    let mut joint_budget = super::joint::JointBudget::new();
+    let mut budget = TerminalSearchBudget {
+        header_prices: TERMINAL_HEADER_MAX_PRICES,
+        joint: super::joint::JointBudget::new(),
+        symbols: super::symbol_set::SymbolSetBudget::new(),
+    };
     let mut bits = 0_u64;
     let mut changed = false;
     for block in &selected.blocks {
         let alignment = (bits % 8) as u8;
-        let (representation, block_bits) = if let Some(plan) = search.plan(
-            block,
-            options.strict,
-            &mut prices_left,
-            &mut joint_budget,
-            stop,
-        ) {
+        let plan = if let Some(plan) = search.plan(block, alignment, options, &mut budget, stop) {
             changed = true;
-            let cost = plan.bits;
-            (Representation::Dynamic(plan), cost)
-        } else if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
-            (Representation::Original(original), original.len)
-        } else if block.source_type == SourceBlockType::Stored {
-            // Earlier header savings can shift the next stored block. Regenerate
-            // its padding and price the actual new alignment before selection.
-            (
-                Representation::Stored,
-                stored_block_bits(alignment, block.plain.len()),
-            )
+            plan
         } else {
-            return Ok(None);
+            let (representation, block_bits) =
+                if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
+                    (Representation::Original(original), original.len)
+                } else if block.source_type == SourceBlockType::Stored {
+                    // Earlier savings can shift the next stored block. Regenerate
+                    // and price its padding at the actual new alignment.
+                    (
+                        Representation::Stored,
+                        stored_block_bits(alignment, block.plain.len()),
+                    )
+                } else {
+                    return Ok(None);
+                };
+            PlannedBlock {
+                tokens: block.tokens.clone(),
+                plain: block.plain.clone(),
+                representation,
+                bits: block_bits,
+                source_type: block.source_type,
+            }
         };
-        let Some(next_bits) = bits.checked_add(block_bits) else {
+        let Some(next_bits) = bits.checked_add(plan.bits) else {
             return Ok(None);
         };
         bits = next_bits;
-        plans.push(PlannedBlock {
-            tokens: block.tokens.clone(),
-            plain: block.plain.clone(),
-            representation,
-            bits: block_bits,
-            source_type: block.source_type,
-        });
+        plans.push(plan);
     }
+
     if !changed {
         return Ok(None);
     }
     let source = rewritten_input(candidate, &selected, decoded_limit, identity);
-    // Zero replays holds every token and distance fixed. The common builder
-    // validates the emitted stream and records its actual wrapper window needs.
+    // Zero replays preserves exactly the proposed tokens and tables. The common
+    // builder validates emission and records the actual wrapper window needs.
     let refined = build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
     Ok(refined
         .is_strictly_smaller_than(candidate)
@@ -3833,7 +3872,51 @@ fn build_complete_default_floor_candidate(
         progress,
         complete,
     )?;
+    let complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::SymbolSets,
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        complete,
+    )?;
     Ok(CompleteDefaultFloor { max_seed, complete })
+}
+
+/// Keep APNG's own Default endpoint without adding standalone feedback routes.
+fn build_complete_apng_default_floor_candidate(
+    source: CandidateInput<'_>,
+    options: &Options,
+    progress: Progress,
+) -> Result<Candidate> {
+    let floor_options = Options {
+        exhaustive: false,
+        ..options.clone()
+    };
+    let initial = build_apng_default_candidate(source, &floor_options, &mut SearchStop::never())?;
+    let mut complete = improve_with_original_match_restoration(
+        source,
+        &floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        initial,
+    )?;
+    for search in [
+        TerminalHeaderSearch::PayloadTradeoff,
+        TerminalHeaderSearch::LiteralSpan,
+        TerminalHeaderSearch::JointTreeRle,
+        TerminalHeaderSearch::SymbolSets,
+    ] {
+        complete = improve_with_terminal_header_search(
+            search,
+            source,
+            &floor_options,
+            DefaultFloorWork::Mandatory,
+            progress,
+            complete,
+        )?;
+    }
+    Ok(complete)
 }
 
 /// Reuse a completed ordinary-mode floor when PNG scheduling already made it.
@@ -5767,6 +5850,11 @@ mod tests {
                 1,
             ),
             (TerminalHeaderSearch::JointTreeRle, joint_block, 7),
+            (
+                TerminalHeaderSearch::SymbolSets,
+                super::super::symbol_set::symbol_set_test_block(),
+                4,
+            ),
         ] {
             let dynamic = block.original_dynamic.as_ref().unwrap();
             for prefix_literals in 1..=8 {
@@ -5840,9 +5928,13 @@ mod tests {
                         assert_eq!(result.output_max_distance, Some(check.max_distance));
                         assert_eq!(check.blocks.len(), parsed.blocks.len());
                         for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
-                            assert_eq!(a.tokens, b.tokens);
+                            if matches!(search, TerminalHeaderSearch::SymbolSets) {
+                                super::super::symbol_set::assert_proven_rewrite(b, &a.tokens);
+                            } else {
+                                assert_eq!(a.tokens, b.tokens);
+                                assert_eq!(a.source_type, b.source_type);
+                            }
                             assert_eq!(a.plain, b.plain);
-                            assert_eq!(a.source_type, b.source_type);
                             if let Some(plan) = &a.original_dynamic {
                                 assert!(plan.has_strictly_compatible_huffman_codes());
                             }

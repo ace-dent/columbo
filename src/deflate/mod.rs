@@ -13,6 +13,7 @@ mod search;
 pub(crate) mod source_recode;
 mod stop;
 pub(crate) mod stream;
+mod symbol_set;
 
 pub(crate) use optimize::{
     inspect_raw_prefix, optimize_raw, optimize_raw_prefix_with_floor,

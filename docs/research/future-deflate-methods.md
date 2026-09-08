@@ -13,6 +13,10 @@ literal-span search is also [implemented and validated](literal-span-validation.
 Joint payload-tree/RLE search is now [implemented and validated](joint-tree-rle-validation.md),
 with bounded-depth exact search under one fixed CL tree and measured additional
 savings beyond the completed span pass.
+Small payload symbol sets are now
+[jointly removed and validated](symbol-set-validation.md), with bounded
+certified rewrites and gains beyond the existing single-symbol and composition
+searches.
 The follow-up distinguishes untested proposals from production methods.
 Further validation of [permanent original-match proofs](permanent-match-proofs-validation.md)
 now identifies a reproducible absent token choice, including a completed Max
