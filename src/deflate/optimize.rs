@@ -206,6 +206,20 @@ impl DefaultFloor {
         matches!(self, Self::CompleteThenBounded)
     }
 
+    /// Whether a bounded PNG owner can run original-source Max beside the
+    /// dependent deft4j refinement inside the same assigned wall window.
+    ///
+    /// A standalone PNG owns the file window directly. Each APNG child owns a
+    /// proportional frame window assigned by the outer scheduler. Both start
+    /// the independent source root even when the direct deft4j parent is
+    /// immediately smaller: score order between complete parents does not
+    /// prove order between their eventual search endpoints. Giving both roots
+    /// a positive concurrent share makes each reachable as the allowance
+    /// grows. Other shared container members retain their serial route order.
+    fn allows_parallel_source_follow_up(self) -> bool {
+        matches!(self, Self::CompleteThenBounded | Self::ApngMax)
+    }
+
     fn owns_terminal_stream_time(self) -> bool {
         matches!(self, Self::Complete | Self::CompleteThenBounded)
     }
@@ -777,10 +791,9 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     // Continue the strongest unfinished dependent lineage before starting
     // refinements from weaker parents. This is a score-ordered search rule,
     // not a size or corpus gate: the retained incumbent protects every other
-    // complete result, and sufficient time still reaches the later siblings.
-    // It also avoids waiting for an independent source worker and then
-    // spending the final allowance refining a candidate already behind the
-    // floor-seeded endpoint.
+    // complete result. It also avoids waiting for an independent source
+    // worker and then spending the final allowance refining a candidate
+    // already behind the floor-seeded endpoint.
     //
     // An admitted compact split is an independent bounded sibling, but merely
     // being eligible does not predict that it will improve its parent. When
@@ -821,6 +834,17 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         parallel_routes,
         seed_weak_deft4j || deft4j_candidate.is_some(),
     );
+    // APNG children have no serial time after a continuation that uses their
+    // whole assigned window. Keep the independent original-source root live
+    // beside that continuation; otherwise every larger allowance merely lets
+    // the same dependent planner run longer and can never reach the omitted
+    // basin. Standalone PNG keeps its existing bounded route envelope here.
+    let overlap_source_max_with_continuation = continue_best_floor_seeded
+        && default_floor == DefaultFloor::ApngMax
+        && parallel_routes
+        && source_max_candidate.is_none()
+        && !suppress_later_source_max
+        && deadline.can_start_route();
     let floor_seeded_step =
         continue_best_floor_seeded.then(|| progress.start("Columbo floor-seeded continuation"));
     let continuation_split_step = (continue_best_floor_seeded
@@ -834,7 +858,60 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         let seeded = floor_seeded_candidate
             .as_mut()
             .expect("continuation requires a floor-seeded candidate");
-        if overlap_deft4j_refinement_with_continuation {
+        if overlap_source_max_with_continuation {
+            let (refined, source_max) =
+                thread::scope(|scope| -> Result<(Option<Candidate>, Option<Candidate>)> {
+                    let source_worker = thread::Builder::new()
+                        .name("columbo-source-max-continuation".into())
+                        .spawn_scoped(scope, || {
+                            run_route_with_cancellation(&deadline, || {
+                                build_source_max_candidate(
+                                    source,
+                                    options,
+                                    progress,
+                                    &deadline,
+                                    integrated_compact_source_max,
+                                    &mut deadline.hard_stop(),
+                                )
+                            })
+                        });
+                    let Ok(source_worker) = source_worker else {
+                        // Thread exhaustion retains the prior score-ordered
+                        // continuation. A later serial source route remains
+                        // eligible if that continuation finishes in time.
+                        let refined = refine_with_max_planner(
+                            seeded,
+                            options,
+                            decoded_limit,
+                            identity,
+                            &mut deadline.hard_stop(),
+                        )?;
+                        return Ok((Some(refined), None));
+                    };
+                    let refined = refine_with_max_planner(
+                        seeded,
+                        options,
+                        decoded_limit,
+                        identity,
+                        &mut deadline.hard_stop(),
+                    );
+                    if refined.is_err() {
+                        deadline.cancel_routes();
+                    }
+                    let source_max = match source_worker.join() {
+                        Ok(result) => result,
+                        Err(payload) => std::panic::resume_unwind(payload),
+                    }?;
+                    Ok((Some(refined?), Some(source_max)))
+                })?;
+            if let Some(source_max) = source_max {
+                source_max_candidate = Some(source_max);
+                suppress_later_source_max = true;
+            }
+            if let Some(refined) = refined {
+                floor_seeded_changed = seeded.replace_if_smaller(refined);
+            }
+        } else if overlap_deft4j_refinement_with_continuation {
             let (refined, split, refinement_completed) = thread::scope(
                 |scope| -> Result<(Option<Candidate>, Option<Candidate>, bool)> {
                     let refinement_worker = thread::Builder::new()
@@ -1113,7 +1190,7 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     .then(|| progress.start("deft4j-derived refinement"));
     if run_bounded_refinement {
         let run_concurrent_source_max = options.exhaustive
-            && default_floor.uses_bounded_png_routes()
+            && default_floor.allows_parallel_source_follow_up()
             && parallel_routes
             && source_max_candidate.is_none()
             && !suppress_later_source_max
@@ -7825,6 +7902,18 @@ mod tests {
             DefaultFloor::MandatoryComplete,
         ] {
             assert!(!shared.owns_terminal_stream_time());
+        }
+        assert!(DefaultFloor::CompleteThenBounded.allows_parallel_source_follow_up());
+        assert!(DefaultFloor::ApngMax.allows_parallel_source_follow_up());
+        for serial in [
+            DefaultFloor::Complete,
+            DefaultFloor::Shared,
+            DefaultFloor::SharedExact,
+            DefaultFloor::ApngDefault,
+            DefaultFloor::Established,
+            DefaultFloor::MandatoryComplete,
+        ] {
+            assert!(!serial.allows_parallel_source_follow_up());
         }
 
         let block = ParsedBlock {

@@ -18,13 +18,14 @@ current results.
 | --- | ---: | --- | --- |
 | DeflOpt last complete journal | 1,914 rows / 957 pairs | `a700a360…` | six strict-policy rows representing three files; no errors; Max never worse than Default |
 | Candidate family sample | 68 rows / 34 pairs | `cef3db1d…` | two rows for one strict-policy file; no route miss or error; Max never worse than Default |
-| Defluff candidate journal | all 66 pairs | `cef3db1d…` | no miss or error |
+| Defluff candidate journal | all 66 pairs | `4eaf3355…` | no miss or error |
 | timed deft4j last complete journal | 1,621 rows | `a700a360…` | twelve strict-policy rows and one safe PNG-preservation row; no errors |
 | targeted deft4j recovery | 2 affected files, 3 runs each | `cef3db1d…` | both former 9-byte regressions recover their exact older byte and bit floors |
-| rolling priority guard | 100 unique files | `cef3db1d…` | 96 floors pass; no new failure; Max never trails current Default |
+| APNG doubled-time regression pass | 70 prior misses | `c5036306…` | 68 strict byte-and-bit recoveries; two accepted route trade-offs; no errors; net 1,800 bytes smaller than the previous binary |
+| rolling priority guard | 100 unique files | `c5036306…` | 97 floors pass; no new failure; Max never trails current Default |
 
 The integrated candidate is `target/release/columbo`, SHA-256
-`cef3db1d92471ddfff1dc9b2ddd6661c7e2c37955deeb64daadb9bcf0289a79a`.
+`c50363060e07b258667a8049db8ab133f011214a1897c2d96da548a450aea825`.
 The complete DeflOpt and timed deft4j journals remain valid evidence for their
 recorded preceding binary; neither has been relabelled as a candidate result.
 A final DeflOpt refresh was stopped after 274 Default rows at the user's
@@ -70,7 +71,7 @@ bits respectively. Each recovery was reproduced three times. A complete
 candidate refresh is still required before the official timed report can
 replace the preceding journal's classification.
 
-## Candidate movement
+## Earlier candidate movement
 
 The exact candidate samples were joined to the preceding complete journals by
 format, source name, and mode. This compares identical files and references
@@ -84,8 +85,8 @@ rather than aggregate results from different samples.
   scheduling class, so they cannot take the changed branch; the variation is
   from deadline-limited search. Every result still passes the reference and
   Max-over-Default gates.
-- The complete Defluff comparison has 58 wins and eight ties, for a net saving
-  of 102 bytes / 852 meaningful Deflate bits.
+- The latest complete Defluff comparison has 58 wins and eight ties, for a net
+  saving of 108 bytes / 918 meaningful Deflate bits.
 - The two deft4j rows directly affected by the scheduling change recover 18
   bytes and 140 bits in total.
 
@@ -98,16 +99,17 @@ on the two sampled Max rows with smaller prior timed endpoints.
 
 `work/regression-guard.json` is authoritative. It retains the latest 100
 unique `(format, source)` identities, and insertion deduplicates a recurring
-file. The candidate run performed 108 serial trials including confirmation
-reruns: 96 historical floors pass at their recorded allowance, the same four
+file. The integrated run performed 106 serial trials including confirmation
+reruns: 97 historical floors pass at their recorded allowance, three inherited
 residual files remain, and Max never trails the Default result produced by the
-same executable. The two newly recovered deft4j files are both present in the
-deduplicated guard tail.
+same executable. A previously inherited one-bit residual for
+`oxipng/palette_should_be_reduced_with_missing.png` now passes. The five new
+failures exposed by the rejected general Huffman/tree-routing experiment also
+pass after retaining their established general routes.
 
 | File | Mode | Byte loss | Bit loss | Disposition |
 | --- | --- | ---: | ---: | --- |
 | `medium/Nutcracker.png` | Max+5s | 1 | 7 | inherited timed route basin |
-| `oxipng/palette_should_be_reduced_with_missing.png` | Max | 0 | 1 | inherited equal-byte historical bit floor |
 | `css-ig-net/sample_34-fs8.png` | Max | 4 | 28 | accepted timed route basin |
 | `medium/LevelLoading.png` | Max+5s | 6 | 49 | inherited timed route basin |
 
@@ -198,6 +200,31 @@ score, or measured-runtime gate. It restores the two affected interlaced PNG
 floors while leaving `oxipng/issue-59.png` on the completed-floor-first path
 and preserving the dense-repartition path used by `GK1.png`.
 
+### Fair APNG independent roots
+
+An APNG frame owns only the proportional wall window assigned by the outer
+file scheduler. A selected floor continuation can consume that entire window,
+and a direct-deft refinement can likewise leave no serial time for the
+independent original-source Max root. Immediate parent size cannot prove the
+order of endpoints reached by different token and boundary topologies.
+
+Under bounded `ApngMax`, original-source Max therefore receives a concurrent
+share beside either dependency. The retained complete incumbent still gates
+selection, so parallel work cannot enlarge the output. Each independent root
+receives positive work as the allowance grows, eliminating structural route
+starvation without a filename, corpus score, or measured-runtime threshold.
+The same direct-deft/source overlap applies to the existing bounded
+single-image PNG policy; other shared container members retain their serial
+resource schedule.
+
+At doubled time, the integrated candidate recovers 68 of the 70 prior APNG
+byte-and-bit floors and is 1,800 bytes / 14,440 meaningful bits smaller in
+aggregate than the previous binary. Three directly affected starvation
+witnesses improve by 7, 49, and 30 bytes. The two retained losses are general
+tree-route trade-offs of 4 and 2 bytes; changing those shared methods recovered
+the six APNG bytes but created five protected PNG regressions totalling 54
+bytes, so that experiment was rejected.
+
 ### Existing accepted controls retained
 
 The candidate retains the previously audited general controls:
@@ -217,11 +244,20 @@ The candidate retains the previously audited general controls:
 
 ## Accepted trade-offs
 
-The four remaining guard differences are kept visible. They total 11 bytes
-and 85 meaningful bits across independent deadline-limited searches; the
+The three remaining guard differences are kept visible. They total 11 bytes
+and 84 meaningful bits across independent deadline-limited searches; the
 largest is 6 bytes / 49 bits. No filename-specific gate, ten-second threshold,
 or reference score is used to hide them. A future change must improve their
 general search classes without sacrificing broader gains.
+
+The APNG doubled-time pass retains two additional general-route trade-offs:
+`2313020_361766…` is 4 bytes / 39 bits above the previous binary, and
+`657730_102978…` is 2 bytes / 14 bits above it. Both remain substantially
+smaller than the pre-fix baseline in aggregate context, and all 70 cases
+produce a net 1,800-byte win. Restoring those two endpoints by changing
+general Huffman/tree pricing caused the five larger rolling-guard regressions
+above; running both complete token planners would impose a broad Max-time cost
+for a six-byte local recovery.
 
 The two smaller sampled Max endpoints that were not reproduced are outside
 the changed work class and still pass both the external reference and
@@ -230,17 +266,20 @@ reason to add an unrelated corpus-specific scheduling rule.
 
 ## Verification
 
-- `cargo test --locked`: 481 tests passed (425 library, 46 CLI, 10 public API).
+- `cargo test --locked`: 507 tests passed (448 library, 46 CLI, 13 public API).
 - `cargo fmt --check`: passed.
 - `cargo clippy --locked --all-targets -- -D warnings`: passed.
-- Full candidate Defluff replay: 66/66 pass with no errors.
+- Latest full Defluff replay (`4eaf3355…`): 66/66 pass with no errors.
 - Candidate DeflOpt family sample: 68 rows / 34 pairs; one strict-policy file,
   no route miss or error, and Max never worse than Default.
 - The two targeted deft4j regressions recover their exact historical byte and
   bit floors in three candidate runs each.
 - Matched sample: all 34 Default outputs are identical; 31 Max outputs are
   identical; every Max output dominates its current Default result.
-- Rolling priority guard: 96/100 floors pass across 108 serial trials, with no
+- Integrated APNG doubled-time pass: 68/70 strict floors recovered, both
+  residuals logged, no errors, and an aggregate 1,800-byte / 14,440-bit win
+  over the previous binary.
+- Rolling priority guard: 97/100 floors pass across 106 serial trials, with no
   new failure and exactly 100 unique entries.
 - A final complete DeflOpt refresh was intentionally interrupted after 274
   Default rows. The last complete public report remains the authoritative
