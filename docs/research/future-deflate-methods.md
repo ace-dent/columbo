@@ -22,6 +22,9 @@ Alphabet support intervals now supply
 gains beyond the old anchor graph and freshly frozen Max parents. The
 Default-enabled experiment exceeded the runtime policy; the retained search
 uses existing Max allowances and preserves measured Default output parity.
+A joint [code-length tree/RLE solver](code-length-tree-validation.md) now has
+an exact fixed-data-tree formulation and a validated bounded Max implementation. It finds gains beyond full existing header repricing,
+including frozen Max endpoints that completed before their deadline.
 The follow-up distinguishes untested proposals from production methods.
 Further validation of [permanent original-match proofs](permanent-match-proofs-validation.md)
 now identifies a reproducible absent token choice, including a completed Max
@@ -124,7 +127,7 @@ first, then meaningful Deflate bits. Padding-only changes do not win.
 | Blocks | Stored/fixed/dynamic pricing; merge/group/split routes; cuts inside proven matches; alignment-aware boundary graph; adaptive split; one reseat; one forced-split escape | A reproducible miss requiring wider lookahead |
 | Tokens | Length-258 handling; match-to-literal families; same-distance repacking; proven-submatch graph; bounded multi-match header-aware composition | A diagnosed joint-header miss outside the current beam |
 | Data trees | DeflOpt, Defluff, deft4j, and Columbo builders; package-first and leaf-first exact package-merge ties; source-tree reuse; equal-frequency assignments; swaps; three pseudo-frequency methods; paired exact depth-10/depth-9 candidates; a completed-stream frontier across every feasible restricted maximum depth; an independent per-alphabet depth cross-product for Max terminal work; pair/quad Kraft moves; paired pricing; terminal positive-payload length swaps | A concrete absent near-optimal tree shape |
-| Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback; terminal advertised literal-span search; joint payload-tree/RLE DP under one fixed CL tree at depth ≤9 | A real header requiring a retained alternate RLE histogram |
+| Dynamic header | All eight repeat-code masks; balanced and zero-continuation encodings; multiple inherited routes; exact shortest RLE for one fixed tree; exhaustive header pricing for Max bounded-depth terminal candidates; bounded feedback; terminal advertised literal-span search; joint payload-tree/RLE DP under one fixed CL tree at depth ≤9; bounded Max joint CL-tree/RLE search for fixed data trees and spans | A real header outside the completed solver domain, or a diagnosed budget cutoff |
 | Runtime | Canonical plan and header caches; range and edge reuse; exact-verified bounded fingerprints; pointer-aware token adoption; fixed-size merge-histogram composition; parser/decode/emission and Huffman-heap hot paths | Measured duplicate work or a new profile hotspot |
 
 After the runtime changes, a second 5-second sample contained no SipHash
@@ -373,6 +376,7 @@ recompression and container transforms that would change Columbo's scope.
 | Source | Responsibility |
 | --- | --- |
 | [`header.rs`](../../src/deflate/header.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE, finished-tree moves |
+| [`header/tree.rs`](../../src/deflate/header/tree.rs) | Joint CL-tree/RLE optimization using run costs and complete Kraft capacity |
 | [`huffman.rs`](../../src/deflate/huffman.rs) | Length-limited builders, pseudo-frequencies, decode tables |
 | [`search.rs`](../../src/deflate/search.rs) | Same-distance, match-family, proven-submatch, feedback, and composition searches |
 | [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, entropy-state scout, boundary graph, reseat, forced split, range caches |
@@ -397,7 +401,11 @@ Retained methods require focused oracles plus wrapper-level differentials.
 Default methods require broad wins with negligible runtime regression. Rare
 header or boundary wins remain Max-only.
 
-Latest retained execution pass:
+The latest CL-tree/RLE change passes 530 tests, preserves 404 Default outputs,
+and passes strict/relaxed Max and Defluff comparisons; its
+[validation report](code-length-tree-validation.md) records the bounds and results.
+
+Earlier execution and profiling validation:
 
 - 466 Rust tests and formatting passed on Apple Silicon;
 - warning-free all-target Clippy passed after the retained change;

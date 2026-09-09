@@ -2029,14 +2029,19 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     )?;
 
     if options.exhaustive {
-        candidate = improve_with_terminal_header_search(
+        for search in [
             TerminalHeaderSearch::AlphabetBoundaries,
-            source,
-            options,
-            DefaultFloorWork::Timed(&deadline),
-            progress,
-            candidate,
-        )?;
+            TerminalHeaderSearch::HeaderTree,
+        ] {
+            candidate = improve_with_terminal_header_search(
+                search,
+                source,
+                options,
+                DefaultFloorWork::Timed(&deadline),
+                progress,
+                candidate,
+            )?;
+        }
     }
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
@@ -3670,6 +3675,7 @@ enum TerminalHeaderSearch {
     JointTreeRle,
     SymbolSets,
     AlphabetBoundaries,
+    HeaderTree,
 }
 
 struct TerminalSearchBudget {
@@ -3677,6 +3683,7 @@ struct TerminalSearchBudget {
     joint: super::joint::JointBudget,
     symbols: super::symbol_set::SymbolSetBudget,
     alphabet: super::stream::AlphabetBudget,
+    header_tree: super::header::HeaderTreeBudget,
 }
 
 impl TerminalHeaderSearch {
@@ -3687,12 +3694,13 @@ impl TerminalHeaderSearch {
             Self::JointTreeRle => "Joint tree/RLE",
             Self::SymbolSets => "Symbol set removal",
             Self::AlphabetBoundaries => "Alphabet boundary search",
+            Self::HeaderTree => "Code-length tree search",
         }
     }
 
     fn max_bytes(self) -> usize {
         match self {
-            Self::AlphabetBoundaries => 1024 * 1024,
+            Self::AlphabetBoundaries | Self::HeaderTree => 1024 * 1024,
             _ => TERMINAL_HEADER_MAX_BYTES,
         }
     }
@@ -3736,6 +3744,12 @@ impl TerminalHeaderSearch {
                     Self::JointTreeRle => {
                         super::joint::plan_joint_tree_rle(block, &mut budget.joint, stop)
                     }
+                    Self::HeaderTree => super::header::plan_header_tree(
+                        block,
+                        options.strict,
+                        &mut budget.header_tree,
+                        stop,
+                    ),
                     Self::SymbolSets | Self::AlphabetBoundaries => unreachable!(),
                 }?;
                 PlannedBlock {
@@ -3824,6 +3838,7 @@ fn refine_with_terminal_header_search(
         joint: super::joint::JointBudget::new(),
         symbols: super::symbol_set::SymbolSetBudget::new(),
         alphabet: super::stream::AlphabetBudget::new(),
+        header_tree: super::header::HeaderTreeBudget::new(),
     };
     let mut bits = 0_u64;
     let mut changed = false;
@@ -3899,7 +3914,7 @@ struct CompleteDefaultFloor {
     /// The ordinary base used by the established bounded max lineage.
     max_seed: Candidate,
     /// The complete Default endpoint, optionally strengthened by the bounded
-    /// Max-only alphabet sibling within the existing Max allowance.
+    /// Max-only terminal siblings within the existing Max allowance.
     complete: Candidate,
 }
 
@@ -3907,7 +3922,7 @@ fn build_complete_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
-    alphabet_work: DefaultFloorWork<'_>,
+    terminal_work: DefaultFloorWork<'_>,
 ) -> Result<CompleteDefaultFloor> {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
@@ -3967,25 +3982,31 @@ fn build_complete_default_floor_candidate(
     // Max alone may strengthen the completed ordinary comparison endpoint.
     // The historical seed stays independent, and this extra search consumes
     // the caller's existing Max allowance rather than mandatory Default work.
-    let complete = improve_with_terminal_header_search(
+    let mut complete = complete;
+    for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
-        source,
-        &floor_options,
-        alphabet_work,
-        progress,
-        complete,
-    )?;
+        TerminalHeaderSearch::HeaderTree,
+    ] {
+        complete = improve_with_terminal_header_search(
+            search,
+            source,
+            &floor_options,
+            terminal_work,
+            progress,
+            complete,
+        )?;
+    }
 
     Ok(CompleteDefaultFloor { max_seed, complete })
 }
 
-/// Keep APNG's Default endpoint, then admit the Max-only alphabet sibling
+/// Keep APNG's Default endpoint, then admit the Max-only terminal siblings
 /// within this frame's existing allowance.
 fn build_complete_apng_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
-    alphabet_work: DefaultFloorWork<'_>,
+    terminal_work: DefaultFloorWork<'_>,
 ) -> Result<Candidate> {
     let floor_options = Options {
         exhaustive: false,
@@ -4014,14 +4035,19 @@ fn build_complete_apng_default_floor_candidate(
             complete,
         )?;
     }
-    complete = improve_with_terminal_header_search(
+    for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
-        source,
-        &floor_options,
-        alphabet_work,
-        progress,
-        complete,
-    )?;
+        TerminalHeaderSearch::HeaderTree,
+    ] {
+        complete = improve_with_terminal_header_search(
+            search,
+            source,
+            &floor_options,
+            terminal_work,
+            progress,
+            complete,
+        )?;
+    }
     Ok(complete)
 }
 

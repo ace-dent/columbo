@@ -1,6 +1,6 @@
 # New byte-saving methods worth exploring
 
-Research date: 5 September 2026. Source baseline: `9ac02b660ca0867da15547d0d2daed3847d5cf37` **plus the existing working-tree changes**, including `optimize.rs`. The original sections record a small exploratory probe. The positive-payload swap method was subsequently [implemented and validated on 6 September](payload-header-tradeoff-validation.md); advertised literal-span search was subsequently [implemented and validated](literal-span-validation.md), and joint payload-tree/RLE search is now [implemented and validated](joint-tree-rle-validation.md). Symbol-set removal is now [implemented and validated](symbol-set-validation.md). Alphabet-boundary search is now [implemented and validated in Max](alphabet-boundary-validation.md). The remaining proposals are research. “New” means an additional search dimension relative to the inspected Columbo implementation; worldwide novelty is not claimed.
+Research date: 5 September 2026. Source baseline: `9ac02b660ca0867da15547d0d2daed3847d5cf37` **plus the existing working-tree changes**, including `optimize.rs`. The original sections record a small exploratory probe. The positive-payload swap method was subsequently [implemented and validated on 6 September](payload-header-tradeoff-validation.md); advertised literal-span search was subsequently [implemented and validated](literal-span-validation.md), and joint payload-tree/RLE search is now [implemented and validated](joint-tree-rle-validation.md). Symbol-set removal is now [implemented and validated](symbol-set-validation.md). Alphabet-boundary search is now [implemented and validated in Max](alphabet-boundary-validation.md). Joint code-length tree/RLE search is now [implemented and validated in Max](code-length-tree-validation.md). The remaining extensions are research. “New” means an additional search dimension relative to the inspected Columbo implementation; worldwide novelty is not claimed.
 
 The first retained method is **payload-cost-increasing code-length swaps**. A small probe found actual gains after Columbo's completed Default raw-stream optimization. Joint optimization of data-code lengths and their RLE description is now retained as a bounded terminal pass.
 
@@ -25,7 +25,7 @@ Improving one term can worsen another. The proposals below target combinations o
 | Implemented | Joint data-tree and RLE dynamic programming | After R3, 160/365 distinct completed Default streams save 3,344 bits and 419 bytes | [Production solver, oracle, bounds and validation](joint-tree-rle-validation.md) |
 | Implemented | Remove a set of symbols to simplify the header | After R4, 27/365 streams save 860 bits and 113 bytes; nine streams retain 49 bits beyond combined existing-route/single-symbol controls | [Production validation and bounds](symbol-set-validation.md) |
 | Implemented in Max | Discover cuts from alphabet changes | Nine real streams retain 377 bits beyond old anchors with Max table prices; fresh Max A/Bs improve six of eight cases | [Production bounds, cost policy and validation](alphabet-boundary-validation.md) |
-| Supporting research | Enumerate the tiny header tree directly | Oracle proposal; not prototyped | Establish whether bounded feedback misses a better header on final trees |
+| Implemented in Max | Joint code-length tree and RLE search | Exact fixed-tree/spans solver; 22 Default parents and 20 frozen Max parents improve beyond full header repricing | [Solver, oracle and validation](code-length-tree-validation.md) |
 
 ## 1. Spend payload bits on better code-length permutations
 
@@ -99,13 +99,28 @@ The test must demonstrate a repeatable gain attributable to an anchor absent fro
 
 **Implemented follow-up.** R6 ranks support intervals, prices eight pairs, then adds their endpoints to the existing eight-alignment graph. Shared stream caps are 2^26 work units and 4,096 range prices. [Validation](alphabet-boundary-validation.md) demonstrates additional anchors beyond Max-priced old-anchor controls and direct gains on freshly frozen Max parents. The Default-enabled experiment saved 539 raw bytes but added 12.4% runtime, and selected containers added 27.7%; that placement was rejected. The retained Max-only search uses existing Max windows, preserves the historical seed and complete candidates, and leaves all 404 measured Default outputs unchanged. Fresh strict Max A/Bs improve six of eight cases; relaxed Max and Defluff checks pass.
 
-## Supporting research: search the header tree directly
+## 6. Search the header tree directly
 
-`shortest_rle` finds the shortest spelling for **one fixed code-length Huffman tree**. `consider_rle` explores seeded, bounded feedback paths; its exhaustive setting is not an enumeration of every possible header tree and spelling. The earlier K-best RLE experiment was rejected on runtime and lack of final real-world gains.
+**Gap.** `shortest_rle` finds the cheapest spelling for one fixed code-length
+Huffman tree. Seeded, bounded feedback does not enumerate every joint tree and
+spelling. The earlier K-best RLE experiment lacked final real-world gains;
+reinstating that path beam without new evidence remains unwarranted.
 
-A different oracle would enumerate complete, at-most-seven-bit code-length trees over the small set of RLE symbols that can occur, including optional repeat-symbol support and strict completion when necessary. For each tree, run the existing shortest-path RLE solver and add its actual HCLEN cost. Enumerate all admitted support choices if claiming exactness; an arbitrary support cap yields only a bounded oracle.
+**Implemented formulation.** Factor the fixed data-length list into maximal
+runs. Enumerate repeat-16's code length, compute each positive value's run cost
+at every possible literal code price, and solve a 128-unit Kraft-capacity DP.
+Enumerating the remaining zero/repeat code lengths selects a capacity state;
+exact zero-run prices complete the objective. HCLEN is fixed by mandatory
+positive values. This covers every useful complete seven-bit CL tree for the
+fixed data trees and advertised spans, including optional repeat support.
 
-This searches the cost models directly instead of retaining many paths with repeated histograms. Begin with final headers having very small possible RLE alphabets. Use any diagnosed miss to design a cheap candidate generator, or use a proven optimum to avoid spending further header-only effort on that state. Do not reinstate broad K-best feedback without new evidence.
+The [validation report](code-length-tree-validation.md) compares the solver
+with exhaustive tree enumeration, existing full header repricing, and freshly
+captured Max parents. A bounded terminal Max implementation preserves every
+completed incumbent, shares 2^24 work units per stream, and leaves Default
+unchanged. Public-API checks improve 10 of 13 selected strict Max cases and three of four relaxed Max cases, with no regressions; all 404 Default outputs remain byte-identical. This is a new joint
+cost-model search within Columbo; it is not a claim of global Deflate
+optimality or worldwide novelty.
 
 ## Probe results and limits
 
@@ -138,4 +153,4 @@ search.rs    63cfcb13590e3c07a53715f70d5813eeff2454340337fd6a3e6b88ba9d7a5c58
 optimize.rs  906ca286df6ebe4cdc8cc8320ce22d3d7e1d85a04546259d461afcb4a6637417
 ```
 
-The positive-payload method has passed its [production acceptance test](payload-header-tradeoff-validation.md), literal-span search has passed its [separate incremental validation](literal-span-validation.md), joint tree/RLE search has passed its [incremental validation](joint-tree-rle-validation.md), symbol-set removal has passed its [incremental validation](symbol-set-validation.md), and alphabet-boundary search has passed its [Max-only validation](alphabet-boundary-validation.md). For the remaining proposals, compare additive terminal candidates against completed Default and Max outputs across PNG/APNG, GZIP, ZIP, and zlib families. Include already-optimized references, deduplicate streams when assessing generality, measure exact work and runtime, and independently decode reconstructed wrappers. Preserve every complete incumbent. Require reproducible incremental savings with acceptable cost; a synthetic witness or a wall-clock scheduling advantage alone is insufficient.
+The positive-payload method has passed its [production acceptance test](payload-header-tradeoff-validation.md), literal-span search has passed its [separate incremental validation](literal-span-validation.md), joint tree/RLE search has passed its [incremental validation](joint-tree-rle-validation.md), symbol-set removal has passed its [incremental validation](symbol-set-validation.md), alphabet-boundary search has passed its [Max-only validation](alphabet-boundary-validation.md), and joint code-length tree/RLE search has passed its [Max-only validation](code-length-tree-validation.md). For the remaining proposals, compare additive terminal candidates against completed Default and Max outputs across PNG/APNG, GZIP, ZIP, and zlib families. Include already-optimized references, deduplicate streams when assessing generality, measure exact work and runtime, and independently decode reconstructed wrappers. Preserve every complete incumbent. Require reproducible incremental savings with acceptable cost; a synthetic witness or a wall-clock scheduling advantage alone is insufficient.
