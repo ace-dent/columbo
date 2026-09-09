@@ -581,13 +581,21 @@ fn strided_range_histograms_match_direct_recounting() {
         (0, 256),
         (0, 257),
         (17, 257),
+        (249, 251),
+        (254, 256),
+        (255, 256),
+        (255, 257),
+        (256, 257),
         (250, 520),
         (256, 512),
         (255, 511),
-        (256, 512),
+        (500, 511),
+        (511, 513),
+        (512, 512),
         (257, 513),
         (257, 699),
         (699, 700),
+        (700, 700),
         (0, 700),
     ] {
         let indexed = composite.range_frequencies(start, end).unwrap();
@@ -600,6 +608,9 @@ fn strided_range_histograms_match_direct_recounting() {
             "{start}..{end}"
         );
     }
+    assert!(composite.range_frequencies(2, 1).is_none());
+    assert!(composite.range_frequencies(0, 701).is_none());
+    assert!(composite.range_frequencies(701, 701).is_none());
 
     // Near the optional-model ceiling, Columbo preserves the established
     // structural route without the index and falls back to a direct scan.

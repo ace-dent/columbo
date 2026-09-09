@@ -3800,15 +3800,16 @@ impl<'a> Composite<'a> {
         Some(frequencies)
     }
 
-    /// Count one token range by subtracting independently reconstructed
-    /// prefixes. The optional index makes work independent of the range's
-    /// interior length; near the memory ceiling, a direct scan preserves the
-    /// established structural route without exceeding its model budget.
+    /// Use the cheaper of a direct scan and two indexed prefixes. The index
+    /// bounds work for long ranges, while direct scans avoid recounting an
+    /// overlapping prefix for short ranges. Near the memory ceiling, a direct
+    /// scan also preserves the route without exceeding its model budget.
     fn range_frequencies(&self, start: usize, end: usize) -> Option<FrequencyCheckpoint> {
         if start > end || end > self.tokens.len() {
             return None;
         }
-        if self.frequency_checkpoints.is_none() {
+        let prefix_tokens = start % RANGE_HISTOGRAM_INTERVAL + end % RANGE_HISTOGRAM_INTERVAL;
+        if self.frequency_checkpoints.is_none() || end - start <= prefix_tokens {
             let mut frequencies = FrequencyCheckpoint::zero();
             for token in &self.tokens[start..end] {
                 frequencies.add_token(token)?;

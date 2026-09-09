@@ -201,3 +201,57 @@ Validation for this follow-up:
 Harness sources, logs and baseline/candidate API drivers are retained under
 `work/efficiency-review-joint/`. The committed baseline build is retained under
 `target/efficiency-review-joint-baseline/`.
+
+## Follow-up against `4cc332f`, 9 September 2026
+
+The committed joint-tree and symbol-set changes match their validated source
+hashes. A further review of boundary scoring found repeated token counting in
+the shared range-histogram helper. Even for a one-token interval near the end
+of a checkpoint, it reconstructed two overlapping cumulative prefixes and
+subtracted their full frequency arrays.
+
+The helper now compares the range length with the number of tokens needed to
+reconstruct those two checkpoint tails. When a direct scan visits no more
+tokens, it counts the range directly using the existing fallback loop.
+Long ranges retain the checkpoint index; indexed calls still visit at most
+510 tokens. No cache, allocation, search route or budget change is introduced.
+The literal/length counts, distance counts, payload extra bits and single
+end-of-block frequency remain exact.
+
+Focused measurements used extracted original/revised helpers and checkpoint
+construction code with identical mixed literal/match input. Rust 1.97.1,
+optimized builds, overflow checks, fat LTO and one codegen unit on macOS arm64;
+medians of seven batches of 100,000 calls, alternating variant order:
+
+| Token range | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| Empty, 255..255 | 0.696 µs | 0.054 µs | 12.99× |
+| One token, 254..255 | 0.699 µs | 0.052 µs | 13.43× |
+| Within a checkpoint, 224..248 | 0.661 µs | 0.069 µs | 9.63× |
+| Across a checkpoint, 250..270 | 0.483 µs | 0.064 µs | 7.51× |
+| Aligned, 256..512 | 0.272 µs | 0.271 µs | 1.00× |
+| Long, 17..32760 | 0.483 µs | 0.483 µs | 1.00× |
+
+These are histogram-call measurements, not whole-file speedups. The two
+indexed control cases were neutral in this sample.
+
+Validation for this follow-up:
+
+- All 522 Rust tests passed with `cargo test --release -- --include-ignored`.
+  The existing direct-recount regression now includes more empty ranges,
+  ranges on both sides of checkpoints and invalid bounds; its duplicate
+  aligned-range case was replaced.
+- 592,138 original/revised comparisons matched, covering every interval of a
+  768-token mixed stream with and without the index, plus invalid bounds.
+  An additional 34,832 checks used an independent direct counter.
+- All 36 API comparisons retained exact output bytes and reported savings,
+  with independent decoding across PNG/APNG, GZIP, ZIP, zlib and raw Deflate.
+  These cover 16 inputs in Default and zero-budget Max, plus four ten-second
+  Max runs. One Max run completed and three reached their deadlines.
+  Whole-file timings were largely unchanged; the focused speedups above
+  should not be applied to complete optimization runs.
+- Clippy with warnings denied, formatting and whitespace checks passed.
+- The baseline and candidate release executables are both 1,728,048 bytes.
+
+The baseline executable/API driver, extracted helpers, source hashes and logs
+are retained under `work/efficiency-review-ranges/`.
