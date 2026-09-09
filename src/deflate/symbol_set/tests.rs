@@ -3,6 +3,84 @@
 use super::*;
 
 #[test]
+fn rewrite_limits_are_inclusive_and_rejections_keep_the_scan_charge() {
+    for (count, length, accepted) in [
+        (64, 3, true),
+        (65, 3, false),
+        (32, 256, true),
+        (32, 257, false),
+        (0, 3, false),
+    ] {
+        let (length_symbol, length_extra, length_extra_bits) =
+            super::super::model::canonical_length_encoding(length).unwrap();
+        let token = Token::Match {
+            length,
+            distance: 1,
+            length_symbol,
+            distance_symbol: 0,
+            length_extra,
+            distance_extra: 0,
+            length_extra_bits,
+            distance_extra_bits: 0,
+        };
+        let mut tokens = vec![Token::Literal(b'a')];
+        tokens.extend(std::iter::repeat(token).take(count));
+        tokens.resize(MAX_BLOCK_TOKENS, Token::Literal(b'a'));
+        let bytes = count * usize::from(length);
+        let plain = vec![b'a'; MAX_BLOCK_TOKENS - count + bytes];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let block = ParsedBlock {
+            tokens: tokens.into(),
+            plain: plain.into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: super::super::model::SourceBlockType::Fixed,
+        };
+        let mut budget = SymbolSetBudget::new();
+        let initial_work = budget.work_left;
+        let mut calls = 0;
+        let mut counter = || {
+            calls += 1;
+            false
+        };
+        let result = rewrite(
+            &block,
+            Ban {
+                lengths: 0,
+                distances: 1,
+            },
+            &super::super::huffman::FIXED_LITERAL_CODE_LENGTHS,
+            &super::super::huffman::FIXED_DISTANCE_CODE_LENGTHS,
+            &mut budget,
+            &mut SearchStop::callback(&mut counter),
+        );
+        assert_eq!(result.is_some(), accepted);
+        let rewrite_work = if accepted {
+            bytes + block.tokens.len()
+        } else {
+            0
+        };
+        assert_eq!(
+            budget.work_left,
+            initial_work - block.tokens.len() - rewrite_work
+        );
+        assert_eq!(budget.prices_left, 128);
+        if let Some(result) = result {
+            assert_eq!(result, vec![Token::Literal(b'a'); block.plain.len()]);
+            assert_proven_rewrite(&block, &result);
+            assert_eq!(calls, 1 + MAX_BLOCK_TOKENS / 256);
+        } else {
+            assert_eq!(calls, 1);
+        }
+    }
+}
+
+#[test]
 fn grouped_removal_keeps_certificates_and_strict_codes() {
     let block = symbol_set_test_block();
     let mut budget = SymbolSetBudget::new();

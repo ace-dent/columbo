@@ -77,23 +77,21 @@ fn payload_suffix(
         if stop.reached() {
             return None;
         }
-        for remaining in 0..=capacity {
-            let mut best = if frequencies[i] == 0 && zero {
-                costs[(i + 1) * stride + remaining]
-            } else {
-                INF
-            };
-            if i < reserved_from {
-                for &(length, units) in allowed {
-                    if units <= remaining {
-                        best = best.min(
-                            costs[(i + 1) * stride + remaining - units]
-                                + u64::from(frequencies[i]) * length as u64,
-                        );
-                    }
+        let (prefix, suffix) = costs.split_at_mut((i + 1) * stride);
+        let current = &mut prefix[i * stride..];
+        let next = &suffix[..stride];
+        if frequencies[i] == 0 && zero {
+            current.copy_from_slice(next);
+        }
+        if i < reserved_from {
+            for &(length, units) in allowed {
+                let price = u64::from(frequencies[i]) * length as u64;
+                // Assign this length to every capacity where it fits. The
+                // shifted suffix rows avoid a per-capacity feasibility test.
+                for (best, &rest) in current[units..].iter_mut().zip(next) {
+                    *best = (*best).min(rest + price);
                 }
             }
-            costs[i * stride + remaining] = best;
         }
     }
     Some(costs)

@@ -4,6 +4,76 @@ use super::super::header::shortest_rle;
 use super::super::huffman::make_lengths;
 use super::*;
 
+#[test]
+fn payload_suffix_matches_exhaustive_assignments_at_every_capacity() {
+    fn enumerate(
+        frequencies: &[u32],
+        reserved: usize,
+        allowed: &[(usize, usize)],
+        zero: bool,
+        remaining: usize,
+    ) -> u64 {
+        let Some((&frequency, rest)) = frequencies.split_first() else {
+            return if remaining == 0 { 0 } else { INF };
+        };
+        let next_reserved = reserved.saturating_sub(1);
+        let mut best = if zero && frequency == 0 {
+            enumerate(rest, next_reserved, allowed, zero, remaining)
+        } else {
+            INF
+        };
+        if reserved > 0 {
+            for &(length, units) in allowed {
+                if units <= remaining {
+                    best = best.min(
+                        u64::from(frequency) * length as u64
+                            + enumerate(rest, next_reserved, allowed, zero, remaining - units),
+                    );
+                }
+            }
+        }
+        best
+    }
+
+    let frequencies = [0, 1, u32::MAX, 0, 2];
+    let capacity = 8;
+    for mask in 0..8 {
+        let allowed: Vec<_> = (1..=3)
+            .filter(|&length| mask & (1 << (length - 1)) != 0)
+            .map(|length| (length, 1 << (3 - length)))
+            .collect();
+        for reserved in 0..=frequencies.len() {
+            for zero in [false, true] {
+                let actual = payload_suffix(
+                    &frequencies,
+                    reserved,
+                    capacity,
+                    &allowed,
+                    zero,
+                    &mut SearchStop::never(),
+                )
+                .unwrap();
+                for i in 0..=frequencies.len() {
+                    for remaining in 0..=capacity {
+                        let expected = enumerate(
+                            &frequencies[i..],
+                            reserved.saturating_sub(i),
+                            &allowed,
+                            zero,
+                            remaining,
+                        );
+                        assert_eq!(
+                            actual[i * (capacity + 1) + remaining],
+                            expected,
+                            "mask {mask}, reserved {reserved}, zero {zero}, suffix {i}, capacity {remaining}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn complete_vectors(frequencies: &[u32], reserved: usize, depth: usize) -> Vec<Vec<u8>> {
     fn visit(
         frequencies: &[u32],

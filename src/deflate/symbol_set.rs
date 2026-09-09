@@ -145,6 +145,11 @@ fn rewrite(
         affected += 1;
         let length = token.decoded_len();
         bytes += length;
+        // These totals only grow. Once either limit is exceeded, later
+        // tokens cannot make this candidate eligible for rewriting.
+        if affected > MAX_AFFECTED_MATCHES || bytes > MAX_REWRITTEN_BYTES {
+            return None;
+        }
         if let Token::Match {
             distance_symbol, ..
         } = token
@@ -156,11 +161,7 @@ fn rewrite(
             }
         }
     }
-    if affected == 0
-        || affected > MAX_AFFECTED_MATCHES
-        || bytes > MAX_REWRITTEN_BYTES
-        || !budget.spend(edges + bytes + block.tokens.len())
-    {
+    if affected == 0 || !budget.spend(edges + bytes + block.tokens.len()) {
         return None;
     }
     let mut result = Vec::new();
