@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 
-//! Shared terminal capability policy for the library progress reporters and CLI.
+//! Shared terminal capability policy for library progress reporters and the
+//! CLI.
+
+pub(crate) mod formatting;
+pub(crate) mod spinner;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -40,27 +44,4 @@ pub(crate) fn color_enabled_for(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_color_disables_styling_even_when_empty() {
-        assert!(!color_enabled_for(
-            true,
-            Some(OsString::new()),
-            Some(OsString::from("xterm"))
-        ));
-        assert!(!color_enabled_for(
-            true,
-            Some(OsString::from("1")),
-            Some(OsString::from("xterm"))
-        ));
-    }
-
-    #[test]
-    fn styling_also_requires_a_capable_terminal() {
-        assert!(!color_enabled_for(false, None, None));
-        assert!(!color_enabled_for(true, None, Some(OsString::from("dumb"))));
-        assert!(color_enabled_for(true, None, Some(OsString::from("xterm"))));
-    }
-}
+mod tests;

@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-/// Default maximum number of compressed input bytes accepted per top-level call.
+/// Default limit on compressed input bytes per top-level call.
 pub const MAX_INPUT_BYTES: u64 = 1 << 30;
 /// Default cumulative decoded-byte ceiling for one top-level call.
 pub const MAX_DECODED_BYTES: u64 = 1 << 30;

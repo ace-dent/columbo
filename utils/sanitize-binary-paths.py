@@ -11,11 +11,10 @@ reach a published artifact.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import stat
 import sys
 import tempfile
-
+from pathlib import Path
 
 UNIX_SEPARATOR = b"/"
 WINDOWS_SEPARATOR = b"\\"
@@ -153,14 +152,14 @@ def replace_atomically(path: Path, data: bytes) -> None:
         with tempfile.NamedTemporaryFile(
             mode="wb", prefix=f".{path.name}.", dir=path.parent, delete=False
         ) as temporary:
-            temporary.write(data)
             temporary_path = Path(temporary.name)
+            temporary.write(data)
         os.chmod(temporary_path, permissions)
         os.replace(temporary_path, path)
         temporary_path = None
     finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def parse_args(arguments: list[str]) -> tuple[bool, Path]:

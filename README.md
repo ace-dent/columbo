@@ -57,11 +57,17 @@ columbo --raw --timeout 60 stream.deflate
 
 Thanks to all contributors.
 
+## Development
+
+See the [contributor guide](docs/CONTRIBUTING.md) for build and test commands,
+and the [codebase guide](docs/architecture.md) for module responsibilities.
+The default test suite needs no private corpus. Corpus regressions are opt-in;
+their fixtures remain local and are excluded from Git and source packages.
 
 ## Legal
 
 All trademarks are the property of their respective owners.
 
-This work is provided under the [MIT](/.LICENSE) license, on an "as is" basis, without warranty of any kind regarding accuracy, completeness, or fitness for any specific purpose. Use of the provided content is entirely at your own risk. Please see the LICENSE for full terms of use.
+This work is provided under the [MIT](LICENSE) license, on an "as is" basis, without warranty of any kind regarding accuracy, completeness, or fitness for any specific purpose. Use of the provided content is entirely at your own risk. Please see the LICENSE for full terms of use.
 
 For alternative licensing arrangements, commercial use, or other permissions, please contact the project author directly.

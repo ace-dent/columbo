@@ -14,7 +14,7 @@ pub enum ErrorKind {
     UnsupportedFeature,
     /// A checksum or declared decoded size does not match the payload.
     IntegrityMismatch,
-    /// A configured input, decoded-size, expansion, or item-count limit was hit.
+    /// An input, decoded-size, expansion, or item-count limit was hit.
     ResourceLimit,
     /// A bounded internal structural-complexity limit was hit.
     ComplexityLimit,
@@ -84,4 +84,5 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Result returned by validation and optimization operations.
 pub type Result<T> = std::result::Result<T, Error>;

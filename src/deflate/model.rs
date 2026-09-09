@@ -168,9 +168,9 @@ pub(crate) struct OriginalBits {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedBlock {
-    // Immutable payload buffers are shared by parsed blocks and plans. Most
-    // planning choices only change representation metadata; sharing avoids
-    // retaining several full copies of a near-limit decoded stream.
+    /// Immutable payload buffers are shared by parsed blocks and plans. Most
+    /// planning choices only change representation metadata; sharing avoids
+    /// retaining several full copies of a near-limit decoded stream.
     pub(crate) tokens: Arc<Vec<Token>>,
     pub(crate) plain: Arc<Vec<u8>>,
     pub(crate) literal_frequencies: [u32; 286],

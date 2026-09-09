@@ -309,7 +309,7 @@ That tradeoff conflicts with Columbo's speed-first default policy.
 
 ### Strided range-frequency index
 
-Columbo's [`Composite`](../src/deflate/stream.rs) builds
+Columbo's [`Composite`](../../src/deflate/stream.rs) builds
 `frequency_checkpoints`, and its `prefix_frequencies` and `range_frequencies`
 methods answer token-range queries.
 
@@ -335,7 +335,7 @@ checks, memory gate, fallback, and extra-bit accounting are independent.
 
 Columbo's `add_adaptive_split_cut`, `coarse_to_fine_split`, and
 `cached_adaptive_split_score` in
-[`src/deflate/stream.rs`](../src/deflate/stream.rs) independently implement
+[`src/deflate/stream.rs`](../../src/deflate/stream.rs) independently implement
 the sample/smooth/narrow/scan concept used by
 `turtledeflate_best_block_split`.
 
@@ -371,7 +371,7 @@ Turtledeflate parity.
 ### Supporting boundary estimator
 
 Columbo's `estimate_boundary_block_bits` in
-[`src/deflate/header.rs`](../src/deflate/header.rs) supplies the cheap score
+[`src/deflate/header.rs`](../../src/deflate/header.rs) supplies the cheap score
 used by the adaptive search. It prices stored output, fixed output, and one
 simple dynamic candidate built with a DeflOpt-derived tree.
 

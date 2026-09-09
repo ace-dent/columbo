@@ -9,12 +9,10 @@ use columbo::{optimize, ErrorKind, Format, Options, MAX_EXPANSION_RATIO};
 const EMPTY_RAW: &[u8] = &[0x03, 0x00];
 const EMPTY_ZLIB: &[u8] = &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
 const NORMALIZED_EMPTY_ZLIB: &[u8] = &[0x08, 0xd7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
-// One stored byte followed by an empty final fixed block. Its 0x78, 0x01
-// prefix is also a valid RFC 1950 header, making byte-only detection ambiguous.
+/// One stored byte followed by an empty final fixed block. Its 0x78, 0x01
+/// prefix is also a valid RFC 1950 header, making byte-only detection
+/// ambiguous.
 const ZLIB_LIKE_RAW: &[u8] = &[0x78, 0x01, 0x00, 0xfe, 0xff, b'x', 0x03, 0x00];
-const RLE_SMOOTHING_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/tbbn2c16.png");
-const RLE_SMOOTHING_DEPTH_11_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/bgyn6a16.png");
-const CLASSIC_RLE_SMOOTHING_PNG: &[u8] = include_bytes!("fixtures/png/PngSuite/tbrn2c08.png");
 
 #[test]
 fn auto_detection_and_explicit_modes_agree() {
@@ -132,105 +130,18 @@ fn errors_expose_stable_machine_readable_kinds() {
 }
 
 #[test]
-fn compact_png_uses_the_rle_smoothed_reduced_depth_tree_floor() {
-    let optimized = optimize(RLE_SMOOTHING_PNG, Format::Png, &Options::default()).unwrap();
-
-    // The pre-floor endpoint is 2,039 bytes; smoothing at depth 15 reaches
-    // 2,037, and the reduced-depth frontier reaches 2,032. Keep this monotone
-    // so a future improvement can make the fixture smaller.
-    assert!(optimized.data.len() <= 2_032);
-    assert!(optimized.bits_saved >= 9 * 8);
-}
-
-#[test]
-fn rle_smoothed_tree_frontier_retains_the_depth_11_win() {
-    let optimized = optimize(RLE_SMOOTHING_DEPTH_11_PNG, Format::Png, &Options::default()).unwrap();
-
-    // Depths 15/10/9 stop at 3,443 bytes; depth 11 saves the next byte.
-    assert!(optimized.data.len() <= 3_442);
-    assert!(optimized.bits_saved >= 11 * 8);
-}
-
-#[test]
-fn rle_smoothed_tree_frontier_retains_the_classic_zopfli_win() {
-    let optimized = optimize(CLASSIC_RLE_SMOOTHING_PNG, Format::Png, &Options::default()).unwrap();
-
-    // The fixed-point family stops at 1,610 bytes; the classic nearby-count
-    // family reaches 1,608.
-    assert!(optimized.data.len() <= 1_608);
-    assert!(optimized.bits_saved >= 25 * 8);
-}
-
-#[test]
-fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
-    let source = include_bytes!("fixtures/png/PngSuite/f00n0g08.png");
-    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
-    // The completed pre-restoration endpoint occupied 297 bytes. Restoring
-    // the original 18-byte match at distance 34 saves its next physical byte.
-    assert!(ordinary.data.len() <= 296);
-    for (verbose, visual) in [(true, false), (false, true)] {
-        let reported = optimize(
-            source,
-            Format::Png,
-            &Options {
-                verbose,
-                visual,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(reported, ordinary);
+fn raw_auto_detection_preserves_resource_limit_errors() {
+    // A valid final stored block containing one byte. Auto mode falls back
+    // to raw Deflate; reaching the decoded limit is not a detection failure.
+    let source = [0x01, 0x01, 0x00, 0xfe, 0xff, b'x'];
+    let options = Options {
+        max_decoded_bytes: 0,
+        ..Options::default()
+    };
+    for format in [Format::Auto, Format::Raw] {
+        assert_eq!(
+            optimize(&source, format, &options).unwrap_err().kind(),
+            ErrorKind::ResourceLimit
+        );
     }
-    let max = optimize(
-        source,
-        Format::Png,
-        &Options {
-            exhaustive: true,
-            timeout: std::time::Duration::ZERO,
-            ..Options::default()
-        },
-    )
-    .unwrap();
-    assert!(max.data.len() <= ordinary.data.len());
-    assert!(max.bits_saved >= ordinary.bits_saved);
-}
-
-#[test]
-fn payload_header_tradeoff_reaches_png_and_the_mandatory_max_floor() {
-    let source = include_bytes!("fixtures/png/PngSuite/basi4a16.png");
-    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
-    // The completed parent was 2,827 bytes. A seven-bit payload tax removes
-    // eighteen header bits, saving eleven meaningful bits and one file byte.
-    assert!(ordinary.data.len() <= 2_826);
-    let max = optimize(
-        source,
-        Format::Png,
-        &Options {
-            exhaustive: true,
-            timeout: std::time::Duration::ZERO,
-            ..Options::default()
-        },
-    )
-    .unwrap();
-    assert!(max.data.len() <= ordinary.data.len());
-    assert!(max.bits_saved >= ordinary.bits_saved);
-}
-
-#[test]
-fn literal_span_reaches_png_output_and_the_mandatory_max_floor() {
-    let source = include_bytes!("fixtures/png/PngSuite/basi0g04.png");
-    let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
-    let max = optimize(
-        source,
-        Format::Png,
-        &Options {
-            exhaustive: true,
-            timeout: std::time::Duration::ZERO,
-            ..Options::default()
-        },
-    )
-    .unwrap();
-    // With no optional time, the complete PNG Default floor must include its
-    // final advertised-span spelling, even when the physical byte count ties.
-    assert_eq!(max.data, ordinary.data);
 }

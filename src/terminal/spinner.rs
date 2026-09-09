@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::presentation::{countdown_seconds, write_spinner_line};
 use crate::terminal;
+use crate::terminal::formatting::{countdown_seconds, write_spinner_line};
 
 const TICK: Duration = Duration::from_secs(1);
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
