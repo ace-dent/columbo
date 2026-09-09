@@ -93,7 +93,7 @@ fn source_ordered_list_removes_empty_blocks_but_keeps_one_empty_block() {
     );
     let all_empty = prepare_source_blocks(&[empty.clone(), empty]).unwrap();
     assert_eq!(all_empty.len(), 1);
-    assert!(all_empty[0].block.plain.is_empty());
+    assert!(all_empty[0].as_ref().unwrap().block.plain.is_empty());
 }
 
 #[test]
@@ -123,6 +123,61 @@ fn source_route_runs_past_the_historical_128_block_threshold() {
 
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].plain.len(), 129);
+}
+
+#[test]
+fn retired_merge_slots_preserve_order_alignment_and_the_unvisited_tail() {
+    let blocks: Vec<_> = [2, 3, 65_531, 4, 5]
+        .into_iter()
+        .enumerate()
+        .map(|(index, length)| {
+            let mut block = literal_block(&[], SourceBlockType::Stored);
+            block.plain = Arc::new(vec![index as u8; length]);
+            block
+        })
+        .collect();
+    let expected: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.plain.iter().copied())
+        .collect();
+    for alignment in 0..8 {
+        for cutoff in [0, 1, 10, 20, 40, usize::MAX] {
+            let mut calls = 0;
+            let mut expired = || {
+                calls += 1;
+                calls > cutoff
+            };
+            let plans = plan_source_blocks(
+                &blocks,
+                alignment,
+                &Options::default(),
+                &mut SearchStop::callback(&mut expired),
+            )
+            .unwrap();
+            let plain: Vec<_> = plans
+                .iter()
+                .flat_map(|plan| plan.plain.iter().copied())
+                .collect();
+            assert_eq!(plain, expected, "alignment {alignment}, cutoff {cutoff}");
+            let mut at = alignment;
+            for plan in &plans {
+                assert!(matches!(plan.representation, Representation::Stored));
+                assert_eq!(plan.bits, stored_block_bits(at, plan.plain.len()));
+                at = ((u64::from(at) + plan.bits) & 7) as u8;
+            }
+            if cutoff == usize::MAX {
+                // Accept the first pair, reject its oversized neighbour,
+                // accept a later pair, then retain the final untouched block.
+                assert_eq!(
+                    plans
+                        .iter()
+                        .map(|plan| plan.plain.len())
+                        .collect::<Vec<_>>(),
+                    [5, 65_535, 5],
+                );
+            }
+        }
+    }
 }
 
 #[test]

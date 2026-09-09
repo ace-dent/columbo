@@ -199,8 +199,12 @@ fn generated_match_lengths_are_canonical() {
             assert_eq!((symbol, extra, extra_bits), (285, 0, 0));
         }
     }
-    assert!(canonical_length_encoding(2).is_none());
-    assert!(canonical_length_encoding(259).is_none());
+    for length in (0..3).chain(259..=u16::MAX) {
+        assert!(
+            canonical_length_encoding(length).is_none(),
+            "length {length}"
+        );
+    }
 }
 
 #[test]

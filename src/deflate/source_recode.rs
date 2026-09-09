@@ -1641,7 +1641,7 @@ fn plan_source_blocks_with_budget(
     // deliberately recomputes the true alignment after every chosen block,
     // correcting beta-17's repeated-pass position-accounting quirk.
     let mut alignment = start_alignment & 7;
-    for block in &mut blocks {
+    for block in blocks.iter_mut().flatten() {
         if stop.reached() {
             break;
         }
@@ -1649,30 +1649,37 @@ fn plan_source_blocks_with_budget(
         alignment = ((u64::from(alignment) + bits) & 7) as u8;
     }
 
-    // deft4j's `mergeBlocks()` is deliberately greedy. An accepted pair stays
-    // at the same list index and is immediately retried against its neighbour.
+    // deft4j's `mergeBlocks()` is deliberately greedy. Keep the accepted left
+    // block in place and retire its right neighbour without shifting the tail.
+    // The right cursor visits each source slot once; the final walk skips the
+    // retired slots. This preserves merge order with linear list maintenance.
     alignment = start_alignment & 7;
     let mut index = 0;
-    while index + 1 < blocks.len() && !stop.reached() {
-        let current_bits = blocks[index].plan(alignment, options, &mut budget, stop)?;
+    let mut next = 1;
+    let mut retained = blocks.len();
+    while next < blocks.len() && !stop.reached() {
+        let (prefix, tail) = blocks.split_at_mut(next);
+        let current = prefix[index].as_mut()?;
+        let neighbour = tail[0].as_mut()?;
+        let current_bits = current.plan(alignment, options, &mut budget, stop)?;
         let next_alignment = ((u64::from(alignment) + current_bits) & 7) as u8;
-        let next_bits = blocks[index + 1].plan(next_alignment, options, &mut budget, stop)?;
+        let next_bits = neighbour.plan(next_alignment, options, &mut budget, stop)?;
 
-        let left_type = blocks[index].block.source_type;
-        let right_type = blocks[index + 1].block.source_type;
+        let left_type = current.block.source_type;
+        let right_type = neighbour.block.source_type;
         let huffman_merge = is_huffman(left_type) && is_huffman(right_type);
         let stored_merge = left_type == SourceBlockType::Stored
-            && blocks[index]
+            && current
                 .block
                 .plain
                 .len()
-                .checked_add(blocks[index + 1].block.plain.len())
+                .checked_add(neighbour.block.plain.len())
                 .is_some_and(|length| length <= 65_535);
 
         if huffman_merge || stored_merge {
             if let Some(merged) = merge_blocks(
-                &blocks[index].block,
-                &blocks[index + 1].block,
+                &current.block,
+                &neighbour.block,
                 if stored_merge {
                     SourceBlockType::Stored
                 } else {
@@ -1688,12 +1695,14 @@ fn plan_source_blocks_with_budget(
                 );
                 let merged_bits = merged.plan(alignment, options, &mut budget, stop)?;
                 if merged_bits < current_bits.checked_add(next_bits)? {
-                    let replaced_bytes = blocks[index]
+                    let replaced_bytes = current
                         .accounted_bytes()?
-                        .checked_add(blocks[index + 1].accounted_bytes()?)?;
-                    blocks[index] = merged;
-                    blocks.remove(index + 1);
+                        .checked_add(neighbour.accounted_bytes()?)?;
+                    *current = merged;
+                    tail[0] = None;
                     budget.release(replaced_bytes)?;
+                    retained -= 1;
+                    next += 1;
                     continue;
                 }
                 let discarded_bytes = merged.accounted_bytes()?;
@@ -1703,13 +1712,14 @@ fn plan_source_blocks_with_budget(
         }
 
         alignment = next_alignment;
-        index += 1;
+        index = next;
+        next += 1;
     }
 
     let mut output = Vec::new();
-    output.try_reserve_exact(blocks.len()).ok()?;
+    output.try_reserve_exact(retained).ok()?;
     alignment = start_alignment & 7;
-    for block in &mut blocks {
+    for block in blocks.iter_mut().flatten() {
         let plan = block.take_plan(alignment, options, &mut budget, stop)?;
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
         output.push(plan);
@@ -1717,7 +1727,7 @@ fn plan_source_blocks_with_budget(
     Some(output)
 }
 
-fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<WorkingBlock>> {
+fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<Option<WorkingBlock>>> {
     // Columbo removes every redundant empty block while retaining one legal
     // block for an all-empty stream. beta-17 intends this behavior but its
     // cleared linked-list successor stops each source walk after one removal.
@@ -1729,12 +1739,12 @@ fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<WorkingBlock>> {
     output.try_reserve_exact(nonempty.max(1)).ok()?;
     if nonempty == 0 {
         if let Some(block) = source.last() {
-            output.push(WorkingBlock::new(block.try_clone_shared()?));
+            output.push(Some(WorkingBlock::new(block.try_clone_shared()?)));
         }
         return Some(output);
     }
     for block in source.iter().filter(|block| !block.plain.is_empty()) {
-        output.push(WorkingBlock::new(block.try_clone_shared()?));
+        output.push(Some(WorkingBlock::new(block.try_clone_shared()?)));
     }
     Some(output)
 }
@@ -1753,7 +1763,7 @@ fn working_block_clone_bytes(block: &ParsedBlock) -> Option<usize> {
                     .checked_mul(size_of::<super::model::RleToken>())?,
             )
     })?;
-    size_of::<WorkingBlock>()
+    size_of::<Option<WorkingBlock>>()
         .checked_add(split_bytes)?
         .checked_add(dynamic_bytes)
 }

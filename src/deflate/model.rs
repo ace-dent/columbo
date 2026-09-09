@@ -27,6 +27,22 @@ pub(crate) const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
+// Index the canonical length family directly. Construct this tiny table at
+// compile time so every fragment/repartition search avoids scanning 28 ranges.
+const LENGTH_FAMILY: [u8; 256] = {
+    let mut families = [0; 256];
+    let mut family = 0;
+    let mut length = 3;
+    while length <= 258 {
+        if family + 1 < LENGTH_BASE.len() && length >= LENGTH_BASE[family + 1] {
+            family += 1;
+        }
+        families[length as usize - 3] = family as u8;
+        length += 1;
+    }
+    families
+};
+
 /// Return the canonical RFC 1951 symbol and extra fields for a match length.
 ///
 /// The arithmetic range of symbol 284 also reaches 258, but RFC 1951 assigns
@@ -34,18 +50,13 @@ pub(crate) const LENGTH_EXTRA_BITS: [u8; 29] = [
 /// explicit relaxed-mode compatibility extension, so structural rewrites must
 /// never create it implicitly.
 pub(crate) fn canonical_length_encoding(length: u16) -> Option<(u16, u16, u8)> {
-    if length == 258 {
-        return Some((285, 0, 0));
-    }
-    for index in 0..28 {
-        let base = LENGTH_BASE[index];
-        let extra_bits = LENGTH_EXTRA_BITS[index];
-        let span = 1_u16 << extra_bits;
-        if (base..base + span).contains(&length) {
-            return Some((257 + index as u16, length - base, extra_bits));
-        }
-    }
-    None
+    let offset = usize::from(length.checked_sub(3)?);
+    let index = usize::from(*LENGTH_FAMILY.get(offset)?);
+    Some((
+        257 + index as u16,
+        length - LENGTH_BASE[index],
+        LENGTH_EXTRA_BITS[index],
+    ))
 }
 
 pub(crate) const DISTANCE_BASE: [u16; 30] = [
