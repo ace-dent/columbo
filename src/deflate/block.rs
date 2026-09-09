@@ -180,7 +180,7 @@ pub(crate) fn plan_reusable_block(
     plan_reusable_block_with_header_cache(block, options, stop, &mut HeaderPlanCache::new())
 }
 
-fn plan_reusable_block_with_header_cache(
+pub(crate) fn plan_reusable_block_with_header_cache(
     block: &ParsedBlock,
     options: &Options,
     stop: &mut SearchStop<'_>,

@@ -1881,6 +1881,7 @@ fn complete_png_floor_reuses_the_full_default_route_sequence() {
             },
             None,
         ),
+        DefaultFloorWork::Timed(&deadline),
     )
     .unwrap()
     .complete;
@@ -1935,6 +1936,7 @@ fn complete_png_floor_includes_terminal_tree_methods() {
             },
             None,
         ),
+        DefaultFloorWork::Timed(&deadline),
     )
     .unwrap()
     .complete;
@@ -2404,4 +2406,137 @@ fn replay_validation_is_enforced_in_release_builds() {
             .message(),
         "internal error: rewritten Deflate stream changed decoded data"
     );
+}
+
+#[test]
+fn alphabet_boundaries_preserve_history_and_reprice_later_stored_padding() {
+    let mut plain: Vec<_> = (0..32).map(|i| (i % 2) as u8).collect();
+    plain.extend((0..256).map(|i| 160 + (i % 16) as u8));
+    plain.extend((0..35).map(|i| (i % 2) as u8));
+    let tokens: Vec<_> = plain.iter().copied().map(Token::Literal).collect();
+    let (literal_frequencies, distance_frequencies) =
+        super::super::model::count_frequencies(&tokens);
+    let block = ParsedBlock {
+        tokens: tokens.into(),
+        plain: plain.clone().into(),
+        literal_frequencies,
+        distance_frequencies,
+        original_literal_lengths: None,
+        original_distance_lengths: None,
+        original_dynamic: None,
+        original: None,
+        source_splits: Vec::new(),
+        source_type: SourceBlockType::Dynamic,
+    };
+    let middle =
+        super::super::block::plan_block(&block, 0, &Options::default(), &mut SearchStop::never());
+    // A trailing match refers back across the source block boundary. New
+    // boundaries must leave that history intact.
+    let tail = PlannedBlock {
+        tokens: vec![Token::Match {
+            length: 3,
+            distance: 1,
+            length_symbol: 257,
+            distance_symbol: 0,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 0,
+            distance_extra_bits: 0,
+        }]
+        .into(),
+        plain: vec![0; 3].into(),
+        representation: Representation::Fixed,
+        bits: 22,
+        source_type: SourceBlockType::Fixed,
+    };
+    for prefix_literals in 1..=8 {
+        let prefix = PlannedBlock {
+            tokens: vec![Token::Literal(200); prefix_literals].into(),
+            plain: vec![200; prefix_literals].into(),
+            representation: Representation::Fixed,
+            bits: 10 + 9 * prefix_literals as u64,
+            source_type: SourceBlockType::Fixed,
+        };
+        let mut writer = BitWriter::default();
+        for plan in [&prefix, &middle, &tail] {
+            emit_block(&mut writer, &[], plan, false).unwrap();
+        }
+        let stored = PlannedBlock {
+            tokens: Vec::new().into(),
+            plain: vec![b'X'; 9].into(),
+            representation: Representation::Stored,
+            bits: stored_block_bits((writer.bit_position() & 7) as u8, 9),
+            source_type: SourceBlockType::Stored,
+        };
+        emit_block(&mut writer, &[], &stored, true).unwrap();
+        let data = writer.into_bytes();
+        let parsed = parse_stream(&data, 1024).unwrap();
+        let identity = StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        };
+        let parent = Candidate {
+            data,
+            bits: parsed.meaningful_bits,
+            output_max_distance: Some(parsed.max_distance),
+            plans: Vec::new(),
+            block_report: None,
+            route: "test parent",
+            max_planner_is_stable: false,
+        };
+        for strict in [false, true] {
+            let result = refine_with_terminal_header_search(
+                TerminalHeaderSearch::AlphabetBoundaries,
+                &parent,
+                &Options {
+                    strict,
+                    ..Options::default()
+                },
+                1024,
+                identity,
+                &mut SearchStop::never(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(result.data.len() < parent.data.len());
+            let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
+            assert!(check.blocks.len() > parsed.blocks.len());
+            assert_eq!(
+                check.blocks.last().unwrap().source_type,
+                SourceBlockType::Stored
+            );
+            assert_eq!(check.max_distance, 1);
+            assert_eq!(result.output_max_distance, Some(1));
+            assert_eq!(
+                check
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.tokens.iter())
+                    .copied()
+                    .collect::<Vec<_>>(),
+                parsed
+                    .blocks
+                    .iter()
+                    .flat_map(|b| b.tokens.iter())
+                    .copied()
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(check.meaningful_bits & 7, 0);
+        }
+        let ordinary = optimize_raw(&parent.data, &Options::default()).unwrap();
+        let zero_max = optimize_raw(
+            &parent.data,
+            &Options {
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            zero_max.data, ordinary.data,
+            "the alphabet sibling must not become mandatory Default-floor work"
+        );
+    }
 }

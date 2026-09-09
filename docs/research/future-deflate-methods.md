@@ -17,6 +17,11 @@ Small payload symbol sets are now
 [jointly removed and validated](symbol-set-validation.md), with bounded
 certified rewrites and gains beyond the existing single-symbol and composition
 searches.
+Alphabet support intervals now supply
+[validated coupled boundaries in Max](alphabet-boundary-validation.md), including
+gains beyond the old anchor graph and freshly frozen Max parents. The
+Default-enabled experiment exceeded the runtime policy; the retained search
+uses existing Max allowances and preserves measured Default output parity.
 The follow-up distinguishes untested proposals from production methods.
 Further validation of [permanent original-match proofs](permanent-match-proofs-validation.md)
 now identifies a reproducible absent token choice, including a completed Max

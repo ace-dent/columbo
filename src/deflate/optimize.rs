@@ -500,7 +500,12 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     } else if prebuild_floor_first {
         Some(match default_floor {
             DefaultFloor::CompleteThenBounded | DefaultFloor::SharedExact => {
-                let floors = build_complete_default_floor_candidate(source, options, progress)?;
+                let floors = build_complete_default_floor_candidate(
+                    source,
+                    options,
+                    progress,
+                    DefaultFloorWork::Timed(&deadline),
+                )?;
                 complete_default_candidate = Some(floors.complete);
                 floors.max_seed
             }
@@ -509,7 +514,10 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
             // lineage; a smaller seed does not dominate its terminal children.
             DefaultFloor::ApngMax => {
                 complete_default_candidate = Some(build_complete_apng_default_floor_candidate(
-                    source, options, progress,
+                    source,
+                    options,
+                    progress,
+                    DefaultFloorWork::Timed(&deadline),
                 )?);
                 build_bounded_floor_candidate(source, options, &mut SearchStop::never())?
             }
@@ -1554,7 +1562,12 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         // deadline has already curtailed optional search.
         match default_floor {
             DefaultFloor::Complete => {
-                let floors = build_complete_default_floor_candidate(source, options, progress)?;
+                let floors = build_complete_default_floor_candidate(
+                    source,
+                    options,
+                    progress,
+                    DefaultFloorWork::Timed(&deadline),
+                )?;
                 complete_default_candidate = Some(floors.complete);
                 floors.max_seed
             }
@@ -2014,6 +2027,17 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         progress,
         candidate,
     )?;
+
+    if options.exhaustive {
+        candidate = improve_with_terminal_header_search(
+            TerminalHeaderSearch::AlphabetBoundaries,
+            source,
+            options,
+            DefaultFloorWork::Timed(&deadline),
+            progress,
+            candidate,
+        )?;
+    }
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
@@ -3352,6 +3376,7 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
 #[derive(Clone, Copy)]
 enum DefaultFloorWork<'a> {
     Timed(&'a Deadline),
+    Window(&'a RouteWindow<'a>),
     Mandatory,
 }
 
@@ -3359,6 +3384,7 @@ impl<'a> DefaultFloorWork<'a> {
     fn can_start_route(self) -> bool {
         match self {
             Self::Timed(deadline) => deadline.can_start_route(),
+            Self::Window(window) => window.can_start_route(),
             Self::Mandatory => true,
         }
     }
@@ -3366,6 +3392,7 @@ impl<'a> DefaultFloorWork<'a> {
     fn stop(self) -> SearchStop<'a> {
         match self {
             Self::Timed(deadline) => deadline.hard_stop(),
+            Self::Window(window) => window.stop(),
             Self::Mandatory => SearchStop::never(),
         }
     }
@@ -3642,12 +3669,14 @@ enum TerminalHeaderSearch {
     LiteralSpan,
     JointTreeRle,
     SymbolSets,
+    AlphabetBoundaries,
 }
 
 struct TerminalSearchBudget {
     header_prices: usize,
     joint: super::joint::JointBudget,
     symbols: super::symbol_set::SymbolSetBudget,
+    alphabet: super::stream::AlphabetBudget,
 }
 
 impl TerminalHeaderSearch {
@@ -3657,6 +3686,14 @@ impl TerminalHeaderSearch {
             Self::LiteralSpan => "Literal/length span",
             Self::JointTreeRle => "Joint tree/RLE",
             Self::SymbolSets => "Symbol set removal",
+            Self::AlphabetBoundaries => "Alphabet boundary search",
+        }
+    }
+
+    fn max_bytes(self) -> usize {
+        match self {
+            Self::AlphabetBoundaries => 1024 * 1024,
+            _ => TERMINAL_HEADER_MAX_BYTES,
         }
     }
 
@@ -3667,38 +3704,59 @@ impl TerminalHeaderSearch {
         options: &Options,
         budget: &mut TerminalSearchBudget,
         stop: &mut SearchStop<'_>,
-    ) -> Option<PlannedBlock> {
-        let dynamic = match self {
-            Self::PayloadTradeoff => {
-                plan_payload_header_tradeoff(block, options.strict, &mut budget.header_prices, stop)
-            }
-            Self::LiteralSpan => {
-                plan_literal_span(block, options.strict, &mut budget.header_prices, stop)
-            }
-            Self::JointTreeRle => super::joint::plan_joint_tree_rle(block, &mut budget.joint, stop),
-            Self::SymbolSets => {
-                return super::symbol_set::plan_symbol_sets(
+    ) -> Option<Vec<PlannedBlock>> {
+        let plan = match self {
+            Self::AlphabetBoundaries => {
+                return super::stream::plan_alphabet_boundaries(
                     block,
                     alignment,
                     options,
-                    &mut budget.symbols,
+                    &mut budget.alphabet,
                     stop,
                 )
             }
-        }?;
-        Some(PlannedBlock {
-            tokens: block.tokens.clone(),
-            plain: block.plain.clone(),
-            bits: dynamic.bits,
-            representation: Representation::Dynamic(dynamic),
-            source_type: block.source_type,
-        })
+            Self::SymbolSets => super::symbol_set::plan_symbol_sets(
+                block,
+                alignment,
+                options,
+                &mut budget.symbols,
+                stop,
+            )?,
+            _ => {
+                let dynamic = match self {
+                    Self::PayloadTradeoff => plan_payload_header_tradeoff(
+                        block,
+                        options.strict,
+                        &mut budget.header_prices,
+                        stop,
+                    ),
+                    Self::LiteralSpan => {
+                        plan_literal_span(block, options.strict, &mut budget.header_prices, stop)
+                    }
+                    Self::JointTreeRle => {
+                        super::joint::plan_joint_tree_rle(block, &mut budget.joint, stop)
+                    }
+                    Self::SymbolSets | Self::AlphabetBoundaries => unreachable!(),
+                }?;
+                PlannedBlock {
+                    tokens: block.tokens.clone(),
+                    plain: block.plain.clone(),
+                    bits: dynamic.bits,
+                    representation: Representation::Dynamic(dynamic),
+                    source_type: block.source_type,
+                }
+            }
+        };
+        let mut plans = Vec::new();
+        plans.try_reserve_exact(1).ok()?;
+        plans.push(plan);
+        Some(plans)
     }
 }
 
-/// Header-driven terminal searches preserve block boundaries. Each complete
-/// parent remains independent, without redirecting the established
-/// search lineages.
+/// Header-driven terminal searches retain every complete parent independently.
+/// Alphabet search can split blocks; the other searches keep their boundaries.
+/// None redirects the established search lineages.
 fn improve_with_terminal_header_search(
     search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
@@ -3708,8 +3766,8 @@ fn improve_with_terminal_header_search(
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     if !floor_work.can_start_route()
-        || candidate.data.len() > TERMINAL_HEADER_MAX_BYTES
-        || source.identity.decoded_size > TERMINAL_HEADER_MAX_BYTES as u64
+        || candidate.data.len() > search.max_bytes()
+        || source.identity.decoded_size > search.max_bytes() as u64
     {
         return Ok(candidate);
     }
@@ -3744,14 +3802,14 @@ fn refine_with_terminal_header_search(
     stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
     if stop.reached()
-        || candidate.data.len() > TERMINAL_HEADER_MAX_BYTES
-        || identity.decoded_size > TERMINAL_HEADER_MAX_BYTES as u64
+        || candidate.data.len() > search.max_bytes()
+        || identity.decoded_size > search.max_bytes() as u64
     {
         return Ok(None);
     }
     let selected = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
     // The parser discards redundant empty blocks. Preserve the parent's block
-    // layout here and leave empty-block normalization to established routes.
+    // source mapping here and leave empty-block normalization to established routes.
     if selected.source_block_count != selected.blocks.len()
         || selected.blocks.len() > TERMINAL_HEADER_MAX_BLOCKS
     {
@@ -3765,15 +3823,31 @@ fn refine_with_terminal_header_search(
         header_prices: TERMINAL_HEADER_MAX_PRICES,
         joint: super::joint::JointBudget::new(),
         symbols: super::symbol_set::SymbolSetBudget::new(),
+        alphabet: super::stream::AlphabetBudget::new(),
     };
     let mut bits = 0_u64;
     let mut changed = false;
-    for block in &selected.blocks {
+    for (block_index, block) in selected.blocks.iter().enumerate() {
         let alignment = (bits % 8) as u8;
-        let plan = if let Some(plan) = search.plan(block, alignment, options, &mut budget, stop) {
+        if let Some(proposed) = search.plan(block, alignment, options, &mut budget, stop) {
+            // Also reserve one original plan for every remaining source
+            // block, so falling back after a split never grows infallibly.
+            let remaining = selected.blocks.len() - block_index - 1;
+            if plans.try_reserve(proposed.len() + remaining).is_err() {
+                return Ok(None);
+            }
+            let Some(next_bits) = proposed
+                .iter()
+                .try_fold(bits, |sum, plan| sum.checked_add(plan.bits))
+            else {
+                return Ok(None);
+            };
+            bits = next_bits;
+            plans.extend(proposed);
             changed = true;
-            plan
-        } else {
+            continue;
+        }
+        let plan = {
             let (representation, block_bits) =
                 if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
                     (Representation::Original(original), original.len)
@@ -3824,7 +3898,8 @@ fn refine_with_terminal_header_search(
 struct CompleteDefaultFloor {
     /// The ordinary base used by the established bounded max lineage.
     max_seed: Candidate,
-    /// The complete result produced by the same routes as Default mode.
+    /// The complete Default endpoint, optionally strengthened by the bounded
+    /// Max-only alphabet sibling within the existing Max allowance.
     complete: Candidate,
 }
 
@@ -3832,6 +3907,7 @@ fn build_complete_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
+    alphabet_work: DefaultFloorWork<'_>,
 ) -> Result<CompleteDefaultFloor> {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
@@ -3888,14 +3964,28 @@ fn build_complete_default_floor_candidate(
         progress,
         complete,
     )?;
+    // Max alone may strengthen the completed ordinary comparison endpoint.
+    // The historical seed stays independent, and this extra search consumes
+    // the caller's existing Max allowance rather than mandatory Default work.
+    let complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::AlphabetBoundaries,
+        source,
+        &floor_options,
+        alphabet_work,
+        progress,
+        complete,
+    )?;
+
     Ok(CompleteDefaultFloor { max_seed, complete })
 }
 
-/// Keep APNG's own Default endpoint without adding standalone feedback routes.
+/// Keep APNG's Default endpoint, then admit the Max-only alphabet sibling
+/// within this frame's existing allowance.
 fn build_complete_apng_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
     progress: Progress,
+    alphabet_work: DefaultFloorWork<'_>,
 ) -> Result<Candidate> {
     let floor_options = Options {
         exhaustive: false,
@@ -3924,6 +4014,14 @@ fn build_complete_apng_default_floor_candidate(
             complete,
         )?;
     }
+    complete = improve_with_terminal_header_search(
+        TerminalHeaderSearch::AlphabetBoundaries,
+        source,
+        &floor_options,
+        alphabet_work,
+        progress,
+        complete,
+    )?;
     Ok(complete)
 }
 
@@ -4010,7 +4108,12 @@ fn build_bounded_floor_descendants_preserving_default(
         );
     }
 
-    let floors = build_complete_default_floor_candidate(source, options, progress)?;
+    let floors = build_complete_default_floor_candidate(
+        source,
+        options,
+        progress,
+        DefaultFloorWork::Window(route_window),
+    )?;
     let complete = floors.complete;
     let (_, descendant) = build_bounded_floor_descendants(
         source,

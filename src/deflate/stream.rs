@@ -18,6 +18,9 @@
 //! concept described by Turtledeflate. The deft4j-derived greedy merge lives
 //! in `source_recode`.
 
+mod alphabet;
+pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
+
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::thread;
@@ -4912,15 +4915,7 @@ fn boundary_dp(
     if cuts.len() > MAX_BOUNDARY_DP_CUTS {
         return None;
     }
-    let mut dp = Vec::<[Option<DpNode>; 8]>::new();
-    dp.try_reserve_exact(cuts.len()).ok()?;
-    for _ in cuts {
-        dp.push(std::array::from_fn(|_| None));
-    }
-    dp[0][usize::from(start_alignment)] = Some(DpNode {
-        bits: 0,
-        previous: None,
-    });
+    let mut graph = BoundaryGraph::new(cuts.len(), start_alignment)?;
 
     for start_index in 0..cuts.len() - 1 {
         if let Some(progress) = progress {
@@ -4929,17 +4924,7 @@ fn boundary_dp(
         if stop.reached() {
             return None;
         }
-        // There are exactly eight possible starting bit alignments, so a
-        // fixed array avoids a small heap allocation at every cut.
-        let mut reachable = [(0_u8, 0_u64); 8];
-        let mut reachable_len = 0;
-        for (alignment, node) in dp[start_index].iter().enumerate() {
-            if let Some(node) = node {
-                reachable[reachable_len] = (alignment as u8, node.bits);
-                reachable_len += 1;
-            }
-        }
-        if reachable_len == 0 {
+        if graph.states[start_index].iter().all(Option::is_none) {
             continue;
         }
 
@@ -4958,56 +4943,107 @@ fn boundary_dp(
                 continue;
             };
 
-            for (reachable_index, &(alignment, prefix_bits)) in
-                reachable[..reachable_len].iter().enumerate()
-            {
-                // Match the former per-alignment loop: a plan that reaches the
-                // deadline is still allowed to update its first DP state.
-                if reachable_index != 0 && stop.reached() {
-                    return None;
-                }
-                let template = edge.plan(alignment);
-                let Some(bits) = prefix_bits.checked_add(template.bits) else {
-                    continue;
-                };
-                let next_alignment = ((u64::from(start_alignment) + bits) & 7) as u8;
-                let destination = &mut dp[end_index][usize::from(next_alignment)];
-                if destination.as_ref().map_or(true, |old| bits < old.bits) {
-                    *destination = Some(DpNode {
-                        bits,
-                        previous: Some(Previous {
-                            cut: start_index,
-                            alignment,
-                            plan: template,
-                        }),
-                    });
-                }
-            }
+            graph.consider(start_index, end_index, &edge, stop)?;
         }
     }
 
-    let end_index = cuts.len() - 1;
-    let (mut alignment, _) = dp[end_index]
-        .iter()
-        .enumerate()
-        .filter_map(|(alignment, node)| node.as_ref().map(|node| (alignment as u8, node.bits)))
-        .min_by_key(|&(_, bits)| bits)?;
+    graph.resolve(composite, cuts)
+}
 
-    let mut at = end_index;
-    let mut plans = Vec::new();
-    plans.try_reserve_exact(cuts.len().saturating_sub(1)).ok()?;
-    while at != 0 {
-        let previous = dp[at][usize::from(alignment)].as_ref()?.previous.as_ref()?;
-        plans.push(
-            previous
-                .plan
-                .instantiate(composite, cuts[previous.cut], cuts[at])?,
-        );
-        at = previous.cut;
-        alignment = previous.alignment;
+/// The same eight-alignment shortest-path kernel serves the established
+/// boundary search and the bounded alphabet-anchor sibling. Only their
+/// candidate cuts and edge-pricing budgets differ.
+struct BoundaryGraph {
+    states: Vec<[Option<DpNode>; 8]>,
+    start_alignment: u8,
+}
+
+impl BoundaryGraph {
+    fn new(cut_count: usize, start_alignment: u8) -> Option<Self> {
+        if !(2..=MAX_BOUNDARY_DP_CUTS).contains(&cut_count) || start_alignment >= 8 {
+            return None;
+        }
+        let mut states = Vec::new();
+        states.try_reserve_exact(cut_count).ok()?;
+        for _ in 0..cut_count {
+            states.push(std::array::from_fn(|_| None));
+        }
+        states[0][usize::from(start_alignment)] = Some(DpNode {
+            bits: 0,
+            previous: None,
+        });
+        Some(Self {
+            states,
+            start_alignment,
+        })
     }
-    plans.reverse();
-    Some(plans)
+
+    fn consider(
+        &mut self,
+        start: usize,
+        end: usize,
+        edge: &PreparedEdge,
+        stop: &mut SearchStop<'_>,
+    ) -> Option<()> {
+        let mut visited = false;
+        for alignment in 0..8 {
+            let Some(prefix_bits) = self.states[start][alignment].as_ref().map(|node| node.bits)
+            else {
+                continue;
+            };
+            // A finished edge may update its first reachable state even if
+            // pricing consumed the last allowance, as in the original DP.
+            if visited && stop.reached() {
+                return None;
+            }
+            visited = true;
+            let template = edge.plan(alignment as u8);
+            let Some(bits) = prefix_bits.checked_add(template.bits) else {
+                continue;
+            };
+            let next = ((u64::from(self.start_alignment) + bits) & 7) as usize;
+            let destination = &mut self.states[end][next];
+            if destination.as_ref().map_or(true, |old| bits < old.bits) {
+                *destination = Some(DpNode {
+                    bits,
+                    previous: Some(Previous {
+                        cut: start,
+                        alignment: alignment as u8,
+                        plan: template,
+                    }),
+                });
+            }
+        }
+        Some(())
+    }
+
+    fn resolve(&self, composite: &Composite, cuts: &[Cut]) -> Option<Vec<PlannedBlock>> {
+        let end_index = cuts.len() - 1;
+        let (mut alignment, _) = self.states[end_index]
+            .iter()
+            .enumerate()
+            .filter_map(|(alignment, node)| node.as_ref().map(|node| (alignment as u8, node.bits)))
+            .min_by_key(|&(_, bits)| bits)?;
+
+        let mut at = end_index;
+        let mut plans = Vec::new();
+        plans.try_reserve_exact(cuts.len().saturating_sub(1)).ok()?;
+        while at != 0 {
+            let previous = self.states[at][usize::from(alignment)]
+                .as_ref()?
+                .previous
+                .as_ref()?;
+            plans.push(
+                previous
+                    .plan
+                    .instantiate(composite, cuts[previous.cut], cuts[at])?,
+            );
+            at = previous.cut;
+            alignment = previous.alignment;
+        }
+        plans.reverse();
+        Some(plans)
+    }
 }
 
 fn edge_allowed(
