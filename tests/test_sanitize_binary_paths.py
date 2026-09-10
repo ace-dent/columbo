@@ -51,6 +51,28 @@ class SanitizeBinaryPathsTests(unittest.TestCase):
         self.assertIn("macOS user directory", str(raised.exception))
         self.assertNotIn("synthetic-builder", str(raised.exception))
 
+    def test_private_paths_are_rejected_in_windows_wide_strings(self) -> None:
+        for category, marker in SANITIZER.PRIVATE_PATH_MARKERS.items():
+            for encoding in ("utf-16-le", "utf-16-be"):
+                with self.subTest(category=category, encoding=encoding):
+                    path = os.fsdecode(marker) + "synthetic-builder/project"
+                    data = b"prefix\0" + path.encode(encoding) + b"\0suffix"
+                    with self.assertRaises(ValueError) as raised:
+                        SANITIZER.audit(data, require_redacted=True)
+                    self.assertIn(category, str(raised.exception))
+                    self.assertNotIn("synthetic-builder", str(raised.exception))
+
+    def test_runtime_build_root_is_checked_in_each_encoding(self) -> None:
+        root = Path(Path.cwd().anchor) / "synthetic-volume" / "build-root"
+        with patch.object(SANITIZER.Path, "cwd", return_value=root):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                with self.subTest(encoding=encoding):
+                    data = str(root / "source.rs").encode(encoding)
+                    with self.assertRaises(ValueError) as raised:
+                        SANITIZER.audit(data, require_redacted=True)
+                    self.assertIn("current build directory", str(raised.exception))
+                    self.assertNotIn("synthetic-volume", str(raised.exception))
+
     def test_atomic_replacement_keeps_permissions_and_removes_the_sibling(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             destination = Path(directory) / "executable"

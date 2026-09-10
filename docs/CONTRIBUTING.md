@@ -22,6 +22,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 The Python checks require Python 3.10 or newer and use only its standard library.
+Packaging checks also require a POSIX shell and `zip`; they skip when these are
+unavailable and use a fake compiler rather than building a release.
 See the [codebase guide](architecture.md) before adding a module or moving files.
 Use four spaces for Python and shell indentation.
 
@@ -85,6 +87,12 @@ toolchain, remaps build paths, checks the final executable with
 Use this script for distributable binaries; ordinary local Cargo builds can
 retain compiler or checkout paths in diagnostics. The script reports required
 toolchains, targets, and tools when they are unavailable.
+
+Each packaging invocation stages its executable and archive in a private,
+temporary directory under `target/dist/`. Concurrent architecture builds cannot
+overwrite each other's staged files, and failed packaging preserves the previous
+release archive. The path audit checks filesystem strings and both UTF-16 byte
+orders, including Windows wide strings.
 
 
 ## Contributor License Agreement (CLA)

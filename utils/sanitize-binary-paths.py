@@ -53,7 +53,7 @@ PRIVATE_PATH_MARKERS = {
 
 
 def private_path_markers() -> dict[str, bytes]:
-    """Return generic markers plus this checkout's runtime-resolved roots."""
+    """Return build roots in filesystem and Windows wide-string encodings."""
 
     markers = dict(PRIVATE_PATH_MARKERS)
     local_roots = {
@@ -70,6 +70,14 @@ def private_path_markers() -> dict[str, bytes]:
             )
             markers[f"{category} (backslash)"] = encoded.replace(
                 UNIX_SEPARATOR, WINDOWS_SEPARATOR
+            )
+    # Windows executables can retain UTF-16 strings alongside Rust's UTF-8
+    # strings. Check both byte orders without decoding arbitrary binary data.
+    for category, marker in list(markers.items()):
+        decoded = os.fsdecode(marker)
+        for encoding in ("utf-16-le", "utf-16-be"):
+            markers[f"{category} ({encoding})"] = decoded.encode(
+                encoding, errors="surrogatepass"
             )
     return markers
 

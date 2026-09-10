@@ -137,11 +137,20 @@ DIST_DIR="${CARGO_TARGET_DIR:-target}/dist"
 RELEASE_STEM="columbo-v$VERSION-$PLATFORM-$CPU_ARCHITECTURE"
 # The archive carries release identity. Keep the executable's product basename
 # stable so process monitors show "columbo", independently of platform/version.
-DIST_NAME="$BINARY_NAME"
 mkdir -p "$DIST_DIR"
-DIST_BINARY="$DIST_DIR/$DIST_NAME"
 ARCHIVE="$DIST_DIR/$RELEASE_STEM.zip"
-TEMP_ARCHIVE="$DIST_DIR/.$RELEASE_STEM.tmp.zip"
+
+# Builds for different architectures share the executable basename. Give each
+# invocation its own staging directory so neither packaging nor cleanup can
+# overwrite another build's executable or unfinished archive.
+STAGING_DIR=$(mktemp -d "$DIST_DIR/.$RELEASE_STEM.XXXXXX")
+cleanup() {
+    rm -rf "$STAGING_DIR"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+DIST_BINARY="$STAGING_DIR/$BINARY_NAME"
+TEMP_ARCHIVE="$STAGING_DIR/$RELEASE_STEM.zip"
 
 cp "$BINARY" "$DIST_BINARY"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$DIST_BINARY"
@@ -149,13 +158,9 @@ python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$DIST_BINARY"
 # -9 selects maximum compression, -X omits host-specific extended attributes,
 # and -j stores only public basenames. Include the project licence beside the
 # executable in every release archive.
-trap 'rm -f "$TEMP_ARCHIVE"' 0 HUP INT TERM
-rm -f "$TEMP_ARCHIVE"
 zip -9 -X -j -q "$TEMP_ARCHIVE" \
     "$DIST_BINARY" "$PROJECT_ROOT/LICENSE"
 zip -T "$TEMP_ARCHIVE" >/dev/null
 mv "$TEMP_ARCHIVE" "$ARCHIVE"
-rm "$DIST_BINARY"
-trap - 0 HUP INT TERM
 
 echo "built $ARCHIVE"

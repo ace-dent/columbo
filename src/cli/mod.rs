@@ -106,9 +106,13 @@ fn execute_file(
             eprintln!("not enough memory to read input {:?}", input_path);
             return Err(1);
         }
-        Err(ReadError::Io) => {
-            // Path's Debug formatter escapes terminal control characters.
-            eprintln!("could not read {:?}", input_path);
+        Err(ReadError::Io(error)) => {
+            // Escape terminal controls in both the path and error message.
+            eprintln!(
+                "could not read {:?}: {}",
+                input_path,
+                error.to_string().escape_debug()
+            );
             return Err(1);
         }
     };
@@ -169,8 +173,12 @@ fn execute_file(
                     );
                     return Err(1);
                 }
-                Err(_) => {
-                    eprintln!("could not write {:?}", output);
+                Err(error) => {
+                    eprintln!(
+                        "could not write {:?}: {}",
+                        output,
+                        error.to_string().escape_debug()
+                    );
                     return Err(1);
                 }
             }
@@ -185,13 +193,21 @@ fn execute_file(
                 Ok(true) => OutputAction::CopiedOriginal(output.to_path_buf()),
                 // Another writer won the race after the existence check.
                 Ok(false) => OutputAction::Preserved(output.to_path_buf()),
-                Err(_) => {
-                    eprintln!("could not write {:?}", output);
+                Err(error) => {
+                    eprintln!(
+                        "could not write {:?}: {}",
+                        output,
+                        error.to_string().escape_debug()
+                    );
                     return Err(1);
                 }
             },
-            Err(_) => {
-                eprintln!("could not inspect {:?}", output);
+            Err(error) => {
+                eprintln!(
+                    "could not inspect {:?}: {}",
+                    output,
+                    error.to_string().escape_debug()
+                );
                 return Err(1);
             }
         },

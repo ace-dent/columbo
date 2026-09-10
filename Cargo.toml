@@ -23,6 +23,7 @@ include = [
     "/src/**/*.rs",
     "/tests/*.rs",
     "/tests/test_sanitize_binary_paths.py",
+    "/tests/test_build_distribution.py",
 ]
 
 [profile.release]

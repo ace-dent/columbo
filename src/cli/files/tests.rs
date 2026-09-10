@@ -8,10 +8,10 @@ use super::*;
 
 #[test]
 fn bounded_reader_rejects_bytes_past_the_limit() {
-    assert_eq!(
+    assert!(matches!(
         read_bounded(Cursor::new(b"abcd"), 3),
         Err(ReadError::TooLarge)
-    );
+    ));
     assert_eq!(read_bounded(Cursor::new(b"abc"), 3).unwrap(), b"abc");
 }
 
@@ -38,7 +38,30 @@ fn bounded_reader_retries_interrupted_and_short_reads_without_losing_the_limit()
         interrupt: false,
     };
     assert_eq!(read_bounded(reader(), 4).unwrap(), b"abcd");
-    assert_eq!(read_bounded(reader(), 3), Err(ReadError::TooLarge));
+    assert!(matches!(
+        read_bounded(reader(), 3),
+        Err(ReadError::TooLarge)
+    ));
+}
+
+#[test]
+fn bounded_reader_preserves_the_io_failure() {
+    struct FailedReader;
+
+    impl Read for FailedReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "synthetic read failure",
+            ))
+        }
+    }
+
+    let ReadError::Io(error) = read_bounded(FailedReader, 10).unwrap_err() else {
+        panic!("expected the original I/O error");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(error.to_string(), "synthetic read failure");
 }
 
 #[test]

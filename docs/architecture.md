@@ -15,6 +15,8 @@ remain private to the crate.
 | `src/cli/files.rs` | Read within resource limits and stage atomic file replacements. |
 | `src/cli/report.rs` | Render per-file results and select the appropriate output channel. |
 | `src/format/` | Detect and validate PNG/APNG, GZIP, ZIP, and zlib wrappers; schedule embedded streams and rebuild containers. |
+| `src/format/deadline.rs` | Share file-wide time limits and scale embedded-stream search allowances. |
+| `src/format/png/chunks.rs` | Parse, validate, and encode PNG/APNG chunks; calculate decoded image sizes. |
 | `src/deflate/` | Parse, price, search, and emit structurally equivalent Deflate streams. |
 | `src/checksum.rs` | Incremental CRC-32 and Adler-32 checksums. |
 | `src/progress/` | Coordinate physical stream order and render verbose or visual route reports. |
@@ -72,8 +74,11 @@ exception; fixture data and standalone test helpers belong in test files.
 
 `tests/public_api.rs` exercises the library as an external consumer.
 `tests/local_corpus.rs` holds opt-in public-API regressions backed by local files.
-`tests/test_sanitize_binary_paths.py` tests distribution tooling using synthetic
-data and temporary directories. Build and packaging scripts live in `utils/`.
+`tests/test_sanitize_binary_paths.py` checks path audits and atomic binary
+redaction. `tests/test_build_distribution.py` checks concurrent packaging and
+failure cleanup with synthetic executables and a fake compiler. Both use
+temporary directories, and neither requires private fixtures. Build and
+packaging scripts live in `utils/`.
 
 Use lowercase `snake_case` for Rust modules and Python test files. Shell scripts
 and documentation use descriptive hyphenated names. Keep named implementation

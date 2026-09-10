@@ -12,16 +12,16 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: usize = 128;
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(super) enum ReadError {
-    Io,
+    Io(io::Error),
     TooLarge,
     Allocation,
 }
 
 pub(super) fn read_file(path: &Path, maximum_size: u64) -> Result<Vec<u8>, ReadError> {
-    let file = File::open(path).map_err(|_| ReadError::Io)?;
-    if file.metadata().map_err(|_| ReadError::Io)?.len() > maximum_size {
+    let file = File::open(path).map_err(ReadError::Io)?;
+    if file.metadata().map_err(ReadError::Io)?.len() > maximum_size {
         return Err(ReadError::TooLarge);
     }
 
@@ -38,8 +38,7 @@ fn read_bounded(reader: impl Read, maximum_size: u64) -> Result<Vec<u8>, ReadErr
     let mut reader = reader.take(maximum_size.saturating_add(1));
     let mut buffer = [0_u8; READ_BUFFER_BYTES];
     loop {
-        let count =
-            read_retrying_interrupts(&mut reader, &mut buffer).map_err(|_| ReadError::Io)?;
+        let count = read_retrying_interrupts(&mut reader, &mut buffer).map_err(ReadError::Io)?;
         if count == 0 {
             break;
         }
