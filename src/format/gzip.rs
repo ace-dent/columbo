@@ -35,12 +35,6 @@ pub(super) fn deflate_stream_count(input: &[u8], max_decoded_bytes: u64) -> Resu
     Ok(preflight(input, max_decoded_bytes)?.len())
 }
 
-#[cfg(test)]
-pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
-    let members = preflight(input, options.max_decoded_bytes)?;
-    optimize_preflight(input, options, members)
-}
-
 pub(super) fn preflight(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     parse_members(input, max_decoded_bytes)
 }

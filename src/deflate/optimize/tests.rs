@@ -6,8 +6,17 @@ use std::time::Duration;
 use super::super::stop::{initial_bounded_phase_share, TIMEOUT_GRACE_BASE, TIMEOUT_GRACE_DIVISOR};
 use super::*;
 use crate::deflate::bitstream::BitWriter;
+use crate::deflate::header::test_support::{
+    header_tree_test_block, literal_span_test_block, payload_tradeoff_test_block,
+};
 use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
 use crate::deflate::model::Token;
+use crate::deflate::stop::timeout_grace;
+use crate::deflate::symbol_set::test_support::{assert_proven_rewrite, symbol_set_test_block};
+
+fn deadline_with_grace(started: Instant, duration: Duration) -> Deadline {
+    Deadline::with_grace(started, duration, timeout_grace(duration))
+}
 
 fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]) -> bool {
     compact_source_split_floor_eligible_with_limits(
@@ -20,26 +29,22 @@ fn compact_source_split_floor_eligible(decoded_size: u64, blocks: &[ParsedBlock]
 
 #[test]
 fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
-    let mut joint_block = super::super::header::literal_span_test_block();
+    let mut joint_block = literal_span_test_block();
     joint_block.original_dynamic =
         Some(plan_literal_span(&joint_block, true, &mut 1024, &mut SearchStop::never()).unwrap());
     for (search, block, saving) in [
         (
             TerminalHeaderSearch::PayloadTradeoff,
-            super::super::header::payload_tradeoff_test_block(),
+            payload_tradeoff_test_block(),
             1,
         ),
         (
             TerminalHeaderSearch::LiteralSpan,
-            super::super::header::literal_span_test_block(),
+            literal_span_test_block(),
             1,
         ),
         (TerminalHeaderSearch::JointTreeRle, joint_block, 7),
-        (
-            TerminalHeaderSearch::SymbolSets,
-            super::super::symbol_set::symbol_set_test_block(),
-            4,
-        ),
+        (TerminalHeaderSearch::SymbolSets, symbol_set_test_block(), 4),
     ] {
         let dynamic = block.original_dynamic.as_ref().unwrap();
         for prefix_literals in 1..=8 {
@@ -112,7 +117,7 @@ fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
                     assert_eq!(check.blocks.len(), parsed.blocks.len());
                     for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
                         if matches!(search, TerminalHeaderSearch::SymbolSets) {
-                            super::super::symbol_set::assert_proven_rewrite(b, &a.tokens);
+                            assert_proven_rewrite(b, &a.tokens);
                         } else {
                             assert_eq!(a.tokens, b.tokens);
                             assert_eq!(a.source_type, b.source_type);
@@ -216,7 +221,7 @@ fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
 
 #[test]
 fn payload_tradeoff_leaves_discarded_empty_blocks_to_other_routes() {
-    let block = super::super::header::payload_tradeoff_test_block();
+    let block = payload_tradeoff_test_block();
     let dynamic = block.original_dynamic.as_ref().unwrap();
     let mut writer = BitWriter::default();
     writer.write(2, 3).unwrap();
@@ -1451,7 +1456,7 @@ fn deferred_bounded_png_floor_retains_exact_default_at_zero_timeout() {
         timeout: Duration::ZERO,
         ..Options::default()
     };
-    let deadline = Deadline::new(Instant::now(), Duration::ZERO);
+    let deadline = deadline_with_grace(Instant::now(), Duration::ZERO);
     let candidates = build_bounded_phase_candidates(
         source,
         &options,
@@ -1679,7 +1684,7 @@ fn bounded_generic_routes_preserve_complete_candidates() {
         decoded_limit: 1,
         identity,
     };
-    let deadline = Deadline::new(Instant::now(), Duration::MAX);
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
     let progress = Progress::begin(
         &options,
         deadline.started,
@@ -1863,7 +1868,7 @@ fn complete_png_floor_reuses_the_full_default_route_sequence() {
         timeout: Duration::MAX,
         ..Options::default()
     };
-    let deadline = Deadline::new(Instant::now(), Duration::MAX);
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
     let base = build_bounded_floor_candidate(source, &options, &mut SearchStop::never()).unwrap();
     let complete = build_complete_default_floor_candidate(
         source,
@@ -1919,7 +1924,7 @@ fn complete_png_floor_includes_terminal_tree_methods() {
         timeout: Duration::MAX,
         ..Options::default()
     };
-    let deadline = Deadline::new(Instant::now(), Duration::MAX);
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
     let complete = build_complete_default_floor_candidate(
         source,
         &options,
@@ -1949,7 +1954,7 @@ fn complete_png_floor_includes_terminal_tree_methods() {
 
 #[test]
 fn route_errors_cancel_siblings_without_marking_a_timeout() {
-    let deadline = Deadline::new(Instant::now(), Duration::MAX);
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
     let failed: Result<()> =
         run_route_with_cancellation(&deadline, || Err(Error::new("synthetic route failure")));
 
@@ -1957,7 +1962,7 @@ fn route_errors_cancel_siblings_without_marking_a_timeout() {
     assert!(deadline.route_should_stop());
     assert!(!deadline.was_triggered());
 
-    let successful = Deadline::new(Instant::now(), Duration::MAX);
+    let successful = deadline_with_grace(Instant::now(), Duration::MAX);
     let completed: Result<()> = run_route_with_cancellation(&successful, || Ok(()));
     assert!(completed.is_ok());
     assert!(!successful.route_should_stop());
@@ -1992,7 +1997,7 @@ fn initial_bounded_routes_leave_one_fifth_for_follow_up_work() {
 fn soft_deadline_stops_new_routes_before_active_work() {
     let duration = Duration::from_secs(10);
     let grace = timeout_grace(duration);
-    let inside_grace = Deadline::new(
+    let inside_grace = deadline_with_grace(
         Instant::now()
             .checked_sub(duration + grace / 2)
             .expect("test duration fits in Instant"),
@@ -2002,7 +2007,7 @@ fn soft_deadline_stops_new_routes_before_active_work() {
     assert!(!inside_grace.expired());
     assert!(inside_grace.was_triggered());
 
-    let past_hard_deadline = Deadline::new(
+    let past_hard_deadline = deadline_with_grace(
         Instant::now()
             .checked_sub(duration + grace + Duration::from_millis(1))
             .expect("test duration fits in Instant"),
@@ -2543,7 +2548,7 @@ fn alphabet_boundaries_preserve_history_and_reprice_later_stored_padding() {
 
 #[test]
 fn header_tree_search_preserves_payload_and_stored_alignment() {
-    let block = super::super::header::header_tree_test_block();
+    let block = header_tree_test_block();
     let middle = PlannedBlock {
         tokens: block.tokens.clone(),
         plain: block.plain.clone(),
@@ -2644,7 +2649,7 @@ fn header_tree_search_preserves_payload_and_stored_alignment() {
 
 #[test]
 fn header_tree_search_is_not_mandatory_at_zero_max_budget() {
-    let block = super::super::header::header_tree_test_block();
+    let block = header_tree_test_block();
     let plan = PlannedBlock {
         tokens: block.tokens.clone(),
         plain: block.plain.clone(),

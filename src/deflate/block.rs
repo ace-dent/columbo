@@ -276,20 +276,6 @@ impl CanonicalPlanCache {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_limits(max_entries: usize, max_token_bytes: usize) -> Self {
-        Self {
-            max_entries,
-            max_token_bytes,
-            ..Self::new()
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stats(&self) -> CanonicalPlanCacheStats {
-        self.stats
-    }
-
     /// Return an exactly matching completed kernel without starting new work.
     pub(crate) fn lookup_reusable(
         &mut self,
@@ -725,5 +711,7 @@ fn emit_symbol_with_extra(
     writer.write(packed, bits)
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

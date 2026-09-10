@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::*;
+use crate::format::test_support::same_byte_bit_win_zlib;
 
 fn feedback_zlib() -> Vec<u8> {
     let raw = [
@@ -26,7 +27,7 @@ fn deflate_bits(input: &[u8]) -> u64 {
 
 #[test]
 fn same_byte_deflate_win_reports_bits_saved() {
-    let input = super::super::same_byte_bit_win_zlib();
+    let input = same_byte_bit_win_zlib();
     let optimized = optimize(&input, &Options::default()).unwrap();
 
     assert_eq!(optimized.data.len(), input.len());
@@ -87,7 +88,7 @@ fn output_window_normalization_does_not_hide_an_invalid_source_window() {
     let mut input = vec![0x78, 0x01, 0x00, 0x01, 0x01, 0xfe, 0xfe];
     input.resize(input.len() + 257, 0);
     input.extend_from_slice(&[0x03, 0x06, 0x00, 0x00]);
-    input.extend_from_slice(&crate::checksum::adler32(&[0; 260]).to_be_bytes());
+    input.extend_from_slice(&crate::checksum::test_support::adler32(&[0; 260]).to_be_bytes());
     assert!(optimize(&input, &Options::default()).is_ok());
     let source_cmf = input[0];
     input[..2].copy_from_slice(&optimized_header(source_cmf, 0));

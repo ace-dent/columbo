@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+use super::test_support::{literal_span_test_block, payload_tradeoff_test_block};
 use super::*;
+use crate::deflate::huffman::Huffman;
 
 fn best_dynamic_plan(
     tokens: &[Token],

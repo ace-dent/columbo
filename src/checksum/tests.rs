@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use super::test_support::adler32;
 use super::*;
 
 fn crc32_reference(mut crc: u32, bytes: &[u8]) -> u32 {

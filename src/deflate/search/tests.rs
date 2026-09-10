@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::deflate::huffman::make_lengths_deflopt_heap;
+use crate::deflate::huffman::test_support::make_lengths_deflopt_heap;
 use crate::deflate::model::{
     token_extra_bits, OriginalBits, SourceBlockType, LENGTH_BASE, LENGTH_EXTRA_BITS,
 };

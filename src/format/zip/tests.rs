@@ -3,6 +3,12 @@
 use std::time::Duration;
 
 use super::*;
+use crate::format::test_support::SAME_BYTE_BIT_WIN_RAW;
+
+fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let parsed = preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
+    optimize_preflight(input, options, &parsed)
+}
 
 fn ordering_entry(method: u16, compressed_size: u32, offset: usize) -> Entry {
     Entry {
@@ -734,7 +740,7 @@ fn deflated_member_reports_same_byte_bit_savings() {
     let decoded = [b'A'; 168];
     let input = single_entry_archive(
         8,
-        super::super::SAME_BYTE_BIT_WIN_RAW,
+        SAME_BYTE_BIT_WIN_RAW,
         crc32_update(0, &decoded),
         decoded.len() as u32,
         false,

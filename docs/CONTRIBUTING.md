@@ -30,8 +30,10 @@ Use four spaces for Python and shell indentation.
 Put each module's unit tests in its own `tests.rs` file, including small suites,
 and declare it with `#[cfg(test)] mod tests;`. Preserve descriptive implementation
 filenames: for example, `src/format/gzip.rs` and `src/format/gzip/tests.rs`.
-Keep test helpers in the suite that uses them unless they are shared. See the
-[codebase guide](architecture.md) for the full layout.
+Keep helpers and methods used by a single suite in its `tests.rs`. Shared helpers,
+fixtures, and accessors belong in a module-local `test_support.rs`, enabled only
+under `#[cfg(test)]`. Keep only necessary instrumentation in implementation
+files. See the [codebase guide](architecture.md) for the full layout.
 
 ### Rust formatting and comments
 

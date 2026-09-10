@@ -256,12 +256,6 @@ pub(super) fn preflight(
     })
 }
 
-#[cfg(test)]
-pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
-    let parsed = preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
-    optimize_preflight(input, options, &parsed)
-}
-
 pub(super) fn optimize_preflight(
     input: &[u8],
     options: &Options,

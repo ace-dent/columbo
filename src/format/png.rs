@@ -212,12 +212,6 @@ pub(super) fn stream_count(parsed: &ParsedPng<'_>) -> Result<usize> {
         .ok_or_else(|| Error::resource_limit("too many PNG Deflate streams"))
 }
 
-#[cfg(test)]
-pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
-    let parsed = preflight(input, options.strip_metadata)?;
-    optimize_preflight(input, options, parsed)
-}
-
 pub(super) fn optimize_preflight(
     input: &[u8],
     options: &Options,

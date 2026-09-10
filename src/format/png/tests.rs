@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
-use crate::checksum::adler32;
+use crate::checksum::test_support::adler32;
+use crate::format::test_support::same_byte_bit_win_zlib;
+
+fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let parsed = preflight(input, options.strip_metadata)?;
+    optimize_preflight(input, options, parsed)
+}
 
 fn chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -536,7 +542,7 @@ fn idat_reports_same_byte_bit_savings() {
     header[..4].copy_from_slice(&167_u32.to_be_bytes());
     let mut input = SIGNATURE.to_vec();
     input.extend(chunk(*b"IHDR", &header));
-    input.extend(chunk(*b"IDAT", &super::super::same_byte_bit_win_zlib()));
+    input.extend(chunk(*b"IDAT", &same_byte_bit_win_zlib()));
     input.extend(chunk(*b"IEND", &[]));
 
     let optimized = optimize(&input, &Options::default()).unwrap();
@@ -1603,7 +1609,7 @@ fn parallel_max_metadata_floor_preserves_the_combined_decode_budget() {
 #[test]
 fn bounded_max_precomputes_complete_metadata_floors() {
     let mut metadata = b"Comment\0\0".to_vec();
-    metadata.extend_from_slice(&super::super::same_byte_bit_win_zlib());
+    metadata.extend_from_slice(&same_byte_bit_win_zlib());
     let mut input = SIGNATURE.to_vec();
     input.extend(chunk(*b"IHDR", &ihdr()));
     input.extend(chunk(*b"zTXt", &metadata));
@@ -1677,7 +1683,7 @@ fn compressed_metadata_contributes_same_byte_bit_savings_in_both_policies() {
     let mut metadata = b"Comment\0\0".to_vec();
     // This source is one bit behind strict output and three bits behind
     // relaxed output, without changing the byte length.
-    metadata.extend_from_slice(&super::super::same_byte_bit_win_zlib());
+    metadata.extend_from_slice(&same_byte_bit_win_zlib());
     let image = zlib::optimize_embedded(
         &black_scanline_zlib(),
         &Options::default(),

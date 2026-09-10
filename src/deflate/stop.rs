@@ -39,11 +39,6 @@ pub(crate) struct Deadline {
 }
 
 impl Deadline {
-    #[cfg(test)]
-    pub(crate) fn new(started: Instant, duration: Duration) -> Self {
-        Self::with_grace(started, duration, timeout_grace(duration))
-    }
-
     pub(crate) fn with_grace(started: Instant, duration: Duration, grace: Duration) -> Self {
         Self {
             started,

@@ -3,11 +3,17 @@
 use std::time::Duration;
 
 use super::*;
+use crate::format::test_support::SAME_BYTE_BIT_WIN_RAW;
+
+fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
+    let members = preflight(input, options.max_decoded_bytes)?;
+    optimize_preflight(input, options, members)
+}
 
 fn same_byte_bit_win_member() -> Vec<u8> {
     let decoded = [b'A'; 168];
     let mut member = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
-    member.extend_from_slice(super::super::SAME_BYTE_BIT_WIN_RAW);
+    member.extend_from_slice(SAME_BYTE_BIT_WIN_RAW);
     member.extend_from_slice(&crc32_update(0, &decoded).to_le_bytes());
     member.extend_from_slice(&(decoded.len() as u32).to_le_bytes());
     member

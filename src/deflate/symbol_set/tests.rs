@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use super::test_support::{assert_proven_rewrite, symbol_set_test_block};
 use super::*;
 
 #[test]

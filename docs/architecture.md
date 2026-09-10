@@ -58,10 +58,17 @@ their descriptive names, while a sibling directory holds the tests: for example,
 `src/format/gzip.rs` and `src/format/gzip/tests.rs`. The format coordinator
 uses `src/format/mod.rs` and `src/format/tests.rs`. Library-root unit tests live
 in `src/tests.rs`. This preserves access to private implementation details
-without exporting test-only APIs. Keep suite-specific helpers with their tests;
-shared CLI test helpers live in `src/cli/test_support.rs`. Test-only accessors
-and helpers shared across suites remain gated by `#[cfg(test)]` in their
-owning module.
+without exporting test-only APIs. Keep helpers and methods used by a single
+suite in its `tests.rs`. Put fixtures, assertions, and accessors used by multiple
+suites in the owning module's `test_support.rs`, loaded with a `#[cfg(test)]`
+module declaration. Import shared helpers from that module explicitly. For
+example, header fixtures live in `src/deflate/header/test_support.rs`, and CLI
+helpers live in `src/cli/test_support.rs`.
+
+Implementation files contain test-module declarations and the minimal
+instrumentation that must observe production code. The parser's test-only
+trailing-empty-block counter and its `ParsedStream` field are the current
+exception; fixture data and standalone test helpers belong in test files.
 
 `tests/public_api.rs` exercises the library as an external consumer.
 `tests/local_corpus.rs` holds opt-in public-API regressions backed by local files.

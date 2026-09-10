@@ -13,8 +13,6 @@ const MAX_CODE_BITS: usize = 15;
 const MAX_C_CODES: usize = 320;
 const MAX_TRACKED_DEPTH: usize = 63;
 const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
-#[cfg(test)]
-const DEFAULT_DECODE_ROOT_BITS: u8 = 9;
 const CODE_LENGTH_DECODE_BITS: u8 = 7;
 const CODE_LENGTH_DECODE_SIZE: usize = 1 << CODE_LENGTH_DECODE_BITS;
 /// Each payload root is one lookup bit above the balanced width implied by its
@@ -384,21 +382,6 @@ impl Huffman {
         })
     }
 
-    /// Build the same canonical representation plus the parser's two-level
-    /// decode table. Planner and emitter trees use `build()` so they do not pay
-    /// this allocation cost.
-    #[cfg(test)]
-    pub(crate) fn build_decoder(lengths: &[u8]) -> Option<Self> {
-        Self::build_decoder_with_root_bits(lengths, DEFAULT_DECODE_ROOT_BITS)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn build_decoder_with_root_bits(lengths: &[u8], root_bits: u8) -> Option<Self> {
-        let mut tree = Self::build(lengths)?;
-        tree.decode_table = Some(build_decode_table(&tree, root_bits)?);
-        Some(tree)
-    }
-
     /// Build a payload decoder whose table entries also carry the base value
     /// and extra-bit width associated with each symbol. This lets parsing
     /// consume a codeword and its extra field as one logical operation.
@@ -429,15 +412,6 @@ impl Huffman {
         tree.decode_table = Some(table);
         tree.decode_profile = Some(profile);
         Some(tree)
-    }
-
-    /// Decode one symbol, consuming no more than the tree's maximum length.
-    #[cfg(test)]
-    pub(crate) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
-        if let Some(table) = &self.decode_table {
-            return self.decode_table(reader, table);
-        }
-        self.decode_canonical(reader)
     }
 
     /// Decode a profiled symbol together with its following extra-bit field.
@@ -482,15 +456,6 @@ impl Huffman {
             extra,
             extra_bits,
         })
-    }
-
-    #[cfg(test)]
-    fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
-        if let Some((entry, bits)) = self.peek_decode_table(reader, table)? {
-            reader.drop_bits(bits)?;
-            return Ok(entry.symbol());
-        }
-        self.decode_canonical(reader)
     }
 
     fn peek_decode_table(
@@ -553,11 +518,6 @@ impl Huffman {
     pub(crate) fn code(&self, symbol: usize) -> Option<HuffCode> {
         let code = *self.codes.get(symbol)?;
         (code.length != 0).then_some(code)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn max_bits(&self) -> u8 {
-        self.max_bits
     }
 }
 
@@ -1705,18 +1665,6 @@ fn heapify_frequency_only(nodes: &[Node], heap: &mut [usize]) {
     }
 }
 
-/// Build the candidate produced by DeflOpt's frequency/height heap.
-#[cfg(test)]
-pub(crate) fn make_lengths_deflopt_heap(
-    frequencies: &[u32],
-    max_bits: u8,
-    variant: u32,
-) -> Vec<u8> {
-    let mut lengths = vec![0; frequencies.len()];
-    make_lengths_deflopt_heap_into(frequencies, &mut lengths, max_bits, variant);
-    lengths
-}
-
 pub(crate) fn make_lengths_deflopt_heap_into(
     frequencies: &[u32],
     lengths: &mut [u8],
@@ -2141,5 +2089,7 @@ fn deft4j_repair_overlong_tree(
     true
 }
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

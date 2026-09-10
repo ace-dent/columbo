@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::deflate::header::rle_cost;
+use crate::deflate::header::test_support::header_tree_test_block;
 
 fn enumerate(seq: &[u8]) -> u64 {
     let mut allowed = [false; 19];
@@ -169,7 +170,7 @@ fn completed_prices_survive_budget_and_deadline_stops() {
 
 #[test]
 fn complete_plan_beats_full_header_repricing_without_changing_payload_codes() {
-    use crate::deflate::header::{header_tree_test_block, plan_for_advertised_lengths, token_bits};
+    use crate::deflate::header::{plan_for_advertised_lengths, token_bits};
     let block = header_tree_test_block();
     let parent = block.original_dynamic.as_ref().unwrap();
     let data = token_bits(
@@ -240,7 +241,7 @@ fn relaxed_distance_exceptions_still_emit_valid_headers() {
     use crate::deflate::{
         bitstream::BitWriter,
         block::emit_block,
-        header::{header_tree_test_block, plan_for_advertised_lengths, token_bits},
+        header::{plan_for_advertised_lengths, token_bits},
         model::{count_frequencies, PlannedBlock, Representation, SourceBlockType, Token},
         parse::parse_stream,
     };

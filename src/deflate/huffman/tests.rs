@@ -1,7 +1,45 @@
 // SPDX-License-Identifier: MIT
 
+use super::test_support::make_lengths_deflopt_heap;
 use super::*;
 use crate::deflate::bitstream::BitWriter;
+
+const DEFAULT_DECODE_ROOT_BITS: u8 = 9;
+
+impl Huffman {
+    /// Build the same canonical representation plus the parser's two-level
+    /// decode table. Planner and emitter trees use `build()` so they do not pay
+    /// this allocation cost.
+    fn build_decoder(lengths: &[u8]) -> Option<Self> {
+        Self::build_decoder_with_root_bits(lengths, DEFAULT_DECODE_ROOT_BITS)
+    }
+
+    fn build_decoder_with_root_bits(lengths: &[u8], root_bits: u8) -> Option<Self> {
+        let mut tree = Self::build(lengths)?;
+        tree.decode_table = Some(build_decode_table(&tree, root_bits)?);
+        Some(tree)
+    }
+
+    /// Decode one symbol, consuming no more than the tree's maximum length.
+    fn decode(&self, reader: &mut BitReader<'_>) -> Result<u16> {
+        if let Some(table) = &self.decode_table {
+            return self.decode_table(reader, table);
+        }
+        self.decode_canonical(reader)
+    }
+
+    fn decode_table(&self, reader: &mut BitReader<'_>, table: &DecodeTable) -> Result<u16> {
+        if let Some((entry, bits)) = self.peek_decode_table(reader, table)? {
+            reader.drop_bits(bits)?;
+            return Ok(entry.symbol());
+        }
+        self.decode_canonical(reader)
+    }
+
+    fn max_bits(&self) -> u8 {
+        self.max_bits
+    }
+}
 
 fn merge_generic_nodes_scanning(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
     while active.len() > 1 {

@@ -104,9 +104,6 @@ pub(crate) fn adler32_update(adler: u32, bytes: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-pub(crate) fn adler32(bytes: &[u8]) -> u32 {
-    adler32_update(1, bytes)
-}
-
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;

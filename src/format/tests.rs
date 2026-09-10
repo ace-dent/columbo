@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 
+use super::test_support::SAME_BYTE_BIT_WIN_RAW;
 use super::*;
 
 fn zlib_header(cinfo: u8, flevel: u8, preset_dictionary: bool) -> [u8; 2] {
