@@ -80,3 +80,40 @@ pub(crate) fn header_tree_test_block() -> ParsedBlock {
     ];
     parse_stream(&raw, 4096).unwrap().blocks.remove(0)
 }
+
+/// A generated literal-only parent at a local optimum for fully repriced
+/// pair swaps. Rotating lengths at positions 4, 13 and 18 saves one bit.
+pub(crate) fn rotation_test_block(distance: &[u8]) -> ParsedBlock {
+    use crate::deflate::bitstream::BitWriter;
+    use crate::deflate::block::emit_block;
+    use crate::deflate::model::{PlannedBlock, Representation};
+
+    let counts = [
+        4, 13, 12, 6, 2, 10, 9, 7, 8, 9, 20, 16, 2, 3, 19, 1, 10, 20, 6, 14, 19, 17, 18, 8,
+    ];
+    let plain: Vec<u8> = counts
+        .iter()
+        .enumerate()
+        .flat_map(|(symbol, &count)| std::iter::repeat(symbol as u8).take(count))
+        .collect();
+    let tokens: Vec<Token> = plain.iter().copied().map(Token::Literal).collect();
+    let mut lengths = [0; 257];
+    lengths[..24].copy_from_slice(&[
+        6, 4, 4, 5, 7, 5, 5, 5, 5, 5, 4, 4, 7, 6, 4, 7, 4, 4, 5, 4, 4, 4, 4, 5,
+    ]);
+    lengths[256] = 7;
+    let dynamic = plan_for_explicit_lengths(&tokens, &lengths, distance, true).unwrap();
+    let plan = PlannedBlock {
+        tokens: tokens.into(),
+        plain: plain.into(),
+        bits: dynamic.bits,
+        representation: Representation::Dynamic(dynamic),
+        source_type: SourceBlockType::Dynamic,
+    };
+    let mut writer = BitWriter::default();
+    emit_block(&mut writer, &[], &plan, true).unwrap();
+    parse_stream(&writer.into_bytes(), 4096)
+        .unwrap()
+        .blocks
+        .remove(0)
+}

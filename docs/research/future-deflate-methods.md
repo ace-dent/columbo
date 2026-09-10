@@ -25,6 +25,9 @@ uses existing Max allowances and preserves measured Default output parity.
 A joint [code-length tree/RLE solver](code-length-tree-validation.md) now has
 an exact fixed-data-tree formulation and a validated bounded Max implementation. It finds gains beyond full existing header repricing,
 including frozen Max endpoints that completed before their deadline.
+Three-symbol payload code-length rotations are now
+[implemented and validated in Max](code-length-rotation-validation.md), including
+pair-swap barriers, gains on frozen Max parents and unchanged Default outputs.
 The follow-up distinguishes untested proposals from production methods.
 Further validation of [permanent original-match proofs](permanent-match-proofs-validation.md)
 now identifies a reproducible absent token choice, including a completed Max
@@ -377,6 +380,7 @@ recompression and container transforms that would change Columbo's scope.
 | --- | --- |
 | [`header.rs`](../../src/deflate/header.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE, finished-tree moves |
 | [`header/tree.rs`](../../src/deflate/header/tree.rs) | Joint CL-tree/RLE optimization using run costs and complete Kraft capacity |
+| [`header/rotate.rs`](../../src/deflate/header/rotate.rs) | Bounded three-symbol payload-length rotations with full header pricing |
 | [`huffman.rs`](../../src/deflate/huffman.rs) | Length-limited builders, pseudo-frequencies, decode tables |
 | [`search.rs`](../../src/deflate/search.rs) | Same-distance, match-family, proven-submatch, feedback, and composition searches |
 | [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, entropy-state scout, boundary graph, reseat, forced split, range caches |
@@ -401,9 +405,9 @@ Retained methods require focused oracles plus wrapper-level differentials.
 Default methods require broad wins with negligible runtime regression. Rare
 header or boundary wins remain Max-only.
 
-The latest CL-tree/RLE change passes 530 tests, preserves 404 Default outputs,
-and passes strict/relaxed Max and Defluff comparisons; its
-[validation report](code-length-tree-validation.md) records the bounds and results.
+The latest code-length rotation change passes 538 tests, preserves 404 Default
+outputs, and passes strict/relaxed Max and Defluff comparisons; its
+[validation report](code-length-rotation-validation.md) records the bounds and results.
 
 Earlier execution and profiling validation:
 

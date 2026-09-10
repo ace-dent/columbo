@@ -8,6 +8,7 @@ use super::*;
 use crate::deflate::bitstream::BitWriter;
 use crate::deflate::header::test_support::{
     header_tree_test_block, literal_span_test_block, payload_tradeoff_test_block,
+    rotation_test_block,
 };
 use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
 use crate::deflate::model::Token;
@@ -2682,4 +2683,146 @@ fn header_tree_search_is_not_mandatory_at_zero_max_budget() {
     )
     .unwrap();
     assert_eq!(zero.data, ordinary.data);
+}
+
+#[test]
+fn code_length_rotations_preserve_tokens_and_stored_alignment() {
+    let block = rotation_test_block(&[1, 1]);
+    let middle = PlannedBlock {
+        tokens: block.tokens.clone(),
+        plain: block.plain.clone(),
+        representation: Representation::Dynamic(block.original_dynamic.clone().unwrap()),
+        bits: block.original.unwrap().len,
+        source_type: SourceBlockType::Dynamic,
+    };
+    let tail = PlannedBlock {
+        tokens: vec![Token::Match {
+            length: 3,
+            distance: 1,
+            length_symbol: 257,
+            distance_symbol: 0,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 0,
+            distance_extra_bits: 0,
+        }]
+        .into(),
+        plain: vec![*block.plain.last().unwrap(); 3].into(),
+        representation: Representation::Fixed,
+        bits: 22,
+        source_type: SourceBlockType::Fixed,
+    };
+    let mut gains = 0;
+    for count in 1..=8 {
+        let prefix = PlannedBlock {
+            tokens: vec![Token::Literal(200); count].into(),
+            plain: vec![200; count].into(),
+            representation: Representation::Fixed,
+            bits: 10 + 9 * count as u64,
+            source_type: SourceBlockType::Fixed,
+        };
+        let mut writer = BitWriter::default();
+        for plan in [&prefix, &middle, &tail] {
+            emit_block(&mut writer, &[], plan, false).unwrap();
+        }
+        let stored = PlannedBlock {
+            tokens: Vec::new().into(),
+            plain: vec![b'X'; 9].into(),
+            representation: Representation::Stored,
+            bits: stored_block_bits((writer.bit_position() & 7) as u8, 9),
+            source_type: SourceBlockType::Stored,
+        };
+        emit_block(&mut writer, &[], &stored, true).unwrap();
+        let data = writer.into_bytes();
+        let parsed = parse_stream(&data, 4096).unwrap();
+        let identity = StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        };
+        let parent = Candidate {
+            data,
+            bits: parsed.meaningful_bits,
+            output_max_distance: Some(parsed.max_distance),
+            plans: Vec::new(),
+            block_report: None,
+            route: "test parent",
+            max_planner_is_stable: false,
+        };
+        for strict in [false, true] {
+            let result = refine_with_terminal_header_search(
+                TerminalHeaderSearch::CodeLengthRotations,
+                &parent,
+                &Options {
+                    strict,
+                    ..Options::default()
+                },
+                4096,
+                identity,
+                &mut SearchStop::never(),
+            )
+            .unwrap();
+            let selected = result.as_ref().unwrap_or(&parent);
+            gains += usize::from(result.is_some());
+            let check = parse_validated_rewrite(&selected.data, 4096, identity).unwrap();
+            assert_eq!(check.blocks.len(), parsed.blocks.len());
+            assert_eq!(check.max_distance, parsed.max_distance);
+            assert_eq!(selected.output_max_distance, Some(parsed.max_distance));
+            for (before, after) in parsed.blocks.iter().zip(&check.blocks) {
+                assert_eq!(before.tokens, after.tokens);
+                assert_eq!(before.plain, after.plain);
+                if let Some(tree) = &before.original_dynamic {
+                    let next = after.original_dynamic.as_ref().unwrap();
+                    let mut before_lengths = tree.literal_lengths.clone();
+                    let mut after_lengths = next.literal_lengths.clone();
+                    before_lengths.sort_unstable();
+                    after_lengths.sort_unstable();
+                    assert_eq!(before_lengths, after_lengths);
+                    assert_eq!(tree.distance_lengths, next.distance_lengths);
+                    assert_eq!((tree.hlit, tree.hdist), (next.hlit, next.hdist));
+                }
+            }
+            assert_eq!(check.meaningful_bits & 7, 0);
+        }
+    }
+    assert!(
+        gains > 0 && gains < 16,
+        "stored padding must absorb only some header wins"
+    );
+}
+
+#[test]
+fn code_length_rotations_do_not_change_zero_budget_default_floor() {
+    let block = rotation_test_block(&[1, 1]);
+    let plan = PlannedBlock {
+        tokens: block.tokens.clone(),
+        plain: block.plain.clone(),
+        representation: Representation::Dynamic(block.original_dynamic.unwrap()),
+        bits: block.original.unwrap().len,
+        source_type: SourceBlockType::Dynamic,
+    };
+    let mut writer = BitWriter::default();
+    emit_block(&mut writer, &[], &plan, true).unwrap();
+    let data = writer.into_bytes();
+    for strict in [false, true] {
+        let ordinary = optimize_raw(
+            &data,
+            &Options {
+                strict,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        let zero = optimize_raw(
+            &data,
+            &Options {
+                strict,
+                exhaustive: true,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ordinary.data, zero.data);
+    }
 }

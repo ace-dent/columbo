@@ -21,7 +21,9 @@ use super::model::{
 };
 use super::stop::SearchStop;
 
+mod rotate;
 mod tree;
+pub(crate) use rotate::{plan_code_length_rotations, RotationBudget};
 pub(crate) use tree::{plan_header_tree, HeaderTreeBudget};
 
 const INF: u64 = u64::MAX / 4;
