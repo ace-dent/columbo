@@ -12,6 +12,121 @@ Private machine-readable states live under `work/`, which remains ignored by
 Git. Public Markdown reports never relabel rows from an older executable as
 current results.
 
+## Refresh on 22 September 2026
+
+The current checkout retains the accepted Max header admission rule described
+below. Subsequent changes accelerated Huffman construction, same-distance
+partitioning and original-match restoration without changing their stated
+search limits. All three newly completed benchmark journals use executable
+SHA-256 `64dad99f0de94bcdbaf9b00fe2a4351b0043f468437ee68736cec98a4431c34c`.
+The 89 source files match the validated build's source manifest, and all 1,640
+inventoried benchmark sources match their 15 September hashes. Reference names,
+bytes and meaningful-bit counts also match the frozen complete journals.
+
+### Complete current journals
+
+The table compares the current executable with the earlier complete
+`6c601870…` executable. A negative size delta means the current result is
+smaller. DeflOpt's Max allowance depends on measured Default time; 36 of its
+957 allowances changed. The same-allowance subset separates those rows.
+
+| Cohort | Improvements / ties / losses | Net bytes / meaningful bits | Earlier → current measured runtime |
+| --- | ---: | ---: | ---: |
+| DeflOpt Default, 957 pairs | 0 / 957 / 0 | 0 / 0 | 1,395.78 → 1,270.97 s |
+| DeflOpt Max, 957 pairs | 147 / 776 / 34 | −7,335 / −58,679 | 9,752.64 → 9,690.18 s |
+| DeflOpt Max, 921 pairs at identical allowances | 130 / 760 / 31 | −7,525 / −60,198 | 9,056.78 → 9,055.83 s |
+| Timed deft4j, 1,621 pairs at identical allowances | 204 / 1,390 / 27 | −2,104 / −16,765 | 17,720.46 → 17,721.63 s |
+| Defluff, 66 pairs | 0 / 66 / 0 | 0 / 0 | 13.38 → 8.12 s |
+
+Default's output byte/bit counts are identical throughout. Against the earlier
+build, DeflOpt Max trades 8,670 bytes / 69,348 bits of gross gains against
+1,335 bytes / 10,669 bits of losses; deft4j trades 2,455 bytes / 19,576 bits
+of gains against 351 bytes / 2,811 bits of losses. Defluff still has 61 wins
+and five ties against its reference, saving 109 bytes / 932 bits. Runtimes are
+observations from different complete runs, not isolated speedup measurements.
+The benchmark policies and overlapping sources prevent adding these totals as
+one independent corpus.
+
+Within the previously inventoried 138-file static PNG Max class, the current
+build has 119 improvements, 16 ties and three losses against `6c601870…`,
+saving 1,851 bytes / 14,782 bits. The 122 rows at identical allowances save
+1,676 bytes / 13,381 bits. The 69 additional policy-matched cases have 38
+improvements, 27 ties and four losses, saving 443 bytes / 3,581 bits; 68 retain
+identical allowances. These are overlapping selections from the complete
+journals, not additions to the table above. They support the general Max work
+class without replacing its [original admission proof](research/terminal-header-work-class-validation.md).
+Measured time is 1,633.17 → 1,642.41 seconds in the 138-file class and
+967.67 → 977.42 seconds in the additional 69 cases; allowances differ for
+some rows as described above.
+
+### Strict misses and hundred-file guard
+
+The same seventeen strict reference misses remain, with identical strict
+byte/bit counts. Fresh `--strict 0` audits on this executable reach reference
+parity or better for sixteen at their recorded allowances; the signed PNG
+remains byte-identical to its source, including the unknown unsafe-to-copy
+chunk. The [DeflOpt](deflopt-benchmark.md) and
+[deft4j](deft4j-timed-benchmark.md) reports now attach those current-executable
+audits while preserving every original strict row. Strict misses are not
+relabeled as wins.
+
+All hundred canonical guard cases have exact source, mode and allowance
+coverage in the current complete journals. At normal allowances, 90 improve,
+six tie and four miss their unchanged historical floors: net savings of
+3,935 bytes / 31,534 bits. Against the earlier `6c601870…` full-journal
+coverage of those same hundred cases, the current build saves 197 bytes /
+1,573 bits, with 1,200.99 → 1,197.34 seconds measured. This small time
+difference is not an isolated speedup claim. The four historical residuals
+and longer-time witnesses are:
+
+| Source | Normal-allowance gap, bytes / bits | Longer allowance and measured runtime | Longer result vs historical floor, bytes / bits |
+| --- | ---: | ---: | ---: |
+| `css-ig-net/sample_53.png` | +1 / +3 | 60 s / 65.65 s | −25 / −204 |
+| `css-ig-net/sample_71.png` | +14 / +114 | 60 s / 65.10 s | −44 / −351 |
+| `oxipng/filter_0_for_grayscale_16.png` | +15 / +121 | 60 s / 65.71 s | −59 / −467 |
+| `medium/LevelLoading.png` | +7 / +52 | 250 s / 270.80 s | −1 / −8 |
+
+Thus all hundred historical floors have witnesses on the current executable:
+96 at normal settings and four after more time. The longer results do not
+replace normal-run losses or runtime. The canonical guard file is unchanged.
+
+### Timing-sensitive examples and stronger targets
+
+Three large journal losses received fresh trials using frozen executables and
+the same source/reference policy. Kiwi512's earlier 10-second journal result
+is 389,163 bytes / 3,089,703 bits. Fresh 10-second runs of both executables
+give 389,163 bytes / 3,089,697 bits; the current build repeats that result at
+60 seconds. The worse current journal row does not reproduce as a build
+difference in this pair.
+
+For `floor pattern.png`, the old journal used 21 seconds and the new one 18.
+At a fresh 21 seconds, the current executable beats the earlier executable by
+48 bytes / 389 bits, although both miss the earlier journal's best result.
+At 60 seconds, the current executable beats that earlier journal result by
+552 bytes / 4,416 bits. A fresh 30-second pair for
+`csgoChat_128_chickendance.png` likewise favors the current executable by
+29 bytes / 234 bits despite its larger current journal row. Its 60-second
+trial beats the earlier journal result by 204 bytes / 1,621 bits. These
+examples show that a journal-to-journal loss is not automatically a causal
+regression in the changed code; all original rows remain in the aggregates.
+
+The five stronger comparable targets left open on 15 September were repeated
+on the current executable at their previous longer allowances. None recovers:
+Briefcase remains +1 byte / +8 bits at 60 seconds, 09 remains +2 bits at
+60 seconds, Fs remains +1 byte / +5 bits at 180 seconds, and the two older
+APNG cases remain +4 bytes / +39 bits and +2 bytes / +14 bits at 60 seconds.
+Their combined gap is eight bytes / 68 meaningful bits. Briefcase already
+passes its separate canonical guard floor. A failed finite run does not prove
+that a whole-optimizer endpoint is unreachable; the prior completed-budget
+probe only rules out increasing R10/R11 budgets alone for its frozen 09 parent.
+
+The latest committed source has already passed 591 Rust tests in debug and
+release, 13 Python tests, contributor checks and 50 exact-output API
+comparisons, as recorded in the [efficiency review](efficiency-review.md).
+No production code or route limit changed in this refresh. Private complete
+comparison, paired-run, longer-time, source-hash and relaxed-audit records
+are under `work/miss-regression-20260922/`.
+
 ## Refresh on 15 September 2026
 
 All three complete journals now use source `7fa3fdf`, executable SHA-256

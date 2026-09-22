@@ -22,7 +22,7 @@ does not replace the independent historical-state audit.
 
 - completed rows: 1914
 - misses: 4
-- strict-policy misses reaching parity in relaxed audit: 0
+- strict-policy misses reaching parity in relaxed audit: 4
 - unresolved misses: 4
 - errors: 0
 - state-carried prior-result regression annotations over 10%: 0
@@ -84,6 +84,22 @@ Comparisons include only rows from the same Columbo binary.
 | png | max+5s | `small/T_Grass.png` | 1 | 7 |
 | png | default | `samplelib-png/sample-green-400x300.png` | 1 | 2 |
 | png | max+5s | `samplelib-png/sample-green-400x300.png` | 1 | 2 |
+
+## Strict-policy Differences
+
+These standard-mode rows are slightly larger than DeflOpt because
+Columbo defaults to strictly compliant Deflate alphabets. Each
+file was independently rerun with `--strict 0`; the relaxed
+result matched or beat the same DeflOpt reference in both file
+bytes and meaningful Deflate bits. This explains the source of
+the difference but does not resolve the strict-output miss.
+
+| format | mode | file | strict bytes | strict bits | relaxed bytes | relaxed bits |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| png | default | `samplelib-png/sample-green-400x300.png` | 1 | 2 | 0 | 0 |
+| png | max+5s | `samplelib-png/sample-green-400x300.png` | 1 | 2 | 0 | 0 |
+| png | default | `small/T_Grass.png` | 2 | 15 | -1 | -10 |
+| png | max+5s | `small/T_Grass.png` | 1 | 7 | -1 | -14 |
 
 ## Rows
 
