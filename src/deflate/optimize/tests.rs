@@ -40,7 +40,7 @@ fn terminal_reservation_requires_max_owned_time_and_the_full_terminal_work_class
             floor.reserves_terminal_search(&options, 1024, 4096, 2),
             matches!(
                 floor,
-                DefaultFloor::Complete | DefaultFloor::CompleteThenBounded
+                DefaultFloor::Complete | DefaultFloor::CompleteThenBounded | DefaultFloor::ApngMax
             )
         );
     }

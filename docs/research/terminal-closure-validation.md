@@ -291,6 +291,8 @@ larger parent could therefore receive no optional terminal time. The extension
 uses the existing Max bound for source admission, with both sizes at most
 1 MiB and at most 128 source wire blocks. Max, nonzero allowance, and stream
 ownership through `Complete` or `CompleteThenBounded` remain required.
+This describes the 13 September admission rule. The later `ApngMax` child
+share is documented in the [benchmark miss audit](../benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026).
 
 The 4/5 primary share, original terminal deadline/grace, deferred coarse split
 rescue and all method budgets remain unchanged. R1–R5 still have their 128 KiB

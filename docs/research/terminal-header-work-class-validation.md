@@ -181,7 +181,9 @@ the second saves two meaningful bits at unchanged byte size. Their gaps to the
 older APNG floors remain four bytes / 39 bits and two bytes / 14 bits. The
 paired times are 22.20 → 22.20 seconds and 22.27 → 22.27 seconds. These sources
 come from the separate older APNG evidence, outside the current complete-journal
-inventory. Their shared frame policy receives no terminal reservation.
+inventory. Their shared frame policy received no terminal reservation in this
+historical test. The later bounded `ApngMax` reservation and its independent
+validation are in the [benchmark miss audit](../benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026).
 
 Nine generated raw/zlib/GZIP controls give four wins, five ties and no losses:
 −24 bytes / −205 meaningful bits, with 84.292 → 85.869 seconds measured.

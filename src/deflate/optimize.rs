@@ -234,8 +234,10 @@ impl DefaultFloor {
     }
 
     /// Give admitted terminal methods a positive share instead of allowing an
-    /// unfinished primary search to make their endpoint unreachable. Reuse
-    /// Max's full work class; larger and shared streams keep their schedule.
+    /// unfinished primary search to make their endpoint unreachable. An APNG
+    /// Max child owns a proportional image-job slice, so it can reserve the
+    /// tail of that slice without consuming a sibling frame's allowance.
+    /// Other shared streams keep their schedule.
     fn reserves_terminal_search(
         self,
         options: &Options,
@@ -244,7 +246,7 @@ impl DefaultFloor {
         source_blocks: usize,
     ) -> bool {
         options.exhaustive
-            && self.owns_terminal_stream_time()
+            && (self.owns_terminal_stream_time() || self == Self::ApngMax)
             && !options.timeout.is_zero()
             && compressed_bytes <= MAX_TERMINAL_HEADER_MAX_BYTES
             && decoded_bytes <= MAX_TERMINAL_HEADER_MAX_BYTES as u64
@@ -478,16 +480,18 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         parsed.decoded_size,
         parsed.source_block_count,
     );
-    // Primary work keeps four fifths of the original allowance, including
-    // elapsed parsing/floor time. No phase grace may consume the terminal
-    // share. Both phases grow with the allowance; finalization alone retains
-    // the original file grace, without adding another timeout window.
+    // A multi-image APNG child keeps nineteen twentieths of its assigned
+    // slice for primary work; its smaller terminal share grows with time and
+    // cannot consume another frame's slice. A stream owning the file clock
+    // keeps four fifths for primary work. No phase grace may consume either
+    // terminal share; finalization alone retains the original grace.
     let deadline = if reserve_terminal {
-        Deadline::with_grace(
-            started,
-            initial_bounded_phase_share(options.timeout),
-            Duration::ZERO,
-        )
+        let primary_share = if default_floor == DefaultFloor::ApngMax {
+            options.timeout.saturating_mul(19) / 20
+        } else {
+            initial_bounded_phase_share(options.timeout)
+        };
+        Deadline::with_grace(started, primary_share, Duration::ZERO)
     } else {
         Deadline::with_grace(started, options.timeout, grace)
     };

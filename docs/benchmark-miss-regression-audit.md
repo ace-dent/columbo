@@ -12,6 +12,77 @@ Private machine-readable states live under `work/`, which remains ignored by
 Git. Public Markdown reports never relabel rows from an older executable as
 current results.
 
+## APNG terminal-share follow-up on 22 September 2026
+
+The five stronger historical Columbo targets were first retried on executable
+`64dad99f…` with larger allowances, without changing its source. The two
+DeflOpt targets still miss: `briefcase.png` is +1 byte / +8 bits after
+180 seconds, and `09-ct-c6-c4.png` is +2 bits after 180 seconds. The former
+chooses a different subset of source-certified four-byte matches; the latter
+moves a two-block boundary by 149 decoded bytes and changes both blocks'
+tokens. A header-only patch cannot recover either output. `FsqwhPuaIAIlojU.png`
+does recover at 360 seconds, finishing 21 bytes / 165 bits below its older
+target. Its older and normal-current outputs have 50 and 52 blocks respectively.
+
+The first older APNG target recovers at 180 seconds on `64dad99f…`, finishing
+9 bytes / 64 bits below the target. Its repeated frame is 25 bits smaller at
+each of four copies than in the 60-second output. The second older APNG target
+remains +2 bytes / +14 bits at 180 seconds, byte-identical to its 60-second
+output. Its historical winning frame splits after 32,101 decoded bytes;
+the current parent splits after 36,627. The older `f287245e…` executable
+reproduces both historical APNG targets. Its first output predates Columbo's
+smallest-sufficient zlib-window normalization and retains one unnecessarily
+wide frame window. That wrapper choice does not change its Deflate bit count
+or explain the missing compression choice.
+
+The diagnosed APNG scheduling gap has a format-independent time basis within
+each child stream: a long primary route can finish on a useful parent with no
+time left for short terminal header passes. For eligible `ApngMax` children,
+the working-tree change reserves the last 1/20 of the child's assigned soft
+allowance for terminal methods and leaves 19/20 for primary routes. It uses
+the existing ≤1 MiB compressed/decoded and ≤128-source-block Max work class,
+adds no worker or new file-wide allowance, and retains the complete Default
+file floor. Candidate executable SHA-256 is
+`e3325451aac96fdc66b313e648898a31a9f8e076352b13cde94d52d42d56d8f9`.
+
+Both APNG targets improve at their original 60-second allowances:
+
+| Source prefix | `64dad99f…` bytes / bits | Candidate bytes / bits | Candidate vs older target |
+| --- | ---: | ---: | ---: |
+| `2313020_361766…` | 65,394 / 517,985 | 65,330 / 517,483 | −60 bytes / −463 bits |
+| `657730_102978…` | 172,311 / 1,371,475 | 172,231 / 1,370,827 | −78 bytes / −634 bits |
+
+Fresh serial controls reproduced those byte and bit counts for both executables
+at the same allowances. In those controls, candidate wall times were 55.82
+versus 64.44 seconds and 60.22 versus 64.51 seconds. One deliberately checked
+short-allowance loss, `apng-medium/Dharma_Wheelmmm-APNG-animation2.png`,
+measured 76,422 / 600,269 at 12.54 seconds on `64dad99f…` and
+76,443 / 600,426 at 10.04 seconds on the candidate. The reservation can
+therefore trade some primary search quality for earlier terminal work; the
+individual loss is retained, not hidden by the aggregate.
+The candidate's Max outputs also dominate fresh Default outputs of
+65,550 / 519,250 and 172,566 / 1,373,519 bytes / bits respectively.
+
+All 30 APNG-named cases in the regular timed deft4j journal were rerun at their
+recorded allowances with output identity, PNG validity and zlib-window checks.
+Against the earlier complete `64dad99f…` journal, 26 improve, two tie and two
+lose in file bytes; 25 improve, two tie and three lose in meaningful bits.
+The net is 2,866 bytes / 22,867 bits saved, with observed total runtime
+661.23 → 592.48 seconds. Those runtime observations are from different full
+cohort runs, not a controlled speedup measurement. Exactly 29 of the 30
+sources contain APNG frames. A source inspection found no APNG frames among
+the other 1,592 timed deft4j sources, any DeflOpt source, or any of the 100
+canonical guard sources, so those sources cannot enter the changed `ApngMax`
+branch. The full 1,621-row deft4j corpus was not rerun on the candidate.
+
+Debug and release Rust tests and `cargo fmt --check` pass on the candidate. The 17
+strict reference misses remain policy cases: 13 references use singleton
+distance trees, three use empty distance alphabets, and the signed PNG must
+stay byte-identical. No strictness rule or Default route changed. Defluff's
+61 wins and five ties remain outside this APNG-only change. The private
+block/token comparisons, extended trials, candidate rows and paired controls
+are under `work/miss-regression-20260922/`.
+
 ## Refresh on 22 September 2026
 
 The current checkout retains the accepted Max header admission rule described
