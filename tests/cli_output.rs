@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! Explicit output validation through the public command-line interface.
+//! Report streams and explicit output validation through the public CLI.
 
 use std::fs;
 use std::io;
@@ -37,6 +37,16 @@ impl TestDirectory {
             .arg(destination)
             .args(extra)
             .arg("input.deflate")
+            .output()
+            .unwrap()
+    }
+
+    fn run_report(&self, extra: &[&str], inputs: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_columbo"))
+            .current_dir(&self.0)
+            .args(["--raw", "--dry-run"])
+            .args(extra)
+            .args(inputs)
             .output()
             .unwrap()
     }
@@ -95,6 +105,97 @@ fn assert_optimization_error(result: &Output) {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(stderr.contains("could not optimize"), "{stderr}");
     assert!(!stderr.contains("cannot use --out destination"), "{stderr}");
+}
+
+#[test]
+fn redirected_reports_use_stdout_in_every_mode() {
+    let directory = TestDirectory::new();
+    fs::write(directory.0.join("input.deflate"), [0x03, 0x00]).unwrap();
+    for flags in [&[][..], &["--verbose"][..], &["--visual"][..]] {
+        let result = directory.run_report(flags, &["input.deflate"]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(stdout.contains("\"input.deflate\""), "{stdout}");
+        assert!(stdout.contains("dry run"), "{stdout}");
+        if flags == ["--visual"] {
+            assert!(stdout.contains("Result\n"), "{stdout}");
+            assert!(!stdout.contains("Stream 01"), "{stdout}");
+            assert_eq!(
+                String::from_utf8_lossy(&result.stderr),
+                "visual mode needs an interactive stdout terminal; continuing without stream maps\n"
+            );
+        } else {
+            assert!(result.stderr.is_empty(), "{result:?}");
+        }
+        assert!(!result.stdout.contains(&0x1b), "{result:?}");
+        assert!(!result.stderr.contains(&0x1b), "{result:?}");
+        assert_eq!(
+            fs::read(directory.0.join("input.deflate")).unwrap(),
+            [0x03, 0x00]
+        );
+        directory.assert_entries(&["input.deflate"]);
+    }
+}
+
+#[test]
+fn relaxed_mode_warns_once_on_stderr_in_every_mode() {
+    let directory = TestDirectory::new();
+    for name in ["first.deflate", "second.deflate"] {
+        fs::write(directory.0.join(name), [0x03, 0x00]).unwrap();
+    }
+    for mode in [None, Some("--verbose"), Some("--visual")] {
+        let mut flags = vec!["--strict", "0"];
+        flags.extend(mode);
+        let result = directory.run_report(&flags, &["first.deflate", "second.deflate"]);
+        assert_eq!(result.status.code(), Some(0), "{result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stdout.contains("\"first.deflate\""), "{stdout}");
+        assert!(stdout.contains("\"second.deflate\""), "{stdout}");
+        assert!(!stdout.contains("Caution:"), "{stdout}");
+        assert_eq!(stderr.matches("Caution: strict mode disabled;").count(), 1);
+        assert!(!result.stdout.contains(&0x1b), "{result:?}");
+        assert!(!result.stderr.contains(&0x1b), "{result:?}");
+    }
+}
+
+#[test]
+fn batch_errors_stay_on_stderr_and_later_reports_use_stdout() {
+    let directory = TestDirectory::new();
+    fs::write(directory.0.join("bad.deflate"), [0xff]).unwrap();
+    fs::write(directory.0.join("good.deflate"), [0x03, 0x00]).unwrap();
+    for flags in [&[][..], &["--verbose"][..], &["--visual"][..]] {
+        let result = directory.run_report(flags, &["bad.deflate", "good.deflate"]);
+        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stdout.contains("\"good.deflate\""), "{stdout}");
+        assert!(!stdout.contains("could not optimize"), "{stdout}");
+        assert!(
+            stderr.contains("could not optimize \"bad.deflate\":"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("good.deflate"), "{stderr}");
+        assert!(!result.stdout.contains(&0x1b), "{result:?}");
+        assert!(!result.stderr.contains(&0x1b), "{result:?}");
+    }
+}
+
+#[test]
+fn help_uses_stdout_and_argument_errors_use_stderr() {
+    let directory = TestDirectory::new();
+    let help = directory.run_report(&["--help"], &[]);
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty(), "{help:?}");
+    let stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        stdout.contains("Reports go to stdout; warnings, errors, and the spinner go to stderr.")
+    );
+
+    let error = directory.run_report(&["--unknown"], &[]);
+    assert_eq!(error.status.code(), Some(2));
+    assert!(error.stdout.is_empty(), "{error:?}");
+    assert!(String::from_utf8_lossy(&error.stderr).contains("unknown option: --unknown"));
 }
 
 #[test]

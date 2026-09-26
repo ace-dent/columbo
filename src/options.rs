@@ -54,7 +54,7 @@ pub struct Options {
     ///
     /// The source row remains fixed while the output row follows the best
     /// complete candidate found so far. Visual reporting is enabled only when
-    /// standard error is an interactive terminal; redirected runs remain free
+    /// standard output is an interactive terminal; redirected runs remain free
     /// of ANSI cursor-control sequences. Enabling it never substitutes a
     /// cheaper optimization schedule for the standard engine.
     pub visual: bool,

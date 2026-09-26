@@ -275,7 +275,7 @@ fn report_modes_have_one_consistent_output_channel() {
 
     let default = ReportMode::for_options(&default.options);
     assert_eq!(default, ReportMode::Default);
-    assert_eq!(default.channel(), OutputChannel::Stderr);
+    assert_eq!(default.channel(), OutputChannel::Stdout);
     assert!(!default.detailed());
     assert!(!default.reports_timeout());
 
@@ -287,7 +287,7 @@ fn report_modes_have_one_consistent_output_channel() {
 
     let visual = ReportMode::for_options(&visual.options);
     assert_eq!(visual, ReportMode::Visual);
-    assert_eq!(visual.channel(), OutputChannel::Stderr);
+    assert_eq!(visual.channel(), OutputChannel::Stdout);
     assert!(visual.detailed());
     assert!(visual.reports_timeout());
 }

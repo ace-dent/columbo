@@ -34,7 +34,7 @@ const DYNAMIC_COLOR: &str = "\x1b[96m";
 static RENDERER: OnceLock<Mutex<Renderer>> = OnceLock::new();
 
 pub(super) fn enabled(options: &Options) -> bool {
-    options.visual && terminal::stderr_interactive()
+    options.visual && terminal::stdout_interactive()
 }
 
 pub(super) fn format_detected(format: &'static str, deflate_streams: Option<usize>) {
@@ -246,7 +246,7 @@ pub(super) fn emit_cards(cards: Vec<[String; 4]>) {
     if cards.is_empty() {
         return;
     }
-    let mut terminal = io::stderr().lock();
+    let mut terminal = io::stdout().lock();
     for lines in cards {
         for line in lines {
             let _ = writeln!(terminal, "{line}");
@@ -408,7 +408,7 @@ impl Renderer {
         self.columns = terminal_columns();
         let (margin_width, card_width) = card_dimensions(self.columns);
         let margin = " ".repeat(margin_width);
-        let mut output = io::stderr().lock();
+        let mut output = io::stdout().lock();
         let _ = write_format_summary(&mut output, format, self.deflate_streams);
         let _ = writeln!(output);
         let full_legend = format!(
@@ -1441,7 +1441,7 @@ fn visible_width(text: &str) -> usize {
 }
 
 fn color_enabled() -> bool {
-    terminal::stderr_color_enabled()
+    terminal::stdout_color_enabled()
 }
 
 fn unicode_enabled() -> bool {

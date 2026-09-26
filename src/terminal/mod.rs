@@ -26,6 +26,11 @@ pub(crate) fn stderr_color_enabled() -> bool {
     )
 }
 
+pub(crate) fn stdout_interactive() -> bool {
+    io::stdout().is_terminal()
+        && env::var_os("TERM").map_or(true, |term| term != OsStr::new("dumb"))
+}
+
 pub(crate) fn stderr_interactive() -> bool {
     io::stderr().is_terminal()
         && env::var_os("TERM").map_or(true, |term| term != OsStr::new("dumb"))

@@ -64,8 +64,10 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
     }
 
     let report_mode = ReportMode::for_options(&command.options);
-    if command.options.visual && !terminal::stderr_interactive() {
-        eprintln!("visual mode needs an interactive terminal; continuing without stream maps");
+    if command.options.visual && !terminal::stdout_interactive() {
+        eprintln!(
+            "visual mode needs an interactive stdout terminal; continuing without stream maps"
+        );
     }
 
     let input_count = command.inputs.len();
@@ -156,7 +158,7 @@ fn execute_file(
     // Strictness is a batch-wide policy, so one caution is sufficient even
     // though each input receives its own detailed header and result.
     if !command.options.strict && !*caution_printed {
-        let channel = report_mode.channel();
+        let channel = OutputChannel::Stderr;
         channel.write(|output| print_strict_mode_caution(output, channel.color_enabled()));
         *caution_printed = true;
     }

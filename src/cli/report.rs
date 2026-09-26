@@ -89,10 +89,7 @@ impl ReportMode {
     }
 
     pub(super) fn channel(self) -> OutputChannel {
-        match self {
-            Self::Verbose => OutputChannel::Stdout,
-            Self::Default | Self::Visual => OutputChannel::Stderr,
-        }
+        OutputChannel::Stdout
     }
 
     pub(super) fn detailed(self) -> bool {

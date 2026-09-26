@@ -1501,7 +1501,7 @@ pub(crate) fn finish_file(options: &Options) {
     match mode {
         ProgressMode::Visual => {
             visual::finish_file();
-            let _ = write_zip_store_changes(&mut io::stderr().lock(), &store_changes);
+            let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
         }
         ProgressMode::Verbose => {
             verbose::flush();
