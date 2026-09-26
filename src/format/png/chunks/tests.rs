@@ -2,6 +2,119 @@
 
 use super::super::test_support::{black_scanline_zlib, chunk, frame_control, ihdr};
 use super::*;
+use crate::ErrorKind;
+
+#[test]
+fn names_unknown_critical_chunks_before_and_after_ihdr() {
+    for strip_metadata in [false, true] {
+        let mut valid = SIGNATURE.to_vec();
+        valid.extend(chunk(*b"IHDR", &ihdr()));
+        valid.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        valid.extend(chunk(*b"IEND", &[]));
+        assert!(parse(&valid, strip_metadata).is_ok());
+
+        for (kind, expected) in [
+            (*b"CgBI", "unknown PNG critical chunk: CgBI"),
+            (*b"ZzZz", "unknown PNG critical chunk: ZzZz"),
+        ] {
+            for position in [
+                SIGNATURE.len(),
+                SIGNATURE.len() + chunk(*b"IHDR", &ihdr()).len(),
+            ] {
+                let mut input = valid.clone();
+                input.splice(position..position, chunk(kind, &[]));
+                let error = parse(&input, strip_metadata)
+                    .err()
+                    .expect("must reject unknown critical chunk");
+                assert_eq!(error.kind(), ErrorKind::InvalidInput);
+                assert_eq!(error.message(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn requires_ihdr_before_known_critical_and_ancillary_chunks() {
+    for kind in [*b"PLTE", *b"IDAT", *b"IEND", *b"tEXt", *b"aaAa"] {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(chunk(kind, &[]));
+        input.extend(chunk(*b"IHDR", &ihdr()));
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for strip_metadata in [false, true] {
+            let error = parse(&input, strip_metadata)
+                .err()
+                .expect("must require IHDR first");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(error.message(), "invalid PNG IHDR");
+        }
+    }
+}
+
+#[test]
+fn preserves_malformed_and_duplicate_ihdr_errors() {
+    let mut zero_width = ihdr();
+    zero_width[..4].fill(0);
+    for header in [
+        chunk(*b"IHDR", &zero_width),
+        chunk(*b"IHDR", &ihdr()[..12]),
+        [chunk(*b"IHDR", &ihdr()), chunk(*b"IHDR", &ihdr())].concat(),
+    ] {
+        let mut input = SIGNATURE.to_vec();
+        input.extend(header);
+        input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+        input.extend(chunk(*b"IEND", &[]));
+
+        for strip_metadata in [false, true] {
+            let error = parse(&input, strip_metadata)
+                .err()
+                .expect("must reject invalid IHDR");
+            assert_eq!(error.kind(), ErrorKind::InvalidInput);
+            assert_eq!(error.message(), "invalid PNG IHDR");
+        }
+    }
+}
+
+#[test]
+fn validates_chunk_structure_and_crc_before_unknown_critical_type() {
+    let mut bad_crc = chunk(*b"ZzZz", &[]);
+    *bad_crc.last_mut().unwrap() ^= 1;
+    let mut truncated = chunk(*b"ZzZz", &[]);
+    truncated[..4].copy_from_slice(&1_u32.to_be_bytes());
+    let mut excessive_length = chunk(*b"ZzZz", &[]);
+    excessive_length[..4].copy_from_slice(&0x8000_0000_u32.to_be_bytes());
+    for (encoded, expected_kind, expected_message) in [
+        (bad_crc, ErrorKind::IntegrityMismatch, "bad PNG chunk CRC"),
+        (truncated, ErrorKind::InvalidInput, "truncated PNG chunk"),
+        (
+            excessive_length,
+            ErrorKind::InvalidInput,
+            "invalid PNG chunk length",
+        ),
+        (
+            chunk(*b"Zzzz", &[]),
+            ErrorKind::InvalidInput,
+            "invalid PNG chunk type",
+        ),
+    ] {
+        for after_ihdr in [false, true] {
+            let mut input = SIGNATURE.to_vec();
+            if after_ihdr {
+                input.extend(chunk(*b"IHDR", &ihdr()));
+            }
+            input.extend_from_slice(&encoded);
+
+            for strip_metadata in [false, true] {
+                let error = parse(&input, strip_metadata)
+                    .err()
+                    .expect("must reject malformed chunk");
+                assert_eq!(error.kind(), expected_kind);
+                assert_eq!(error.message(), expected_message);
+            }
+        }
+    }
+}
 
 #[test]
 fn image_decoded_size_matches_scanline_and_adam7_geometry() {

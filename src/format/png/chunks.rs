@@ -128,6 +128,10 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
             return Err(Error::integrity_mismatch("bad PNG chunk CRC"));
         }
 
+        if kind[0] & 0x20 == 0 && !is_known_critical(kind) {
+            let name = std::str::from_utf8(&kind).unwrap();
+            return Err(Error::new(format!("unknown PNG critical chunk: {name}")));
+        }
         if position == SIGNATURE.len() {
             validate_ihdr(kind, data, &mut state)?;
         } else if kind == *b"IHDR" {
@@ -135,9 +139,6 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
         }
         if kind == *b"IEND" && !data.is_empty() {
             return Err(Error::new("invalid PNG IEND"));
-        }
-        if kind[0] & 0x20 == 0 && !is_known_critical(kind) {
-            return Err(Error::new("unknown PNG critical chunk"));
         }
         let strip_chunk = should_strip_kind(kind, strip_metadata);
         if is_rewrite_sensitive_ancillary(kind) {
