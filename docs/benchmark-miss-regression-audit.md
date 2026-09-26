@@ -12,6 +12,85 @@ Private machine-readable states live under `work/`, which remains ignored by
 Git. Public Markdown reports never relabel rows from an older executable as
 current results.
 
+## Bounded APNG Default scheduling follow-up on 26 September 2026
+
+The complete 2,431-case APNG Max and Default journals use executable
+`e3325451…`. Max has no deft4j misses or Default-quality failures. Default
+has four speed-gate flags. Fresh serial controls show that two are run-to-run
+timing variation: Default finishes before Max when retried. The other two
+recur at 34.22 versus 24.16 seconds and 53.61 versus 40.22 seconds. They
+contain 240 and 100 unique image streams respectively; Default scheduled
+them serially while bounded Max used independent image-worker lanes.
+
+The accepted change schedules bounded multi-image Default work on up to the
+smaller of eight and the available CPU count worker lanes when at least two
+CPUs are available. Each lane processes a small-to-large slice. The serial
+scheduler's source-weighted timeout formula and the `ApngDefault` search
+policy remain;
+the complete Default sibling raced by bounded Max uses the same schedule, so
+Max still has a full-file Default quality floor. Existing 8 MiB compressed
+and 64 MiB decoded work bounds, duplicate-frame grouping, validation,
+decoded-byte budget, and serial fallback continue to apply. This gate follows
+independent stream structure and bounded work, not any corpus filename or
+observed benchmark result. The final executable is `9b0b6fa3…`.
+
+At the four original flags, fresh Default runs on that executable finish in
+2.64, 4.90, 9.80, and 34.51 seconds, all before their respective Max runs.
+They reproduce the frozen build's output byte and meaningful-bit counts.
+Across these same four paired Max runs, the candidate loses 90 bytes / 711
+meaningful bits against fresh frozen controls while Max time is essentially
+unchanged (93.07 → 93.15 seconds). A separate eight-file, timing-stratified
+paired Max holdout loses a net 62 bytes / 502 bits (204.01 → 203.14 seconds),
+with two improvements and six losses. All 12 candidate Max outputs remain no
+worse than Default in both metrics and beat their deft4j references. These
+small timed-search losses are part of the tradeoff, not hidden as ties.
+
+The 29-file Default holdout selects five files from each runtime quintile
+with a fixed seed, then includes the four speed-gate files. A paired trial of
+the frozen build against a code-equivalent standalone Default prototype
+produced identical bytes and bits on every file and reduced total observed
+runtime from 279.61 to 99.07 seconds; all 29 candidate runs were faster.
+The final executable also gives identical bytes and bits on all 29, with
+80.95 seconds observed total versus those frozen controls' 279.61 seconds;
+all 29 remain faster. The two candidate timing totals were recorded in
+separate runs, so their difference is timing variation rather than a claimed
+second scheduling improvement. These results are kept separately from the
+complete 2,431-row journals. The full APNG corpus has **not** been rerun on
+`9b0b6fa3…`, so no full-corpus runtime or compression claim is inferred from
+these samples.
+
+All 30 APNG-named cases in the regular timed deft4j cohort were also rerun at
+their recorded allowances on `9b0b6fa3…` against the earlier `e3325451…`
+rows. Exactly 29 have APNG frames. Twenty-four improve, four tie, and two
+lose in file bytes, for a net 494 bytes / 4,057 meaningful bits saved. There
+are no deft4j reference misses. Observed Max time is 592.48 → 589.70
+seconds across different runs, so that small difference is not an isolated
+speedup measurement. The remaining 1,592 regular deft4j sources cannot
+enter the changed multi-image schedule; the full 1,621-row corpus was not
+rerun on this executable.
+
+The historical `f287245e…` APNG Max state and complete `e3325451…` Max state
+overlap on 2,377 successful cases: 2,331 improve, one ties, and 45 lose in
+file bytes, for a net 1,057,014 bytes / 8,456,569 meaningful bits saved.
+Gross losses total 9,586 bytes. Their recorded total times are 53,886.53
+and 49,329.72 seconds respectively, from different runs. On the largest
+historical Max loss, a fresh 36-second old/current comparison yields
+1,233,270 / 1,234,928 bytes. Giving the current frozen build 144 seconds
+instead yields 1,231,247 bytes / 9,799,916 bits, beating its old historical
+target by 1,669 bytes / 13,376 bits. This witness shows that the route is
+reachable with more time in that case; it does not erase the normal-allowance
+loss or prove that every historical target is reachable.
+
+The prior DeflOpt, Defluff, and 100-file guard audits below remain the
+applicable full-corpus evidence. None of their sources has APNG `fdAT` frames,
+so none can enter this new multi-image schedule. The regular deft4j cohort
+has the separately rerun framed APNG sources above. The complete Steam
+stickers APNG benchmark reports still describe `e3325451…`; private paired
+trials, extended run, and output comparisons are under
+`work/apng-goal-20260926/`. Debug and release Rust suites,
+`cargo fmt --check`, and a verbose-versus-quiet APNG output identity check
+pass on the final source and executable.
+
 ## APNG terminal-share follow-up on 22 September 2026
 
 The five stronger historical Columbo targets were first retried on executable

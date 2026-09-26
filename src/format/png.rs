@@ -971,12 +971,38 @@ fn optimize_image_streams(
         .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
     let image_floor = image_default_floor(single_image, options.exhaustive);
-    let parallel_multi_image = options.exhaustive
-        && !single_image
+    let parallel_multi_image = !single_image
         && !budget.deadline.remaining().is_zero()
-        && parallel_multi_image_is_bounded(total_weight, total_decoded_size);
+        && parallel_multi_image_is_bounded(total_weight, total_decoded_size)
+        && (options.exhaustive
+            || thread::available_parallelism().is_ok_and(|cpus| cpus.get() >= 2));
     let mut results = if parallel_multi_image {
         let phase_fraction = if has_later_streams { 0.86 } else { 0.96 };
+        // Default uses the serial scheduler's source-weighted per-job timeout
+        // formula. Parallelizing independent frames must not grant every
+        // small frame a whole file allowance or change its search class.
+        let mut default_timeouts = Vec::new();
+        if !options.exhaustive {
+            default_timeouts
+                .try_reserve_exact(jobs.len())
+                .map_err(|_| Error::internal("could not allocate PNG image schedule"))?;
+            let remaining = budget.deadline.remaining();
+            let image_remaining = if has_later_streams {
+                scale_duration(remaining, NON_LARGEST_IMAGE_SEARCH_FRACTION)
+            } else {
+                remaining
+            };
+            for &job in &jobs {
+                default_timeouts.push(image_stream_timeout(
+                    options.timeout,
+                    image_remaining,
+                    image_job_weight(job, idat, &representative_weights),
+                    total_weight,
+                    non_largest_fraction,
+                    job == reserved_largest,
+                ));
+            }
+        }
         let results = optimize_image_jobs_parallel(
             &jobs,
             idat,
@@ -986,6 +1012,8 @@ fn optimize_image_streams(
             &representative_weights,
             &representatives,
             options,
+            image_floor,
+            (!options.exhaustive).then_some(default_timeouts.as_slice()),
             // Reserve a small container margin outside child raw-route grace
             // for per-stream parsing, worker joins, and PNG reconstruction.
             scale_duration(budget.deadline.remaining(), phase_fraction),
@@ -1297,9 +1325,18 @@ fn optimize_image_jobs_parallel(
     representative_weights: &[usize],
     representatives: &[usize],
     options: &Options,
+    image_floor: DefaultFloor,
+    default_timeouts: Option<&[Duration]>,
     phase_timeout: Duration,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
-    let worker_count = jobs.len().min(PARALLEL_MAX_IMAGE_WORKERS);
+    let worker_limit = if options.exhaustive {
+        PARALLEL_MAX_IMAGE_WORKERS
+    } else {
+        thread::available_parallelism()
+            .map_or(1, |cpus| cpus.get())
+            .min(PARALLEL_MAX_IMAGE_WORKERS)
+    };
+    let worker_count = jobs.len().min(worker_limit);
     let jobs_per_worker = jobs.len() / worker_count;
     let workers_with_extra_job = jobs.len() % worker_count;
 
@@ -1313,6 +1350,7 @@ fn optimize_image_jobs_parallel(
         for worker_index in 0..worker_count {
             let count = jobs_per_worker + usize::from(worker_index < workers_with_extra_job);
             let worker_jobs = &jobs[start..start + count];
+            let worker_timeouts = default_timeouts.map(|times| &times[start..start + count]);
             start += count;
             let worker = thread::Builder::new()
                 .name(format!("columbo-png-images-{worker_index}"))
@@ -1326,6 +1364,8 @@ fn optimize_image_jobs_parallel(
                         representative_weights,
                         representatives,
                         options,
+                        image_floor,
+                        worker_timeouts,
                         phase_timeout,
                     )
                 });
@@ -1344,6 +1384,8 @@ fn optimize_image_jobs_parallel(
                         representative_weights,
                         representatives,
                         options,
+                        image_floor,
+                        worker_timeouts,
                         phase_timeout,
                     )?;
                     fallback_results.append(&mut results);
@@ -1372,6 +1414,8 @@ fn optimize_image_job_slice(
     representative_weights: &[usize],
     representatives: &[usize],
     options: &Options,
+    image_floor: DefaultFloor,
+    default_timeouts: Option<&[Duration]>,
     phase_timeout: Duration,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
     let total_weight = jobs.iter().try_fold(0_usize, |total, &job| {
@@ -1382,21 +1426,17 @@ fn optimize_image_job_slice(
     results
         .try_reserve_exact(jobs.len())
         .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
-    for &job in jobs {
+    for (index, &job) in jobs.iter().enumerate() {
         let weight = image_job_weight(job, idat, representative_weights);
         let mut call_options = options.clone();
-        call_options.timeout =
-            parallel_image_job_timeout(phase_timeout, jobs.len(), weight, total_weight);
+        call_options.timeout = default_timeouts.map_or_else(
+            || parallel_image_job_timeout(phase_timeout, jobs.len(), weight, total_weight),
+            |timeouts| timeouts[index],
+        );
         let (stream, expected_decoded_size) =
             image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
-        let optimize_job = || {
-            run_png_image_zlib(
-                stream,
-                &call_options,
-                expected_decoded_size,
-                DefaultFloor::ApngMax,
-            )
-        };
+        let optimize_job =
+            || run_png_image_zlib(stream, &call_options, expected_decoded_size, image_floor);
         let (stream_id, duplicates) = image_job_stream_group(job, representatives);
         let optimized =
             crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?;
