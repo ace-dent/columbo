@@ -204,3 +204,152 @@ sample, the three copies of `kzipmix-20200115-linux-static.tar.gz` each saved
 identically. `__text` grows by 1,244 bytes, which crosses a 16 KiB page: the
 executable grows from 1,810,848 to 1,827,360 bytes.
 
+
+## Follow-up: sliding to a fixed point
+
+Date: 8 October 2026. Baseline: `7212d6b`. Re-planning fits a moved block's
+trees to its new contents, but its cuts were fitted to the trees it had
+before. The new trees can make further cuts cheaper, so one R1c invocation did
+not reach a fixed point. A control arm in the distance-alphabet ladder
+experiment, which slid a second time after R1c, found 1 byte on 365 raw
+streams, 503 on 1,052 Default PNGs, 2,145 on 202 container files and 2,004 in
+a 60-second Max sample, with no output larger.
+
+The slide now runs in rounds. A round runs the existing sweeps with every tree
+fixed, then re-plans each block the round moved, keeping a re-planned code
+only when it is strictly cheaper; a tie keeps the current trees. If any block
+took a new code, the next round sweeps again under the new trees and
+re-plans the blocks it moves. Otherwise the cuts are already optimal for the
+trees that stay, and the slide ends; a round that moves nothing also ends it.
+Every round strictly lowers the planned stream, so rounds terminate. The cap
+is 16; the probe below never needed more than 5. A block re-planned as stored
+stays stored, so its boundaries stay fixed, as they would after a reparse.
+
+The rounds work on the plan and emit once. Each invocation therefore keeps its
+single candidate emission and parse, its whole-stream byte/meaningful-bit
+admission and its linear-finalization start rule, and it needs no size class:
+each round is linear in parsed tokens, plus the re-plans of the blocks it
+moved. The call sites are unchanged: Default's single sweep, Max's settled
+sweep and R12 closure, and Max's slid Default endpoint, which remains only a
+final competitor.
+
+### Round counts
+
+An instrumented copy with a 1,000-round cap recorded every invocation in
+Default runs. An invocation with zero rounds found no cheaper cut.
+
+| Set | Invocations | Rounds: 0 / 1 / 2 / 3 / 4 / 5 | Planned bits after round 1 |
+| --- | ---: | --- | ---: |
+| Raw streams | 59 | 32 / 26 / 1 / 0 / 0 / 0 | 4 |
+| PNG | 540 | 134 / 347 / 45 / 12 / 2 / 0 | 4,365 |
+| GZIP, zlib, ZIP and APNG | 981 | 555 / 404 / 13 / 5 / 2 / 2 | 25,181 |
+| Relaxed: raw streams and 16 PNG | 74 | 32 / 28 / 6 / 7 / 1 / 0 | 1,678 |
+
+The most rounds came from `kzipmix-20200115-linux-static.tar.gz`: five rounds
+over 175 blocks, 7,004 bits after the first. Among PNGs,
+`FsqwhPuaIAIlojU.png` needed four rounds for 662 bits.
+
+### Measurements
+
+Paired runs alternate five arms per input, in four lanes for Default and two
+for Max, and compare complete files: the baseline; the control above, which
+slides twice; this change; and, for coordination, the distance-ladder
+prototype with and without this change. The sets are those of the
+distance-ladder validation.
+
+| Set | Files | Smaller / larger | Bytes saved | Beyond the control: smaller / larger, bytes | CPU: baseline → candidate (control) |
+| --- | ---: | --- | ---: | --- | --- |
+| Raw streams | 365 | 1 / 0 | 1 | 0 / 0, 0 | 100.91 → 101.32 s (100.44) |
+| PNG: medium, large, small, imageworsener, pkmn-col | 1,052 | 54 / 0 | 549 | 10 / 0, 46 | 1,553.55 → 1,557.16 s (1,555.52) |
+| GZIP, zlib, ZIP and APNG | 202 | 17 / 0 | 3,145 | 7 / 0, 1,000 | 919.05 → 929.45 s (918.75) |
+| Relaxed: raw streams and 16 PNG | 381 | 11 / 0 | 210 | 6 / 0, 33 | 218.69 → 219.08 s (220.25) |
+| Max, 60 s, 25 PNG | 25 | 13 / 3 | 589 net | 5 / 3, −147 net | 3,104.44 → 3,138.23 s (3,138.97) |
+
+No Default output grew against the baseline or the control. Two ZIP layouts
+are rejected by every arm. The control's second slide already reaches the
+fixed point on most files; the further rounds matter on large multi-block
+streams. On `kzipmix-20200115-linux-static.tar.gz` the candidate saves 875
+bytes and the control 535; on `FsqwhPuaIAIlojU.png`, 83 against 60.
+
+**Max.** Max results depend on timing: 24 of the 25 runs used their whole
+allowance, and the timed bounded routes end wherever the deadline finds
+them. In the five-arm run the candidate saved 668 bytes on 13 files and lost
+79 on three, and trailed the control on three files. Those files and
+`FsqwhPuaIAIlojU.png` were then run three more times per arm, in the same two
+lanes:
+
+| File | Baseline | Control | Candidate | Five-arm run: baseline, control, candidate |
+| --- | --- | --- | --- | --- |
+| `floor pattern-deflopt.png` | 519,838 ×3 | 519,834 ×3 | 519,834 ×3 | 519,873, 519,840, 519,945 |
+| `Partnership_Card___John_Lewis_Finance-deft4j-t139s.png` | 2,751,732–2,752,397 | 2,751,009–2,751,010 | 2,750,981–2,751,007 | 2,751,089, 2,751,010, 2,751,089 |
+| `4.2.03.PNG` | 748,571 ×2, 748,614 | 748,571 ×2, 748,614 | 748,570 ×2, 748,614 | 748,623, 748,618, 748,624 |
+| `nascar.png` | 22,761 ×2, 22,767 | 22,761, 22,767 ×2 | 22,767 ×3 | 22,761, 22,767, 22,767 |
+| `FsqwhPuaIAIlojU.png` | 544,139 ×3 | 543,640 ×3 | 543,613 ×2, 543,614 | 544,145, 543,640, 543,614 |
+
+The losses do not repeat. `nascar.png` and `4.2.03.PNG` take one of the same
+two sizes in every arm; on the other three files the candidate is never
+larger than the control in a repeat. The steady Max gain is
+`FsqwhPuaIAIlojU.png`, 525–526 bytes. Max process CPU follows the allowance,
+not the method.
+
+**Cost.** Default CPU rises 0.2–1.1% across the sets. Timed alone, three
+runs each, `kzipmix-20200115-linux-static.tar.gz` takes 9.68 → 10.32 s
+(control 9.98 s), 6.6% for its five rounds over 175 blocks, and the 3.2 MB
+`Partnership_Card___John_Lewis_Finance.png` 30.71 → 31.06 s (control
+31.20 s): the extra rounds cost less than the control's second emission and
+parse.
+
+### Validation
+
+- `iterated_slide_equals_repeated_slides_and_reaches_a_fixed_point` generates
+  400 streams of two to four Huffman blocks with different alphabets, some
+  with a stored block between them, in both strict modes. The iterated slide
+  must emit exactly the bytes obtained by running one round at a time, each
+  from a fresh parse of the previous emission, until a round finds nothing;
+  sliding its result again must find nothing. 281 streams slide and 21 need
+  more than one round; with the round cap set to one the test fails. Each
+  result also reparses with its planned bit count, decoded bytes, block count,
+  nonempty blocks, unchanged stored blocks and, in strict mode, strictly
+  compatible codes.
+- The terminal dispatch test now also checks that sliding the accepted
+  candidate again, in Default and Max, finds nothing. The fixed-tree oracle
+  and the other slide tests run unchanged, with one round.
+- All library, binary, CLI, public API, doc and Python tests pass in debug and
+  release, including the private-corpus regressions with
+  `--include-ignored`. `cargo fmt --check` and `cargo clippy --all-targets
+  --all-features -- -D warnings` pass.
+- Python's `zlib`, `gzip` and `zipfile` decoded every output of all five arms
+  and compared it with its source, including PNG chunk CRCs and APNG frames:
+  1,825 raw, 5,260 PNG, 970 container, 1,905 relaxed and 125 Max outputs, with
+  no mismatch. The eight container sources Python cannot decode give
+  identical outputs in every arm.
+- `__text` grows by 2,156 bytes; the release executable stays at 1,827,360
+  bytes.
+
+### Coordination with the distance-alphabet ladder
+
+The distance-alphabet ladder, R13, was an uncommitted prototype when this
+was measured. It slides once more after a winning ladder; that slide now runs
+to a fixed point too, without a change to the ladder. The two prototypes
+compose as follows:
+
+| Set | Ladder → ladder with this change: smaller / larger, bytes | This change → ladder with this change: smaller / larger, bytes |
+| --- | --- | --- |
+| Raw streams | 0 / 0, 0 | 1 / 0, 1 |
+| PNG | 31 / 7, +138 −7 | 50 / 0, 475,932 |
+| GZIP, zlib, ZIP and APNG | 14 / 0, 1,051 | 26 / 0, 205 |
+| Relaxed | 5 / 1, +44 −2 | 16 / 0, 95,050 |
+
+Against the ladder alone, this change makes seven PNG files one byte larger
+and one relaxed file two bytes larger. The ladder decides each block with its
+boundaries fixed, so its choice depends on where the slide left them. On
+`4.2.03.PNG` both arms end with the same boundaries, but they keep different
+distance symbols in blocks 22 and 23. Without this change the ladder chose
+them for the blocks as one slide left them; with it, after the fixed-point
+slide had moved 1,471 decoded bytes from block 22 into block 23, it dropped
+different symbols and spelled other matches as literals. The final blocks
+cost 13 bits more and cross a byte boundary. With this change as the
+baseline, the ladder makes no Default output larger, and its own container
+gain falls from 2,299 to 205 bytes, since most of it came from the slide that
+followed a ladder win. Max was not repeated for the ladder arms; their
+five-arm differences include the same timing outliers as above.

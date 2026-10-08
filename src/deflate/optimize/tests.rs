@@ -331,6 +331,18 @@ fn boundary_slide_runs_as_a_terminal_method_in_both_modes() {
             let dynamic = block.original_dynamic.as_ref().unwrap();
             assert!(dynamic.has_strictly_compatible_huffman_codes());
         }
+        // The slide repeats under its re-planned trees, so sliding its result
+        // again finds nothing.
+        assert!(refine_with_terminal_header_search(
+            TerminalHeaderSearch::BoundarySlide,
+            &result,
+            &options,
+            1 << 20,
+            identity,
+            &mut SearchStop::never(),
+        )
+        .unwrap()
+        .is_none());
     }
 
     // The slide is linear finalization: after the soft deadline it may still

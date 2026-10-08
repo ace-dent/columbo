@@ -129,6 +129,7 @@ fn a_literal_run_moves_to_the_block_that_codes_it_cheaper() {
         &source.blocks,
         &Options::default(),
         false,
+        MAX_ROUNDS,
         &mut SearchStop::never(),
     )
     .expect("the z run is cheaper under the right-hand tree");
@@ -152,6 +153,7 @@ fn a_literal_run_moves_to_the_block_that_codes_it_cheaper() {
         &again.blocks,
         &Options::default(),
         false,
+        MAX_ROUNDS,
         &mut SearchStop::never()
     )
     .is_none());
@@ -159,6 +161,7 @@ fn a_literal_run_moves_to_the_block_that_codes_it_cheaper() {
         &source.blocks,
         &Options::default(),
         false,
+        MAX_ROUNDS,
         &mut SearchStop::always()
     )
     .is_none());
@@ -170,7 +173,14 @@ fn moved_blocks_are_replanned_when_fresh_trees_are_cheaper() {
     left.extend(std::iter::repeat(b'z').take(291));
     let (data, source) = planned_stream(&[literals(&left), literals(&[b'z'; 1_024])]);
     let options = Options::default();
-    let fixed = plan_slide(&source.blocks, &options, false, &mut SearchStop::never()).unwrap();
+    let fixed = plan_slide(
+        &source.blocks,
+        &options,
+        false,
+        MAX_ROUNDS,
+        &mut SearchStop::never(),
+    )
+    .unwrap();
     let replanned =
         plan_boundary_slide(&source.blocks, &options, &mut SearchStop::never()).unwrap();
 
@@ -198,6 +208,7 @@ fn stored_boundaries_never_move() {
         &source.blocks,
         &Options::default(),
         false,
+        MAX_ROUNDS,
         &mut SearchStop::never()
     )
     .is_none());
@@ -250,6 +261,7 @@ fn two_block_slides_match_an_exhaustive_cut_oracle() {
             &source.blocks,
             &Options::default(),
             false,
+            MAX_ROUNDS,
             &mut SearchStop::never(),
         );
         if source.blocks.len() != 2
@@ -315,6 +327,7 @@ fn a_match_the_neighbour_cannot_code_joins_it_as_literals() {
         &source.blocks,
         &Options::default(),
         false,
+        MAX_ROUNDS,
         &mut SearchStop::never(),
     )
     .expect("the match is cheaper as left-hand literals");
@@ -400,4 +413,85 @@ fn exhaustive_slide_saving(blocks: &[ParsedBlock], trees: &[(Vec<u8>, Vec<u8>); 
         sides = next;
     }
     saving
+}
+
+fn emitted(parent: &[u8], plans: &[PlannedBlock]) -> Vec<u8> {
+    let mut writer = BitWriter::default();
+    for (index, plan) in plans.iter().enumerate() {
+        emit_block(&mut writer, parent, plan, index + 1 == plans.len()).unwrap();
+    }
+    writer.into_bytes()
+}
+
+#[test]
+fn iterated_slide_equals_repeated_slides_and_reaches_a_fixed_point() {
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let (mut slid, mut repeated) = (0, 0);
+    for round in 0..400 {
+        let options = Options {
+            strict: round % 4 != 3,
+            ..Options::default()
+        };
+        // Blocks with different alphabets, and sometimes a stored block, so
+        // re-planned trees differ and stored boundaries stay in the way.
+        let mut blocks = Vec::new();
+        for part in 0..2 + round % 3 {
+            if part == 1 && round % 5 == 4 {
+                blocks.push(literals(&(0..=255).collect::<Vec<u8>>()));
+            }
+            let (tokens, plain) = random_tokens(&mut seed, 20 + (round * 13 + part * 29) % 150);
+            blocks.push(block(tokens, plain));
+        }
+        let (data, source) = planned_stream(&blocks);
+        let never = &mut SearchStop::never();
+        let Some(plans) = plan_boundary_slide(&source.blocks, &options, never) else {
+            assert!(plan_slide(&source.blocks, &options, true, 1, never).is_none());
+            continue;
+        };
+        let output = emitted(&data, &plans);
+        let parsed = parse_stream(&output, 1 << 20).unwrap();
+        assert_eq!(
+            parsed.meaningful_bits,
+            plans.iter().map(|plan| plan.bits).sum::<u64>()
+        );
+        assert!(parsed.meaningful_bits < source.meaningful_bits);
+        assert_eq!(parsed.blocks.len(), source.blocks.len());
+        assert_eq!(parsed.crc32, source.crc32);
+        for (after, before) in parsed.blocks.iter().zip(&source.blocks) {
+            assert!(!after.tokens.is_empty());
+            if before.source_type == SourceBlockType::Stored {
+                assert_eq!(after.plain, before.plain);
+            }
+            if let (true, Some(dynamic)) = (options.strict, &after.original_dynamic) {
+                assert!(dynamic.has_strictly_compatible_huffman_codes());
+            }
+        }
+
+        // The same rounds run one at a time, each from a fresh parse of the
+        // previous emission, end at the same stream.
+        let mut reference = data.clone();
+        let mut calls = 0;
+        while let Some(plans) = plan_slide(
+            &parse_stream(&reference, 1 << 20).unwrap().blocks,
+            &options,
+            true,
+            1,
+            never,
+        ) {
+            reference = emitted(&reference, &plans);
+            calls += 1;
+            assert!(calls <= MAX_ROUNDS, "round {round}");
+        }
+        assert_eq!(output, reference, "round {round}");
+        // A fixed point: sliding the result again finds nothing.
+        assert!(plan_boundary_slide(&parsed.blocks, &options, never).is_none());
+        slid += 1;
+        repeated += usize::from(calls > 1);
+    }
+    eprintln!("slid {slid}, repeated {repeated}");
+    assert!(slid > 100, "only {slid} streams slid");
+    assert!(
+        repeated > 10,
+        "only {repeated} slides needed a second round"
+    );
 }

@@ -12,7 +12,8 @@
 //! A joining match the neighbour cannot code, or codes expensively, may be
 //! spelled as its decoded literals instead; equal bytes need no match proof.
 //! Each moved block is then re-planned with fresh trees, keeping whichever of
-//! its transmitted and re-planned codes is cheaper.
+//! its transmitted and re-planned codes is cheaper. New trees can make further
+//! cuts profitable, so the slide repeats under them until no block moves.
 
 use std::sync::Arc;
 
@@ -21,7 +22,8 @@ use crate::Options;
 use super::block::{plan_block, reusable_original_bits, stored_block_bits};
 use super::huffman::{FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS};
 use super::model::{
-    count_frequencies, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
+    count_frequencies, DynamicPlan, ParsedBlock, PlannedBlock, Representation, SourceBlockType,
+    Token,
 };
 use super::restore::token_cost;
 use super::stop::SearchStop;
@@ -29,18 +31,90 @@ use super::stop::SearchStop;
 /// Every accepted move strictly lowers the payload, so sweeps terminate; the
 /// cap only bounds work on a long chain of interacting boundaries.
 const MAX_SWEEPS: usize = 16;
+/// Every round after the first follows a strictly cheaper re-plan, so rounds
+/// terminate; the cap only bounds work.
+const MAX_ROUNDS: usize = 16;
 /// Poll the stop between boundaries and within long block pairs.
 const STOP_POLL_TOKENS: usize = 1 << 16;
 
 type Trees<'a> = (&'a [u8], &'a [u8]);
 
+/// How a block is coded while the slide runs.
+enum Code<'a> {
+    /// Stored, or re-planned as stored: its boundaries stay fixed.
+    Stored,
+    /// The parsed block's own trees, dynamic or fixed.
+    Transmitted(Trees<'a>),
+    /// The fixed trees, chosen by re-planning a moved block.
+    Fixed,
+    /// A dynamic header chosen by re-planning a moved block.
+    Dynamic(DynamicPlan),
+}
+
+impl Code<'_> {
+    fn trees(&self) -> Option<Trees<'_>> {
+        match self {
+            Self::Stored => None,
+            Self::Transmitted(trees) => Some(*trees),
+            Self::Fixed => Some((
+                &FIXED_LITERAL_CODE_LENGTHS[..],
+                &FIXED_DISTANCE_CODE_LENGTHS[..],
+            )),
+            Self::Dynamic(dynamic) => Some((&dynamic.literal_lengths, &dynamic.distance_lengths)),
+        }
+    }
+}
+
 struct Slot<'a> {
     tokens: Arc<Vec<Token>>,
     plain: Arc<Vec<u8>>,
-    /// Transmitted literal/length and distance code lengths; `None` when stored.
-    trees: Option<Trees<'a>>,
+    code: Code<'a>,
     payload: u64,
-    original_payload: u64,
+    /// The block's bits other than its payload under `code`: block header,
+    /// trees and end-of-block code.
+    overhead: u64,
+    /// Whether a sweep moved the block since it was last planned.
+    moved: bool,
+}
+
+impl Slot<'_> {
+    /// The block coded as it stands, at `alignment`.
+    fn planned(&self, block: &ParsedBlock, alignment: u8) -> Option<(Representation, u64)> {
+        if matches!(self.code, Code::Stored) {
+            let bits = stored_block_bits(alignment, self.plain.len());
+            return Some((Representation::Stored, bits));
+        }
+        let bits = self.overhead.checked_add(self.payload)?;
+        let dynamic = match &self.code {
+            Code::Transmitted(_) => block.original_dynamic.as_ref(),
+            Code::Dynamic(dynamic) => Some(dynamic),
+            Code::Stored | Code::Fixed => None,
+        };
+        let representation = match dynamic {
+            Some(dynamic) => {
+                let mut dynamic = dynamic.try_clone()?;
+                dynamic.bits = bits;
+                Representation::Dynamic(dynamic)
+            }
+            None => Representation::Fixed,
+        };
+        Some((representation, bits))
+    }
+
+    /// Code the block from now on as `replanned` chose.
+    fn adopt(&mut self, replanned: &PlannedBlock) -> Option<()> {
+        self.code = match &replanned.representation {
+            Representation::Stored => Code::Stored,
+            Representation::Fixed => Code::Fixed,
+            Representation::Dynamic(dynamic) => Code::Dynamic(dynamic.try_clone()?),
+            Representation::Original(_) => return None,
+        };
+        if let Some(trees) = self.code.trees() {
+            self.payload = payload_bits(&self.tokens, trees)?;
+            self.overhead = replanned.bits.checked_sub(self.payload)?;
+        }
+        Some(())
+    }
 }
 
 fn payload_bits(tokens: &[Token], (literal, distances): Trees<'_>) -> Option<u64> {
@@ -229,8 +303,9 @@ fn split_pair<T: Copy>(left: &[T], right: &[T], cut: usize) -> Option<(Vec<T>, V
     Some((first, second))
 }
 
-/// Move Huffman block boundaries to cheaper token cuts under fixed trees, then
-/// re-plan each moved block.
+/// Move Huffman block boundaries to cheaper token cuts under fixed trees,
+/// re-plan each moved block, and repeat under the new trees until no block
+/// moves.
 ///
 /// Stored blocks and their boundaries stay in place. Every Huffman block keeps
 /// at least one token, so the parse that follows retains the block layout
@@ -241,15 +316,17 @@ pub(crate) fn plan_boundary_slide(
     options: &Options,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
-    plan_slide(blocks, options, true, stop)
+    plan_slide(blocks, options, true, MAX_ROUNDS, stop)
 }
 
 /// The slide itself. Without `refit`, every moved block keeps its transmitted
-/// trees, so the result is exactly the fixed-tree optimum the tests check.
+/// trees, so the result is exactly the fixed-tree optimum the tests check and
+/// one round reaches it.
 fn plan_slide(
     blocks: &[ParsedBlock],
     options: &Options,
     refit: bool,
+    max_rounds: usize,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let strict = options.strict;
@@ -259,32 +336,58 @@ fn plan_slide(
     let mut slots = Vec::new();
     slots.try_reserve_exact(blocks.len()).ok()?;
     for block in blocks {
-        let trees = match block.source_type {
-            SourceBlockType::Stored => None,
+        let code = match block.source_type {
+            SourceBlockType::Stored => Code::Stored,
             // Fixed trees cannot change, so the strict policy is decided here.
             _ if reusable_original_bits(block, 0, strict).is_none() => return None,
-            SourceBlockType::Fixed => Some((
+            SourceBlockType::Fixed => Code::Transmitted((
                 &FIXED_LITERAL_CODE_LENGTHS[..],
                 &FIXED_DISTANCE_CODE_LENGTHS[..],
             )),
             SourceBlockType::Dynamic => {
                 let dynamic = block.original_dynamic.as_ref()?;
-                Some((&dynamic.literal_lengths[..], &dynamic.distance_lengths[..]))
+                Code::Transmitted((&dynamic.literal_lengths[..], &dynamic.distance_lengths[..]))
             }
         };
-        let payload = match trees {
-            Some(trees) => payload_bits(&block.tokens, trees)?,
-            None => 0,
+        let (payload, overhead) = match code.trees() {
+            Some(trees) => {
+                let payload = payload_bits(&block.tokens, trees)?;
+                let original = reusable_original_bits(block, 0, strict)?;
+                (payload, original.len.checked_sub(payload)?)
+            }
+            None => (0, 0),
         };
         slots.push(Slot {
             tokens: Arc::clone(&block.tokens),
             plain: Arc::clone(&block.plain),
-            trees,
+            code,
             payload,
-            original_payload: payload,
+            overhead,
+            moved: false,
         });
     }
 
+    // Each round fits the boundaries to the current trees, then re-plans the
+    // blocks it moved. A strictly cheaper re-plan changes some trees, which
+    // can make further cuts profitable; otherwise the cuts are already
+    // optimal for the trees that stay.
+    let mut plans = None;
+    for _ in 0..max_rounds {
+        if !sweep(&mut slots, stop)? {
+            break;
+        }
+        let (round, refitted) = assemble(blocks, &mut slots, options, refit, stop)?;
+        plans = Some(round);
+        if !refitted {
+            break;
+        }
+    }
+    plans
+}
+
+/// Sweep every boundary between two Huffman blocks, repeating while a sweep
+/// moves one, at most `MAX_SWEEPS` times. Returns whether any block moved.
+fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
     let mut changed = false;
     'sweeps: for _ in 0..MAX_SWEEPS {
         let mut moved = false;
@@ -292,7 +395,9 @@ fn plan_slide(
             if stop.reached() {
                 break 'sweeps;
             }
-            let (Some(left_trees), Some(right_trees)) = (slots[k].trees, slots[k + 1].trees) else {
+            let (Some(left_trees), Some(right_trees)) =
+                (slots[k].code.trees(), slots[k + 1].code.trees())
+            else {
                 continue;
             };
             let pair = Pair {
@@ -312,12 +417,16 @@ fn plan_slide(
             })?;
             let (left_plain, right_plain) =
                 split_pair(pair.left_plain, pair.right_plain, left_plain_len)?;
-            slots[k].tokens = Arc::new(left_tokens);
-            slots[k].plain = Arc::new(left_plain);
-            slots[k].payload = left_bits;
-            slots[k + 1].tokens = Arc::new(right_tokens);
-            slots[k + 1].plain = Arc::new(right_plain);
-            slots[k + 1].payload = right_bits;
+            for (slot, tokens, plain, payload) in [
+                (k, left_tokens, left_plain, left_bits),
+                (k + 1, right_tokens, right_plain, right_bits),
+            ] {
+                let slot = &mut slots[slot];
+                slot.tokens = Arc::new(tokens);
+                slot.plain = Arc::new(plain);
+                slot.payload = payload;
+                slot.moved = true;
+            }
             moved = true;
             changed = true;
         }
@@ -325,14 +434,27 @@ fn plan_slide(
             break;
         }
     }
-    if !changed {
-        return None;
-    }
+    Some(changed)
+}
 
+/// Plan every block at its actual alignment. Unchanged blocks keep their
+/// original bits; moved blocks keep their code with an adjusted bit count.
+/// With `refit`, each block moved since it was last planned is re-planned,
+/// and a strictly cheaper plan becomes its code; a tie keeps the code. Also
+/// returns whether any block took a re-planned code.
+fn assemble(
+    blocks: &[ParsedBlock],
+    slots: &mut [Slot<'_>],
+    options: &Options,
+    refit: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<(Vec<PlannedBlock>, bool)> {
+    let strict = options.strict;
     let mut plans = Vec::new();
     plans.try_reserve_exact(blocks.len()).ok()?;
     let mut alignment = 0_u8;
-    for (block, slot) in blocks.iter().zip(slots) {
+    let mut refitted = false;
+    for (block, slot) in blocks.iter().zip(slots.iter_mut()) {
         let original = reusable_original_bits(block, alignment, strict);
         let (representation, bits) = if block.source_type == SourceBlockType::Stored {
             // Earlier savings can shift a stored block's padding.
@@ -347,37 +469,29 @@ fn plan_slide(
             let original = original?;
             (Representation::Original(original), original.len)
         } else {
-            let bits = original?
-                .len
-                .checked_sub(slot.original_payload)?
-                .checked_add(slot.payload)?;
-            let transmitted = match &block.original_dynamic {
-                Some(dynamic) => {
-                    let mut dynamic = dynamic.try_clone()?;
-                    dynamic.bits = bits;
-                    (Representation::Dynamic(dynamic), bits)
-                }
-                None => (Representation::Fixed, bits),
-            };
-            // The transmitted trees were fitted to the block's old contents.
-            // Re-plan the moved block and keep the cheaper; a tie keeps them.
-            match refit.then(|| replan(block, &slot, alignment, options, stop)) {
-                Some(Some(replanned)) if replanned.bits < transmitted.1 => {
+            let current = slot.planned(block, alignment)?;
+            // The block's trees were fitted to its old contents. Re-plan it
+            // and keep the cheaper; a tie keeps its trees.
+            let moved = std::mem::take(&mut slot.moved);
+            match (refit && moved).then(|| replan(block, slot, alignment, options, stop)) {
+                Some(Some(replanned)) if replanned.bits < current.1 => {
+                    slot.adopt(&replanned)?;
+                    refitted = true;
                     (replanned.representation, replanned.bits)
                 }
-                _ => transmitted,
+                _ => current,
             }
         };
         alignment = ((u64::from(alignment) + bits) & 7) as u8;
         plans.push(PlannedBlock {
-            tokens: slot.tokens,
-            plain: slot.plain,
+            tokens: Arc::clone(&slot.tokens),
+            plain: Arc::clone(&slot.plain),
             representation,
             bits,
             source_type: block.source_type,
         });
     }
-    Some(plans)
+    Some((plans, refitted))
 }
 
 #[cfg(test)]
