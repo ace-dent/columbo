@@ -4550,7 +4550,7 @@ fn consider_all_literals(
 /// arithmetic. Only then do we reserve the complete vector fallibly and make
 /// a second, allocation-free pass to populate it. A malformed internal
 /// token/plain pairing is treated like any other unusable optional candidate.
-fn expand_selected_matches<F>(
+pub(super) fn expand_selected_matches<F>(
     source: &[Token],
     plain: &[u8],
     should_expand: F,

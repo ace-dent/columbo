@@ -3472,6 +3472,84 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
 }
 
 #[test]
+fn default_sweep_finishes_with_the_distance_ladder() {
+    // One block carried by distance-4 runs, plus one length-3 match in each
+    // of distance symbols 5 through 29. Only the ladder removes them all.
+    let input = crate::deflate::distance_band::test_support::distance_ladder_test_stream();
+    let parsed = parse_stream(&input, 1 << 20).unwrap();
+    let identity = StreamIdentity {
+        decoded_size: parsed.decoded_size,
+        crc32: parsed.crc32,
+        adler32: parsed.adler32,
+    };
+    let source = CandidateInput {
+        compressed: &input,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 1 << 20,
+        identity,
+    };
+    let parent = Candidate {
+        data: input.clone(),
+        bits: parsed.meaningful_bits,
+        output_max_distance: Some(parsed.max_distance),
+        plans: Vec::new(),
+        block_report: None,
+        route: "generated distance-ladder parent",
+        max_planner_is_stable: false,
+    };
+    let options = Options::default();
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
+    let progress = Progress::begin(
+        &options,
+        deadline.started,
+        StreamProgress {
+            blocks: parsed.source_block_count,
+            compressed_bytes: input.len(),
+            decoded_bytes: parsed.decoded_size,
+            empty_blocks: parsed.source_empty_block_count,
+            meaningful_bits: parsed.meaningful_bits,
+            parse_elapsed: Duration::ZERO,
+        },
+        None,
+    );
+    let only_distance_four = |candidate: &Candidate| {
+        let check = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        assert_eq!(candidate.bits, check.meaningful_bits);
+        assert!(check
+            .blocks
+            .iter()
+            .flat_map(|block| block.tokens.iter())
+            .all(|token| !matches!(token, Token::Match { distance, .. } if *distance != 4)));
+    };
+
+    let ordinary = improve_with_terminal_searches(
+        source,
+        &options,
+        DefaultFloorWork::Mandatory,
+        DefaultFloorWork::Timed(&deadline),
+        progress,
+        parent.clone(),
+    )
+    .unwrap();
+    assert!(ordinary.is_strictly_smaller_than(&parent));
+    only_distance_four(&ordinary);
+
+    // Max's mandatory Default endpoint keeps the ladder in its final
+    // competitor even when the slide itself finds nothing.
+    let slid = slid_default_endpoint(
+        source,
+        &options,
+        progress,
+        &mut TerminalParseCache::default(),
+        &parent,
+    )
+    .unwrap()
+    .unwrap();
+    only_distance_four(&slid);
+}
+
+#[test]
 fn tree_response_searches_keep_history_and_stored_alignment_at_every_bit_offset() {
     for (search, original) in [
         (

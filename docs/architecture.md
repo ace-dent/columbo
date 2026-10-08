@@ -50,6 +50,7 @@ in `optimize.rs`.
 | `restore` | Restore original match choices after other routes settle. |
 | `joint` | Search payload code lengths and header run-length encoding together. |
 | `symbol_set` | Price removal of small sets of payload symbols. |
+| `distance_band` | Collapse a block's distance alphabet to a kept set of distance symbols. |
 | `stop` | Apply shared deadlines, grace periods, and cooperative cancellation. |
 
 The engine never discovers new LZ77 matches. Keep source-proof checks, fallible

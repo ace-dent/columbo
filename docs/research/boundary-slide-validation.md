@@ -329,9 +329,11 @@ parse.
 ### Coordination with the distance-alphabet ladder
 
 The distance-alphabet ladder, R13, was an uncommitted prototype when this
-was measured. It slides once more after a winning ladder; that slide now runs
-to a fixed point too, without a change to the ladder. The two prototypes
-compose as follows:
+was measured, and was merged after this change; its
+[rebased measurements](distance-ladder-validation.md#rebased-onto-the-fixed-point-slide)
+come from the same runs. It slides once more after a winning ladder; that
+slide now runs to a fixed point too, without a change to the ladder. The two
+prototypes compose as follows:
 
 | Set | Ladder → ladder with this change: smaller / larger, bytes | This change → ladder with this change: smaller / larger, bytes |
 | --- | --- | --- |

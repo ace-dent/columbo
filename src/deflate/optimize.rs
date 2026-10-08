@@ -2026,6 +2026,7 @@ enum TerminalHeaderSearch {
     LiteralSpan,
     JointTreeRle,
     SymbolSets,
+    DistanceBands,
     AlphabetBoundaries,
     HeaderTree,
     CodeLengthRotations,
@@ -2054,6 +2055,7 @@ impl TerminalHeaderSearch {
             Self::LiteralSpan => "Literal/length span",
             Self::JointTreeRle => "Joint tree/RLE",
             Self::SymbolSets => "Symbol set removal",
+            Self::DistanceBands => "Distance-alphabet ladder",
             Self::AlphabetBoundaries => "Alphabet boundary search",
             Self::HeaderTree => "Code-length tree search",
             Self::CodeLengthRotations => "Code-length rotations",
@@ -2065,10 +2067,11 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // The boundary slide is linear in the parsed tokens and blocks. Its
-        // one candidate parse costs no more than a replay round, which every
-        // candidate may already pay at any size, so it has no work class.
-        if matches!(self, Self::BoundarySlide) {
+        // The boundary slide and distance ladder are linear in the parsed
+        // tokens and blocks. Their one candidate parse costs no more than a
+        // replay round, which every candidate may already pay at any size, so
+        // they have no work class.
+        if matches!(self, Self::BoundarySlide | Self::DistanceBands) {
             return usize::MAX;
         }
         // The smaller class also bounds mandatory Default work. Optional Max
@@ -2090,7 +2093,7 @@ impl TerminalHeaderSearch {
 
     fn max_blocks(self) -> usize {
         match self {
-            Self::BoundarySlide => usize::MAX,
+            Self::BoundarySlide | Self::DistanceBands => usize::MAX,
             _ => TERMINAL_HEADER_MAX_BLOCKS,
         }
     }
@@ -2100,7 +2103,7 @@ impl TerminalHeaderSearch {
     fn waits_for_settled_sweep(self) -> bool {
         matches!(
             self,
-            Self::HeaderResponse | Self::LengthExchange | Self::BoundarySlide
+            Self::DistanceBands | Self::HeaderResponse | Self::LengthExchange | Self::BoundarySlide
         )
     }
 
@@ -2154,6 +2157,9 @@ impl TerminalHeaderSearch {
                 &mut budget.symbols,
                 stop,
             )?,
+            Self::DistanceBands => {
+                super::distance_band::plan_distance_bands(block, alignment, options, stop)?
+            }
             _ => {
                 let dynamic = match self {
                     Self::StrictDistanceCompletion => {
@@ -2196,6 +2202,7 @@ impl TerminalHeaderSearch {
                     ),
                     Self::BoundarySlide
                     | Self::SymbolSets
+                    | Self::DistanceBands
                     | Self::AlphabetBoundaries
                     | Self::HeaderResponse
                     | Self::LengthExchange => {
@@ -2236,7 +2243,7 @@ fn improve_with_terminal_searches(
     progress: Progress,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
-    let mut visited = [None; 13];
+    let mut visited = [None; 14];
     let mut first_sweep = true;
     let mut parse_cache = TerminalParseCache::default();
     loop {
@@ -2267,6 +2274,7 @@ fn improve_with_terminal_searches(
             TerminalHeaderSearch::HeaderResponse,
             TerminalHeaderSearch::LengthExchange,
             TerminalHeaderSearch::BoundarySlide,
+            TerminalHeaderSearch::DistanceBands,
         ]
         .into_iter()
         .enumerate()
@@ -2277,14 +2285,17 @@ fn improve_with_terminal_searches(
             }
             let score = (candidate.data.len(), candidate.bits);
             // Settle the established methods before fitting a new payload to
-            // a proposed tree, or boundaries to the current trees. Earlier
+            // a proposed tree, boundaries to the current trees, or a
+            // collapsed distance alphabet to the slid blocks. Earlier
             // adoption can redirect a later search and lose an improvement
             // reachable from the unchanged endpoint. Default's single sweep
-            // has no later search, so its boundary slide runs regardless, as
-            // does Max's once no further sweep can start.
+            // has no later search, so its boundary slide and distance ladder
+            // run regardless, as do Max's once no further sweep can start.
             let later_sweep_possible = options.exhaustive
-                && !(matches!(search, TerminalHeaderSearch::BoundarySlide)
-                    && !max_work.can_start_route());
+                && !(matches!(
+                    search,
+                    TerminalHeaderSearch::BoundarySlide | TerminalHeaderSearch::DistanceBands
+                ) && !max_work.can_start_route());
             if later_sweep_possible && search.waits_for_settled_sweep() && score != before {
                 continue;
             }
@@ -2292,15 +2303,27 @@ fn improve_with_terminal_searches(
                 continue;
             }
             visited[index + 1] = Some(score);
-            candidate = improve_with_terminal_header_search(
-                search,
-                source,
-                options,
-                if max_only { max_work } else { ordinary_work },
-                progress,
-                &mut parse_cache,
-                candidate,
-            )?;
+            let work = if max_only { max_work } else { ordinary_work };
+            candidate = if matches!(search, TerminalHeaderSearch::DistanceBands) {
+                improve_with_distance_ladder(
+                    source,
+                    options,
+                    work,
+                    progress,
+                    &mut parse_cache,
+                    candidate,
+                )?
+            } else {
+                improve_with_terminal_header_search(
+                    search,
+                    source,
+                    options,
+                    work,
+                    progress,
+                    &mut parse_cache,
+                    candidate,
+                )?
+            };
         }
         if !options.exhaustive
             || (candidate.data.len(), candidate.bits) == before
@@ -2326,10 +2349,13 @@ fn improve_with_terminal_header_search(
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
-    // The boundary slide is linear finalization, like the bounded-depth tree
-    // floor: it may start until the hard stop it polls, not only before the
-    // soft deadline that admits new search routes.
-    let may_start = if matches!(search, TerminalHeaderSearch::BoundarySlide) {
+    // The boundary slide and distance ladder are linear finalization, like
+    // the bounded-depth tree floor: they may start until the hard stop they
+    // poll, not only before the soft deadline that admits new search routes.
+    let may_start = if matches!(
+        search,
+        TerminalHeaderSearch::BoundarySlide | TerminalHeaderSearch::DistanceBands
+    ) {
         floor_work.can_finalize()
     } else {
         floor_work.can_start_route()
@@ -2362,6 +2388,41 @@ fn improve_with_terminal_header_search(
         candidate.replace_if_smaller(refined);
     }
     Ok(candidate)
+}
+
+/// R13 follows R1c: a collapsed distance alphabet replaces trees the slide
+/// fitted its cuts to, so a winning ladder is slid once more under its new
+/// trees. Each step keeps its parent unless strictly smaller.
+fn improve_with_distance_ladder(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    let before = (candidate.data.len(), candidate.bits);
+    let candidate = improve_with_terminal_header_search(
+        TerminalHeaderSearch::DistanceBands,
+        source,
+        options,
+        floor_work,
+        progress,
+        parse_cache,
+        candidate,
+    )?;
+    if (candidate.data.len(), candidate.bits) == before {
+        return Ok(candidate);
+    }
+    improve_with_terminal_header_search(
+        TerminalHeaderSearch::BoundarySlide,
+        source,
+        options,
+        floor_work,
+        progress,
+        parse_cache,
+        candidate,
+    )
 }
 
 /// The validated parse of an unchanged terminal candidate.
@@ -2543,14 +2604,15 @@ struct CompleteDefaultFloor {
     /// The complete Default endpoint, optionally strengthened by the bounded
     /// Max-only terminal siblings within the existing Max allowance.
     complete: Candidate,
-    /// The Default result after R1c, when its boundary slide wins.
+    /// The Default result after R1c and R13, when either wins.
     slid: Option<Candidate>,
 }
 
-/// Default ends its single sweep with R1c's boundary slide. Max keeps that
-/// result only as a final competitor: boundaries fitted to the current trees
-/// can remove an improvement Max's own tree floors would find from the
-/// unslid endpoint, so the slide must not choose Max's terminal parent.
+/// Default ends its single sweep with R1c's boundary slide and R13's
+/// distance ladder. Max keeps that result only as a final competitor:
+/// boundaries fitted to the current trees can remove an improvement Max's own
+/// tree floors would find from the unslid endpoint, so the slide must not
+/// choose Max's terminal parent.
 fn slid_default_endpoint(
     source: CandidateInput<'_>,
     floor_options: &Options,
@@ -2566,6 +2628,14 @@ fn slid_default_endpoint(
         progress,
         parse_cache,
         complete.clone(),
+    )?;
+    let slid = improve_with_distance_ladder(
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        parse_cache,
+        slid,
     )?;
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }

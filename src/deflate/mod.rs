@@ -11,6 +11,7 @@
 
 mod bitstream;
 mod block;
+mod distance_band;
 mod header;
 mod huffman;
 mod joint;
