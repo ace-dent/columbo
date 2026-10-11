@@ -12,6 +12,165 @@ Private machine-readable states live under `work/`, which remains ignored by
 Git. Public Markdown reports never relabel rows from an older executable as
 current results.
 
+## Iterated slide and distance ladder on 9 October 2026
+
+### Benchmark state
+
+All three reports come from executable `069e236f…`, which adds the iterated
+boundary slide and R13, the distance-alphabet ladder. Against the
+`b4c4329b…` reports at the same allowances:
+
+| Benchmark | Result |
+| --- | --- |
+| DeflOpt Default, 957 rows | 72 smaller, 885 identical, none larger; net −50,966 bytes; runtime 1,214.7 → 1,248.0 s (+2.7%) |
+| DeflOpt Max, 943 rows with unchanged allowances | 97 smaller, 832 identical, 14 larger; net −1,536 bytes / −12,345 bits; runtime 9,314.4 → 9,310.2 s |
+| Timed deft4j, 1,621 pairs | 158 smaller, 1,424 identical, 39 larger; net −1,207 bytes / −9,598 bits; runtime 17,429.9 → 17,448.2 s |
+| Defluff, 66 pairs | Unchanged: 61 wins and five ties, −109 bytes / −932 bits |
+
+The misses are unchanged: four DeflOpt rows on two files and twelve deft4j
+rows, all strict-policy floors except the preserved signed PNG.
+
+### Rows that grew
+
+Quiet serial pairs of the two executables at each recorded allowance
+separate code effects from benchmark-load variance.
+
+- `oxipng/interlaced_odd_width.png`, the largest deft4j loss (+2,184 bytes at
+  37 seconds), is 24 bytes smaller with the new executable when run alone.
+- The other 38 larger deft4j rows net −1 byte / +7 bits: 7 smaller, 24
+  identical and 7 larger. Only two losses repeat: `054-Psyduck-1.png` and
+  `007-Squirtle.png`, one bit each.
+- Of the four largest DeflOpt Max losses, only `css-ig-net/Apricot512.png`
+  repeats: +361 bytes at 10 and 15 seconds. `BNDT…png` is smaller in quiet
+  runs, and `nerd.png` and `profile_gray_disallow_color.png` vary in both
+  executables.
+
+The three repeating losses have one cause, the early-lineage parent effect
+recorded on 8 October. R13 now also improves the PNG early lineage's quick
+floor: Apricot512's falls from 300,389 to 300,284 bytes and Psyduck's from
+1,567 to 1,566 bits. The `Established` refinement then ends worse from the
+better parent: 296,654 instead of 296,293 bytes of Deflate on Apricot512. Its
+main lineage differs only by timing and loses to the early lineage in both
+executables. With 20 or 30 seconds the new executable is 10 bytes smaller
+(298,967 against 298,977), so the route stays reachable.
+
+Withholding the quick floor's terminal finish only reverses the coin.
+Withholding R1c there lost 3,156 bytes over 131 paired cases on 8 October.
+Withholding only R13 was tested on its own premise: Columbo never searches for
+new matches, so matches the ladder spells as literals in a parent are lost to
+every descendant. It restored all three files, but over the same 131 cases it
+was 4 smaller and 20 larger, net +1,148 bytes, including +469 on
+`grayscale_alpha_8` and +586 on `download_webp__260×280_.png`; the DeflOpt
+every-tenth Max sample was neutral. Lost matches do not predict the basin, so
+no change is made there.
+
+Hedging instead of choosing was also tested, on the principle the main
+lineage already applies to its continuations: score order between complete
+parents does not prove order between their endpoints. A prototype built the
+unfinished quick floor (without R1c and R13) beside the finished one and
+refined both concurrently, keeping the better endpoint. It recovered
+Apricot512 (−637 bytes) and the Psyduck, Squirtle and Pikachu guard floors at
+unchanged wall time. Over the same 131 deft4j cases it was 12 smaller and 15
+larger, net +3,183 bytes with 15% more CPU; on the DeflOpt sample, 2 smaller
+and 11 larger, net +149 bytes with 17% more CPU. The two refinements compete
+for cores, and time-bound files lose most: `interlaced_odd_width.png`
++2,338 bytes, `FsqwhPuaIAIlojU.png` +828 and `nerd.png` +127. Rejected.
+
+A work-conserving form avoids that competition: refine the unfinished quick
+floor only after the first refinement finishes with allowance left, as the
+reclaim passes spend real leftover time. Time-bound files cannot change. But
+Psyduck, Squirtle and Apricot512 also refine until the deadline, so only
+Pikachu was recovered (2,090 → 2,089 bits), at 2.9 seconds more wall time on
+that file. One bit does not justify extra wall time on every early-finishing
+image, so this variant was rejected as well. The four early-lineage losses
+are accepted against the corpus wins.
+
+### Hundred-file guard
+
+The new executable passes 93 of 100 floors at their recorded allowances.
+Psyduck and Squirtle fail by one bit each for the reason above. The two timed
+cases reach their floors with more time: `css-ig-net/sample_61-fs8.png` gives
+9,731 bytes at 60 seconds (floor 9,738) and `medium/LevelLoading.png` 222,662
+at 250 seconds (floor 222,666).
+
+The three `pkmn` floors set on 22 September were bisected with clean builds of
+each commit; the 8 October attribution of all three to R1b was wrong.
+
+| File | Floor | HEAD | Cause |
+| --- | ---: | ---: | --- |
+| `pkmn-bw/000-Logo-2.png` | 1,059 bits | 1,064 | R1b (`344a76a`); the earlier build keeps 1,059 at 60 seconds |
+| `pkmn-bw-hard/062-Poliwrath-1.png` | 1,118 | 1,120 | Timing: `85bf3d7` gives 1,118 at 10 seconds but 1,120 at 30, and `b4a8249`, a speed-only change, moves the 10-second result |
+| `pkmn-col-hard/025-Pikachu-2.png` | 2,089 | 2,090 | R1c (`bf2fe12`); the earlier build keeps 2,089 at 60 seconds |
+
+### Strict completion as a final competitor
+
+Logo-2's loss is in Max's mandatory Default endpoint. R1b ran first, before
+R2–R5 and before Max's R6–R9 strengthening, and that endpoint can become Max's
+terminal parent. On Logo-2 the old path reached 37 saved bits through R6 and a
+final literal/length span; with R1b adopted first, R6 found nothing and the
+endpoint settled at 32. R1b fits the current state, a uniform complete
+distance tree chosen for the current payload, which changes the header the
+later searches start from. R1c already follows the matching rule: Max keeps
+the slid endpoint only as a final competitor.
+
+**Accepted.** When R1b wins on a mandatory endpoint, its R2–R5 finish and
+R6–R9 strengthening now start from the endpoint without R1b. Default's exact
+endpoint, R1b then R2–R5, R1c and R13, is kept only as a final competitor,
+compared after Max's terminal searches, which apply R1b to Max's own
+incumbent. Max therefore never trails Default. R2–R5 run twice only when R1b
+wins. The same rule applies to the PNG, standalone, `SharedExact` and
+`ApngMax` endpoints.
+
+Only streams where R1b wins can change, so the complete affected set was
+measured. A Default scan of every PNG within R1b's 128 KiB class and every
+GZIP, ZIP and zlib fixture found 37 such files: 12 single-image PNGs, 9 APNG
+stickers and 16 ZIP archives. Paired Max runs at 10 seconds, two or three
+repeats each:
+
+| Cohort | Result |
+| --- | --- |
+| 12 single-image PNGs, two repeats | 4 smaller, 8 identical, none larger, every repeat identical: `000-Logo-2.png` 461 → 460 bytes (1,064 → 1,055 bits, below its 1,059 floor), both `060-Poliwag-2.png` −2 bits, `T_Grass.png` −1 bit |
+| 16 ZIP archives, two repeats | Identical; their Max members do not build this endpoint |
+| 9 APNG stickers, three repeats | Mean +0.7 bytes in total; individual files move up to ±8 bytes between repeats of the same executable |
+
+Two variants were rejected first. Moving R1b to the end of the terminal sweep
+changed none of the three files and made `T_Grass.png` Default one byte
+larger. Removing it from the sweep alone left Logo-2 at 1,064, which located
+the effect in the mandatory endpoint. The new unit test
+`strict_completion_competes_only_after_max_searches_its_parent` checks that
+the competitor equals Default's output, that Max's parent keeps the planned
+`[1, 1]` completion, and that Max does not trail Default.
+
+With the accepted change the hundred-file guard passes 94 of 100: Logo-2 now
+passes, and the six remaining failures are Psyduck, Squirtle, Poliwrath,
+Pikachu and the two timed cases, for the causes above. Pikachu's is the
+early-lineage parent effect too: both executables reach 2,090 bits in the main
+lineage, while the early lineage refines a quick floor that R1c slid to 2,092
+bits and finds nothing; the pre-R1c build reached 2,089 from the unslid floor.
+
+All three reports were then refreshed with the accepted executable,
+`2825c48f…`, and compared with the `069e236f…` states:
+
+| Benchmark | Result |
+| --- | --- |
+| Defluff, 66 pairs | Unchanged: 61 wins and five ties, −109 bytes / −932 bits; no misses |
+| DeflOpt Default, 957 rows | Identical; runtime 1,248.0 → 1,254.3 s |
+| DeflOpt Max, 939 rows with unchanged allowances | 19 smaller, 892 identical, 28 larger; net −132 bytes / −1,025 bits; runtime 9,267.6 → 9,271.0 s |
+| Timed deft4j, 1,621 pairs | 52 smaller, 1,532 identical, 37 larger; net +32 bytes / +232 bits; runtime 17,448.2 → 17,430.6 s |
+
+Only the 37 files where R1b wins can change. Their rows show exactly the
+paired results: Logo-2 −1 byte / −9 bits, each Poliwag-2 −2 bits and T_Grass
+−1 bit in both benchmarks, net −1 byte / −12 bits per benchmark. The one other
+affected row, `8x8-zip/Architecture.playdate-pulp.zip` (+2 bits), gives 72,567
+bits with both executables in quiet runs at its 13-second allowance. Every
+other moved row is a file the change cannot reach, mostly APNGs. Quiet paired
+runs of the 37 deft4j rows that grew, one per executable at each recorded
+allowance, favour the accepted executable: 14 smaller, 15 identical and 8
+larger, net −149 bytes / −1,186 bits. The deft4j journal's +32 bytes is
+therefore benchmark-load variance. The misses are unchanged: four DeflOpt rows and twelve deft4j rows,
+all strict-policy floors that reach parity in the relaxed audit except the
+preserved signed PNG.
+
 ## Linear finalization share on 8 October 2026
 
 ### Current benchmark state
@@ -103,10 +262,9 @@ paired runs of HEAD and the accepted build, two repeats each at the recorded
 allowance, tie or favour the accepted build on all ten, so most journal losses
 were benchmark-load variance. Three of them, the `pkmn` bit losses of 1, 2
 and 5 bits, are deterministic and finish in about a second, so more time
-cannot change them. They come from R1b (30 September): strict distance
-completion now runs first in the Default sweep, and the later header searches
-settle at a different fixed point. The 29 September build still reaches the
-older bit counts. They cost no bytes and are recorded, not fitted.
+cannot change them. They were attributed here to R1b; the clean bisect on
+9 October found R1b, R1c and a timing-dependent floor instead (see the
+9 October section). They cost no bytes.
 
 `oxipng/grayscale_alpha_8_should_be_grayscale_alpha_8.png` is a real,
 deterministic loss at 10 seconds: 80,094 → 80,637 bytes. At 60 seconds HEAD

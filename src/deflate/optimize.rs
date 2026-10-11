@@ -2604,7 +2604,9 @@ struct CompleteDefaultFloor {
     /// The complete Default endpoint, optionally strengthened by the bounded
     /// Max-only terminal siblings within the existing Max allowance.
     complete: Candidate,
-    /// The Default result after R1c and R13, when either wins.
+    /// Default's exact endpoint, kept only as a final competitor: the result
+    /// after R1c and R13 when either wins, or with R1b when `complete`
+    /// omitted it.
     slid: Option<Candidate>,
 }
 
@@ -2640,6 +2642,72 @@ fn slid_default_endpoint(
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 
+/// Default's R1b–R5 finish for one of Max's mandatory endpoints.
+///
+/// Returns Max's parent and Default's exact endpoint as a final competitor.
+/// R1b, like R1c, fits the current state: it re-prices a degenerate distance
+/// alphabet with whichever uniform complete tree the current payload prefers,
+/// which changes the header that R2–R9 search from. Adopted first, it can
+/// lead them to a worse fixed point than the endpoint without it. When R1b
+/// wins, the parent therefore omits it; Max's terminal sweep applies R1b to
+/// its own final incumbent, and Default's endpoint with R1b, R1c and R13
+/// stays a final competitor, so Max never trails Default. Otherwise the
+/// parent is Default's endpoint and only its slid form competes.
+fn finish_mandatory_default_endpoint(
+    source: CandidateInput<'_>,
+    floor_options: &Options,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    base: Candidate,
+) -> Result<(Candidate, Option<Candidate>)> {
+    let completed = improve_with_terminal_header_search(
+        TerminalHeaderSearch::StrictDistanceCompletion,
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        parse_cache,
+        base.clone(),
+    )?;
+    let completion_won = completed.is_strictly_smaller_than(&base);
+    let endpoint =
+        finish_default_header_searches(source, floor_options, progress, parse_cache, completed)?;
+    let slid = slid_default_endpoint(source, floor_options, progress, parse_cache, &endpoint)?;
+    if !completion_won {
+        return Ok((endpoint, slid));
+    }
+    let parent =
+        finish_default_header_searches(source, floor_options, progress, parse_cache, base)?;
+    Ok((parent, Some(slid.unwrap_or(endpoint))))
+}
+
+/// Default's R2–R5 terminal header searches, in their sweep order.
+fn finish_default_header_searches(
+    source: CandidateInput<'_>,
+    floor_options: &Options,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    for search in [
+        TerminalHeaderSearch::PayloadTradeoff,
+        TerminalHeaderSearch::LiteralSpan,
+        TerminalHeaderSearch::JointTreeRle,
+        TerminalHeaderSearch::SymbolSets,
+    ] {
+        candidate = improve_with_terminal_header_search(
+            search,
+            source,
+            floor_options,
+            DefaultFloorWork::Mandatory,
+            progress,
+            parse_cache,
+            candidate,
+        )?;
+    }
+    Ok(candidate)
+}
+
 fn build_complete_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2670,57 +2738,12 @@ fn build_complete_default_floor_candidate(
         complete,
     )?;
     let mut parse_cache = TerminalParseCache::default();
-    let complete = improve_with_terminal_header_search(
-        TerminalHeaderSearch::StrictDistanceCompletion,
+    let (complete, slid) = finish_mandatory_default_endpoint(
         source,
         &floor_options,
-        DefaultFloorWork::Mandatory,
         progress,
         &mut parse_cache,
         complete,
-    )?;
-    let complete = improve_with_terminal_header_search(
-        TerminalHeaderSearch::PayloadTradeoff,
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        &mut parse_cache,
-        complete,
-    )?;
-    let complete = improve_with_terminal_header_search(
-        TerminalHeaderSearch::LiteralSpan,
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        &mut parse_cache,
-        complete,
-    )?;
-    let complete = improve_with_terminal_header_search(
-        TerminalHeaderSearch::JointTreeRle,
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        &mut parse_cache,
-        complete,
-    )?;
-    let complete = improve_with_terminal_header_search(
-        TerminalHeaderSearch::SymbolSets,
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        &mut parse_cache,
-        complete,
-    )?;
-    let slid = slid_default_endpoint(
-        source,
-        &floor_options,
-        progress,
-        &mut parse_cache,
-        &complete,
     )?;
     // Max alone may strengthen the completed ordinary comparison endpoint.
     // The historical seed stays independent, and this extra search consumes
@@ -2763,7 +2786,7 @@ fn build_complete_apng_default_floor_candidate(
         ..options.clone()
     };
     let initial = build_apng_default_candidate(source, &floor_options, &mut SearchStop::never())?;
-    let mut complete = improve_with_original_match_restoration(
+    let restored = improve_with_original_match_restoration(
         source,
         &floor_options,
         DefaultFloorWork::Mandatory,
@@ -2771,29 +2794,12 @@ fn build_complete_apng_default_floor_candidate(
         initial,
     )?;
     let mut parse_cache = TerminalParseCache::default();
-    for search in [
-        TerminalHeaderSearch::StrictDistanceCompletion,
-        TerminalHeaderSearch::PayloadTradeoff,
-        TerminalHeaderSearch::LiteralSpan,
-        TerminalHeaderSearch::JointTreeRle,
-        TerminalHeaderSearch::SymbolSets,
-    ] {
-        complete = improve_with_terminal_header_search(
-            search,
-            source,
-            &floor_options,
-            DefaultFloorWork::Mandatory,
-            progress,
-            &mut parse_cache,
-            complete,
-        )?;
-    }
-    let slid = slid_default_endpoint(
+    let (mut complete, slid) = finish_mandatory_default_endpoint(
         source,
         &floor_options,
         progress,
         &mut parse_cache,
-        &complete,
+        restored,
     )?;
     for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
