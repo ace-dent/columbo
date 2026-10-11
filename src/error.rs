@@ -23,7 +23,7 @@ pub enum ErrorKind {
     Internal,
 }
 
-/// A malformed input, unsupported container feature, or resource-limit error.
+/// A validation or optimization failure, classified by [`ErrorKind`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
     kind: ErrorKind,

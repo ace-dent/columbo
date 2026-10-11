@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Heap candidate construction shared by Huffman and search tests.
+//! Heap-built code lengths shared by Huffman and search tests.
 
 use super::make_lengths_deflopt_heap_into;
 
-/// Build the candidate produced by DeflOpt's frequency/height heap.
+/// Build the code lengths of DeflOpt's frequency/height heap.
 pub(crate) fn make_lengths_deflopt_heap(
     frequencies: &[u32],
     max_bits: u8,

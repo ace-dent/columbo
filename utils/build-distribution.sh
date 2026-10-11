@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-# Build a release executable without trading runtime speed for binary size.
+# Build and package a distribution executable, favoring runtime speed over
+# binary size.
 #
-# The pinned nightly compiler rebuilds the standard library with the same
-# speed-first profile as Columbo, allowing unused panic formatting and source
-# paths to disappear under whole-program LTO. Measured distribution builds
-# were no slower than the prebuilt standard library. The final path audit is
-# retained as a fail-closed check for toolchain or linker changes.
+# The pinned nightly compiler rebuilds the standard library with Columbo's
+# speed-first profile, so whole-program LTO can drop unused panic formatting
+# and source paths (measured no slower than the prebuilt standard library).
+# The final path audit fails the build if build paths leak.
 
 set -eu
 
@@ -25,8 +25,8 @@ fi
 TARGET="$1"
 cd "$PROJECT_ROOT"
 
-# Public release names use the package's major/minor version. Patch releases
-# remain reproducible through Cargo.lock and the pinned compiler toolchain.
+# Release names use the package's major.minor version. Patch releases stay
+# reproducible through Cargo.lock and the pinned toolchain.
 VERSION=$(awk -F '"' '
     /^version = "/ {
         split($2, parts, ".")
@@ -90,8 +90,7 @@ if ! rustup component list --toolchain "$TOOLCHAIN" --installed | grep -qx "rust
     exit 1
 fi
 
-# Cargo normally discovers a native linker itself. Supply the conventional
-# MinGW cross-linker explicitly when producing Windows GNU binaries elsewhere.
+# Use the MinGW cross-linker when installed; Cargo finds native linkers itself.
 if [ "$TARGET" = "x86_64-pc-windows-gnu" ] && \
         command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="x86_64-w64-mingw32-gcc"
@@ -102,9 +101,9 @@ PINNED_RUSTC=$(rustup which --toolchain "$TOOLCHAIN" rustc)
 RUST_SYSROOT=$(rustup run "$TOOLCHAIN" rustc --print sysroot)
 RUST_SOURCE_ROOT="$RUST_SYSROOT/lib/rustlib/src/rust"
 
-# Remap source names before they can reach an object file. Cargo splits
-# RUSTFLAGS on whitespace, so use its unit-separator encoding to keep checkout
-# and toolchain paths containing spaces intact as single rustc arguments.
+# Drop panic locations and remap build paths before they can reach an object
+# file. Cargo splits RUSTFLAGS on whitespace, so pass the flags through
+# CARGO_ENCODED_RUSTFLAGS (separated by 0x1F) to keep paths with spaces intact.
 RUSTFLAG_SEPARATOR=$(printf '\037')
 CARGO_ENCODED_RUSTFLAGS="-Zlocation-detail=none"
 append_rustflag() {
@@ -126,8 +125,8 @@ CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS" \
 BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/distribution/$BINARY_NAME"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" "$BINARY"
 
-# Editing a Mach-O invalidates its linker-generated ad-hoc signature. Restore
-# that signature locally; release signing can still replace it afterwards.
+# Editing a Mach-O invalidates its linker-generated ad hoc signature. Re-sign
+# ad hoc here; release signing can still replace it afterward.
 case "$TARGET" in
     *-apple-darwin) codesign --force --sign - "$BINARY" ;;
 esac
@@ -136,14 +135,12 @@ python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$BINARY"
 
 DIST_DIR="${CARGO_TARGET_DIR:-target}/dist"
 RELEASE_STEM="columbo-v$VERSION-$PLATFORM-$CPU_ARCHITECTURE"
-# The archive carries release identity. Keep the executable's product basename
-# stable so process monitors show "columbo", independently of platform/version.
+# The executable keeps its plain name, so process monitors show "columbo".
 mkdir -p "$DIST_DIR"
 ARCHIVE="$DIST_DIR/$RELEASE_STEM.zip"
 
-# Builds for different architectures share the executable basename. Give each
-# invocation its own staging directory so neither packaging nor cleanup can
-# overwrite another build's executable or unfinished archive.
+# Builds for different architectures share the executable basename, so each
+# invocation stages in its own directory.
 STAGING_DIR=$(mktemp -d "$DIST_DIR/.$RELEASE_STEM.XXXXXX")
 cleanup() {
     rm -rf "$STAGING_DIR"
@@ -156,9 +153,8 @@ TEMP_ARCHIVE="$STAGING_DIR/$RELEASE_STEM.zip"
 cp "$BINARY" "$DIST_BINARY"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$DIST_BINARY"
 
-# -9 selects maximum compression, -X omits host-specific extended attributes,
-# and -j stores only public basenames. Include the project licence beside the
-# executable in every release archive.
+# -9 selects maximum compression, -X omits extra file attributes such as Unix
+# owner IDs, and -j stores only base names.
 zip -9 -X -j -q "$TEMP_ARCHIVE" \
     "$DIST_BINARY" "$PROJECT_ROOT/LICENSE"
 zip -T "$TEMP_ARCHIVE" >/dev/null

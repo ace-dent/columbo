@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Remove small sets of payload symbols for their combined header effect.
-//! Every replacement is confined to an existing match and retains its distance.
+//! Remove small sets of length or distance symbols from a dynamic block to
+//! shrink its header (R5).
+//!
+//! Each change stays within one existing match: a match whose distance symbol
+//! is removed becomes literals, and a match whose length symbol is removed is
+//! re-spelled as literals and proven submatches at the same distance.
 
 use super::block::plan_block;
 use super::header::{
@@ -76,9 +80,10 @@ impl Ban {
     }
 }
 
-/// Forbid every position between two support endpoints, including unused
-/// interior positions. Otherwise a submatch could reintroduce a hole inside
-/// the intended zero run. Only usable distance symbols enter this menu.
+/// List candidate bans, single symbols first. Each covers 1-4 consecutive
+/// used length symbols or distance symbols and every unused symbol between
+/// them, so a submatch cannot reintroduce a nonzero length inside the
+/// intended zero run.
 fn masks(block: &ParsedBlock) -> Option<Vec<Ban>> {
     let mut singles = Vec::new();
     let mut groups = Vec::new();
@@ -146,8 +151,6 @@ fn rewrite(
         affected += 1;
         let length = token.decoded_len();
         bytes += length;
-        // These totals only grow. Once either limit is exceeded, later
-        // tokens cannot make this candidate eligible for rewriting.
         if affected > MAX_AFFECTED_MATCHES || bytes > MAX_REWRITTEN_BYTES {
             return None;
         }
@@ -157,7 +160,7 @@ fn rewrite(
         {
             if ban.distances & (1 << distance_symbol) == 0 {
                 // The restricted submatch solver visits this many match edges,
-                // including forbidden lengths. Reserve the whole search first.
+                // including banned lengths. Charge the whole search up front.
                 edges += (length - 1) * (length - 2) / 2;
             }
         }
@@ -241,10 +244,9 @@ fn estimate(tokens: &[Token]) -> Option<u64> {
     estimate_boundary_block_bits(&literal, &distance, token_extra_bits(tokens), true)
 }
 
-/// Price one token spelling with the ordinary family grid and two small
-/// existing table families. Full Max's much larger tree cross-product is not
-/// needed for the measured set-removal witnesses. Each complete intermediate
-/// remains available if a later family reaches the stop boundary.
+/// Price one token spelling with the standard planner (strict, not exhaustive)
+/// plus depth-limited and RLE-smoothed dynamic-code searches; Max's larger
+/// cross-product of code builders was not needed in measured cases.
 fn price_spelling(
     parent: &ParsedBlock,
     tokens: Vec<Token>,
@@ -345,8 +347,9 @@ pub(crate) fn plan_symbol_sets(
         if count <= 2 {
             retain_seed(&mut seeds[usize::from(ban.distances != 0)], (score, ban));
         }
-        // This is candidate ranking, not an impossibility bound. Normalize to
-        // the same cheap model of the parent and keep a small losing window.
+        // The estimate only ranks candidates; it is not a bound. Keep
+        // candidates up to `ESTIMATE_WINDOW` bits worse than the parent under
+        // the same estimate.
         if count >= 2 && score <= parent_score + ESTIMATE_WINDOW {
             retain_proposal(&mut proposals, Proposal { ban, score, tokens });
         }
@@ -398,9 +401,9 @@ pub(crate) fn plan_symbol_sets(
             _ => None,
         };
         if let Some((literal_lengths, distance_lengths)) = lengths {
-            // Revisit the original certificates under the new table costs,
-            // keeping the entire forbidden set. Do not extend a submatch or
-            // turn a newly emitted literal into a new match certificate.
+            // Re-spell the original matches under the new code lengths with
+            // the same ban; this never extends a submatch or turns a new
+            // literal into a match.
             if let Some(tokens) = rewrite(
                 block,
                 proposal.ban,

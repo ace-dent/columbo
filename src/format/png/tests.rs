@@ -803,9 +803,8 @@ fn apng_max_file_floor_requires_no_worse_bytes_and_bits() {
 
 #[test]
 fn coalesces_ten_idat_chunks_and_preserves_registered_scal() {
-    // This is the already-minimal 1x1 zlib stream used by the 24-chunk
-    // corpus case. Only removing nine redundant IDAT wrappers can shrink
-    // it, for an exact saving of 9 * 12 bytes.
+    // This 1x1 zlib stream is already minimal, so only merging the ten IDAT
+    // chunks into one can shrink the file, saving exactly 9 * 12 bytes.
     let zlib = [0x78, 0x01, 0x63, 0xf8, 0x0f, 0x00, 0x01, 0x01, 0x01, 0x00];
     let scal = [1, b'1', b'.', b'0', 0, b'1', b'.', b'0'];
     let mut input = SIGNATURE.to_vec();
@@ -871,8 +870,8 @@ fn checksum_tuple_is_only_a_filter_for_cross_frame_reuse() {
     let second_data = stored_zlib(&[0, 1]);
     assert_eq!(first_data.len(), second_data.len());
 
-    // Deliberately forge equal summary fields. The second representation
-    // appears cheaper by bit count, but its exact decoded bytes differ.
+    // Forge equal summary fields. The second stream appears cheaper by bit
+    // count, but its decoded bytes differ.
     let summary = RawInfo {
         size: 2,
         crc32: 7,
@@ -1059,8 +1058,8 @@ fn image_timeout_is_proportional_and_gives_largest_the_remainder() {
 #[test]
 fn image_scheduler_obeys_a_tiny_wall_budget_in_both_modes() {
     let source_idat = black_scanline_zlib();
-    // Distinct payloads prevent representative folding, so this exercises
-    // the actual multi-job schedule rather than one cloned job.
+    // Distinct payloads keep frames from sharing a representative, so the
+    // multi-job schedule runs.
     let frames: Vec<_> = (0_u8..12).map(|value| stored_zlib(&[value, 0])).collect();
     let source_lengths: Vec<_> = frames.iter().map(Vec::len).collect();
     for exhaustive in [false, true] {
@@ -1282,7 +1281,8 @@ fn idot_is_dropped_when_image_data_is_rewritten() {
     input.extend(chunk(*b"IDAT", &zlib[5..]));
     input.extend(chunk(*b"IEND", &[]));
 
-    // Without --strip, iDOT no longer forces the source to be preserved.
+    // Without --strip, iDOT is dropped and does not force the source to be
+    // preserved.
     let rewritten = optimize(&input, &Options::default()).unwrap();
     assert!(rewritten.should_replace());
     let parsed = parse(&rewritten.data, false).unwrap();
@@ -1450,7 +1450,7 @@ fn relaxed_compressed_metadata_retains_flevel_only_improvement() {
 fn metadata_probe_counts_decoded_bytes_only_once() {
     // This valid zTXt stream expands to one byte and is already too small
     // for the quick pass to shrink. Together with the two-byte image row,
-    // it exactly fills the deliberately tiny decoded-data budget.
+    // it exactly fills the tiny decoded-size budget.
     let metadata_zlib = [0x78, 0x9c, 0xab, 0x00, 0x00, 0x00, 0x79, 0x00, 0x79];
     let mut metadata = b"Comment\0\0".to_vec();
     metadata.extend_from_slice(&metadata_zlib);
@@ -1726,8 +1726,8 @@ fn image_png(idat: &[u8], before_idat: &[Vec<u8>]) -> Vec<u8> {
 #[test]
 fn preserved_png_is_returned_without_decoding_its_streams() {
     // An unknown, unsafe-to-copy ancillary chunk forces the original output.
-    // Columbo cannot rewrite these image streams, so it does not decode them:
-    // even a corrupt stream is returned unchanged rather than diagnosed.
+    // The image streams are not decoded, so even a corrupt one is returned
+    // unchanged.
     let mut corrupt = black_scanline_zlib();
     *corrupt.last_mut().unwrap() ^= 1;
     for idat in [black_scanline_zlib(), corrupt] {

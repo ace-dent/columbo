@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
+//! Least-significant-bit-first bit reader and writer for Deflate streams.
+
 use crate::{Error, Result};
 
-/// LSB-first reader used by the Deflate format.
 pub(crate) struct BitReader<'a> {
     input: &'a [u8],
     byte_pos: usize,
@@ -105,8 +106,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// LSB-first writer. Bits not explicitly written remain zero, giving
-/// deterministic padding in the final partial byte.
+/// Unwritten bits in the final partial byte are zero.
 #[derive(Default)]
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
@@ -161,9 +161,8 @@ impl BitWriter {
         };
         self.buffer |= (u64::from(value) & mask) << self.buffered_bits;
         self.buffered_bits = pending_bits;
-        // Keep enough headroom for any following 32-bit write. Draining one
-        // little-endian word at a time reduces Vec updates without relying on
-        // the host's native word width or unaligned memory access.
+        // Drain whole 32-bit words so the next write of up to 32 bits fits in
+        // the 64-bit buffer.
         if self.buffered_bits >= 32 {
             self.bytes
                 .extend_from_slice(&(self.buffer as u32).to_le_bytes());
@@ -190,10 +189,9 @@ impl BitWriter {
             .ok_or_else(|| Error::new("original Deflate bit range is out of bounds"))?;
         let mut position = start;
 
-        // Original blocks usually retain their starting bit residue when they
-        // are placed in the new stream. Peel at most one partial byte in that
-        // case, copy the aligned interior directly, and finish with the tail.
-        // Differently aligned ranges still use the general bounded-bit path.
+        // Copied source blocks usually keep their bit offset within a byte, so
+        // whole bytes copy directly between a partial head and tail. Other
+        // ranges copy up to 32 bits at a time.
         if (self.bit_pos & 7) == (position & 7) {
             let leading_bits = ((8 - (position & 7)) & 7).min(end - position);
             if leading_bits != 0 {
@@ -295,8 +293,8 @@ impl BitWriter {
     pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         self.flush_complete_bytes();
         if self.buffered_bits != 0 {
-            // Every write reserves room for its possible trailing partial byte,
-            // so finalization cannot introduce an infallible allocation.
+            // Every write reserved room for this byte, so the push does not
+            // reallocate.
             self.bytes.push(self.buffer as u8);
         }
         self.bytes

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Canonical Huffman encoding, decoding tables, and bounded tree construction.
+//! Canonical Huffman codes, decoding tables and length-limited code
+//! construction.
 
 use std::collections::VecDeque;
 use std::sync::OnceLock;
@@ -16,9 +17,8 @@ const MAX_TRACKED_DEPTH: usize = 63;
 const COMPLETE_HUFFMAN_CODE_SPACE: u32 = 1 << MAX_CODE_BITS;
 const CODE_LENGTH_DECODE_BITS: u8 = 7;
 const CODE_LENGTH_DECODE_SIZE: usize = 1 << CODE_LENGTH_DECODE_BITS;
-/// Each payload root is one lookup bit above the balanced width implied by its
-/// maximum alphabet: ceil(log2(288)) + 1 and ceil(log2(32)) + 1. Measurements
-/// verify the format-derived choice against build/cache costs.
+/// Root table widths of the two-level decoders: one bit more than each alphabet
+/// needs, chosen from measured build and cache costs.
 pub(crate) const LITERAL_LENGTH_DECODE_ROOT_BITS: u8 = 10;
 pub(crate) const DISTANCE_DECODE_ROOT_BITS: u8 = 6;
 
@@ -40,13 +40,10 @@ const fn make_fixed_literal_code_lengths() -> [u8; 288] {
     lengths
 }
 
-/// RFC 1951 fixed literal/length code lengths, including reserved symbols
-/// 286 and 287 because they are part of the predefined Huffman alphabet.
 pub(crate) const FIXED_LITERAL_CODE_LENGTHS: [u8; 288] = make_fixed_literal_code_lengths();
-/// RFC 1951 fixed distance code lengths, including reserved symbols 30 and 31.
 pub(crate) const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
 
-/// Whether code lengths occupy the complete canonical Huffman code space.
+/// Whether the code lengths form a complete prefix code (Kraft sum exactly 1).
 pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
     let mut occupied = 0_u32;
     for &length in lengths {
@@ -64,17 +61,15 @@ pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
     occupied == COMPLETE_HUFFMAN_CODE_SPACE
 }
 
-/// Code-length alphabets have no empty or one-symbol exceptions.
+/// The code-length code must be complete; there is no empty or single-code
+/// exception.
 pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
     huffman_tree_shape_is_complete(lengths)
 }
 
-/// Validate the tree shapes accepted for Deflate payload alphabets.
-///
-/// A populated literal/length or distance tree is normally complete. RFC 1951
-/// explicitly permits a one-bit singleton distance tree; the zlib-compatible
-/// profile also accepts a one-bit singleton literal/end tree. `allow_empty`
-/// admits the literal-only distance-alphabet case.
+/// Accept a complete code, a single one-bit code (RFC 1951 allows this for
+/// distances; zlib also accepts it for literal/length codes), or an empty code
+/// if `allow_empty` (the distance code of a literal-only block).
 pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> bool {
     let populated = lengths.iter().filter(|&&length| length != 0).count();
     match populated {
@@ -84,8 +79,8 @@ pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> 
     }
 }
 
-/// Validate that lengths can form a canonical Deflate Huffman table without
-/// allocating the emission and decode structures built by `Huffman::build`.
+/// Whether [`Huffman::build`] would accept `lengths`, without allocating its
+/// tables.
 pub(crate) fn huffman_code_lengths_are_valid(lengths: &[u8]) -> bool {
     analyze_code_lengths(lengths).is_some()
 }
@@ -122,10 +117,8 @@ fn analyze_code_lengths(lengths: &[u8]) -> Option<([u32; MAX_CODE_BITS + 1], u8,
     Some((count_by_length, max_bits, populated))
 }
 
-/// One canonical Huffman code in the bit order used on the Deflate wire.
-///
-/// Deflate writes bits least-significant bit first, so `code` is the reverse
-/// of the conventional, most-significant-bit-first canonical representation.
+/// `code` is bit-reversed: RFC 1951 packs Huffman codes most significant bit
+/// first into an LSB-first stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HuffCode {
     pub(crate) symbol: u16,
@@ -133,18 +126,13 @@ pub(crate) struct HuffCode {
     pub(crate) code: u16,
 }
 
-/// A small canonical Huffman table.
-///
-/// Deflate alphabets contain at most 288 payload symbols. Emission retains a
-/// direct symbol-indexed code table, while decoding uses one canonical range
-/// per possible bit length so malformed input cannot trigger alphabet-wide
-/// scans.
+/// Canonical Huffman code for one alphabet, with encoding and decoding tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Huffman {
-    /// Emission entries are indexed directly by symbol; zero length is unused.
+    /// Indexed by symbol; length 0 means unused.
     codes: Vec<HuffCode>,
-    /// Canonical-code ranges allow decoding in at most fifteen comparisons,
-    /// independent of the alphabet size.
+    /// Per-length canonical code ranges, so decoding takes at most 15
+    /// comparisons.
     first_code: [u16; MAX_CODE_BITS + 1],
     first_symbol: [u16; MAX_CODE_BITS + 1],
     code_count: [u16; MAX_CODE_BITS + 1],
@@ -233,11 +221,8 @@ pub(crate) struct DecodedValue {
     pub(crate) extra_bits: u8,
 }
 
-/// Compact decoder for Deflate's 19-symbol code-length alphabet.
-///
-/// Every transmitted code length is at most seven bits, so one complete
-/// 128-entry table can store both the symbol and width in a byte. Payload
-/// alphabets keep the general two-level decoder and its value metadata.
+/// Single-level decoder for the code-length alphabet: its codes are at most 7
+/// bits (lengths are sent in 3-bit fields), so one 128-entry table holds them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodeLengthDecoder {
     entries: [u8; CODE_LENGTH_DECODE_SIZE],
@@ -293,9 +278,8 @@ impl CodeLengthDecoder {
             return Ok(u16::from(packed >> 3));
         }
 
-        // A valid final stream can have fewer than seven physical bits left
-        // after a short codeword. Find that short code without requiring the
-        // wide table lookup to read past the input.
+        // Near the end of input, fewer than seven bits may remain. Try each
+        // length so decoding never reads past the input.
         for bits in 1..=CODE_LENGTH_DECODE_BITS {
             let value = reader.peek(bits)?;
             let packed = self.entries[value as usize];
@@ -315,12 +299,9 @@ struct DecodeTable {
 }
 
 impl Huffman {
-    /// Build canonical codes from code lengths.
-    ///
-    /// `None` means that a length exceeds Deflate's 15-bit limit, the tree is
-    /// oversubscribed, or the alphabet exceeds the original Columbo C decoder's
-    /// 320-code table limit. Construction can represent an incomplete tree;
-    /// callers apply the alphabet-specific complete, empty, or singleton rule.
+    /// Build canonical codes from code lengths. Incomplete codes are accepted;
+    /// callers apply each alphabet's rule. At most `MAX_C_CODES` symbols may
+    /// have codes, the table limit of Columbo's C decoder.
     pub(crate) fn build(lengths: &[u8]) -> Option<Self> {
         let (count_by_length, max_bits, populated) = analyze_code_lengths(lengths)?;
 
@@ -383,9 +364,9 @@ impl Huffman {
         })
     }
 
-    /// Build a payload decoder whose table entries also carry the base value
-    /// and extra-bit width associated with each symbol. This lets parsing
-    /// consume a codeword and its extra field as one logical operation.
+    /// Build a two-level decoder whose entries also hold each symbol's base
+    /// value and extra-bit count, so a code and its extra bits are read in one
+    /// step.
     pub(crate) fn build_value_decoder_with_root_bits(
         lengths: &[u8],
         first_value_symbol: u16,
@@ -415,7 +396,6 @@ impl Huffman {
         Some(tree)
     }
 
-    /// Decode a profiled symbol together with its following extra-bit field.
     pub(crate) fn decode_value(&self, reader: &mut BitReader<'_>) -> Result<DecodedValue> {
         let profile = self
             .decode_profile
@@ -441,9 +421,8 @@ impl Huffman {
             }
         }
 
-        // Near the end of a stream there may be enough input for the actual
-        // codeword but not for the table's wider root lookup. Preserve the
-        // canonical fallback and consume its extra field separately.
+        // Near the end of input the wider table lookup may not fit; decode
+        // bit by bit instead.
         let symbol = self.decode_canonical(reader)?;
         let (base, extra_bits) = decode_metadata(profile, symbol);
         let extra = if extra_bits == 0 {
@@ -500,10 +479,8 @@ impl Huffman {
     fn decode_canonical(&self, reader: &mut BitReader<'_>) -> Result<u16> {
         let mut code = 0_u16;
         for length in 1..=self.max_bits {
-            // Huffman bits arrive in canonical most-significant-bit order,
-            // even though fixed-width Deflate fields are least-significant
-            // bit first. Building the canonical value incrementally avoids a
-            // bit reversal and an alphabet-wide scan at every depth.
+            // Huffman codes are packed most significant bit first, so
+            // building the code one bit at a time needs no bit reversal.
             code = (code << 1) | reader.read(1)? as u16;
             let index = usize::from(length);
             let offset = code.wrapping_sub(self.first_code[index]);
@@ -515,7 +492,6 @@ impl Huffman {
         Err(Error::new("invalid Huffman code in Deflate stream"))
     }
 
-    /// Look up a symbol for emission.
     pub(crate) fn code(&self, symbol: usize) -> Option<HuffCode> {
         let code = *self.codes.get(symbol)?;
         (code.length != 0).then_some(code)
@@ -556,11 +532,9 @@ fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
     entries.try_reserve_exact(root_size).ok()?;
     entries.resize(root_size, DecodeEntry::default());
 
-    // Grow the direct root table one address bit at a time. Duplicating the
-    // already populated prefix keeps the inherited shorter codes contiguous
-    // in memory; codes introduced at this width then replace their one exact
-    // slot. The resulting bit-reversed lookup layout is identical to filling
-    // every symbol's widely spaced suffixes independently.
+    // Build the root table by doubling: for each code length, copy the filled
+    // lower half into the upper half, then write each code of that length
+    // into its one slot.
     for length in 1..=root_bits {
         if length > 1 {
             let previous_size = 1_usize << (length - 1);
@@ -576,8 +550,8 @@ fn build_decode_table(tree: &Huffman, root_bits: u8) -> Option<DecodeTable> {
         }
     }
 
-    // Install subtable pointers only after the root has been expanded so the
-    // contiguous copies above cannot replicate a pointer into another prefix.
+    // Add subtable pointers after the root table is complete, so the doubling
+    // copies above cannot duplicate them into other slots.
     for (prefix, &subtable_bits) in subtable_widths.iter().enumerate() {
         if subtable_bits != 0 {
             let subtable_start = u16::try_from(entries.len()).ok()?;
@@ -608,11 +582,6 @@ fn reverse_bits(code: u16, length: u8) -> u16 {
     code.reverse_bits() >> (u16::BITS as u8 - length)
 }
 
-/// Return the RFC 1951 fixed literal/length and distance trees.
-///
-/// `OnceLock` avoids rebuilding the decode tables for every fixed block. The
-/// underlying code lengths are shared with every planner that prices a fixed
-/// representation, so the RFC table has a single definition.
 pub(crate) fn fixed_trees() -> (&'static Huffman, &'static Huffman) {
     static FIXED: OnceLock<(Huffman, Huffman)> = OnceLock::new();
     let (literal_length, distance) = FIXED.get_or_init(|| {
@@ -743,11 +712,9 @@ fn generic_heap_pop_active(
     }
 }
 
-/// Merge variants whose first and second child reverse their equal-frequency
-/// preference. Each node enters both total-order heaps; removing it only marks
-/// the shared active bit, and the other heap discards that stale entry when it
-/// reaches its front. This preserves the two distinct choices without an
-/// active-set scan or deletion from the middle of a heap.
+/// Merge for variants 2 and 3, whose first and second child break ties in
+/// opposite directions: one heap per tie order, and a node taken from one is
+/// skipped by the other.
 fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
     debug_assert_ne!(variant & 2, 0);
     let mut increasing_order = active.clone();
@@ -826,9 +793,8 @@ fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
         }
     });
 
-    // The sorted leaves occupy the original prefix. Newly formed branches
-    // have nondecreasing frequencies and increasing creation order, so variant
-    // zero can consume each front exactly once without maintaining a heap.
+    // Two-queue construction: branch frequencies never decrease and creation
+    // order increases, so for variant 0 both queues stay sorted.
     let leaf_end = active.len();
     active.reserve(leaf_end.saturating_sub(1));
     let mut leaf = 0;
@@ -912,9 +878,9 @@ fn take_reverse_front(
     }
 }
 
-/// Variant one prefers the newest node within an equal-frequency group. The
-/// leaves are sorted once; generated branch frequencies are monotonic, so one
-/// linked stack per frequency run exposes that newest branch in constant time.
+/// Two-queue merge for variant 1, which prefers the newest node on equal
+/// frequency; a linked stack per run of equal frequencies gives the newest
+/// branch in constant time.
 fn merge_generic_nodes_reverse_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>) {
     active.sort_unstable_by(|&left, &right| {
         if node_less(nodes, left, right, 1) {
@@ -994,14 +960,17 @@ fn first_leaf_at_depth(
     })
 }
 
-/// Build the generic Columbo Huffman-length candidate.
+/// Build Columbo's generic Huffman code lengths, limited to `max_bits`.
+///
+/// `variant` (0-3) sets the equal-frequency tie rule: bit 0 prefers newer
+/// nodes, and bit 1 makes the second child use the opposite order to the
+/// first. Over-long codes are shortened with zlib's overflow repair.
 pub(crate) fn make_lengths(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_into(frequencies, &mut lengths, max_bits, variant);
     lengths
 }
 
-/// Fill a caller-owned buffer with the generic Columbo length candidate.
 pub(crate) fn make_lengths_into(
     frequencies: &[u32],
     lengths: &mut [u8],
@@ -1011,8 +980,8 @@ pub(crate) fn make_lengths_into(
     make_lengths_inner(frequencies, lengths, max_bits, variant);
 }
 
-/// Return whether the unconstrained tree exceeded `max_bits` before its
-/// generic repair was applied.
+/// Return whether the unlimited tree was deeper than `max_bits` and needed
+/// repair.
 fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, variant: u32) -> bool {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
@@ -1036,10 +1005,8 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
         _ => {}
     }
 
-    // Variant zero's increasing tie order makes both its leaf and newly formed
-    // branch fronts monotonic. Use ordered fronts for variants zero and one
-    // when no wrapped frequency sum can invalidate that property. Variants two
-    // and three use one heap for each of their opposing child tie orders.
+    // Variants 0 and 1 use a two-queue merge, which needs nondecreasing
+    // branch frequencies; use a heap instead if a frequency sum could wrap.
     let total_frequency: u64 = frequencies
         .iter()
         .map(|&frequency| u64::from(frequency))
@@ -1085,8 +1052,9 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         count_by_length[length] += 1;
     }
 
-    // This is zlib's familiar overflow repair: split a shorter code into two
-    // children, then reclaim one slot at the maximum permitted depth.
+    // zlib's overflow repair (`gen_bitlen`): move a leaf from the deepest
+    // level below `limit` down one level and give it an overflowed leaf as
+    // its sibling.
     while overflow != 0 {
         let mut bits = limit - 1;
         while bits > 0 && count_by_length[bits] == 0 {
@@ -1098,10 +1066,9 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         count_by_length[bits] -= 1;
         count_by_length[bits + 1] += 2;
         count_by_length[limit] -= 1;
-        // The original Columbo C counter is unsigned. An odd overflow wraps
-        // after its last pair and keeps repairing until no shorter code
-        // remains. Preserve that observable, occasionally incomplete-tree
-        // behavior.
+        // Matches Columbo's C implementation, whose counter is unsigned: an
+        // odd overflow wraps after its last pair and repair continues until
+        // no shorter code remains, which can leave an incomplete code.
         overflow = overflow.wrapping_sub(2);
     }
 
@@ -1111,9 +1078,10 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         .enumerate()
         .filter_map(|(symbol, frequency)| (frequency != 0).then_some((frequency, symbol)))
         .collect();
-    // Longest repaired lengths go to the least frequent symbols. Symbol is a
-    // deterministic ascending tie-break, matching Columbo's original C
-    // `qsort` comparator.
+    // Assign lengths longest first to symbols in decreasing frequency order,
+    // so the longest codes go to the most frequent symbols. Equal
+    // frequencies are ordered by symbol, matching the `qsort` comparator of
+    // Columbo's C implementation.
     leaves.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     lengths.fill(0);
@@ -1134,22 +1102,18 @@ fn columbo_rle_frequency_bucket(frequency: u32) -> u32 {
         return 0;
     }
 
-    // Retain roughly two leading significant bits. A u64 calculation makes
-    // rounding safe even for a count at u32::MAX.
+    // Round to about two significant bits, in u64 so rounding cannot overflow.
     let highest_bit = u32::BITS - 1 - frequency.leading_zeros();
     let quantum = 1_u64 << highest_bit.saturating_sub(1);
     let rounded = ((u64::from(frequency) + quantum / 2) / quantum) * quantum;
     rounded.min(u64::from(u32::MAX)) as u32
 }
 
-/// Construct Columbo's adjacency-aware Huffman pseudofrequencies.
+/// Build Columbo's adjacency-based RLE-friendly Huffman pseudofrequencies.
 ///
-/// Zopfli's `OptimizeHuffmanForRle`, which Turtledeflate embeds with Zopfli's
-/// attribution, motivates trying an alternate tree from RLE-friendly weights.
-/// This quantizer is Columbo-original: it rounds counts onto a logarithmic grid
-/// and changes a nonzero count only when an immediate neighbour shares its
-/// bucket. It does not implement Zopfli's run marking or stride averaging.
-/// Callers must score the resulting tree against the original frequencies.
+/// The idea comes from Zopfli's `OptimizeHuffmanForRle` (via Turtledeflate);
+/// this quantizer is Columbo's own. Callers of all three smoothers must price
+/// the resulting code against the true frequencies.
 pub(crate) fn make_columbo_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
     let mut buckets = [0_u32; N];
     for (bucket, &frequency) in buckets.iter_mut().zip(frequencies.iter()) {
@@ -1169,8 +1133,8 @@ pub(crate) fn make_columbo_rle_pseudofrequencies<const N: usize>(frequencies: &m
     }
 }
 
-/// Mark equal-count runs preserved by both frequency smoothers. The caller
-/// excludes trailing zeros and supplies an initially clear marking buffer.
+/// Mark runs of equal counts that the Zopfli and Brotli smoothers keep. The
+/// caller excludes trailing zeros and passes a cleared buffer.
 fn mark_rle_runs(frequencies: &[u32], protected: &mut [bool]) {
     let mut run_start = 0;
     while run_start < frequencies.len() {
@@ -1187,16 +1151,12 @@ fn mark_rle_runs(frequencies: &[u32], protected: &mut [bool]) {
     }
 }
 
-/// Construct Zopfli-compatible RLE-friendly Huffman pseudofrequencies.
+/// Independent implementation of Zopfli's `OptimizeHuffmanForRle`: keep useful
+/// runs of equal counts, then replace each long enough stretch of similar
+/// counts with its rounded mean.
 ///
-/// This independently implements the published behavior of Zopfli's
-/// `OptimizeHuffmanForRle`: preserve already-useful equal-count runs, then
-/// replace sufficiently long nearby-count strides by their rounded mean.
-/// Trailing zero symbols remain untouched. Callers must build an alternate
-/// tree from these weights and score that tree against the original counts.
-///
-/// Algorithm source and authorship: Google Zopfli, Copyright 2011 Google Inc.,
-/// Lode Vandevenne and Jyrki Alakuijala, Apache License 2.0.
+/// Algorithm: Google Zopfli, Copyright 2011 Google Inc., Lode Vandevenne and
+/// Jyrki Alakuijala, Apache License 2.0.
 pub(crate) fn make_zopfli_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
     let Some(last_nonzero) = frequencies.iter().rposition(|&frequency| frequency != 0) else {
         return;
@@ -1243,18 +1203,12 @@ pub(crate) fn make_zopfli_rle_pseudofrequencies<const N: usize>(frequencies: &mu
     }
 }
 
-/// Construct Brotli-style RLE-friendly Huffman pseudofrequencies.
+/// Independent implementation of Brotli's fixed-point smoother: keep useful
+/// runs, and replace long stretches whose counts stay close to a moving mean
+/// (24.8 fixed point) by that mean. Trailing zero symbols are never introduced.
 ///
-/// ECT evaluates both Zopfli's original nearby-count smoother and Brotli's
-/// later fixed-point streak model before emitting a Deflate tree. This is an
-/// independent implementation of that published search dimension: existing
-/// useful runs are protected, while long unprotected runs that remain close
-/// to a moving 24.8 fixed-point mean are collapsed. Trailing zero symbols are
-/// never introduced. Callers must score the resulting tree against the
-/// original frequencies.
-///
-/// Algorithm source and authorship: Google Brotli, Copyright 2010 Google Inc.,
-/// MIT License. ECT identified its usefulness for Deflate tree construction.
+/// Algorithm: Google Brotli, Copyright 2010 Google Inc., MIT License; ECT
+/// applies it to Deflate codes.
 pub(crate) fn make_brotli_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
     let Some(last_nonzero) = frequencies.iter().rposition(|&frequency| frequency != 0) else {
         return;
@@ -1321,10 +1275,8 @@ pub(crate) fn make_brotli_rle_pseudofrequencies<const N: usize>(frequencies: &mu
     }
 }
 
-/// Build Columbo's generic tree with Defluff's package-list depth limiter.
-///
-/// This is a Columbo hybrid, not Defluff's complete tree builder: it keeps
-/// Columbo's ordinary tree whenever that tree already satisfies `max_bits`.
+/// Build [`make_lengths`] code lengths (variant 0), applying Defluff's
+/// package-merge only when they exceed `max_bits`.
 pub(crate) fn make_lengths_columbo_defluff_limited(
     frequencies: &[u32],
     max_bits: u8,
@@ -1347,7 +1299,8 @@ pub(crate) fn make_lengths_columbo_defluff_limited_into(
     apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
 }
 
-/// Build the exact Defluff tree, including its leaf-before-branch tie rule.
+/// Build Defluff's code lengths exactly, including its leaf-before-branch tie
+/// rule.
 pub(crate) fn make_lengths_defluff_exact(
     frequencies: &[u32],
     max_bits: u8,
@@ -1370,20 +1323,14 @@ pub(crate) fn make_lengths_defluff_exact_into(
         return;
     }
 
-    // Defluff enters its allocating package-list path only for an over-depth
-    // ordinary tree. Keep a valid bounded tree if reconstruction cannot win.
+    // Start package-merge from the `make_lengths` result, kept if it fails.
     make_lengths_into(frequencies, lengths, max_bits, 0);
     apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
 }
 
-/// Re-run package merge with package-first ties, retaining an already valid
-/// tree if the bounded reconstruction cannot complete.
-///
-/// Package merge can have several equal-payload solutions. Defluff retains a
-/// leaf when its weight ties the next package, while Zopfli retains the
-/// package. This independently extends Columbo's existing package-list
-/// builder by changing only that equality decision; no upstream implementation
-/// structure is reproduced.
+/// Run package-merge with Zopfli's package-first tie rule (Defluff takes the
+/// leaf on equal weight), keeping `fallback` if package-merge fails. Only the
+/// tie rule follows Zopfli, not its implementation.
 pub(crate) fn make_lengths_zopfli_package_from(
     frequencies: &[u32],
     fallback: &[u8],
@@ -1402,7 +1349,6 @@ pub(crate) fn make_lengths_zopfli_package_from(
 
 fn make_lengths_defluff_unconstrained(frequencies: &[u32], lengths: &mut [u8]) -> usize {
     lengths.fill(0);
-    // Leaves and their branches fit without regrowing the node list.
     let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
     nodes.extend(
         frequencies
@@ -1433,8 +1379,8 @@ fn make_lengths_defluff_unconstrained(frequencies: &[u32], lengths: &mut [u8]) -
     let mut leaf_position = 0;
     let mut branch_position = leaf_count;
 
-    // Merge a sorted leaf queue with the queue of completed branches. Defluff
-    // chooses a leaf on equal weight (`<=`), unlike several other candidates.
+    // Two-queue merge of the sorted leaves and the new branches. Defluff
+    // takes the leaf on equal weight (`<=`).
     while nodes.len() < final_count {
         let mut children = [0_usize; 2];
         for child in &mut children {
@@ -1495,8 +1441,8 @@ fn apply_package_merge(
     let mut nodes = Vec::new();
     let mut leaves = Vec::with_capacity(leaf_count);
 
-    // Node indices retain ascending symbol order, including across zero counts.
-    // Sort once instead of shifting the growing leaf list at each insertion.
+    // Leaf node indices increase with symbol (zero counts are skipped), so
+    // sorting once by (weight, index) breaks ties by symbol.
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency == 0 {
             continue;
@@ -1510,7 +1456,6 @@ fn apply_package_merge(
     }
     leaves.sort_unstable_by_key(|&leaf| (nodes[leaf].weight, leaf));
 
-    // Alternate two list buffers instead of allocating one at every depth.
     let mut previous = Vec::with_capacity(target);
     previous.extend_from_slice(&leaves);
     let mut current = Vec::new();
@@ -1607,11 +1552,8 @@ enum HeapTie {
     Order,
 }
 
-/// Reusable storage for DeflOpt-compatible heap tree construction.
-///
-/// Dynamic-header feedback builds many trees over the same nineteen-symbol
-/// alphabet. Keeping its temporary nodes, heap, and overflow order here avoids
-/// three allocator round trips per variant without retaining any tree state.
+/// Reusable buffers for the DeflOpt-style heap builder; no state carries over
+/// between builds.
 #[derive(Default)]
 pub(crate) struct DefloptHeapScratch {
     nodes: Vec<Node>,
@@ -1734,8 +1676,8 @@ fn make_lengths_variant_heap_inner(
     let mut leaf_order_position = leaf_count;
     heapify_frequency_only(nodes, heap);
 
-    // Variant bits select one policy for each repair and do not change during
-    // construction. Resolve them once instead of at every merged node.
+    // Variant bit 1 sets the tie rule of the sift-down after removing the
+    // first child, and bit 0 the one after inserting the parent.
     let first_tie = if variant & 2 != 0 {
         HeapTie::FrequencyOnly
     } else if use_order_tie {
@@ -1760,7 +1702,6 @@ fn make_lengths_variant_heap_inner(
         let last = heap.pop().expect("heap is non-empty");
         heap[0] = last;
 
-        // Variant bit 1 controls repair after removing the first child.
         heap_sift_down(nodes, heap, 0, first_tie);
 
         let right = heap[0];
@@ -1779,7 +1720,6 @@ fn make_lengths_variant_heap_inner(
         nodes.push(parent);
         heap[0] = index;
 
-        // Variant bit 0 independently controls repair after parent insertion.
         heap_sift_down(nodes, heap, 0, second_tie);
     }
 
@@ -1812,8 +1752,9 @@ fn repair_deflopt_overflow(
     }
 
     let mut deepest = max_depth.min(MAX_TRACKED_DEPTH);
-    // Split one shorter code into two and replace two deepest codes by their
-    // parent until every count fits. This mirrors DeflOpt's 0x407a80 loop.
+    // Until no code exceeds `limit`, split one shorter code into two and
+    // merge two of the deepest codes into their parent, as DeflOpt's loop at
+    // 0x407a80 does.
     while deepest > limit {
         let mut bits = limit - 1;
         while bits > 0 && count_by_length[bits] == 0 {
@@ -1834,8 +1775,7 @@ fn repair_deflopt_overflow(
     }
     count_by_length[limit + 1..].fill(0);
 
-    // DeflOpt records leaves backwards as the heap first consumes them. After
-    // repair, shorter lengths are assigned by walking that exact saved order.
+    // Like DeflOpt, assign the shortest lengths in reverse heap-removal order.
     lengths.fill(0);
     let mut leaf = 0;
     for (bits, &count) in count_by_length.iter().enumerate().take(limit + 1).skip(1) {
@@ -1857,9 +1797,8 @@ fn java_heap_offer(nodes: &[Node], heap: &mut Vec<usize>, node: usize) {
     heap.push(node);
     while position > 0 {
         let parent = (position - 1) >> 1;
-        // `java.util.PriorityQueue.siftUpComparable` stops on compare >= 0.
-        // deft4j compares only frequency, so an equal node retains its current
-        // heap relationship.
+        // `java.util.PriorityQueue.siftUpComparable` stops on compare >= 0,
+        // and deft4j compares only frequency, so an equal node stays put.
         if nodes[node].frequency >= nodes[heap[parent]].frequency {
             break;
         }
@@ -1899,10 +1838,8 @@ fn java_heap_poll(nodes: &[Node], heap: &mut Vec<usize>) -> Option<usize> {
     Some(result)
 }
 
-/// Build the tree produced by deft4j's `java.util.PriorityQueue` path.
-///
-/// Columbo defensively falls back to DeflOpt's variant-zero tree if an
-/// internally inconsistent heap or over-depth repair cannot be reconstructed.
+/// Build the code lengths deft4j's `java.util.PriorityQueue` builder produces,
+/// falling back to the DeflOpt heap builder (variant 0) if that fails.
 pub(crate) fn make_lengths_deft4j_java_heap(frequencies: &[u32], max_bits: u8) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, max_bits);
@@ -1928,9 +1865,8 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
         java_heap_offer(&nodes, &mut heap, index);
     }
 
-    // `HuffmanTree` forces at least two leaves when the alphabet has spare
-    // symbols. deft4j's payload-distance caller separately bypasses this raw
-    // builder for zero- and one-symbol distance alphabets.
+    // Like deft4j's `HuffmanTree`, add unused symbols with weight 1 until
+    // there are two leaves.
     let mut symbol = 0;
     while heap.len() < 2 && symbol < frequencies.len() {
         if frequencies[symbol] == 0 {
@@ -1983,8 +1919,7 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
         return;
     }
 
-    // deft4j reshapes the explicit tree instead of merely redistributing its
-    // length counts. Use the DeflOpt candidate only if that reshape fails.
+    // deft4j reshapes the tree rather than redistributing length counts.
     if !deft4j_repair_overlong_tree(&mut nodes, root, lengths, max_bits) {
         make_lengths_deflopt_heap_into(frequencies, lengths, max_bits, 0);
     }

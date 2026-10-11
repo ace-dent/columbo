@@ -2,17 +2,15 @@
 
 # Columbo routes and optimization methods
 
-This document describes the routes and methods implemented by the current
-Columbo source tree. It is a source-grounded map, not a promise that every
-optional route will run for every input: format, topology, work, memory, mode,
-and deadline gates decide which complete candidates are built.
+This document maps Columbo's routes and methods, and the format, topology,
+work, memory, mode, and deadline gates that decide which optional routes build
+complete candidates.
 
-Columbo is a **post-optimizer**. It preserves the decoded byte stream and works
-from literals, matches, blocks, and Huffman information already proved by the
-source. It does not run a new LZ77 match finder, choose a new match distance, or
-delegate recompression to Zopfli, libdeflate, or another compressor.
+Columbo is a **post-optimizer**: it preserves the decoded bytes and works from
+the source's literals, matches, blocks, and Huffman codes, with no new LZ77
+match finder and no external recompressor ([Scope boundary](#scope-boundary)).
 
-The routing ground truth lives primarily in:
+Routing code:
 
 | Area | Source |
 | --- | --- |
@@ -25,25 +23,22 @@ The routing ground truth lives primarily in:
 | Huffman construction and dynamic-header search | `src/deflate/huffman.rs`, `src/deflate/header.rs` |
 | Source-ordered recode route (deft4j-derived) | `src/deflate/source_recode.rs` |
 
-Thresholds below are implementation work bounds, not Deflate format limits.
-Parser validity checks and the configurable input/decoded safety limits still
-apply before or around every route. Corpus measurements validate a gate's cost
-and a method's usefulness; they do not accept an output. Every retained
-candidate is compared by exact complete-stream bytes and meaningful bits. The
-bounded-depth terminal frontier deliberately uses mathematical feasibility and
-deadline availability rather than a corpus-derived file-size band.
+Thresholds below are work bounds, not Deflate format limits; parser validity
+checks and the configurable input and decoded-size limits apply to every route.
+Corpus measurements set gates but never accept an output: every candidate is
+compared by its exact complete-stream bytes and meaningful bits.
 
 ## Speed legend
 
 | Indicator | Speed | Meaning |
 | --- | --- | --- |
-| 🟢 | Fast | Small, bounded work; normally close to linear in the relevant bytes, blocks, or tokens. |
+| 🟢 | Fast | Small, bounded work; normally close to linear in bytes, blocks, or tokens. |
 | 🟡 | Medium | Rebuilds and compares several trees, token spellings, or block layouts. |
-| 🔴 | Slow | Searches broad token, table, merge, replay, or boundary state, especially in max mode. |
+| 🔴 | Slow | Searches broad token, table, merge, replay, or boundary state, especially in Max. |
 
-The indicators are relative. A 🟢 method can still be noticeable on a very
-large stream or a container with many streams. A method spanning two classes
-uses the slower indicator.
+Indicators are relative: a 🟢 method can still be noticeable on a very large
+stream or many streams. A method spanning two classes shows the range (🟡–🔴)
+or the slower one.
 
 ## Overall pipeline
 
@@ -64,7 +59,7 @@ flowchart TD
     SCHEDULE --> MAX["🔴 Max-only source, replay, and refinement lineages"]
 
     MODEL --> CACHE["🟢 Route-local canonical block-plan cache"]
-    CACHE -. "reuse exact-verified completed kernels" .-> BLOCK
+    CACHE -. "reuse exact-verified completed plans" .-> BLOCK
     CACHE -. "reuse within this planning run" .-> STRUCTURE
 
     ORIGINAL --> POOL["Complete candidate pool"]
@@ -78,79 +73,76 @@ flowchart TD
     WRAP --> OUT["Selected output"]
 ```
 
-Candidate ordering is strict and stable: fewer output bytes wins; at equal byte
-length, fewer meaningful compressed-payload bits wins; an exact tie retains the
-earlier candidate. For Deflate this is the complete stream through EOB without
-final-byte padding. Therefore a same-byte Deflate result that saves **one
-meaningful bit** is a real win, and the CLI will write it unless `--dry-run` is
-used. A padding-only change outside that meaningful count is not reported as a
-saving and does not replace a file solely for compression.
+Candidate ordering is strict and stable: fewer output bytes win; at equal byte
+length, fewer meaningful bits win; an exact tie keeps the earlier candidate.
+Meaningful bits cover the complete stream through the final block's
+end-of-block symbol, excluding final-byte padding. A same-byte result that saves
+**one meaningful bit** is a real win, which the CLI writes unless `--dry-run`
+is used. A padding-only change is not reported as a saving and does not
+replace a file for compression alone.
 
-ZIP has one explicit wrapper-policy exception. An unencrypted method-8 member
-whose decoded length is zero through four bytes always becomes method 0 in
-Default and Max. No valid Deflate stream can use fewer physical payload bytes
-at those lengths, so the member bypasses every Deflate optimization route. A
-four-byte Deflate payload can tie Store in physical bytes while using fewer
+ZIP has one wrapper-policy exception. An unencrypted method-8 member that
+decodes to 0–4 bytes always becomes method 0 (Store) in Default and Max,
+bypassing every Deflate route, because no valid Deflate stream is smaller at
+those lengths. A four-byte Deflate payload can tie Store in bytes with fewer
 meaningful bits; the CLI still writes this mandatory normalization but reports
-no compression saving. For larger members, only Max may choose method 0, and
-only when Store is at least 10% smaller in payload bytes than the final
-optimized Deflate stream. Stored payloads cost exactly eight meaningful bits
-per byte in aggregate ZIP result ordering.
+no saving. For larger members, only Max may choose Store, and only when Store is
+at least 10% smaller in payload bytes than the final Deflate stream. In
+aggregate ZIP ordering, a stored payload costs eight meaningful bits per byte.
 
-For raw Deflate candidate selection, relaxed mode retains the original unless a
-generated stream wins under that ordering. A wrapper can still be rebuilt for a
-wrapper-level normalization, notably zlib FLEVEL. Strict mode may instead have
-to emit a larger standards-compatible raw stream when the source uses a
-noncanonical length-258 spelling or an incompatible Huffman alphabet.
+For raw Deflate, relaxed mode keeps the original unless a generated stream wins;
+a wrapper can still be rebuilt to normalize a field such as zlib FLEVEL. Strict
+mode may emit a larger standards-compatible stream when the source uses the
+non-standard length-258 spelling or an incompatible Huffman alphabet.
 
 ## Routing decision tree
 
-This section covers every condition that decides whether a top-level candidate
-route runs. The diagrams use gate IDs; the tables immediately below give the
-complete conditions. Lower-level block and boundary gates are listed separately
-under [Inner stream-planner gates](#inner-stream-planner-gates).
+The diagrams use gate IDs, defined in the
+[route-gate reference](#route-gate-reference) (top-level routes) and
+[Inner stream-planner gates](#inner-stream-planner-gates) (block and boundary
+methods). The [codebase guide](architecture.md#terms) defines route, candidate,
+floor, and lineage.
 
 | Term | Meaning in the routing diagrams |
 | --- | --- |
-| Candidate | One complete encoded alternative that can be compared with the source or another complete alternative. |
-| Floor | A complete, safe baseline candidate secured before optional broader search. |
-| Lineage | A sequence of transformations or replays starting from the same source or rewritten floor. |
-| Fixed point | A completed replay that reproduces the same bytes and meaningful-bit count, proving that the same planner need not run again on that encoding. |
-| `Complete` | Standalone raw/zlib and ZIP-default policy: finish the ordinary comparison route before max-only work for that stream. |
-| `CompleteThenBounded` | Single unique PNG image-job policy: preserve the complete default result, then give max routes a bounded shared schedule. |
-| `Shared` | Generic multi-stream and ZIP-max refinement policy: use a bounded per-stream heuristic floor so surrounding work retains time and decoded-size budget. |
-| `SharedExact` | GZIP Max and uncached PNG-metadata Max policy: keep `Shared` scheduling, but retain the complete Default feedback endpoint before Max-only descendants. |
-| `ApngDefault` | Multi-image APNG Default policy: run the full initial stream planner once, but leave additive reparse/replay, endpoint-proven, and compact feedback lineages to Max. |
-| `ApngMax` | Multi-image APNG Max policy: retain shared per-stream scheduling while running the full Max route set. Independently retains the complete `ApngDefault` result of the initial planner and R1–R5 alongside its historical replay-bounded seed. Original-source Max receives a positive concurrent share beside deft4j-derived refinement and a selected floor continuation, because the immediate order of complete parents does not prove the order of their search endpoints. An admitted child reserves the final 1/20 of its own assigned slice for terminal methods; the primary routes keep 19/20. |
-| `Established` | A caller already retains this complete, validated stream as its floor. Copy it into a new Max lineage without rebuilding Default; every selectable descendant is still reparsed and identity-checked. |
+| Fixed point | A completed replay that reproduces the same bytes and meaningful-bit count; the same planner need not rerun on that encoding. |
+| Max seed | The ordinary planner's candidate before Default's feedback and terminal methods. Max routes start from it; the complete Default endpoint is kept separately. |
+| `Complete` | Standalone raw and zlib streams, and ZIP in Default: finish the ordinary route before Max-only work on the same stream. |
+| `CompleteThenBounded` | A PNG with exactly one unique image job: keep the complete Default result, then give Max routes a bounded shared schedule. |
+| `Shared` | Multi-stream Default work and ZIP Max refinement: a bounded per-stream heuristic floor that leaves time and decoded-size budget for later streams. |
+| `SharedExact` | GZIP Max and streaming PNG-metadata Max: `Shared` scheduling that keeps the complete Default endpoint before Max-only descendants. |
+| `ApngDefault` | Multi-image APNG Default: run the full initial planner once; leave reparse/replay, endpoint-proven, and compact feedback lineages to Max. |
+| `ApngMax` | Multi-image APNG Max: shared per-stream scheduling with all Max routes; keeps the complete `ApngDefault` result (initial planner, then R1–R5) beside a replay-bounded Max seed. |
+| `Established` | A complete, validated stream the caller keeps as its floor; a new Max lineage starts from it without rebuilding Default, and every selectable descendant is still reparsed and identity-checked. |
+| `MandatoryComplete` | A container-level Default branch built for Max (ZIP Default archive sibling, cached PNG-metadata floors): ordinary routes that Max's clock cannot interrupt. |
 
-Within the same strictness, stripping, and safety policy, sufficient-time Max is
-monotone over Default for every supported wrapper. Exact floor policies retain
-the completed Default endpoint independently of Max's historical seed; APNG
-Max explicitly retains the complete Default result of its initial planner and
-R1–R5 alongside its historical replay-bounded seed, with a complete file-level
-Default sibling for bounded models; and
-container selection rejects any complete ZIP or PNG/APNG contender that
-regresses either bytes or aggregate meaningful Deflate bits. A finite deadline
-can still expire before an exact floor finishes on work outside the bounded
-file races, so this is a sufficient-time quality guarantee rather than a claim
-that equal short timeouts must always produce equal results.
+With the same strictness, stripping, and safety policy and enough time, Max is
+never worse than Default for any supported wrapper: exact floor policies keep
+the completed Default endpoint beside the Max seed, APNG Max also keeps a
+complete file-level Default sibling for bounded models, and container selection
+rejects any ZIP or PNG/APNG contender worse in bytes or aggregate meaningful
+bits. A short deadline can expire before an exact floor finishes outside the
+bounded file races, so equal short timeouts need not give equal results.
 
 ### Wrapper and floor-policy routing
 
 ```mermaid
 flowchart TD
-    IN["Input"] --> EXPLICIT{"Format explicitly selected"}
+    IN["Input"] --> EXPLICIT{"Format selected by caller"}
     EXPLICIT -- "Yes" --> PARSER["Use selected parser"]
     EXPLICIT -- "No · auto" --> PNG{"PNG signature"}
     PNG -- "Yes" --> PPNG["PNG / APNG"]
-    PNG -- "No" --> GZ{"GZIP signature"}
+    PNG -- "No" --> GZ{"GZIP header start<br/>magic, CM 8, no reserved flags"}
     GZ -- "Yes" --> PGZ["GZIP"]
-    GZ -- "No" --> ZIP{"Recognizable ZIP structure"}
+    GZ -- "No" --> ZIP{"Plausible ZIP end record"}
     ZIP -- "Yes" --> PZIP["ZIP"]
-    ZIP -- "No" --> ZL{"Recognizable zlib method/window byte"}
+    ZIP -- "No" --> ZL{"Valid zlib header"}
     ZL -- "Yes" --> PZL["zlib"]
-    ZL -- "No" --> PRAW["Raw Deflate"]
+    ZL -- "No" --> GZM{"GZIP magic bytes"}
+    GZM -- "Yes" --> PGZ
+    GZM -- "No" --> ZIPS{"Recognizable ZIP structure"}
+    ZIPS -- "Yes" --> PZIP
+    ZIPS -- "No" --> PRAW["Raw Deflate<br/>must consume the whole input"]
 
     PARSER --> POLICY{"Parsed format"}
     POLICY -- "Raw or zlib" --> COMPLETE
@@ -162,80 +154,63 @@ flowchart TD
     PGZ --> SHARED["Default: Shared floor<br/>Max: SharedExact floor per serial member"]
     PPNG --> PPNGROUTES
     PPNGROUTES --> PMETA["Supported compressed metadata streams"]
-    PMETA --> SHAREDMETA["Default: Shared floor<br/>Max: cached Complete or streaming SharedExact"]
+    PMETA --> SHAREDMETA["Default: Shared floor<br/>Max: cached MandatoryComplete floor or streaming SharedExact"]
     PPNGROUTES --> PJOBS{"Exactly one unique image job"}
     PJOBS -- "Yes" --> PMAX{"Bounded single-image Max"}
     PMAX -- "No" --> CTB["CompleteThenBounded"]
     PMAX -- "Yes" --> PRACE["Main CompleteThenBounded lineage<br/>+ eligible early transformed lineage"]
-    PJOBS -- "No" --> PMULTI{"Mode and whole-file race bounds"}
-    PMULTI -- "Default" --> APNGDEFAULT["ApngDefault per image stream"]
-    PMULTI -- "Max · ≤8 MiB compressed<br/>≤64 MiB decoded · 2+ CPUs" --> PFILE["Race complete Default APNG<br/>against full-budget original-source Max"]
-    PFILE --> PPAR["Max: up to 8 fixed worker lanes<br/>ApngMax floor per image stream"]
-    PMULTI -- "Max · outside race bounds" --> SHAREDPNG["ApngMax floor per serial image job"]
+    PJOBS -- "No" --> PMULTI{"--max"}
+    PMULTI -- "No" --> APNGDEFAULT["ApngDefault per image stream"]
+    PMULTI -- "Yes" --> PRACEGATE{"≤8 MiB compressed · ≤64 MiB decoded<br/>2+ CPUs · nonzero timeout"}
+    PRACEGATE -- "Yes" --> PFILE["Race complete Default APNG<br/>against full-budget original-source Max"]
+    PFILE --> PMAXJOBS
+    PRACEGATE -- "No" --> PMAXJOBS["ApngMax floor per image job<br/>up to 8 lanes within 8 MiB / 64 MiB, else serial"]
     PZIP --> ZTINY["Validate 0–4-byte Deflate members<br/>exclude them from optimization jobs"]
     ZTINY --> ZMAX{"--max"}
     ZMAX -- "No" --> ZDEFAULT["Complete single archive pass<br/>uniform members may use worker lanes"]
     ZMAX -- "Yes" --> ZJOBS{"Any Deflate job over 4 decoded bytes"}
     ZJOBS -- "No" --> ZDEFAULT
-    ZJOBS -- "Yes" --> ZBOUND{"Nonuniform archive ≤8 MiB<br/>optimizable decoded work ≤64 MiB"}
-    ZBOUND -- "Yes" --> ZRACE["Complete Default archive + Established-source Max<br/>in parallel; 2+ bounded Default members may use worker lanes"]
+    ZJOBS -- "Yes" --> ZBOUND{"Nonuniform archive ≤8 MiB<br/>decoded work ≤64 MiB"}
+    ZBOUND -- "Yes" --> ZRACE["MandatoryComplete Default archive + Established-source Max<br/>in parallel; 2+ Default members may use worker lanes"]
     ZRACE --> ZREFINE["Refine completed Default archive<br/>and require byte+bit dominance"]
     ZREFINE --> ZSTORE["Terminal Store pass<br/>0–4 bytes always · larger Max members require ≥10%"]
-    ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · complete Default archive<br/>uniform members may use worker lanes"]
+    ZBOUND -- "No" --> ZPHASE1["🟡 Phase 1 · MandatoryComplete Default archive<br/>uniform members may use worker lanes"]
     ZPHASE1 --> ZTIME{"Time remains"}
     ZTIME -- "No" --> ZSTORE
-    ZTIME -- "Yes" --> ZPHASE2["🔴 Phase 2 · refine finished archive<br/>Shared floors and actual remainder"]
+    ZTIME -- "Yes" --> ZPHASE2["🔴 Phase 2 · Established-source Max for half the remainder,<br/>then refine the finished archive with Shared floors"]
     ZPHASE2 --> ZSTORE
     ZDEFAULT --> ZSTORE
-
 ```
 
-`Shared` and `SharedExact` are per-stream floor and deadline policies. They do
-**not** mean that separate members share a Huffman tree, candidate, or worker.
+`Shared` and `SharedExact` are per-stream floor and deadline policies; separate
+members do **not** share a Huffman tree, candidate, or worker.
 
-Every multi-stream wrapper has one authoritative file deadline. A proportional
-child allowance is a scheduling slice, not a file timeout: the best complete
-candidate is retained when that slice ends, and locally yielded PNG image jobs,
-ZIP members, and concatenated GZIP members enter a weighted reclaim pass using
-actual time left after the initial schedule. Only expiry of the shared file
-deadline sets the public timeout result. Verbose and visual output produce the
-CLI timeout warning, distinguish `search slice reached` from `deadline
-reached`, and label a follow-up card `reclaimed time`; default output keeps its
-compact per-file result to one line.
-
-Reporting is observational. Default, verbose, and visual modes use the same
-route gates, deadlines, candidate ordering, memory bounds, and worker
-parallelism. Detailed stream updates are cached by the worker that produced
-them. One file-level coordinator emits each completed physical stream as soon
-as every earlier stream and every producer for that stream are final. Timed-out
-jobs remain cached through reclaim passes; ZIP Max similarly waits for all of a
-stream's archive lineages. Reporting never serializes or replaces optimization
-work. Every interactive CLI mode shows an `optimizing` spinner and timeout
-countdown on standard error during work. Verbose and Visual also show how many
-physical streams have completed at least one optimizer report, even when an
-earlier stream is temporarily holding those reports in source order. The
-coordinator clears the spinner around each ordered report, then resumes it
-until the complete file finishes.
+Every multi-stream wrapper has one file deadline. A child's proportional
+allowance is a scheduling slice, not a file timeout: when it ends, the best
+complete candidate is kept, and locally yielded PNG image jobs, ZIP members, and
+GZIP members enter a weighted reclaim pass using the time actually left after
+the initial schedule. Only expiry of the file deadline sets the public timeout
+result ([reporting](#scheduling-and-observability)).
 
 | Wrapper route | Exact gate and scheduling behavior | Indicator |
 | --- | --- | --- |
-| Auto detection | In order: PNG signature, GZIP signature, recognizable ZIP structure, recognizable zlib method/window byte, then raw Deflate. | 🟢 |
-| Raw / top-level zlib | Uses `Complete`; default and max route families run serially. A compact completed source-max parent may receive the bounded M10d structural split finalization after ordinary timed routes. | 🔴 |
-| GZIP | Up to 16,384 concatenated members are preflighted before optimization, then run serially from smallest to largest compressed payload under one file deadline and cumulative decoded budget. Default members use `Shared`; Max members use `SharedExact`, retaining the complete Default endpoint before broader work. Initial slices are weighted by decoded work. Locally yielded members receive weighted reclaim passes from the actual remainder, and reconstruction restores physical source order. | 🟡 |
-| PNG metadata | Compressed `zTXt`, compressed `iTXt`, and `iCCP` zlib streams use `Shared` in Default. A non-Max stream not selected for stripping and no larger than 4,096 bytes may receive a 100 ms probe, under a 64 MiB compressed-plus-decoded probe-work budget. Max precomputes and caches complete Default metadata floors when aggregate compressed metadata is ≤64 MiB. In a static PNG that bounded floor may overlap independent image work in every reporting mode; APNG avoids nested worker layers. If time remains after image work, reconstruction gives half of that remainder to an `Established` original-source Max branch, then continues the cached floor through its own `Established` branch with the actual remainder. The known exact decoded size validates both without charging the container budget twice, and either branch replaces the floor only when both metadata bytes and meaningful bits dominate it. Larger sets retain the streaming schedule and use `SharedExact`, so sufficient time still retains the complete Default endpoint without caching attacker-sized metadata. The rewrite-sensitive early return below is the exception. | 🟡 |
-| PNG / APNG image data | IDAT is always its own job. Exact-compressed duplicate fdAT frames share one optimization job only when both compressed bytes and exact decoded size match. Every IDAT/fdAT stream must decode to the exact IHDR/fcTL scanline size, including Adam7 passes. Exactly one job uses `CompleteThenBounded`. With two or more jobs, Default uses `ApngDefault`, retaining the complete initial planner while moving repeated replay, endpoint-proven, and compact-feedback work to Max; Max uses `ApngMax`, which keeps shared per-stream scheduling while running the full Max route set. One-block image streams remain direct-deft eligible, but that eligibility is now format-independent rather than an APNG exception. In the single-image policy, a decoded block above 128 KiB with more than 2,048 tokens normally lets the stronger completed-floor beam own cache and range-materialization bandwidth before source max. Two bounded topologies are exceptions: a compact graph with at least one independent repartition per 16 source tokens, or a graph of at most 4,000 tokens averaging at least 224 decoded bytes per token. Dense structural alternatives justify overlapping the otherwise unique source root; the second case is cheap because its tokens are almost all long matches. Source max remains eligible later when the initial overlap is withheld. In bounded `CompleteThenBounded` and `ApngMax` work, original-source Max also overlaps a direct-deft refinement; an APNG child keeps that source root live beside a selected floor continuation that can otherwise consume the child's entire assigned window. Those are independent topologies, so an immediately smaller parent cannot soundly suppress either endpoint. A compact completed source-max parent may then receive M10d after all timed routes. Multi-image policies omit that per-stream terminal overrun so one frame cannot consume another frame's time. Eligible `ApngMax` children instead reserve a final 1/20 within their already assigned image-job slice for the bounded terminal passes, leaving 19/20 for primary search. On a machine with at least two available CPUs, bounded multi-image APNG work (≤8 MiB compressed and ≤64 MiB decoded in aggregate) schedules Default jobs on up to the smaller of eight and the available CPU count fixed worker lanes. Each lane runs its small-to-large slice serially. Default children use the serial scheduler's source-weighted timeout formula and retain the `ApngDefault` route policy. Bounded APNG Max races a quiet complete Default file sibling using that same schedule against original-source Max with Max's full configured allowance. Max replaces that file floor only when it is no larger in bytes and has no more aggregate meaningful Deflate bits. The Max image branch continues to use up to eight fixed worker lanes; each lane runs its small-to-large slice serially and its initial image phase reserves 4% for container overhead. When mandatory compressed metadata follows, Default caps initial per-image allowances against 90% of the file remainder. Max has already cached that complete metadata floor, so optional metadata refinement consumes only time genuinely left by the dominant image search. Locally yielded image jobs then receive compressed-work-weighted reclaim passes while preserving any mandatory later-stream reserve. Work outside the image-worker bounds retains the serial image schedule; on one CPU, Max may still use bounded image lanes without the whole-file floor race. | 🔴 |
-| PNG single-image Max | For ≤8 MiB compressed and ≤64 MiB decoded, the main `CompleteThenBounded` lineage races an early transformed lineage only when the source has a same-distance graph above the complete 512-match bound, or when a 2+-block stream of ≤768 KiB would otherwise serialize exact Default. The early lineage spends one fifth on an ordinary parent, then refines it through `Established`; the exact Default lineage remains the quality floor. | 🔴 |
-| PNG decoded-equivalent frame reuse | After image-job optimization, checksum/size groups are decoded and byte-compared before the best compressed spelling is reused. Retained comparison data is capped at 32 MiB and comparison work at 64 MiB. | 🟡 |
-| PNG unsafe ancillary fallback | If a `caBX` or `dSIG` signature or an unknown unsafe-to-copy ancillary chunk remains because `--strip` does not remove it, Columbo cannot update that chunk's contract and returns the complete source PNG unchanged. `Optimization::blocking_chunk` names the first such chunk, and the CLI reports it on stderr with a reminder that `--strip` removes it. Invalid `tRNS` that a rewrite would drop is kept in this case too. Beyond the container parse, it neither optimizes nor decodes streams it cannot rewrite; full conformance checking is left to tools such as `pngcheck`. Apple's `iDOT` is not in this set: it records byte offsets into the original IDAT layout for parallel decoding, which rewritten image data invalidates, and decoders without it decode the same image, so Columbo drops it whenever it rewrites the PNG. | 🟢 |
-| PNG invalid-exporter repair | A color-type-6 RGBA PNG may carry one known indexed-conversion vestige: a non-empty, palette-sized `tRNS` after a valid suggested `PLTE` and before image data. PNG forbids `tRNS` for RGBA, so Columbo accepts only that structural signature and omits the chunk from every output. Bytes after `IEND` are outside the PNG datastream and are likewise discarded. Other invalid `tRNS` shapes remain errors; rewrite-sensitive unknown ancillary data also prevents this repair unless stripping is requested. | 🟢 |
-| ZIP member scheduling | Every unencrypted method-8 entry is validated. Entries with decoded length zero through four bytes are not Deflate optimization jobs: neither mode admits them to the raw planner, and the terminal wrapper pass always changes them to method 0. If these are the only Deflate entries, Max skips its direct and refinement archive lineages. Unencrypted method-8 entries over four decoded bytes are optimization jobs; unencrypted stored entries are validated but not Deflate-optimized, and encrypted entries are preserved without payload decoding. Default is largest-first and Max is small-first. Ordinary work uses up to eight balanced worker slices when at least eight optimizable members are similarly distributed, input is ≤8 MiB, and decoded work is ≤64 MiB. During a bounded nonuniform Max archive race, the mandatory Default sibling may use the same lanes for any set of at least two independent members; the direct Max sibling retains its normal schedule. Each exhaustive worker budgets only its own serial slice. After either the parallel or serial initial pass, locally yielded members receive weighted reclaim passes from the actual file remainder; byte length then meaningful Deflate bits select the retained result. Default preserves method 8 only for members over four bytes. After a complete Max archive lineage has exhausted its admitted Deflate work, the wrapper may also change a larger final method-8 payload to method 0 when Store is at least 10% smaller in payload bytes; header and descriptor savings do not count toward that threshold. Both ZIP headers are updated. Verbose and Visual identify every selected Deflate-to-Store change by stream and report its exact payload sizes and percentage saving, including a possible zero-saving four-byte normalization. Raw Deflate already prices stored blocks internally; zlib, GZIP, and PNG provide no equivalent container-level uncompressed method. Reconstruction emits local records in original physical order and central records in original directory order. | 🟡–🔴 |
-| ZIP max archive lineages | An archive with at least one optimization job over four decoded bytes races its complete Default archive against direct original-source Max when member work is nonuniform, input is ≤8 MiB, and total optimizable decoded work is ≤64 MiB. The direct branch uses the validated source as `Established`, so it does not rebuild the ordinary floor owned by the Default branch. With two or more members, bounded Default-member lanes complete that mandatory sibling sooner and leave the actual remainder for its distinct refinement. Larger or uniformly distributed archives avoid two simultaneous archive models: they complete Default, give original-source Max half of the actual remainder, then refine the completed floor with whatever time remains. Thus memory scheduling does not make the source deft4j basin permanently unreachable. Stored-only and tiny-Deflate-only archives have no Deflate optimization jobs and use one archive pass in either mode. A Max archive replaces its retained Default archive only when file bytes and aggregate meaningful Deflate bits are both no worse. | 🔴 |
+| Auto detection | In order: PNG signature; GZIP header start (magic bytes, CM 8, no reserved flags); plausible ZIP end-of-central-directory record; valid zlib header (CM 8, CINFO ≤7, FCHECK); bare GZIP magic bytes; recognizable ZIP structure; else raw Deflate, which must consume the whole input (trailing data needs `--raw`). | 🟢 |
+| Raw / top-level zlib | `Complete`; Default and Max route families run serially. M10d may follow the timed routes for a compact completed source-max parent. | 🔴 |
+| GZIP | ≤16,384 concatenated members, preflighted, then optimized serially from smallest to largest compressed payload; one file deadline and cumulative decoded budget; `Shared` in Default, `SharedExact` in Max; initial slices weighted by decoded work; output in physical order. | 🟡 |
+| PNG metadata | `zTXt`, compressed `iTXt`, and `iCCP` zlib streams. Default: `Shared`; an unstripped stream ≤4,096 bytes may get a 100 ms probe (64 MiB compressed-plus-decoded probe budget). Max with ≤64 MiB compressed metadata in total: cached complete Default floors (`MandatoryComplete`), built beside image work (static PNG) or before it (APNG); time left after image work goes half to an `Established` original-source Max branch, half to an `Established` continuation of the floor, both validated against the known decoded size without recharging the budget. Either replaces the floor only if no worse in metadata bytes and meaningful bits and better in one. Larger: streaming `SharedExact`. Exception: the unsafe-ancillary early return. | 🟡 |
+| PNG / APNG image data | IDAT is one job; fdAT frames share a job only with equal compressed bytes and decoded size. One job: `CompleteThenBounded`; more: `ApngDefault` (Default) or `ApngMax` (Max). M8, M7a, and M10b govern original-source Max overlap. M10d only for a single job, after all timed routes; eligible `ApngMax` children reserve 1/20 of their slice instead (G0t). Bounded multi-image work (≤8 MiB compressed, ≤64 MiB decoded in total) runs on image lanes, and bounded APNG Max races a complete Default file sibling ([Multithreading](#multithreading)); other work is serial. With compressed metadata after the images, Default caps initial per-image allowances at 90% of the file remainder, and Max refines metadata only in time image search leaves. Yielded jobs get compressed-work-weighted reclaim passes that keep any mandatory later-stream reserve. | 🔴 |
+| PNG single-image Max | ≤8 MiB compressed; ≤64 MiB decoded; and either >512 matches in same-distance runs, or ≥2 nonempty blocks decoding to ≤768 KiB that would otherwise build exact Default serially. The main `CompleteThenBounded` lineage then races an early lineage that spends 1/5 of the allowance on an ordinary parent and refines it through `Established`; exact Default stays the floor. | 🔴 |
+| PNG decoded-equivalent frame reuse | After image-job optimization, frames with matching checksum and size are decoded and byte-compared; equal frames reuse the best compressed spelling. Caps: 32 MiB retained comparison data; 64 MiB comparison work. | 🟡 |
+| PNG unsafe ancillary fallback | Without `--strip`, a `caBX` or `dSIG` signature or an unknown unsafe-to-copy ancillary chunk returns the source PNG unchanged (even with invalid `tRNS`) after only the container parse; `Optimization::blocking_chunk` names the first such chunk, and the CLI reports it on stderr with a `--strip` hint. Apple's `iDOT` does not block; rewrites drop it because they invalidate its IDAT offsets. | 🟢 |
+| PNG invalid-exporter repair | Accepts and omits one `tRNS` that PNG forbids in color-type-6 (RGBA) images: non-empty, palette-sized, after a valid suggested `PLTE`, before image data. Other invalid `tRNS` shapes are errors; rewrite-sensitive unknown ancillary data blocks the repair unless stripping. Bytes after `IEND` are kept unless `--strip`. | 🟢 |
+| ZIP member scheduling | All unencrypted method-8 entries are validated. Entries >4 decoded bytes are jobs; 0–4-byte entries are always stored ([Overall pipeline](#overall-pipeline)), and if they are the only Deflate entries, Max skips its direct and refinement archive lineages. Unencrypted stored entries: validated only; encrypted: kept undecoded. Order: Default largest-first, Max small-first ([member lanes](#multithreading)). Max's 10% Store test follows a complete archive lineage and ignores header and descriptor savings. Both ZIP headers are updated; Verbose and Visual report each Deflate-to-Store change with sizes and saving, including zero-saving normalizations. Local records keep physical order, central records directory order. | 🟡–🔴 |
+| ZIP max archive lineages | ≥1 optimization job; nonuniform member work; input ≤8 MiB; jobs ≤64 MiB decoded in total: race the complete Default archive (`MandatoryComplete`) against direct original-source Max from the validated source (`Established`). Larger or uniform archives: complete Default, give original-source Max half the actual remainder, then refine the completed floor with the rest. No jobs: one pass. A Max archive replaces the Default archive only when no worse in file bytes and aggregate meaningful bits and better in one. | 🔴 |
 
 ### Raw-stream route tree
 
-Any diamond labelled `+ G0` rechecks the soft route deadline and sibling
-cancellation state at that point. Deterministic cleanup that has already been
-admitted is explicitly labelled and may finish after the soft boundary.
+A diamond labeled `+ G0` rechecks the soft route deadline and sibling
+cancellation. Deterministic cleanup, labeled as such, may finish after the soft
+deadline once started.
 
 #### Default and standalone max
 
@@ -251,9 +226,9 @@ flowchart TD
     D2 -- "No" --> D3
     D2RUN --> D3{"D3 · strict literal-only tree"}
     D3 -- "Yes" --> D3RUN["🟡 Up to 4 improving balanced-tree rounds"]
-    D3 -- "No" --> PICK
-    D3RUN --> PICK["Select byte/meaningful-bit winner"]
-    PICK --> R1{"R1 · original-match restoration + G0"}
+    D3 -- "No" --> TFLOORS
+    D3RUN --> TFLOORS["🟡 Terminal tree floors"]
+    TFLOORS --> R1{"R1 · original-match restoration + G0"}
     R1 -- "Yes" --> RESTORE["🟢 Restore certified matches under unchanged trees"]
     R1 -- "No" --> R1B{"R1b · strict degenerate distance tree + G0"}
     RESTORE --> R1B
@@ -297,6 +272,9 @@ flowchart TD
     POLICY -- "CompleteThenBounded, Shared, SharedExact,<br/>ApngMax, or Established" --> BOUNDED["Continue at bounded-max tree"]
 ```
 
+`ApngDefault` skips D1–D3 and the terminal tree floors; Max runs them for
+APNG.
+
 #### Bounded max
 
 ```mermaid
@@ -304,7 +282,7 @@ flowchart TD
     START["Max + bounded floor policy"] --> EST{"Established"}
     EST -- "Yes" --> EFLOOR["Retain caller-validated complete floor"]
     EST -- "No" --> M0{"M0 · prebuild floor"}
-    M0 -- "Yes" --> PREFLOOR["Shared / ApngMax: bounded floor<br/>SharedExact / CompleteThenBounded: complete Default + retained Max seed<br/>eligible D1/D2 still check G0"]
+    M0 -- "Yes" --> PREFLOOR["Shared: bounded floor<br/>SharedExact / CompleteThenBounded: complete Default + Max seed<br/>ApngMax: complete APNG Default + bounded floor"]
     M0 -- "No" --> DEFER["Build floor inside bounded phase"]
     EFLOOR --> M1F
     PREFLOOR --> M1F["M1 · record deft eligibility"]
@@ -323,19 +301,19 @@ flowchart TD
     M6 -- "FloorExpansion" --> M10A{"M10a · dependency-first deft case<br/>M1 + G0"}
     M10A -- "Yes" --> PREDEP["🟡 Prebuild/refine deft prerequisite"]
     M10A -- "No" --> M8
-    PREDEP --> M10CPRE{"M10c · dependency split parent admitted"}
+    PREDEP --> M10CPRE{"M10c · dependency split parent eligible"}
     M10CPRE -- "Yes" --> PREDSPLIT["🟡 Deterministic compact split cleanup"]
     M10CPRE -- "No" --> M8
     PREDSPLIT --> M8{"M8 · compact initial source-max class"}
     M8 -- "No" --> EXPAND
-    M8 -- "Yes" --> M9{"M9 · choose source-max / M3 token owner"}
+    M8 -- "Yes" --> M9{"M9 · choose source-max / M3 token route"}
     M9 --> EXPAND["🔴 FloorExpansion phase<br/>floor + eligible M1/M2<br/>source/M3 workers per M8/M9"]
 
     SERIAL --> M7
     SHARED --> M7
     GENERIC --> M7
     STANDARD --> M7
-    EXPAND --> M7{"M7 · floor admitted + route window open"}
+    EXPAND --> M7{"M7 · floor selected + route window open"}
     M7 -- "No" --> POST
     M7 -- "Yes" --> DESC{"GenericParallel or FloorExpansion"}
     DESC -- "Yes" --> SEEDED["🔴 Established-floor max descendant"]
@@ -352,22 +330,28 @@ flowchart TD
     S0 -- "Yes" --> SINTEGRATED["Later source max uses integrated compact order"]
     S0 -- "No" --> SORDINARY["Later source max uses ordinary order"]
     SINTEGRATED --> M10CSEED
-    SORDINARY --> M10CSEED{"M10c · M4 flag + floor-seeded split parent admitted"}
+    SORDINARY --> M10CSEED{"M10c · M4 flag + floor-seeded split parent eligible"}
     M10CSEED -- "Yes" --> SEEDSPLIT["🟡 Deterministic compact split cleanup"]
     M10CSEED -- "No" --> M4SEED
     SEEDSPLIT --> M4SEED{"M4 · resulting floor-seeded parent eligible"}
     M4SEED -- "Yes" --> M4SEEDRUN["🟡 Deterministic balanced-tree / feedback cleanup"]
-    M4SEED -- "No" --> M2C
-    M4SEEDRUN --> M2C{"M2c · changed no-split winner<br/>new topology + G0"}
-    M2C -- "Yes" --> M2CRUN["🔴 One no-split continuation<br/>instead of simultaneous source max"]
-    M2C -- "No" --> M10B
-    M2CRUN --> M10B{"M10b · bounded deft / weak-split lineage"}
-    M10B -- "Applicable" --> M10RUN["🔴 Timed refinements start under G0<br/>admitted compact cleanup may finish deterministically"]
-    M10B -- "Not applicable" --> M10CPOST
-    M10RUN --> M10CPOST{"M10c · normal/direct/refined parent admitted"}
-    M10CPOST -- "Yes" --> POSTSPLIT["🟡 Deterministic compact split cleanup"]
-    M10CPOST -- "No" --> LATE["Continue at late-max tree"]
-    POSTSPLIT --> LATE
+    M4SEED -- "No" --> M7A
+    M4SEEDRUN --> M7A{"M7a · floor-seeded descendant leads + G0"}
+    M7A -- "Yes" --> M7ARUN["🔴 Continue the floor-seeded lineage first<br/>beside eligible deft4j, compact-split,<br/>or ApngMax source-max workers"]
+    M7A -- "No" --> FOLLOW
+    M7ARUN --> FOLLOW["Bounded follow-up + G0<br/>caller refines the deft4j lineage (M10b)<br/>beside the M2c or source-max worker and M10c"]
+    FOLLOW --> M2C{"M2c · changed no-split winner<br/>new topology + G0"}
+    FOLLOW --> M10B{"M10b · bounded deft / weak-split lineage"}
+    FOLLOW --> M10CPOST{"M10c · normal/seeded/direct/refined parent eligible"}
+    M2C -- "Yes" --> M2CRUN["🔴 One no-split continuation<br/>in the source-max worker slot"]
+    M2C -- "No" --> LATE
+    M2CRUN --> LATE
+    M10B -- "Applicable" --> M10RUN["🔴 Timed refinements start under G0<br/>started compact cleanup may finish deterministically"]
+    M10B -- "Not applicable" --> LATE
+    M10RUN --> LATE
+    M10CPOST -- "Yes" --> POSTSPLIT["🟡 Compact split cleanup"]
+    M10CPOST -- "No" --> LATE
+    POSTSPLIT --> LATE["Continue at late-max tree"]
 ```
 
 #### Late max sequence
@@ -379,23 +363,24 @@ flowchart TD
     M11 -- "Ineligible" --> M12
     FRAG --> M12{"M12 · earlier source-max state"}
     M12 -- "Completed" --> M4SRC
-    M12 -- "Suppressed" --> M2LATE
+    M12 -- "Suppressed" --> M13
     M12 -- "Absent" --> M12G{"G0"}
     M12G -- "Yes" --> SMAX["🔴 Broad source-max route<br/>+ eligible forced-split escape"]
-    M12G -- "No" --> M2LATE
+    M12G -- "No" --> M13
     SMAX --> M4SRC{"M4 · rewritten source-max parent eligible"}
     M4SRC -- "Yes" --> M4SRUN["🟡 Deterministic balanced-tree / feedback cleanup"]
-    M4SRC -- "No" --> M2LATE
-    M4SRUN --> M2LATE{"M2 late · complementary no-split<br/>policy eligible + G0"}
-    M2LATE -- "Yes" --> M2LATERUN["🔴 Complementary cumulative / individual route"]
-    M2LATE -- "No" --> M13
-    M2LATERUN --> M13{"M13 · seed selectable, not stable,<br/>optional routes allowed, + G0"}
+    M4SRC -- "No" --> M13
+    M4SRUN --> M13{"M13 · seed selectable, not stable,<br/>optional routes allowed, + G0"}
     M13 -- "Yes" --> SEEDRUN["🔴 Max planner on selected rewrite"]
-    M13 -- "No" --> M4FINAL
-    SEEDRUN --> M4FINAL{"M4 · final selected parent eligible + G0"}
+    M13 -- "No" --> M2LATE
+    SEEDRUN --> M2LATE{"M2 late · complementary no-split<br/>policy eligible + G0"}
+    M2LATE -- "Yes" --> M2LATERUN["🔴 Complementary cumulative / individual route"]
+    M2LATE -- "No" --> M4FINAL
+    M2LATERUN --> M4FINAL{"M4 · final selected parent eligible + G0"}
     M4FINAL -- "Yes" --> QFINAL["🟡 Final balanced-tree cleanup"]
-    M4FINAL -- "No" --> M10D
-    QFINAL --> M10D{"M10d · saved source-max parent<br/>owns terminal stream time"}
+    M4FINAL -- "No" --> CDEFAULT
+    QFINAL --> CDEFAULT["Compare the retained complete Default endpoint"]
+    CDEFAULT --> M10D{"M10d · saved source-max parent<br/>Complete or CompleteThenBounded"}
     M10D -- "Eligible" --> DSPLIT["🟡 Deferred bounded split finalization"]
     M10D -- "Ineligible" --> FINALFLOORS
     DSPLIT --> FINALFLOORS["🟡 Terminal tree floors"]
@@ -449,273 +434,245 @@ flowchart TD
     R12 -- "No" --> PICKMAX["Select byte/meaningful-bit winner,<br/>including Default's final competitor,<br/>or relaxed raw source"]
 ```
 
-For stream owners admitted by G0t, G0 uses the primary phase deadline through M10d,
-then the original full deadline from the terminal tree floors onward. R12
-revisits only methods whose input has changed; it does not rerun the primary
-planner. Default retains its single R1–R5 sweep, ending with R1c, R13 and R14; after a win, R13 and R14 run one more pass.
+The diagrams show eligibility and dependencies: M1–M4 are recorded as flags for
+the bounded phase, not started on those four arrows. Eligible independent
+branches may overlap where M5 and the thread-site gates allow, then rejoin in a
+fixed comparison order.
 
-Together the three diagrams expose every top-level gate. They are eligibility
-and dependency maps: M1–M4 are first recorded as booleans for the bounded
-phase, not started on those four arrows. Independent eligible branches may
-overlap where M5 and the thread-site gates allow it, then rejoin in a fixed
-comparison order.
+The terminal methods run as one ordered sweep: R1, R1b, R2–R11, R1c, R13, R14.
+Default runs one sweep without the Max-only R6–R11; when R13 or R14 wins, R13
+and R14 run one more pass, each sliding (R1c) once more after a win. In Max,
+R10, R11, R1c, R13, and R14 run only when nothing earlier in the same sweep
+changed the candidate; R1c, R13, and R14 also run once no further sweep can
+start, then with Default's one-pass repeat bound. R12 repeats the sweep after
+any improvement while G0 permits, revisiting only methods whose input changed
+and never rerunning the primary planner.
 
-Max may strengthen a completed ordinary or APNG Default comparison endpoint
-with R6–R9 before continuing its historical Max seed. These optional
-siblings use the owner's existing deadline or assigned route window; they add
-no mandatory
-Default work, extra time or grace. The final Max incumbent receives the R1–R11 sequence, then R1c, R13 and R14 once it settles, and may repeat it
-through R12 while G0 remains open.
+Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`,
+`SharedExact`, and `ApngMax`) run Default's sweep but keep its R1c, R13, and R14
+finish, and an R1b win, only as a final competitor compared after Max's terminal
+sweeps; Max's own sweep applies those steps to its final incumbent. Max may also
+strengthen a completed ordinary or APNG Default endpoint with R6–R9, within the
+existing deadline or route window, before continuing from its Max seed. With a
+G0t share, G0 uses the primary phase deadline through M10d and the full
+deadline from the terminal tree floors onward.
 
 ### Route-gate reference
 
-| Gate | Complete condition | Effect |
-| --- | --- | --- |
-| G0 · timed-route start | A new independent timed route starts only before its soft deadline and while no sibling cancellation flag is set. Active work that polls the file hard deadline may finish until configured timeout + 10% + 1 second; a zero timeout has no grace, and the G0t search phase has zero phase grace. Linear finalization, the bounded-depth tree floor, R1c, R13 and R14, may start until that hard stop, because it only finishes the incumbent. Multi-route bounded phases normally receive 4/5 of the then-remaining soft time, reserving 1/5 for follow-up. | Stops new timed starts; never skips parsing, validation, or a complete fallback. A currently active atomic price or candidate validation may finish before forwarding its completed incumbent. One already-admitted compact-split parent may use the file-level grace for the bounded coarse rescue described by M10c. M10d uses that rescue only when its floor policy owns the complete stream's terminal time; a zero-grace container child and a route-window yield cannot multiply the allowance. |
-| G0t · Max terminal share | Search share: Max under `Complete`, `CompleteThenBounded`, or `ApngMax`, with nonzero allowance, source compressed and decoded size each ≤1 MiB and ≤128 source blocks. This is the common Max terminal header work class. R1 restoration retains its 128 KiB gates; R1c, R13 and R14 have no size class; R2–R5 retain that smaller envelope in Default and its mandatory comparison work. Finalization share: the same policies outside that class, and an `Established` continuation outside it, where only linear finalization can use terminal time. | Search share: `Complete` and `CompleteThenBounded` primary routes receive 4/5 of the original allowance. An `ApngMax` child keeps 19/20 of its assigned image-job slice for primary routes and reserves 1/20 for terminal work. Both primary phases have zero phase grace; terminal tree floors and R1–R12 use the original full deadline and original grace for that stream. Finalization share: primary routes keep 19/20 of the allowance and their phase grace, so they end at least 1/20 before the full allowance's hard boundary; the bounded-depth tree floor, R1c, R13 and R14 finish the incumbent in that window. An `Established` continuation applies it to its own window. A primary yield is not a file timeout. Both phases grow with the allowance; no worker or extra time window is added. Other shared/established container children retain their earlier schedule. M10d's coarse rescue remains limited to policies owning complete stream terminal time. [Validation](research/terminal-closure-validation.md#follow-up-on-13-september-2026-the-larger-max-work-class); [APNG evidence](benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026); [finalization evidence](benchmark-miss-regression-audit.md#linear-finalization-share-on-8-october-2026). |
-| D1 · match-preserving default feedback | A complete non-exhaustive/default-floor pass; exactly one parsed block; at least one match; at most 4,000 tokens and 80,000 decoded bytes. | Runs proven-before-feedback and ordinary endpoint orders as independent complete candidates. Default mode and exact Max floors (`Complete`, `CompleteThenBounded`, and `SharedExact`) retain it independently of broader Max routes. |
-| D2 · integrated default feedback | A complete non-exhaustive/default-floor pass; 2–4 parsed blocks; compressed stream at most 16 KiB; decoded stream at most 128 KiB; at most 16 Ki tokens total; at least one block satisfies D1's match/token/plain eligibility. | Runs a compact multi-block integrated-proven candidate in Default mode and exact Max floors (`Complete`, `CompleteThenBounded`, and `SharedExact`). Its second endpoint replay runs only if the first candidate did not beat the incumbent and hard time remains. |
-| D3 · strict literal-only balanced tree | Strict complete Default/default-floor pass; source compressed bytes ≤8 KiB; exactly one nonempty dynamic source block; ≤4,096 tokens; no distance symbols. | Runs up to four strictly improving one-block balanced-tree rounds. Each round ranks bounded pair and quad moves with the ordinary header grid, exhaustively finalizes only the winning tree, reparses the complete candidate, and stops at a fixed point. This structurally targets the complete-distance-alphabet overhead that strict mode cannot omit. |
-| R1 · original-match restoration | A completed parent differs from the original; original/parent compressed size and decoded size ≤128 KiB; each parsed layout ≤128 blocks; at least one original match certificate; the selected parser model retains every wire block. Eligible Huffman blocks have ≤16 Ki tokens; a certificate clipped to the current block must span 3–4,096 decoded bytes, meet current token boundaries, and include selected literals. Default and Max use G0; Max's mandatory Default floor completes the same bounded pass without the optional-search deadline. | Searches only source-certified distances under the final transmitted trees, with at most 2^20 DP edge evaluations per stream. Polls the hard stop during search; retains completed interval repairs on interruption. Original stored/literal bytes get no certificates. Restoration itself holds trees and headers fixed and runs no replay; complete emitted bytes/bits must strictly improve, including stored alignment, and actual maximum distance is propagated to wrappers. The independent R2 terminal pass may then change the header and code lengths. |
-| R1b · strict distance completion | Strict mode only, after R1, with R2's size, block and discarded-wire-block limits and G0. Applies per dynamic block whose tokens use no distance symbol or exactly one, and whose parent header is strictly compatible. | Planning completes such a distance alphabet with two one-bit codes, which forces code-length symbol 1 (position 18 of RFC 1951's code-length order) into the header. Keeps the finished literal/length tree and prices four uniform complete distance trees, depths 1–4 (2, 4, 8 or 16 codes of one length, contiguous and covering the used symbol), as complete headers. These are the complete trees needing the fewest distinct code-length symbols. The used symbol's payload bits are charged exactly; an empty alphabet's payload is unchanged. At most four prices per eligible block from R2's shared budget. The payload is priced once and adjusted only for the used symbol's length change. Only a whole-stream byte/meaningful-bit win replaces the parent; later R-steps start from it. Max's mandatory Default floors (`Complete`, `CompleteThenBounded`, `SharedExact` and `ApngMax`) keep the R1b result only as a final competitor, like R1c's: when R1b wins, their R2–R5 finish and Max's R6–R9 strengthening start from the endpoint without it, and Default's exact endpoint (R1b, R2–R5, then R1c and R13) is compared after Max's terminal searches, which apply R1b to Max's own incumbent. A uniform tree fitted to the current payload changes the header those searches start from, so adopted first it can lead them to a worse fixed point. Max never trails Default ([evidence](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor)). Relaxed mode skips it, since it may omit or halve the tree instead. |
-| R1c · fixed-tree boundary slide | The last boundary step. Default runs it once after R5, and once more after a winning R13 or R14. Max runs it only after an R1–R11 sweep that changed nothing, as R10 and R11 wait for earlier methods, or once no further sweep can start, when nothing later could be redirected; R12 repeats the sweep after a win. Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`, `SharedExact` and `ApngMax`) keep their slid result only as a final competitor, compared after Max's terminal searches: boundaries fitted to the current trees can remove an improvement that Max's terminal tree floors would find from the unslid endpoint, so the slid result never chooses their parent. The PNG early lineage's quick floor keeps its slide: it only seeds that lineage's `Established` refinement, and omitting R1c there lost more than it restored, since a slid parent leads to a better basin about as often as a worse one ([evidence](benchmark-miss-regression-audit.md#rows-that-grew)). It is linear finalization: like the bounded-depth tree floor it may start until the hard stop it polls, not only before G0's soft deadline, and G0t's finalization share keeps time for it on streams outside the terminal header class. Requires a parser model retaining every wire block. It has no size or block-count class: each round is linear in parsed tokens, the rounds work on the plan without emitting, and the one candidate parse costs no more than a replay round. Applies to each boundary between two non-stored blocks; stored blocks and their boundaries stay fixed. | Slides with every transmitted tree and header held fixed. For each adjacent Huffman pair, a prefix/suffix scan finds the cheapest token cut that both trees can price, keeping both blocks nonempty and the current cut on a tie; sweeps repeat, at most 16, while the payload strictly falls. A token keeps its spelling in its own block; a match joining the neighbour costs the cheaper of its own spelling and its decoded bytes as literals, so a match the neighbour cannot code no longer blocks the cut. Literals need no match proof. Each moved block is then re-planned with the ordinary block planner, keeping the cheaper of its current and re-planned codes; a tie keeps the current header. A strictly cheaper re-plan changes trees and can make further cuts profitable, so the slide repeats under the new trees, re-planning the blocks each round moves, until a round moves nothing or keeps every code: at most 16 rounds, each strictly smaller. A block re-planned as stored stays stored, with its boundaries fixed. Polls the hard stop between boundaries and every 64 Ki tokens. Only a whole-stream byte/meaningful-bit win replaces the parent, with stored padding repriced. [Validation](research/boundary-slide-validation.md). |
-| R2 · payload/header tradeoff | After R1, selected compressed and decoded size each ≤128 KiB in Default or ≤1 MiB in Max, ≤128 parsed blocks, and no discarded wire blocks; Default and Max use G0. Max's mandatory Default floor completes the same 128 KiB pass independently of the optional deadline. | Reprices unchanged dynamic trees, then at most 32 positive-payload length swaps per alphabet, sharing 1,024 complete header prices across the stream per invocation. Max may price its final selected result after retaining the independently completed Default floor. Swaps cost 1–18 payload bits and reduce adjacent length transitions; ranking is heuristic and includes the LL/DD seam. All proposals retain the same parent tokens, support and tree-length histogram. Polls the hard stop, preserves completed prices, regenerates stored padding, and accepts only a complete byte/meaningful-bit win. No primary planner replay follows; R12 may revisit changed inputs. [Admission validation](research/terminal-header-work-class-validation.md). |
-| R3 · literal/length span | After the complete R2 result, selected compressed and decoded size each ≤128 KiB in Default or ≤1 MiB in Max, ≤128 parsed blocks, and no discarded wire blocks; G0 for timed work. Max's mandatory Default floor includes the same 128 KiB pass without the optional deadline. | Keeps all tokens, payload codewords, distance lengths and HDIST fixed. Tries every legal HLIT from the minimum required count through 286, except the exact parent count, using complete header/RLE pricing and an independent 1,024-price stream budget per invocation. Zero padding can shorten the header; strict trees stay complete. Completed prices survive interruption, stored padding is regenerated, and only a whole-stream byte/meaningful-bit win replaces the parent. No primary planner replay follows; R12 may revisit changed inputs. |
-| R4 · joint tree/RLE | After the complete R3 result, selected compressed and decoded size each ≤128 KiB in Default or ≤1 MiB in Max, ≤128 parsed blocks, and no discarded wire blocks; G0 for timed work. Max’s mandatory Default floor includes the same 128 KiB pass. | Jointly chooses complete payload code lengths and their RLE under the parent CL tree, at depth ≤9 and fixed HLIT/HDIST. Separate Kraft capacities permit crossing repeat instructions; unused usable positions may gain codes, reserved distances stay zero. Admissible payload/header suffix bounds prune the search. A shared 2^27 work budget charges preparation, dense scans and attempted edges; scratch is <24 MiB per active solver. At most one full header reprice per successful block retains the frozen-CL winner. Stops/budget cutoffs retain only completed candidates. Tokens and boundaries stay fixed; complete emission, stored padding and bytes/bits determine acceptance. No primary planner replay follows; R12 may revisit changed inputs. |
-| R5 · symbol set removal | After the complete R4 result, selected compressed and decoded size each ≤128 KiB in Default or ≤1 MiB in Max, ≤128 parsed blocks, no discarded wire blocks; strict dynamic parent blocks with ≤128 KiB decoded bytes and ≤8,192 tokens. G0 for timed work; exact Max Default floors retain the 128 KiB enclosing-stream pass. | Ranks two-to-four-symbol intervals and mixed LL/DD sets. Forbidden distances become literals; forbidden lengths use same-distance submatches confined to the original match. Each proposal affects ≤64 matches and ≤8,192 bytes. Keeps eight proposals with one feedback attempt each; the stream shares 2^25 rewrite-work units and 128 spelling prices. Prices use the Default table grid plus paired bounded-depth and RLE-smoothed families with strict codes. Ranking is heuristic. Complete candidates survive stops, stored padding is repriced, and bytes/bits determine acceptance. Boundaries remain fixed; no primary planner replay follows; R12 may revisit changed inputs. [Validation](research/symbol-set-validation.md). |
-| R6 · alphabet boundaries | Max only: after a completed Default/APNG Default comparison endpoint, or the final Max incumbent after R5, while G0 and the owner’s deadline or route window permit. Selected compressed and decoded size ≤1 MiB, ≤128 parsed blocks, no discarded wire blocks; eligible non-stored blocks contain 16–32,768 tokens. | Ranks first/last-occurrence intervals of individual symbols, groups and high-symbol tails. Exactly prices up to eight pairs within a 64-bit heuristic estimate window, then admits improving endpoints alongside old anchors in the eight-alignment graph, with ≤80 cuts. Uses the Default table grid, shared stream caps of 2^26 work units and 4,096 range prices, and a 512-entry header cache. Keeps the parent and completed pair on stops; reprices stored padding and accepts only a whole-stream byte/meaningful-bit win. No mandatory Default work or primary planner replay; R12 may revisit changed inputs. [Validation](research/alphabet-boundary-validation.md). |
-| R7 · code-length tree | Max only, after R6 on a completed ordinary/APNG Default comparison endpoint or the final Max incumbent; G0 and the owner’s deadline or route window must permit. Selected compressed and decoded size ≤1 MiB, ≤128 parsed blocks, no discarded wire blocks; dynamic parents only. | Holds data-code lengths, tokens and advertised spans fixed. Factors equal-length runs, enumerates optional zero/repeat code prices, and assigns mandatory CL lengths with an exact 128-unit Kraft DP. Completed search covers all useful seven-bit CL trees for this domain. Shares 2^24 work units across the stream, keeps completed prices on stops, reconstructs one shortest RLE, and reprices later stored padding. Only a complete byte/meaningful-bit win replaces the parent; no primary planner replay or mandatory Default work; R12 may revisit changed inputs. [Validation](research/code-length-tree-validation.md). |
-| R8 · code-length rotations | Max only, after R7 on a completed ordinary/APNG Default comparison endpoint or the final Max incumbent; G0 and the owner’s existing deadline or route window must permit. Selected compressed and decoded size ≤1 MiB, ≤128 parsed blocks, no discarded wire blocks; dynamic parents only. | Rotates three distinct positive payload lengths within one alphabet, preserving tokens, support, the length histogram and advertised spans. Ranks cycles with payload deltas −32 through +32 bits and fewer adjacent transitions; keeps 64 proposals per alphabet. The stream shares 2^24 generation units and 512 full header prices. Ranking is heuristic; only complete byte/meaningful-bit wins survive. Completed improvements remain available on stops, later stored padding is repriced, and no primary planner replay or mandatory Default work is added; R12 may revisit changed inputs. [Validation](research/code-length-rotation-validation.md). |
-| R9 · coupled code-length swaps | Max only, after R8 on a completed ordinary/APNG Default comparison endpoint or the final Max incumbent; G0 and the owner’s existing deadline or route window must permit. Selected compressed and decoded size ≤1 MiB, ≤128 parsed blocks, no discarded wire blocks; dynamic parents only. | Swaps two distinct positive lengths in each payload alphabet together, preserving tokens, support, length histograms and advertised spans. Keeps 32 swaps per alphabet and 256 paired proposals; individual and combined payload deltas lie in −32…+32 bits. Ranks exact local transition changes, including the shared seam, heuristically. Shares 2^20 generation units and 512 full header prices per stream. Only complete byte/meaningful-bit wins survive; completed candidates remain available on stops, stored padding is repriced, and no primary planner replay, grace or mandatory Default work is added; R12 may revisit changed inputs. [Validation](research/coupled-code-length-swaps-validation.md). |
-| R10 · header-directed match response | Max only, on the final Max incumbent after an unexpired R1–R9 sweep makes no change; G0 and the owner’s existing deadline or route window must permit. Selected compressed and decoded size ≤1 MiB, ≤128 parsed blocks, no discarded wire blocks. Dynamic blocks must have ≤4,096 decoded bytes, ≤1,024 tokens and 1–128 matches. | Proposes the unchanged tree and nonzero single swaps, then solves each current match’s exact certified spelling under those fixed trees. Preserves support, length histograms, advertised spans and block boundaries; every submatch retains its interval and distance. Keeps 256 profiles ranked heuristically by payload tax and transition reduction, with tax ≤128 bits and no increased transitions. Shares 2^25 work units and 512 full header prices across the stream. Missing codes are forbidden. Changed spellings and their trees are kept together only after complete byte/meaningful-bit validation, including stored padding. Stops retain completed winners; no mandatory Default work or extra grace is added. R12 may revisit changed inputs. [Validation](research/header-response-validation.md). |
-| R11 · length-symbol exchange | Max only, on the final incumbent after an unexpired R1–R10 sweep makes no change; G0 and the existing owner deadline or route window must permit. Selected compressed and decoded size ≤1 MiB, ≤128 blocks, no discarded wire blocks. Dynamic blocks must have ≤4,096 decoded bytes, ≤1,024 tokens and 1–128 matches. | Moves a used length symbol’s code length to any absent length symbol, including an unused spare code, then fits exact certified spellings. Literal/EOB and distance prices stay fixed; the LL length histogram and block boundaries are preserved. At most 210 pairs, each priced at its minimum and source-preserving literal spans. Complete headers are ranked by an admissible interval payload bound before exact DP; missing source codes are allowed only when an alternative spelling exists. Shares 2^25 bound/response units and 512 full header prices per stream invocation. Only complete byte/meaningful-bit wins survive, with stored padding and identity validated. R12 may revisit changed inputs; no earlier comparison-floor work, Default work or extra grace. [Validation](research/length-symbol-exchange-validation.md). |
-| R12 · terminal method closure | Final Max incumbent after R1–R11, R1c, R13 and R14; repeat only following a strict complete-stream improvement while G0 permits another route. R1 retains its 128 KiB work class; R1c, R13 and R14 have none; R2–R11 share the 1 MiB Max enclosing-stream class and keep their separate block-local limits; R10 waits for an unchanged R1–R9 sweep, R11 for unchanged R1–R10, R1c for unchanged R1–R11, R13 for unchanged R1–R11 and R1c, and R14 for unchanged R1–R11, R1c and R13. None changes earlier comparison floors. | Later methods can change tokens, lengths, support or boundaries that earlier methods priced. Revisit those changed inputs in the same order, with each invocation’s existing shared operation/price bounds. Fourteen input-score slots skip methods already tried on the unchanged generation; strict descent makes those scores unique within this lineage, not across alternative parents. No arbitrary round cap, primary planner replay, extra grace or repeated mandatory Default work. A completed unexpired sweep without a change establishes a fixed point only for these bounded operators. [Validation](research/terminal-closure-validation.md). |
-| R13 · distance-alphabet ladder | Follows R1c. Default runs it after R1c; after a win, R1c runs once more under the new trees, and when R13 or R14 won, both run one more pass. Max's later sweeps revisit both with no pass bound; Max applies Default's one-pass bound only when no further sweep can start, and to its mandatory Default endpoints. Max runs it only after a sweep in which R1–R11 and R1c changed nothing, or once no further sweep can start; R12 repeats the sweep after a win. Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`, `SharedExact` and `ApngMax`) apply the same R1c, R13, R1c finish to their slid final competitor, so Max never trails Default. Like R1c it also finishes the PNG early lineage's quick floor, which only seeds that lineage's `Established` refinement; a smaller parent can lead that refinement to a worse endpoint, which is recorded rather than avoided ([evidence](benchmark-miss-regression-audit.md#iterated-slide-and-distance-ladder-on-9-october-2026)). Linear finalization like R1c: it may start until the hard stop it polls, and G0t's finalization share keeps time for it outside the terminal header class. Requires a parser model retaining every wire block. No size or block-count class. Applies to each non-stored block whose tokens use at least two distance symbols. | Builds three ladders of kept distance-symbol sets over the used symbols: shortest distances first, most frequent first, and each symbol alone; at most 88 masks after deduplication. One linear pass records what spelling each symbol's matches as literals does to the histograms, so every rung is estimated from frequencies (DeflOpt variant-0 trees with a greedy header, or the fixed tree) without building its tokens. At most two rungs whose estimate does not exceed the parent's own estimate are materialized and priced with the ordinary non-exhaustive block planner in both modes; ties keep the smaller mask. A block keeps the cheaper plan only when strictly smaller than its current bits. Polls the stop every 4,096 tokens and between rungs. Only a whole-stream byte/meaningful-bit win replaces the parent, with stored padding repriced. [Validation](research/distance-ladder-validation.md). |
-| R14 · smoothed-tree finish | Follows R13. Default runs it after R13; after a win, R1c runs once more under the new trees, and when R13 or R14 won, both run one more pass. Max's later sweeps revisit both with no pass bound; Max applies Default's one-pass bound only when no further sweep can start, and to its mandatory Default endpoints. Max runs it only after a sweep in which R1–R11, R1c and R13 changed nothing, or once no further sweep can start; R12 repeats the sweep after a win. Max's mandatory Default endpoints apply the same R1c, R13, R14 finish to their slid final competitor, so Max never trails Default. Linear finalization like R1c: it may start until the hard stop, and G0t's finalization share keeps time for it outside the terminal header class. Requires a parser model retaining every wire block. No size or block-count class. Applies to each non-stored block; the compact payload-tree floor keeps its earlier pass and closure. | Prices the Brotli fixed-point and Zopfli nearby-count smoothed seed families at every maximum depth from 15 through 9 against the block's true counts, as the compact payload-tree floor does. A block adopts the cheapest plan only when strictly smaller than its current bits and, in strict mode, strictly compatible. Checks the stop between blocks. Only a whole-stream byte/meaningful-bit win replaces the parent, with stored padding repriced. Pricing the same families earlier, in the general bounded-depth floor, redirected R2–R5, R1c and R13 and was rejected. [Validation](research/smoothed-tree-finish-validation.md). |
-| M0 · bounded-floor prebuild | Max plus `Shared` always prebuilds a bounded floor; `SharedExact` and `ApngMax` always prebuild their historical Max seed plus their own complete Default endpoint. Max plus `CompleteThenBounded` prebuilds when nonempty blocks ≤1, decoded bytes ≤768 KiB, decoded bytes >2 MiB, or more than 512 matches belong to source same-distance runs. `Established` directly retains the complete caller-provided floor; `Complete` builds its exact floor later in the serial tree. | Otherwise the multi-block single-image PNG floor is built inside the bounded phase. |
-| M1 · deft4j source | Max. Any single nonempty fixed/dynamic block is eligible regardless of wrapper or floor policy. Every source list with at least two nonempty blocks is also eligible, including mixed or all-stored lists and lists longer than 128 blocks. An all-empty stream and a lone stored block are rejected because the direct graph has no table, token, boundary, or adjacent-merge operation that could improve them. Route-local byte accounting, the configured memory ceiling, and G0 bound actual work rather than an arbitrary source-list or state-iteration cap. | Adds the direct deft4j-derived source candidate. |
-| M2 · no-split source | Max + `CompleteThenBounded`; compressed bytes ≤1 MiB; 2–128 nonempty blocks; every nonempty block fixed/dynamic. | Adds the bounded narrow source route. Its deft4j-derived per-block seed is followed by Columbo length-family pruning and adjacent source-order merges. Lists of two or three nonempty blocks run individual one-match pruning first because they expose at most two adjacent merge boundaries. Lists of four or more run cumulative pruning first so local work on an early block cannot consume the route window before later alignment and merge states are visited. If time remains late in Max, the complementary policy is priced as an independent topology. If the early parent changes block boundaries or token spellings, one dependent Default refinement may use the file's existing hard grace; a header-only rewrite does not repeat planning. The 1 MiB/128-block pair bounds retained route-local models below the existing 64 MiB parallel class. |
-| M2c · changed no-split continuation | M2 completed a strict score improvement over the source that changes tokens or block boundaries, and G0 remains open. | Re-enters the distinct no-split transformation once on the emitted parent. Encoded score alone cannot dominate this dependency: a smaller sibling with different tokens or trees can reach a worse terminal fixed point. This dependency takes the source-max worker slot, preserving the existing worker/memory envelope; source max remains eligible later if time remains. |
-| M3 · compact proven feedback | Max + `CompleteThenBounded`; exactly one parsed block; at least one match; ≤4,000 tokens; ≤80,000 decoded bytes. | Schedules the proven-first sibling in the initial phase under M8/M9, or tries it after that phase if it has not completed and G0 remains open. Its completed initial floor also receives the bounded header-aware spelling beam when the rewritten parent has ≤8,000 tokens and 2–128 matches. |
-| M4 · compact balanced tree | The top-level flag requires max + `CompleteThenBounded`, compressed bytes ≤8 KiB, decoded bytes ≤128 KiB, exactly one nonempty dynamic source block, and ≤4,096 tokens in that block. Each rewritten parent must parse as exactly one dynamic block with ≤4,096 tokens and a retained source dynamic-tree seed. | On floor-seeded and source-max parents, admitted balanced-tree and feedback cleanup is deterministic and needs no new G0 start; the final selected-parent trial does require G0. Pair/quad moves are exact-priced independently on the literal/length and distance alphabets. Up to the four lowest-payload-delta moves from each side form at most sixteen paired candidates. Default admits paired work only at non-positive combined payload delta; Max permits the existing positive eighteen-bit margin. Matched Max streams omit only standalone literal pair pricing, while retaining distance and paired work. Every result survives only when complete header-plus-payload pricing wins. |
-| M5 · route-level parallel cap | Max + bounded floor policy (`CompleteThenBounded`, `Shared`, `SharedExact`, `ApngMax`, or `Established`); compressed bytes ≤8 MiB; decoded bytes ≤64 MiB; estimated parsed model ≤64 MiB. | Allows broad independent candidate arenas to overlap. Failure selects Standard scheduling: floor, eligible M1/M2 routes, and dependent work remain serial, M8 is disabled, and source max remains eligible later; it does not promise an equivalent deferred floor-max descendant. |
-| M6 · bounded PNG policy | Evaluated only for `CompleteThenBounded` after M5. `GenericParallel` when neither M1 nor M2 is eligible. Otherwise `FloorExpansion` when source has ≥2 nonempty blocks or the completed floor changes nonempty boundaries/token arrays. Otherwise `Standard`. | Chooses which independent source and floor lineages own the initial wall-clock window. |
-| M7 · floor descendant | The floor must be selected (`strict` or strictly smaller than source) and its bounded route window must remain open. `GenericParallel` and `FloorExpansion` run an established-floor max descendant. Standard scheduling may instead run standalone bounded grouping when the reparsed floor has multiple nonempty blocks. | The established-floor max and standalone grouping descendants are mutually exclusive. If the max descendant rejoins as the strongest completed candidate without proving a fixed point, M7a continues that exact dependent state before weaker-parent refinements. |
-| M7a · best-first floor continuation | A completed floor-seeded Max descendant strictly beats the retained normal floor, no direct-deft, no-split, or source-Max candidate beats it, it has not proved an exact Max fixed point, and G0 still permits a route start. | Reparses and continues the strongest dependent lineage first. In the bounded single-image work class, the independent deft4j refinement overlaps this continuation. Under `ApngMax`, original-source Max overlaps it instead, because the continuation can consume the child's whole assigned window. The complete incumbent remains protected; every independent root receives positive work as the allowance grows. Candidate score, rather than a filename, size band, or measured elapsed time, determines priority. |
-| M8 · initial compact source max | `FloorExpansion` + M5; compressed bytes ≤16 KiB. One nonempty block additionally needs decoded bytes ≤128 KiB, or ≤16 Ki tokens plus at least two repartition runs. For 2–4 nonempty blocks: decoded bytes ≤128 KiB × block count, ≤16 Ki tokens, and at least two repartition runs. Under `CompleteThenBounded`, a one-block source above 128 KiB decoded overlaps the completed-floor beam only when its token graph is tiny (≤2,048 tokens), when the bounded graph has at least one repartition run per 16 source tokens, or when it has ≤4,000 tokens averaging ≥224 decoded bytes per token. Shared multi-stream policies retain the general rule. | Makes source max eligible for the initial bounded worker phase. The single-image rule prevents two range-materializing beams from competing for cache/memory bandwidth when the source graph is sparse. Dense independent structural choices justify the unique source root; a bounded graph made almost entirely from long matches is also cheap to price because it has little literal/alphabet work per decoded byte. Source max remains a later G0 route when initial overlap is withheld. |
-| M9 · compact source-token owner | Given M8: keep both roots when total tokens ≤2,048. In the 2,500–4,000-token band, source max alone owns the work when M3 exists and topology is distinct (a repartition run exists or decoded bytes >65,535). Otherwise source max requires at least two repartition runs or no M3 route; M3 is suppressed only when the single-owner source route actually starts. The 2,049–2,499 gap therefore normally favours M3 unless there are at least two repartition runs. | Avoids two long workers traversing substantially the same compact token graph. |
-| S0 · source-max state order | A completed M3 candidate has the same byte length as the normal bounded floor but fewer meaningful bits. | Later source max begins with integrated compact proven order. A byte win, byte loss, or exact tie retains ordinary order; an already-running initial source max is unaffected. |
-| M10a · dependency-first deft | `FloorExpansion` + M1 + G0, and either a unique one-nonempty-block floor descendant or a compact multi-block source: compressed ≤16 KiB, decoded ≤128 KiB, tokens ≤16 Ki, multiple nonempty blocks, and a non-dense repartition graph. Dense means every nonempty block has ≤4,000 tokens and repartition-run count ≥ nonempty-block count. | Prebuilds and ordinarily refines the direct deft parent before long independent beams; the compact multi-block case also completes its admitted split descendant. |
-| M10b · bounded deft refinement | A bounded policy and G0. A weak deft signal requires `CompleteThenBounded`, a completed deft candidate, multiple nonempty blocks, and <2% meaningful-bit gain. Re-seeding from the normal floor requires that floor to strictly beat the source. In that weak floor-reseed branch, ordinary replay and terminal merge each recheck G0; terminal merge also requires a seed ≤1 MiB and no already-better M2 candidate. Refinement of an existing direct deft candidate uses the single M10b admission check. | Refines the direct or floor-seeded deft lineage while eligible independent work may run. `CompleteThenBounded` and `ApngMax` overlap the independent original-source root with an existing direct-deft refinement when bounded parallel work is available; the other shared policies retain serial ordering. If Default emits a genuinely new, smaller topology that also beats completed M2, that parent receives one no-split continuation. A changed direct-deft parent may then receive one full Max continuation; a header-only rewrite cannot trigger either. |
-| M10c · compact split cleanup | A prepared parent is ≤16 KiB compressed and reparses to 2–4 blocks, none empty or stored, ≤128 KiB decoded, ≤16 Ki tokens, with at least one block having ≥16 tokens and ≥128 decoded bytes. A later refined parent must be nonduplicate and either beat every early parent or still pass G0. | Prices ordinary, floor-seeded, direct-deft, and admitted refined-deft parents. The timed route first covers every eighth cut with the ordinary Huffman planner, exhaustively finalizes only the winning alignment-independent suffix, then uses remaining hard time for the complete Max sweep. If an admitted parent reaches the hard boundary before its first cut, the single file-grace owner cheaply scores at most fourteen cuts on the largest eligible block and exactly prices only the best child pair. Every stage forwards a complete parent or descendant. The bounded phase records its completed parent exactly; when no cut or block-type transition won, it records the same-token/block endpoint as the deterministic fixed point so the follow-up phase does not repeat it. A structurally changed descendant remains eligible for another pass. |
-| M10d · deferred source-max split | Max under a stream-owning `Complete` or `CompleteThenBounded` policy; a distinct completed source-max parent is ≤16 KiB compressed and reparses to 1–4 nonempty, non-stored blocks, ≤256 KiB decoded and ≤16 Ki tokens, with at least one block having ≥16 tokens and ≥128 decoded bytes. | Saves only the compact encoded parent while timed routes run, then applies M10c's coarse-to-fine planner or bounded hard-deadline rescue. A one-block parent is admitted because the dependent operation creates its second Huffman regime. Deferral cannot starve later timed siblings, and complete-candidate comparison makes the result additive. `Shared`, `SharedExact`, `ApngMax`, and `Established` omit M10d so per-stream terminal overruns cannot consume time reserved for later ZIP, GZIP, metadata, or APNG streams. |
-| M11 · fragmented collection | Max; optional routes not suppressed; G0; at least 64 source blocks; encoded source size 16,000–100,000 bytes; no stored source block. Collection uses ≤4,096 tokens and ≤512 KiB plain per run and must produce fewer source blocks and 2–8 collected blocks. | Replays the independent fragmented seed until a metric fixed point or deadline; replay itself accepts 1–12 non-stored blocks. |
-| M12 · later source max | Max. Reuse an earlier completed source-max candidate; skip when policy marked it suppressed; otherwise start the broad route only while G0 remains open. | Ensures original-source max precedes a rewritten seed without repeating an initial source-max route. |
-| M13 · rewritten-seed refinement | Max; selected candidate is allowed (`strict` or it beats the source); no exact unexpired max-planner fixed point; optional routes not suppressed; G0. | Reparses and runs the max planner from the selected rewrite. |
+Rules shared by the terminal methods R1b–R14: run on the complete incumbent;
+skipped when parsing it drops redundant empty blocks (every planned block must
+map to one wire block); keep completed work at the stop; reprice stored-block
+padding; no primary-planner replay; replace the parent only with a strictly
+smaller whole stream (bytes, then meaningful bits); one work and price budget
+per invocation, shared across the stream's blocks. R1b–R11 also need ≤128 parsed
+blocks, and candidate compressed size and stream decoded size each ≤128 KiB in
+Default (including Max's mandatory Default floors) or ≤1 MiB in Max. The
+mandatory floors run R1–R5 to completion without the optional-search deadline;
+the Max-only R6–R11 add no mandatory Default work, time, or grace.
 
-Standalone `Complete` max mode builds the complete ordinary candidate with the
-non-max stream planner and independently retains all eligible D1/D2/D3
-feedback endpoints before continuing Max from the historical ordinary seed.
-The retained complete Default endpoint also includes R1; its restored tokens
-do not replace that historical seed. R1 runs on the final selected parent in
-both modes and does not start another optional route after the soft deadline.
-`SharedExact` applies the same separation to scheduled multi-stream work.
-Ordinary/default and
-compact-feedback lineages use at most three replays; broad, floor-seeded, and
-fragmented Max lineages continue until a metric fixed point or deadline. Their
-proof-derived ceiling is eight times the initially emitted byte length because
-each byte length has only eight possible meaningful-bit residues and every
-accepted replay strictly improves the byte/bit pair. Terminal merge uses at most two;
-direct deft candidates use no replay until an explicitly scheduled refinement.
-The initial no-split candidate may receive one Default refinement when it
-exposes new boundaries or tokens. M2c can then run the distinct no-split
-transformation once more on that changed topology; it is not an unbounded
-replay loop. With time still available, Max also prices the complementary
-individual/cumulative policy as an independent late route.
-A round is adopted only on a strict byte/meaningful-bit win. An unexpired
-exhaustive round establishes a fixed point only when it reproduces the same
-bytes and meaningful-bit count.
+| Gate | Condition | Effect |
+| --- | --- | --- |
+| G0 · timed-route start | New independent timed route: before its soft deadline; no sibling cancellation. Hard stop for active work: timeout + 10% + 1 second (no grace for a zero timeout or the G0t search phase). Linear finalization (bounded-depth tree floor, R1c, R13, R14) may start until the hard stop. Multi-route bounded phases: 4/5 of the remaining soft time; 1/5 kept for follow-up. | Blocks new timed starts only; parsing, validation, and the complete fallback always run, and an active atomic price or validation may finish. One accepted compact-split parent may use the file grace for M10c's rescue ([Boundary polishing](#boundary-polishing-inside-proven-matches)). |
+| G0t · Max terminal share | Max; `Complete`, `CompleteThenBounded`, or `ApngMax`; nonzero timeout. Search share: source ≤1 MiB compressed and decoded, ≤128 blocks. Finalization share: the same policies outside that class, and any `Established` continuation outside it. Judged on the source; R1b–R11 still gate on the candidate. | Search share: primary routes get 4/5 of the allowance (`ApngMax` child: 19/20 of its slice) without grace; tree floors and R1–R14 get the full deadline and grace. Finalization share: primary routes get 19/20 of the allowance with grace; the bounded-depth tree floor, R1c, R13, and R14 finish in the last 1/20. `Established` applies this to its own window. A primary yield is not a file timeout and does not change other container children. [Validation](research/terminal-closure-validation.md#follow-up-on-13-september-2026-the-larger-max-work-class); [APNG evidence](benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026); [finalization evidence](benchmark-miss-regression-audit.md#linear-finalization-share-on-8-october-2026). |
+| D1 · match-preserving default feedback | Complete Default floor pass; one parsed block; ≥1 match; ≤4,000 tokens; ≤80,000 decoded bytes. | Adds proven-before-feedback and ordinary endpoint orders as independent candidates, in Default and in the exact Max floors (`Complete`, `CompleteThenBounded`, `SharedExact`), where it is mandatory and skips G0. |
+| D2 · integrated default feedback | Complete Default floor pass; 2–4 parsed blocks; ≤16 KiB compressed; ≤128 KiB decoded; ≤16 Ki tokens; ≥1 block within D1's limits. | Adds a compact multi-block integrated-proven candidate, scheduled like D1. The second endpoint replay runs only if the first did not beat the incumbent and hard time remains. |
+| D3 · strict literal-only balanced tree | Strict; complete Default floor pass; ≤8 KiB compressed; one nonempty block: dynamic, ≤4,096 tokens, no distance symbols. | ≤4 strictly improving balanced-tree rounds (pair and quad moves on the ordinary header grid; only the winner exhaustively finalized and reparsed); stops at a fixed point. |
+| R1 · original-match restoration | Parent differs from the original; both ≤128 KiB compressed and decoded; each layout ≤128 blocks; ≥1 original match certificate; parser keeps every wire block; Huffman blocks ≤16 Ki tokens; a certificate clipped to its block spans 3–4,096 decoded bytes, meets token boundaries, and includes selected literals; G0 (not in Max's mandatory Default floor). | Restores certified source matches under the final trees and headers: ≤2^20 DP edge evaluations per stream; no replay; source stored and literal bytes uncertified. Keeps completed repairs at the hard stop. Must strictly improve bytes and bits, including stored alignment; reports the actual maximum distance to wrappers. [Validation](research/permanent-match-proofs-validation.md). |
+| R1b · strict distance completion | Strict; after R1; G0. Each dynamic block using ≤1 distance symbol with a strictly compatible parent header. | Prices, against planning's two one-bit distance codes, the four uniform complete trees of depth 1–4 (contiguous, covering the used symbol), literal/length tree kept: ≤4 prices per block, 1,024 per stream. [Validation](benchmark-miss-regression-audit.md#strict-distance-completion-on-30-september-2026); [final-competitor evidence](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor). |
+| R1c · fixed-tree boundary slide | After R5 (Default) or R11 (Max); also ends the PNG early lineage's quick floor, a seed only ([evidence](benchmark-miss-regression-audit.md#rows-that-grew-1)). No size or block limit; linear per round. Boundaries between two non-stored blocks only. | Moves each boundary to the cheapest token cut both fixed trees can price (blocks stay nonempty; ties keep the cut), ≤16 sweeps while payload falls; re-plans moved blocks, keeping the cheaper code (ties keep the header), and repeats, ≤16 strictly improving rounds. Tokens keep their spelling; a match joining the neighbor costs the cheaper of its spelling and its literals. Stored blocks (including blocks re-planned as stored) and their boundaries stay fixed. Polls the hard stop between boundaries and every 64 Ki tokens. [Validation](research/boundary-slide-validation.md). |
+| R2 · payload/header tradeoff | After R1; G0. | Reprices unchanged dynamic trees, then ≤32 length swaps per alphabet (two unequal nonzero lengths, no reserved distances, 1–18 payload bits, fewer adjacent transitions); 1,024 header prices per stream. Tokens, support, and code-length histogram fixed. Max may price its final result after keeping the Default floor. [Validation](research/payload-header-tradeoff-validation.md); [size-class validation](research/terminal-header-work-class-validation.md). |
+| R3 · literal/length span | After R2; G0 for timed work. | Tries every legal HLIT from the minimum to 286 except the parent's, with complete header pricing; 1,024 prices. Tokens, codewords, distance lengths, and HDIST fixed; strict trees stay complete. [Validation](research/literal-span-validation.md). |
+| R4 · joint tree/RLE | After R3; G0 for timed work. | Jointly chooses complete payload code lengths (depth ≤9) and their RLE under the parent's code-length tree; repeats may cross the alphabet seam and unused positions may gain codes. HLIT/HDIST, tokens, boundaries, and zero reserved distances fixed. 2^27 shared work units; ≤24 MiB scratch per solver; ≤1 full header reprice per successful block. [Validation](research/joint-tree-rle-validation.md). |
+| R5 · symbol set removal | After R4; G0 for timed work; dynamic parent blocks with strictly compatible codes, ≤128 KiB decoded, ≤8,192 tokens. | Tries removing 2–4-symbol sets (intervals and mixed literal/length–distance sets): distances become literals, lengths become same-distance submatches. Per proposal ≤64 matches and ≤8,192 bytes; 8 proposals, one feedback attempt each; per stream 2^25 rewrite units and 128 spelling prices. Prices on the Default table grid plus bounded-depth and RLE-smoothed families (strict codes); boundaries fixed. [Validation](research/symbol-set-validation.md). |
+| R6 · alphabet boundaries | Max; after R5; completed Default or APNG Default endpoint, or final Max incumbent; G0; non-stored blocks with 16–32,768 tokens. | Tries cuts at first/last occurrences of symbols, symbol groups, and high-symbol tails: ≤8 exact-priced pairs within a 64-bit estimate window, then the eight-residue boundary graph (≤80 cuts). Per stream 2^26 work units and 4,096 range prices; 512-entry header cache. [Validation](research/alphabet-boundary-validation.md). |
+| R7 · code-length tree | Max; after R6; same parents; G0; dynamic only. | Optimizes the code-length tree (symbols 0, 16, 17, 18 enumerated, the rest by an exact 128-unit Kraft DP); data codes, tokens, and spans fixed. 2^24 work units per stream. [Validation](research/code-length-tree-validation.md). |
+| R8 · code-length rotations | Max; after R7; same parents; G0; dynamic only. | Rotates three distinct positive payload lengths in one alphabet: ≤64 cycles per alphabet, payload delta −32…+32 bits; 2^24 generation units and 512 header prices per stream. Tokens, support, length histogram, and spans fixed. [Validation](research/code-length-rotation-validation.md). |
+| R9 · coupled code-length swaps | Max; after R8; same parents; G0; dynamic only. | Swaps lengths in both payload alphabets at once: ≤32 swaps per alphabet, ≤256 pairs, individual and combined deltas −32…+32 bits; 2^20 generation units and 512 header prices per stream. Tokens, support, histograms, and spans fixed. [Validation](research/coupled-code-length-swaps-validation.md). |
+| R10 · header-directed match response | Max; final Max incumbent; R1–R9 changed nothing this sweep; G0; dynamic blocks with ≤4,096 decoded bytes, ≤1,024 tokens, 1–128 matches. | For the current tree and each nonzero single swap, re-solves every match's certified spelling: ≤256 profiles (payload tax ≤128 bits, no added transitions); 2^25 work units and 512 header prices per stream. Support, histograms, spans, boundaries, and submatch intervals and distances fixed; no missing codes. [Validation](research/header-response-validation.md). |
+| R11 · length-symbol exchange | Max; final incumbent; R1–R10 changed nothing this sweep; G0; dynamic blocks with ≤4,096 decoded bytes, ≤1,024 tokens, 1–128 matches. | Moves a used length symbol's code length to an absent one (including an unused spare), then fits certified spellings: ≤210 pairs, bound-ranked before the exact DP; 2^25 units and 512 header prices per stream. Literal, end-of-block, and distance prices, the literal/length length histogram, and boundaries fixed; a source code may vanish only if another spelling exists. [Validation](research/length-symbol-exchange-validation.md). |
+| R12 · terminal method closure | Max; final incumbent after R1–R11, R1c, R13, R14; repeats only after a strict complete-stream improvement while G0 allows. | Reruns, in order and with usual bounds, methods whose input changed; 15 input-score slots skip repeats. No round cap, primary replay, extra grace, or mandatory Default rework; earlier floors unchanged. A completed unexpired sweep without change is a fixed point for these methods only. [Validation](research/terminal-closure-validation.md). |
+| R13 · distance-alphabet ladder | After R1c; no size or block limit; non-stored blocks using ≥2 distance symbols. Also ends the PNG early lineage's quick floor, a seed only ([evidence](benchmark-miss-regression-audit.md#iterated-slide-and-distance-ladder-on-9-october-2026)). | Estimates three ladders of kept distance-symbol sets (shortest first, most frequent first, singletons; ≤88 sets) in one pass, with DeflOpt variant-0 trees and a greedy header or the fixed tree; plans ≤2 rungs not above the parent's estimate with the non-exhaustive planner in both modes (ties: smaller set). Adopts only a strictly smaller block plan. Polls the stop every 4,096 tokens and between rungs. A win triggers one more R1c. [Validation](research/distance-ladder-validation.md). |
+| R14 · smoothed-tree finish | After R13; no size or block limit; non-stored blocks (the compact payload-tree floor keeps its earlier pass and closure). | Prices Brotli fixed-point and Zopfli nearby-count smoothed trees at maximum depths 15–9 on true counts; adopts the cheapest if strictly smaller and, in strict mode, strictly compatible. Polls the stop between blocks. A win triggers one more R1c. [Validation](research/smoothed-tree-finish-validation.md). |
+| M0 · bounded-floor prebuild | Max. `Shared`: bounded floor. `SharedExact`: complete Default endpoint and Max seed. `ApngMax`: complete APNG Default endpoint and bounded floor. `CompleteThenBounded`: when ≤1 nonempty block, decoded ≤768 KiB or >2 MiB, or >512 matches in same-distance runs (plus complete Default endpoint and Max seed). `Established`: caller's floor. `Complete`: exact floor later, in the serial tree. | Builds the floor before the bounded phase; otherwise the multi-block single-image PNG floor is built inside it. |
+| M1 · deft4j source | Max; any wrapper or policy; one nonempty fixed or dynamic block, or ≥2 nonempty blocks of any type and count. Rejected: all-empty stream; lone stored block. Bounded by a 128 MiB route arena and G0 only. | Adds the direct deft4j-derived source candidate. |
+| M2 · no-split source | Max; `CompleteThenBounded`; ≤1 MiB compressed; 2–128 nonempty blocks, all fixed or dynamic. | Deft4j-derived per-block seed, then length-family pruning (individual first for 2–3 blocks, cumulative first for ≥4) and adjacent source-order merges; late Max time also tries the other order as an independent topology. Changed boundaries or spellings get one Default refinement (route window if parallel, hard deadline if serial); header-only rewrites do not. |
+| M2c · changed no-split continuation | M2 strictly improved with changed tokens or boundaries; G0. | Reruns the no-split transformation once on the emitted parent, in the source-max worker slot (follow-up ≤3 workers); source max stays eligible later. M2's limits apply instead of M5. |
+| M3 · compact proven feedback | Max; `CompleteThenBounded`; one parsed block; ≥1 match; ≤4,000 tokens; ≤80,000 decoded bytes. | Proven-first sibling in the initial phase under M8/M9, or afterward if unfinished and G0 allows. Its floor also gets the header-aware spelling beam when the rewritten parent has ≤8,000 tokens and 2–128 matches. |
+| M4 · compact balanced tree | Max; `CompleteThenBounded`; ≤8 KiB compressed; ≤128 KiB decoded; one nonempty dynamic source block, ≤4,096 tokens. Each rewritten parent: one dynamic block, ≤4,096 tokens, kept source dynamic-tree seed. | Pair/quad tree cleanup of floor-seeded and source-max parents (deterministic, no G0; the final selected-parent trial needs G0): ≤16 paired candidates from the four lowest-payload-delta moves per side. Pairing: Default at combined delta ≤0; Max ≤18 extra payload bits and, with matches, no standalone literal pairs. Only a complete header-plus-payload win survives. |
+| M5 · route-level parallel cap | Max; bounded floor policy (`CompleteThenBounded`, `Shared`, `SharedExact`, `ApngMax`, `Established`); ≤8 MiB compressed; ≤64 MiB decoded; estimated model ≤64 MiB. | Allows broad routes to overlap. Otherwise Standard scheduling: floor, M1/M2, and dependents serial; no M8; source max later; no deferred floor-max descendant guaranteed. |
+| M6 · bounded PNG policy | `CompleteThenBounded`, after M5. `GenericParallel`: neither M1 nor M2. Else `FloorExpansion`: ≥2 nonempty source blocks, or the floor changed nonempty boundaries or tokens. Else `Standard`. | Chooses the independent lineages of the initial window. |
+| M7 · floor descendant | Floor selected (strict mode, or strictly smaller than the source); bounded window open. `GenericParallel`, `FloorExpansion`: established-floor Max descendant. Standard: standalone bounded grouping if the reparsed floor has ≥2 nonempty blocks. | Runs one descendant (mutually exclusive). A Max descendant that rejoins as the strongest candidate without a fixed point continues under M7a before weaker parents. |
+| M7a · best-first floor continuation | Floor-seeded Max descendant strictly beats the floor; no deft4j, no-split, or source-max candidate beats it; no exact Max fixed point; G0. With a pending compact split that cannot run in parallel: ≥2% saving over the floor. | Continues the strongest dependent lineage first; beside it run the deft4j-derived refinement and any pending compact split (bounded single-image class) or original-source Max (`ApngMax`). Every independent root still gets work as the allowance grows. |
+| M8 · initial compact source max | `FloorExpansion` + M5 (`CompleteThenBounded` only), and one of: ≤2,048 tokens; ≤16 KiB compressed, one nonempty block, ≤128 KiB decoded; ≤16 KiB compressed, 2–4 nonempty blocks, decoded ≤128 KiB × nonempty blocks, ≤16 Ki tokens, ≥2 repartition runs; one block >128 KiB decoded, ≤16 KiB compressed, ≤16 Ki tokens, and either ≥1 repartition run per 16 tokens or ≤4,000 tokens averaging ≥224 decoded bytes per token. | Source max joins the initial bounded worker phase; otherwise it is a later G0 route. |
+| M9 · compact source-token route | M8. ≤2,048 tokens: both roots. 2,500–4,000 tokens: source max alone if M3 exists and the topology is distinct (a repartition run, or >65,535 decoded bytes). Otherwise source max needs ≥2 repartition runs or no M3. | Selects source max, M3, or both; M3 is suppressed only when the single source route starts. |
+| S0 · source-max state order | Completed M3 candidate ties the bounded floor in bytes with fewer meaningful bits. | Later source max starts with the integrated compact proven order; otherwise the ordinary order. A running initial source max is unaffected. |
+| M10a · dependency-first deft | `FloorExpansion`; M1; G0; and a unique one-nonempty-block floor descendant, or a source with ≤16 KiB compressed, ≤128 KiB decoded, ≤16 Ki tokens, ≥2 nonempty blocks, and a non-dense repartition graph (dense: every nonempty block ≤4,000 tokens and repartition runs ≥ nonempty blocks). | Builds and refines the direct deft parent before long beams; the multi-block case also completes its eligible split descendant. |
+| M10b · bounded deft refinement | Bounded policy; G0. Weak deft signal: `CompleteThenBounded`, completed deft candidate, ≥2 nonempty blocks, meaningful-bit gain <2%. Floor reseed: floor strictly beats the source; in the weak reseed branch, ordinary replay and terminal merge each recheck G0, and terminal merge also needs a seed ≤1 MiB and no better M2 candidate. Existing direct deft candidate: the single M10b check. | Refines the direct or floor-seeded deft lineage beside eligible work; original-source Max runs beside direct-deft refinement under `CompleteThenBounded` and `ApngMax` when bounded parallel work is available, serially otherwise. A new, smaller Default topology that beats a completed M2 candidate gets one no-split continuation, then a changed direct-deft parent may get one full Max continuation; header-only rewrites get neither. |
+| M10c · compact split cleanup | Prepared parent ≤16 KiB compressed; reparses to 2–4 blocks, none empty or stored; ≤128 KiB decoded; ≤16 Ki tokens; ≥1 block with ≥16 tokens and ≥128 decoded bytes. A later refined parent: distinct, and beats every early parent or passes G0. | Runs the compact split floor ([Boundary polishing](#boundary-polishing-inside-proven-matches)) on normal, floor-seeded, direct-deft, and refined-deft parents; each stage forwards a complete candidate. The bounded phase records its completed parent and any same-token, same-block endpoint as fixed points, so follow-up skips them; structurally changed descendants stay eligible. |
+| M10d · deferred source-max split | Max; `Complete` or `CompleteThenBounded`; distinct completed source-max parent ≤16 KiB compressed; reparses to 1–4 blocks, none empty or stored; ≤256 KiB decoded; ≤16 Ki tokens; ≥1 block with ≥16 tokens and ≥128 decoded bytes. | Keeps the compact parent during timed routes, then runs M10c's coarse-to-fine planner or bounded rescue (a one-block parent gains its second block). Not under `Shared`, `SharedExact`, `ApngMax`, or `Established`, whose time is reserved for later streams. |
+| M11 · fragmented collection | Max; optional routes not suppressed; G0; ≥64 source blocks; encoded source 16,000–100,000 bytes; no stored block. Collection: ≤4,096 tokens and ≤512 KiB decoded per run; yields fewer source blocks and 2–8 collected blocks. | Replays the fragmented seed until a metric fixed point or the deadline; the replay accepts 1–12 non-stored blocks. |
+| M12 · later source max | Max; reuse a completed earlier source-max candidate; skip if policy suppressed it; else start only while G0 allows. | Runs original-source Max before a rewritten seed, never repeating an initial source-max route. |
+| M13 · rewritten-seed refinement | Max; selected candidate allowed (strict mode, or beats the source); no exact unexpired Max-planner fixed point; optional routes not suppressed; G0. | Reparses and runs the Max planner from the selected rewrite. |
+
+Replay limits: ordinary Default and compact-feedback lineages ≤3 replays;
+terminal merge ≤2; direct deft candidates none until a scheduled refinement.
+Broad, floor-seeded, and fragmented Max lineages continue until a metric fixed
+point or the deadline, capped at eight times the initially emitted byte length.
+A replay round is adopted only on a strict byte/meaningful-bit win, and only an
+unexpired exhaustive round can establish a fixed point. Standalone `Complete`
+Max keeps every eligible D1/D2/D3 endpoint and R1 in its complete Default
+endpoint, then continues Max from the Max seed; `SharedExact` does the same for
+scheduled multi-stream work.
 
 ## Inner stream-planner gates
 
-These gates are below the top-level scheduler. They control which block-layout
-and boundary methods contribute to an already-started route.
+These gates decide which block-layout and boundary methods run inside a started
+route.
 
 | Method | Exact gate | Indicator |
 | --- | --- | --- |
-| All-stored repack | At least two blocks, every block stored, and total decoded bytes ≤64,000,000. Rechunk to payloads ≤65,535 bytes. | 🟢 |
-| Regroup family | Floor work remains and either max is enabled or encoded source size is 16,000–100,000 bytes. | 🟡 |
-| Source-aligned floor | Regroup allowed; 2–8 source blocks; no stored block. Each candidate range remains ≤250,000 tokens and ≤64,000,000 decoded bytes, and the optional composite model must stay within 48 MiB. | 🟡 |
-| Whole-stream merged replay | Within an eligible source-aligned floor, the full merged range has ≥100,000 decoded bytes. A transformed fixed/dynamic seed no more than 256 bits above the best immediate recode may receive extended-floor replay at ≤50,000 tokens/10,000,000 decoded bytes and a four-step table ladder at ≤100,000 tokens/10,000,000 decoded bytes. | 🟡 |
-| Greedy and bounded grouping | Ordinary regroup uses 9–128 blocks; the floor-seeded standalone form uses 2–128. Both reject a stored source block and require twice retained payload storage ≤48 MiB. Bounded grouping prices spans of at most 16 and also aborts if independently planning any source block selects a stored representation. | 🟡 |
-| Collected and wide-collected layouts | Regroup allowed and >8 blocks. Three times retained payload storage must be ≤48 MiB and output is capped at 2,048 blocks. Bounded runs use ≤8,192 tokens/512 KiB plain. Wide collection is added in max or at ≥128 blocks, uses the normal 250,000-token/64,000,000-byte merge caps, and must differ from bounded collection. | 🟡 |
-| Mandatory token floor | At most 128 blocks; the extended compact feedback floor applies only at ≤8 blocks. If same-distance repartition opportunities exist, proven resegmentation is integrated before feedback; otherwise proven search remains an independent endpoint lineage. | 🟡 |
-| Selected-plan merge cleanup | Max; the searched source-order plan strictly replaced the fallback; 2–8 alignment-independent Huffman blocks; ≤8,192 tokens and ≤512 KiB plain. | 🟡 |
-| Comparison-floor boundary reseat | Max + deadline remains; the secured comparison floor has 2–8 alignment-independent Huffman blocks, ≤8,192 tokens, and ≤512 KiB plain. Each adjacent union must satisfy the adaptive probe's histogram, ≥513-token, and ≥128-byte gates, and its discovered cut must differ from the existing boundary. Exactly price every completed replacement, retain only the strongest single reseat, and accept only a strict complete-plan bit win. | 🟡 |
-| Forced-split boundary escape | Max + deadline remains; the secured comparison floor has 2–7 alignment-independent Huffman blocks, ≤8,192 tokens, and ≤512 KiB plain. Select the largest block with ≥513 tokens and ≥128 decoded bytes. Its adaptive histogram search must expose a sampled local minimum separated from the best basin by at least the greater of one seventh of the token span or 16 tokens. Force exactly that runner-up cut, exactly plan both children, and then try one existing adjacent-boundary reseat. Accept only a complete-plan bit win over the secured floor. | 🟡 |
-| Per-source split | Otherwise falls back to whole-block search when tokens <16, decoded bytes <128, or default decoded bytes <32,768. Eligible blocks receive seven decoded-eighth probes. Max blocks ≤512 tokens also receive every interior 32-token anchor, capped with the source cut set at 32. | 🔴 |
-| Exact inside-match siblings | Max always admits them. Default admits them when `token_count × 7 ≤ 32,768`. A source's own exact eighths still need ≥16 tokens, ≥128 decoded bytes, and in default ≥32,768 decoded bytes. With regroup and ≤8 sources, compact default as well as max also adds exact siblings for combined Huffman runs and their 2+-source subgroups; every combined interval still needs ≥16 tokens and ≥128 decoded bytes. | 🔴 |
-| Default nested split | At least two exact-priced split candidates and runner-up cost within 64 bits of the best; refine only the larger child around its midpoint. Retain the snapped midpoint and, when the compact default inside-match gate passes, an exact inside-match sibling, for at most two nested cuts. | 🟡 |
-| Adaptive split | Max; 513–250,000 tokens, at least 128 decoded bytes, a usable range histogram, and a cut not already present. At most 128 sample/probe positions; accept only after exact structural planning saves at least 32 bits. | 🟡 |
-| Entropy-state boundary scout | Max global-boundary work only; 513–250,000 tokens, at least 128 decoded bytes, no stored source block, and deadline remains. Assign the complete existing-token stream to 2–8 learned literal/length-plus-distance code states through two refinement rounds, charge 128 bits per state switch, rank transitions in 64-token neighbourhoods, and retain at most 16 token-boundary anchors. The pre-scout cut graph remains available and exact boundary pricing decides the result. | 🔴 |
-| Priority boundary graph | Max + established comparison floor + regroup + one or two blocks + ≤8,192 total tokens + ≥100,000 total decoded bytes + at least two same-distance repartition runs. The two-block case covers the first replay after a structural split while bounding the cut graph; broader block lists retain source-order priority. | 🔴 |
-| Global boundary graph | Regroup allowed, deadline remains, and more than two distinct cuts exist. Building the composite and its range state must stay within the 48 MiB optional-model cap. Token-boundary cuts are retained before optional inside-match cuts; total cuts ≤2,048. | 🔴 |
-| Boundary edge legality | Default same-source edges must touch that source's start or end; max may take middle ranges. Max cross-source edges stay ≤250,000 tokens/64,000,000 plain bytes. Stored edges cover whole sources and ≤65,535 bytes; mixed stored/Huffman ranges are rejected. Default cross-source Huffman ranges require regroup and ≤8 sources plus a touched source boundary, except ≤512-byte whole-source or all-fixed whole-source cases. Every legal edge is priced over all eight starting bit residues. | 🔴 |
-| Adjacent merge | Merge search is enabled and either combined plain ≤512 bytes, max is enabled, or the route selected long-run Huffman merging; combined range ≤250,000 tokens/64,000,000 bytes. Exact fixed/fixed joining and identical-source-dynamic-tree reuse have cheaper dedicated candidates. | 🔴 |
-| No-split route | Uses a complete direct fallback, narrow whole-block searches, and long-run adjacent merging; omits grouping, split probes, global boundary search, broad state queues, and unbounded iterative replay. Two- and three-block lists prioritize individual pruning; longer lists prioritize cumulative pruning, with the complementary policy eligible late in Max. A completed boundary/token rewrite may receive the single M2 Default refinement. One changed winner may then receive the single M2c no-split continuation; a header-only result cannot trigger either step. | 🟡 |
+| All-stored repack | ≥2 blocks, all stored; ≤64,000,000 decoded bytes. Rechunks to payloads ≤65,535 bytes. | 🟢 |
+| Regroup family | Floor work remains; Max, or encoded source 16,000–100,000 bytes. | 🟡 |
+| Source-aligned floor | Regroup; 2–8 source blocks; no stored block; each range ≤250,000 tokens and ≤64,000,000 decoded bytes; optional composite model ≤48 MiB. | 🟡 |
+| Whole-stream merged replay | Eligible source-aligned floor; merged range ≥100,000 decoded bytes. A fixed or dynamic seed ≤256 bits above the best immediate recode may get extended-floor replay (≤50,000 tokens) and a four-step table ladder (≤100,000 tokens), both ≤10,000,000 decoded bytes. | 🟡 |
+| Greedy and bounded grouping | Ordinary regroup 9–128 blocks; floor-seeded standalone form 2–128; no stored source block; 2 × retained payload ≤48 MiB. Bounded grouping: spans ≤16; aborts if any source block planned alone selects stored. | 🟡 |
+| Collected and wide-collected layouts | Regroup; >8 blocks; 3 × retained payload ≤48 MiB; layouts >2,048 blocks abandoned. Bounded runs ≤8,192 tokens and ≤512 KiB decoded. Wide: Max or ≥128 blocks; 250,000-token/64,000,000-byte merge caps; must differ from bounded collection. | 🟡 |
+| Mandatory token floor | ≤128 blocks; extended compact feedback floor only at ≤8 blocks. Proven resegmentation runs before feedback when same-distance repartition opportunities exist, else as an independent endpoint lineage. | 🟡 |
+| Selected-plan merge cleanup | Max; searched source-order plan strictly replaced the fallback; 2–8 alignment-independent Huffman blocks; ≤8,192 tokens; ≤512 KiB decoded. | 🟡 |
+| Comparison-floor boundary reseat | Max; deadline remains; secured comparison floor of 2–8 alignment-independent Huffman blocks, ≤8,192 tokens, ≤512 KiB decoded; each adjacent union passes the adaptive probe's histogram, ≥513-token, and ≥128-byte gates and finds a new cut. Keeps only the strongest single reseat, on a strict complete-plan bit win. | 🟡 |
+| Forced-split boundary escape | Max; deadline remains; secured floor of 2–7 alignment-independent Huffman blocks, ≤8,192 tokens, ≤512 KiB decoded; largest block with ≥513 tokens and ≥128 decoded bytes has a sampled local minimum ≥ max(span / 7, 16) tokens from its best cut. Forces that cut, plans both children exactly, tries one adjacent reseat; needs a complete-plan bit win over the floor. | 🟡 |
+| Per-source split | Whole-block search instead when <16 tokens, <128 decoded bytes, or (Default) <32,768 decoded bytes. Else seven decoded-eighth probes; Max blocks ≤512 tokens add cuts at multiples of 32 tokens (≥32 before, >32 after), ≤32 cuts with the source cuts. | 🔴 |
+| Exact inside-match siblings | Max: always; Default: `token_count × 7 ≤ 32,768`. A source's own eighths: ≥16 tokens, ≥128 decoded bytes, (Default) ≥32,768 decoded bytes. With regroup and ≤8 sources, both modes add combined Huffman runs and their ≥2-source subgroups, each ≥16 tokens and ≥128 decoded bytes. | 🔴 |
+| Default nested split | ≥2 exact-priced splits; runner-up ≤64 bits behind the best. Refines only the runner-up's larger child at its snapped midpoint, plus an exact inside-match sibling if Default's gate passes (≤2 cuts). | 🟡 |
+| Adaptive split | Max; 513–250,000 tokens; ≥128 decoded bytes; usable range histogram; new cut; ≤128 sample/probe positions; exact structural saving ≥32 bits. | 🟡 |
+| Entropy-state boundary scout | Max global-boundary work; 513–250,000 tokens; ≥128 decoded bytes; no stored source block; deadline remains. Fits 2–8 literal/length-plus-distance code states to the existing tokens (two refinement rounds, 128 bits per switch), ranks transitions in 64-token neighborhoods, keeps ≤16 token-boundary anchors. The pre-scout cut graph stays; exact boundary pricing decides. | 🔴 |
+| Priority boundary graph | Max; established comparison floor; regroup; 1–2 blocks; ≤8,192 tokens; ≥100,000 decoded bytes; ≥2 same-distance repartition runs. Two blocks: first replay after a structural split; longer lists keep source-order priority. | 🔴 |
+| Global boundary graph | Regroup; deadline remains; >2 distinct cuts; composite within the 48 MiB optional-model cap (histogram probes skipped if their index is not); token-boundary cuts before inside-match cuts; ≤2,048 cuts. | 🔴 |
+| Boundary edge legality | Default same-source edges touch the source's start or end; Max may use middle ranges. Cross-source edges ≤250,000 tokens and ≤64,000,000 decoded bytes. Cross-source stored edges: whole sources, ≤65,535 bytes; no mixed stored/Huffman ranges. Default cross-source Huffman ranges: regroup, ≤8 sources, a touched source boundary, except ≤512-byte or all-fixed whole-source ranges. Each edge is priced from every reachable start residue. | 🔴 |
+| Adjacent merge | Merge search on; combined decoded ≤512 bytes, Max, or route-selected long-run Huffman merging; ≤250,000 tokens and ≤64,000,000 bytes. Fixed/fixed joins and identical-source-tree reuse have cheaper dedicated candidates. | 🔴 |
+| No-split route | Direct fallback, narrow whole-block searches, and long-run adjacent merging only; no grouping, split probes, global boundaries, broad state queues, or unbounded replay. See M2 and M2c. | 🟡 |
 
 ### Inner token-search gates
 
 | Method | Exact gate | Indicator |
 | --- | --- | --- |
-| Same-distance candidate | At least two tokens and one adjacent same-distance run; retain only a strict complete-block bit win. Non-exhaustive structural floors—including such floors inside max—use exact deficit pricing only when active shortened matches ≤16. Full max token search admits the wider bounded deficit table. | 🟢 |
-| Mandatory block floor | ≤50,000 tokens and ≤10,000,000 decoded bytes. | 🟡 |
-| Ordinary short-family floor | ≤250,000 tokens and ≤64,000,000 decoded bytes; price cumulative symbol ranges 260, 260–261, through 260–264. | 🟡 |
-| Compact short-band floor | ≤12,000 tokens and ≤80,000 decoded bytes; price prefixes ending at 257, 258, 259, 260, 262, and 264. | 🟡 |
-| Large no-split bands | Narrow/no-split block search only; decoded bytes ≥128,000 and tokens ≤80,000. Price cumulative endpoints 262, 265, 267, 269, and 270 plus the sparse 260–270-and-280 family. | 🟡 |
-| All-literal endpoint | Decoded bytes ≤80,000, or ≤1,000,000 with at most 256 matches; the enclosing floor/search token and decoded-work bounds still apply. A frequency-only preflight rejects distant candidates before token expansion. | 🟡 |
-| Match-expansion ladder | Begins only when matches exist; follows each seed for at most 12 token-expansion states, retaining strict winners and useful non-larger intermediates according to the route policy. | 🔴 |
-| Match groups | Max; ≤250,000 tokens and ≤10,000,000 decoded bytes. For each of at most two deduplicated table seeds, price up to 20 individual groups and the first 2-, 3-, 4-, and 5-group prefixes. | 🔴 |
-| Individual match pruning | Default: ≤20,000 tokens, ≤10,000,000 decoded bytes, and ≤32 matches. Max's dedicated individual-prune root is limited to ≤4,000 tokens; it shares exact state deduplication with the intact root. | 🔴 |
-| Ordered token-state queue | Max; ≤12,000 tokens and ≤80,000 decoded bytes. Beam width 8, depth 5, at most 6 children per state, with a 256-bit admission margin. | 🔴 |
-| Transformed-winner replay | Max; after a transformed token winner, at most four non-max child rounds. Outside block search, ordinary/compact lineages use at most three rounds; broad, floor-seeded, and fragmented Max lineages continue to their proof-derived metric fixed-point ceiling or deadline; terminal merge uses two; direct routes use zero until separately refined. M2 has the distinct Default refinement and at most one score-ordered M2c continuation described above. | 🔴 |
-| Terminal tightening | Huffman plan ≤50,000 tokens and ≤10,000,000 decoded bytes. Extended floor replay uses the same bound; the four-pass table ladder allows ≤100,000 tokens at the same decoded bound. | 🟡 |
+| Same-distance candidate | ≥2 tokens; ≥1 adjacent same-distance run; strict complete-block bit win. DP limits: [same-distance normalization](#same-distance-match-run-normalization). | 🟢 |
+| Mandatory block floor | ≤50,000 tokens; ≤10,000,000 decoded bytes. | 🟡 |
+| Ordinary short-family floor | ≤250,000 tokens; ≤64,000,000 decoded bytes. Cumulative ranges 260, 260–261, …, 260–264. | 🟡 |
+| Compact short-band floor | ≤12,000 tokens; ≤80,000 decoded bytes. Prefixes ending at 257, 258, 259, 260, 262, 264. | 🟡 |
+| Large no-split bands | Narrow/no-split block search; ≥128,000 decoded bytes; ≤80,000 tokens. Cumulative endpoints 262, 265, 267, 269, 270, plus the sparse 260–270-and-280 family. | 🟡 |
+| All-literal endpoint | ≤80,000 decoded bytes, or ≤1,000,000 with ≤256 matches; enclosing bounds apply. A frequency-only preflight rejects distant candidates before expansion. | 🟡 |
+| Match-expansion ladder | Matches exist; ≤12 token-expansion states per seed; keeps strict winners and useful non-larger intermediates per route policy. | 🔴 |
+| Match groups | Max; ≤250,000 tokens; ≤10,000,000 decoded bytes. Per ≤2 deduplicated table seeds: ≤20 individual groups and the first 2-, 3-, 4-, and 5-group prefixes. | 🔴 |
+| Individual match pruning | Default: ≤20,000 tokens, ≤10,000,000 decoded bytes, ≤32 matches. Max individual-prune root: ≤4,000 tokens; shares state deduplication with the intact root. | 🔴 |
+| Ordered token-state queue | Max; ≤12,000 tokens; ≤80,000 decoded bytes. Beam 8, depth 5, ≤6 children per state; a child enters within 256 bits of its parent or if no worse than the best. | 🔴 |
+| Transformed-winner replay | Max; after a transformed token winner; ≤4 non-Max child rounds. Lineage limits: [route-gate reference](#route-gate-reference). | 🔴 |
+| Terminal tightening | Huffman plan and extended floor replay ≤50,000 tokens; four-pass table ladder ≤100,000 tokens; all ≤10,000,000 decoded bytes. | 🟡 |
 
-The stream planner secures a complete structural/token floor before optional
-search. With more than eight source blocks, default can search the selected and
-collected layouts but returns before the broad cross-source boundary graph. If
-regroup is disabled, it returns after the per-source work. Max may continue into
-the global graph until its deadline.
+The stream planner secures a complete structural and token floor before
+optional search. With more than eight source blocks, Default can search the
+selected and collected layouts but returns before the broad cross-source
+boundary graph; with regroup disabled, it returns after the per-source work.
+Max may continue into the global graph until its deadline.
 
 ## Same-distance match-run normalization
 
 🟢 A maximal sequence of adjacent matches using one semantic distance forms a
-proven run. If it decodes `S` bytes, the minimum legal match count is
-`ceil(S / 258)`:
+proven run. A run decoding `S` bytes needs at least `ceil(S / 258)` matches:
 
-- A run of at most 258 bytes becomes one canonical match.
-- An exact multiple of 258 becomes all 258-byte matches.
-- Other runs use a bounded deficit search under current Huffman costs.
+- ≤258 bytes: one canonical match.
+- An exact multiple of 258: all 258-byte matches.
+- Otherwise: a bounded deficit search under current Huffman costs.
 
-Non-exhaustive structural work uses the exact cost search when at most 16
-shortened matches are active; otherwise it emits a legal minimum-token fallback
-requiring at most two shortened matches. This remains true for structural floors
-inside max. The full max token search keeps the wider bounded cost table. The
-distance never changes, the history window is never searched, and the complete
-block is replanned before adoption.
+Non-exhaustive structural work, including structural floors inside Max, uses
+the exact cost search with ≤16 active shortened matches and otherwise a legal
+minimum-token fallback with ≤2 shortened matches; the full Max token search
+keeps the wider bounded cost table. The distance never changes, and the
+complete block is replanned before adoption.
 
-Verbose mode reports source-only opportunity counters:
-
-- Maximal same-distance runs.
-- Matches and decoded bytes in those runs.
-- Direct coalesces and longer repartition opportunities.
-- Maximum removable match tokens.
-
-The counter joins source token lists, so a source block boundary does not end a
-reported opportunity. The transformation itself can cross that boundary only
-after another route has legally merged the blocks into one candidate.
+Verbose mode reports source-only counters: maximal same-distance runs, their
+matches and decoded bytes, direct coalesces, longer repartition opportunities,
+and the maximum removable match tokens. Counters span block boundaries; the
+transformation crosses one only after another route has merged the blocks.
 
 ## Proven-submatch resegmentation and feedback
 
-Within one existing match, 🔴 proven-submatch search constructs an acyclic
-graph over decoded positions:
+🔴 Proven-submatch search builds an acyclic graph over the decoded positions
+of one existing match:
 
 - A literal edge emits the already-known byte.
 - A match edge emits 3–258 bytes at the source match's distance.
 - No edge leaves the source match's decoded interval.
 
-The source match wins estimated payload ties, but Columbo also prices
-source-symbol-free and highest-used-length-symbol-elimination alternatives so a
-small payload penalty can expose a larger header saving. Complete materialized
-spellings are deduplicated, replanned, and exactly compared.
+The source match wins estimated payload ties; alternatives that avoid the
+source length symbol or remove the highest used length symbol are also priced
+for their header savings. Complete spellings are deduplicated, replanned, and
+compared exactly.
 
 | Policy | Gate and breadth | Indicator |
 | --- | --- | --- |
-| Default targeted pass | Block ≤50,000 tokens and ≤10,000,000 decoded bytes with a match. Rank at most 8 targets, at most 2 per length symbol; one pass. | 🟡 |
-| Max targeted pass | Block ≤250,000 tokens and ≤10,000,000 decoded bytes with a match. Rank at most 32 targets, at most 4 per length symbol. | 🔴 |
-| Compact individual trials | ≤4,000 tokens and ≤80,000 decoded bytes. Price up to 4 default or 8 max individual siblings per rewrite family. | 🔴 |
-| Full max graph | ≤12,000 tokens, ≤80,000 decoded bytes, and ≤512 matches. May target every eligible match. | 🔴 |
-| Max repetition | Continue only after a strict token/bit winner, until stable, deadline, or 12 passes. Highest-symbol elimination is capped at 64 matches. | 🔴 |
+| Default targeted pass | Block ≤50,000 tokens, ≤10,000,000 decoded bytes, ≥1 match. ≤8 ranked targets, ≤2 per length symbol; one pass. | 🟡 |
+| Max targeted pass | Block ≤250,000 tokens, ≤10,000,000 decoded bytes, ≥1 match. ≤32 ranked targets, ≤4 per length symbol. | 🔴 |
+| Compact individual trials | ≤4,000 tokens; ≤80,000 decoded bytes. ≤4 (Default) or ≤8 (Max) individual siblings per rewrite family. | 🔴 |
+| Full max graph | ≤12,000 tokens; ≤80,000 decoded bytes; ≤512 matches. May target every eligible match. | 🔴 |
+| Max repetition | Only after a strict token/bit winner; until stable, deadline, or 12 passes. Highest-symbol elimination: ≤64 matches. | 🔴 |
 
-Ranking favours high, rare, or expensive length symbols, positions within two
-decoded bytes of a length-code transition, and positions within eight bytes of
-a source split. Rare means frequency ≤2; expensive means at least nine code bits
-or absent from the seed tree.
+Ranking favors rare (frequency ≤2), expensive (≥9 code bits or absent from the
+seed tree), or high length symbols, and positions within two decoded bytes of a
+length-code transition or eight bytes of a source split.
 
-The ordinary planner stabilizes proven resegmentation as an independent
-endpoint lineage so a locally smaller spelling cannot hide the ordinary replay
-fixed point. Compact default and single-image PNG routes additionally retain
-the proven-before-feedback and integrated-proven state orders described by D1,
-D2, and M3.
+The ordinary planner runs proven resegmentation as an independent endpoint
+lineage, so a locally smaller spelling cannot hide the ordinary replay fixed
+point. D1, D2, and M3 add the proven-before-feedback and integrated-proven
+state orders.
 
-Within Max's compact M3 route, 🔴 header-aware proven-spelling composition can
-combine different choices across as many as eight ranked matches. Each menu
-contains the source spelling and at most three frequency-distinct alternatives:
-the current-tree payload minimum, the source-length-symbol-free path, and all
-literals. The beam keeps at most 16 exact frequency/extra-bit states within 24
-estimated payload bits of its best state. Only combinations rewriting at least
-two matches are materialized, with a hard ceiling of 32 complete block prices.
-The initial source has at most 4,000 tokens and 80,000 decoded bytes; the
-rewritten parent has at most 8,000 tokens and 2–128 matches. Every emitted match
-still uses its original proven distance, and the earlier complete M3 floor wins
-every exact tie.
+Within M3, 🔴 header-aware proven-spelling composition combines choices across
+≤8 ranked matches. Each menu holds the source spelling and ≤3
+frequency-distinct alternatives: the current-tree payload minimum, the path
+without the source length symbol, and all literals. The beam keeps ≤16 exact
+frequency/extra-bit states within 24 estimated payload bits of its best. Only
+combinations rewriting ≥2 matches are materialized, with ≤32 complete block
+prices; the earlier M3 floor wins exact ties.
 
-For an unsplit source block of at most 1,024 decoded bytes, Max adds a second
-🔴 closed-loop composition sibling. It ranks one best alternate spelling per
-menu under the current global frequency state, exact-prices cumulative forward
-prefixes, then ranks a reverse repair sweep using the aggressive endpoint's
-exact Huffman lengths. A strict exact winner becomes the next round's source;
-without one, the route stops after the first pass. At least three menus are
-required, and two rounds share a hard ceiling of 24 complete block prices.
-This search is additive: the completed static composition parent remains the
-incumbent, decoded identity is preserved, and exact complete-block bits decide
-every replacement.
+For an unsplit source block of ≤1,024 decoded bytes with ≥3 menus, Max adds a 🔴
+closed-loop composition sibling: exact-priced cumulative forward prefixes of
+each menu's best alternate under the current frequencies, then a reverse repair
+sweep ranked by the aggressive endpoint's Huffman lengths. A strict win seeds
+one second round. Both rounds share ≤24 complete block prices; the static
+composition parent stays the incumbent.
 
 ## Boundary polishing inside proven matches
 
-🔴 A selected decoded cut may fall inside an existing match. Columbo retains
-the snapped token-boundary candidate and may add an exact sibling at the decoded
-target. A fragment of 3–258 bytes becomes a canonical match at the original
-distance; a one- or two-byte fragment becomes known literals. No alternative
-distance is invented.
+🔴 A selected decoded cut may fall inside an existing match. Columbo keeps the
+snapped token-boundary candidate and may add an exact sibling at the decoded
+target: a 3–258-byte fragment becomes a canonical match at the original
+distance, a one- or two-byte fragment becomes known literals. No new distance is
+introduced; the [inner gates](#inner-stream-planner-gates) limit where siblings
+are added. The boundary graph tracks all eight bit residues at each cut, so
+stored and Huffman representations are compared at their real alignment.
 
-Default exact siblings are work-bounded by `token_count × 7 ≤ 32,768`; max
-admits them throughout its existing cut limits. This applies not only to
-per-source eighths but, for regroupable lists of at most eight sources, to
-combined Huffman runs and their subgroups. The boundary graph carries all eight
-starting bit residues, so stored-block padding and Huffman representations are
-compared at their real alignment. A combined run or subgroup must itself have
-at least 16 tokens and 128 decoded bytes before those exact siblings are added.
+The compact split floor (M10c, M10d) prices decoded-eighth splits without deep
+token or merge search and forwards a complete best prefix at the deadline. Its
+timed form is coarse-to-fine: a non-exhaustive sweep with ordinary headers over
+every token-boundary cut and the inside-match cuts Default's work bound allows;
+then exhaustive header finalization only for blocks after the last one kept in
+original or stored form; then, if hard time remains, the exact Max sweep.
 
-The compact split floor is a separate bounded structural method. It prices
-decoded-eighth splits without deep token or merge search and forwards a complete
-best prefix when the deadline arrives. Its timed form is coarse-to-fine: a fast
-ordinary-header sweep covers every structural cut, then only the winning suffix
-after the last alignment-sensitive stored/original block receives exhaustive
-header finalization. If hard time remains, the exact Max sweep follows, so the
-unlimited route is never lost and the additional completed seed may still win.
-If an admitted route reaches its hard boundary before the sweep begins, only
-the child that owns file-level grace may run Columbo's bounded rescue. It
-ordinary-prices every snapped/exact eighth of the largest eligible block and
-exhaustively prices only the strongest topology—at most fourteen cheap probes
-and one exact child pair. Earlier zero-grace container children and
-route-window yields forward immediately, preventing per-stream multiplication.
-G0t is a distinct stream-owner phase. After its primary yield, M10d may run
-this same coarse rescue while the original soft deadline remains open only
-under `Complete` or `CompleteThenBounded`; `ApngMax` skips that overrun. It
-cannot spend the reserved terminal share on exhaustive split pricing.
-Its parent gate is
-compressed bytes ≤16 KiB, decoded bytes ≤128 KiB, 2–4 parsed blocks, no empty or
-stored block, ≤16 Ki tokens total, and at least one block with ≥16 tokens and
-≥128 decoded bytes. Completed parent identity is carried across the bounded
-phase. A result that preserves the same shared token/plain arrays, block count,
-and emitted block types is also a deterministic endpoint and is not immediately
-replanned; an accepted split or type transition still exposes a distinct state
-and remains eligible.
+If an accepted route reaches its hard deadline before that sweep, only a route
+with the file-level grace may run the bounded rescue: ordinary-header prices
+for every snapped and exact eighth of the largest eligible block (≤14 probes),
+then exhaustive pricing of the best child pair. Zero-grace container children
+and route-window yields forward their incumbent immediately. After a G0t
+primary yield, M10d may run the rescue only under `Complete` or
+`CompleteThenBounded` while the full allowance's soft deadline is open, never
+spending the reserved terminal share on exhaustive split pricing. A result with
+the same token and decoded arrays, block count, and block types is a
+deterministic endpoint and is not immediately replanned; an accepted split or
+block-type change is a new state and stays eligible.
 
 ## Candidate reuse and duplicate-work control
 
-Columbo has two bounded route-local caches, not a global route DAG or interval
+Columbo has two bounded route-local caches and no global route DAG or interval
 cache. The block-plan cache stores completed alignment-independent fixed,
 dynamic, and header results for identical token states within one planning run.
 
@@ -723,312 +680,235 @@ dynamic, and header results for identical token states within one planning run.
 flowchart LR
     STATE["Block token state"] --> FP["🟢 Canonical fingerprint"]
     FP --> HIT{"Exact state and policy match"}
-    HIT -- "Yes" --> REUSE["🟢 Reuse completed Huffman kernel"]
+    HIT -- "Yes" --> REUSE["🟢 Reuse completed Huffman plan"]
     HIT -- "No" --> PLAN["🟡 Complete deterministic planning"]
     PLAN --> INSERT{"Within 512 entries and 16 MiB token charge"}
-    INSERT -- "Yes" --> STORE["🟢 Cache kernel"]
+    INSERT -- "Yes" --> STORE["🟢 Cache plan"]
     INSERT -- "No" --> SAFE["Continue without insertion"]
     REUSE --> ALIGN["Layer on alignment, stored cost,<br/>and exact-source reuse"]
     STORE --> ALIGN
     SAFE --> ALIGN
 ```
 
-Inside complete dynamic planning, the header-kernel cache uses a narrower key:
-the exact trimmed literal/distance length sequences and header policy. It can
-therefore reuse deterministic header work across different token orders while
-each caller independently supplies its checked payload cost. The header cache
-has a separate 512-entry cap and never stores incomplete work.
+A hash hit is verified exactly against the token spelling, symbol frequencies,
+source dynamic-tree seed, and strict and Default/Max policy, so collisions are
+harmless. Timed work may use a completed entry but never stores a partial plan;
+each route worker has its own caches, with no shared lock. The header-plan
+cache (`HeaderPlanCache`, ≤512 entries) keys on the exact trimmed code-length
+sequences and header policy, so dynamic planning reuses header work across
+token orders; each caller adds its own checked payload cost. The deft4j state
+queue likewise compares complete token and code-length arrays after a
+fingerprint match.
 
-A hash hit is followed by exact verification of token spelling, symbol
-frequencies, source dynamic-tree seed, and strict/default-or-max policy, making
-hash collisions harmless. Timed work may consume a completed entry but never
-publishes a partial plan. Separate route workers own separate caches; there is
-no shared cache lock between them.
+Besides the gates that skip repeated work (M9, M13, R12, `Established`, and
+fdAT deduplication), Columbo:
 
-The deft4j state queue follows the same collision-safe split: a compact
-word-mixed fingerprint selects a candidate state, then complete token and
-literal/distance-length arrays are compared before a state can be reused. The
-fingerprint is accumulated while an expanded state is materialized, avoiding a
-second hashing pass and the keyed-hasher cost that does not contribute to
-correctness here.
-
-Other duplicate-work controls include:
-
-- Reusing a completed default/floor candidate before max descendants.
-- Revisiting R1–R10 after later terminal improvements while skipping each
-  method already tried on the unchanged generation. Only strict descent makes
-  the ten score slots a valid identity check within this particular lineage.
-- Using `Established` when a PNG worker already owns the complete transformed
-  parent, so the descendant does not rebuild the same ordinary floor.
-- Parsing a completed bounded floor once for its grouping and Max descendants.
-- Skipping rewritten-seed replay after an exact unexpired max fixed point.
-- Deduplicating exact compressed APNG frames with matching decoded geometry
-  before optimization.
-- Exact decoded comparison before cross-frame compressed-stream reuse.
-- Racing `Established` source-Max ZIP work beside exact Default only for
-  bounded nonuniform archives, without rebuilding an ordinary floor in the
-  direct branch.
-- Completing one outer ZIP lineage for uniform many-member archives and
-  distributing independent members across balanced worker slices.
-- Ordering distinct compact-split parents by their completed byte/bit score,
-  while retaining every parent for a sufficiently long Max run.
-- Selecting one compact source-token owner when proven and source-max beams
-  would substantially overlap.
-- Continuing a changed no-split topology in the existing source-max worker
-  slot. A sibling's smaller current encoding does not suppress this dependency,
-  because different tokens and trees are not ordered until terminal closure.
-- Closing a losing floor-seeded, deft4j, source-max, or changed no-split
-  topology with the bounded terminal tree methods before discarding it. A
-  branch that already wins receives the same closure only once at the ordinary
-  final stage.
-- Pricing bounded grouping ranges once before selecting the least-cost ordered
-  segmentation.
-- Combining authoritative per-block literal/distance histograms in fixed-size
-  arrays when blocks join, rather than rescanning the token buffers immediately
-  before or after copying them.
-- Rebuilding a block histogram after plan adoption only when the immutable
-  token buffer changed; representation-only wins retain the existing counts.
+- reuses a completed Default floor before Max descendants, and parses a
+  completed bounded floor once for its grouping and Max descendants;
+- closes a losing floor-seeded, deft4j, source-max, or changed no-split
+  topology with the terminal tree floors before discarding it, and a winning
+  branch once, at the final stage;
+- prices bounded grouping ranges once before selecting the segmentation;
+- merges per-block literal/length and distance histograms in fixed-size arrays
+  when blocks join, and rebuilds a block histogram after plan adoption only
+  when the token buffer changed.
 
 ## Multithreading
 
-Columbo does not parallelize files supplied to the CLI. GZIP members and
-standalone raw/top-level-zlib planning remain algorithmically serial. A
-structurally uniform many-member ZIP may parallelize independent members in
-either mode. A bounded nonuniform ZIP Max race may also parallelize the
-mandatory Default sibling's independent members. In other bounded `--max`
-work, Columbo may overlap independent raw routes, APNG image streams,
-static-PNG image and metadata-floor work, the two useful single-image PNG
-lineages, or complete ZIP archive lineages. Every site has explicit
-compressed, decoded, or model bounds and rejoins before wrapper
-reconstruction.
-
-Broad candidate-route overlap requires **all** of M5: max mode, a bounded floor
-policy, compressed bytes ≤8 MiB, decoded bytes ≤64 MiB, and parsed-model
-estimate ≤64 MiB. The estimate charges token storage, decoded bytes, and
-per-block model overhead. Two narrower sites use their own tighter work caps:
-compact-split follow-up and floor-seeded grouping range pricing. The wrapper
-sites below have their own 8 MiB compressed and 64 MiB decoded bounds. There
-is no persistent thread pool or CLI thread-count option.
+The CLI processes files one at a time; there is no persistent thread pool or
+thread-count option. GZIP members and standalone raw and zlib streams run
+serially, though a GZIP Max member may overlap its own routes under M5. Each
+site below has its own bounds and rejoins before wrapper reconstruction. Broad
+candidate-route overlap requires **all** of M5, whose model estimate charges
+token storage, decoded bytes, and per-block overhead; compact-split follow-up,
+M2c, and floor-seeded grouping use their own limits.
 
 | Internal thread site | When it runs | Work split | Indicator |
 | --- | --- | --- | --- |
-| ZIP archive lineages | Max; at least one optimizable member; nonuniform member distribution; input ≤8 MiB; total decoded bytes of optimizable entries ≤64 MiB. | One worker runs original-source Max from `Established` while the caller owns all ordinary Default work and later refines that finished archive. With at least two members, that bounded Default sibling may itself use up to eight member lanes. A complete Max archive wins only when it is no worse in both bytes and aggregate meaningful bits. | 🔴 |
-| ZIP member lanes | In every reporting mode: either at least eight similarly distributed optimizable entries, or at least two entries in the bounded Default sibling of a nonuniform Max archive race; input ≤8 MiB; aggregate decoded bytes ≤64 MiB. | Up to eight balanced contiguous slices of the mode's entry order. Each worker owns cloned entry metadata/output. Exhaustive workers divide time using only their own serial slice; the mandatory Default-floor workers run ordinary routes. Locally yielded members rejoin a serial weighted reclaim pass under the shared file deadline. Reconstruction restores source order. | 🟡–🔴 |
-| Single-image PNG lineages | Max; compressed ≤8 MiB; exact decoded image bytes ≤64 MiB; source either exceeds the 512-match complete graph or is a 2+-block ≤768 KiB serial-floor class. | One worker builds a quick ordinary parent and continues it through `Established`; the caller preserves exact Default and the direct bounded routes. | 🔴 |
-| APNG whole-file lineages | Max; at least one fdAT frame; at least two available CPUs; aggregate image data ≤8 MiB compressed and ≤64 MiB decoded. | One quiet worker completes the APNG Default file pipeline while the caller gives original-source Max its full configured allowance. Both siblings own complete parsed/output models. The complete Max file is retained only when it dominates Default in bytes and meaningful bits; otherwise Default wins. | 🔴 |
-| Multi-image PNG jobs | Max; at least two unique jobs; aggregate compressed ≤8 MiB; aggregate exact decoded bytes ≤64 MiB. | Inside the Max whole-file lineage, up to eight fixed lanes receive balanced contiguous slices of the small-to-large job order. Each lane runs its jobs serially with child-grace-aware proportional time. The initial phase retains 4% for container work. Because Max has already completed the mandatory compressed-metadata floor, optional metadata refinement does not reduce that image allowance. Locally yielded jobs then rejoin a serial weighted reclaim pass. | 🔴 |
-| Initial bounded max phase | M5 plus the individual M1/M2/M8/M9 route gates and G0. | Up to four named workers for deft4j, no-split, initial source max, and initial proven feedback; caller builds/reuses the floor lineage. `Shared`, `SharedExact`, and `ApngMax` generally overlap any eligible direct deft work with their Max seed. | 🔴 |
-| Generic single-image PNG phase | `CompleteThenBounded`, M5, G0, and M6=`GenericParallel`. | One source-max worker while the caller builds the floor→seeded-max lineage. | 🔴 |
-| Bounded PNG follow-up | `CompleteThenBounded`, G0, and bounded refinement remains. A source-max worker additionally requires M5 and no completed or suppressing source-max route. A changed M2c parent takes that worker slot instead. A compact-split worker requires at least one prepared weak-deft parent: multiple nonempty blocks, <2% direct deft gain, ≤16 KiB compressed, ≤128 KiB decoded, 2–4 nonempty non-stored blocks, ≤16 Ki tokens, and at least one block with ≥16 tokens and ≥128 decoded bytes. | The caller refines the deft lineage while compact split and exactly one of source max or the changed no-split dependency may run. This preserves the prior three-worker envelope. | 🔴 |
-| Floor-seeded bounded grouping | The standalone grouping descendant from M7 is selected; grouping has 2–128 blocks, no stored source block, twice its retained payload storage is ≤48 MiB, and independently planning each source does not select a stored representation. | Up to four workers—further limited by available hardware threads and block count—price ranges beginning at assigned source blocks. Results return to source order, and the final best segmentation is selected serially. | 🟡 |
-| CLI spinner | Every mode on interactive terminal stderr; detailed modes begin after format preflight. | Presentation-only thread: 300 ms delay, then roughly 500 ms updates. Every frame says `optimizing` and counts down the file timeout; Verbose and Visual atomically count physical streams that have completed at least one report as `checked/total`. Where terminal styling is allowed, the line is bold, its cursor uses 16-colour cyan, and the final three countdown seconds use 16-colour red. Detailed-mode spinners pause around ordered reports, resume during remaining work, and stop before the footer. It performs no optimization and does not affect scheduling or budgets. | 🟢 |
+| ZIP archive lineages | ZIP max archive lineages row of the [wrapper table](#wrapper-and-floor-policy-routing). | One worker runs original-source Max from `Established`; the caller builds the `MandatoryComplete` Default archive (≤8 member lanes for ≥2 members), then refines it. | 🔴 |
+| ZIP member lanes | Any reporting mode; ≥8 similarly distributed jobs, or ≥2 in the Default sibling of a nonuniform Max race; input ≤8 MiB; unencrypted stored and Deflate entries ≤64 MiB decoded. | ≤8 balanced contiguous slices of the mode's entry order, each with its own metadata and output. Exhaustive workers time only their own slice; Default-floor workers run ordinary routes. Yielded members rejoin a serial weighted reclaim pass. | 🟡–🔴 |
+| Single-image PNG lineages | PNG single-image Max row of the [wrapper table](#wrapper-and-floor-policy-routing). | One worker builds a quick ordinary parent and continues it through `Established`; the caller keeps exact Default and the direct bounded routes. | 🔴 |
+| APNG whole-file lineages | Max; ≥1 fdAT frame; ≥2 CPUs; nonzero timeout; image data ≤8 MiB compressed, ≤64 MiB decoded. | A quiet worker completes the APNG Default file while the caller runs original-source Max for the full allowance, each with its own decode budget, state, and output. Max is kept only if no larger in bytes and aggregate meaningful bits. | 🔴 |
+| Multi-image PNG jobs | ≥2 unique jobs; time remains; ≤8 MiB compressed and ≤64 MiB exact decoded; Default also ≥2 CPUs. | ≤8 fixed lanes (Default: ≤ CPU count) run balanced contiguous slices of the small-to-large job order. Default lanes use the serial per-job timeouts; Max lanes use child-grace-aware proportional time and keep 4% of the phase for container work. Yielded jobs rejoin a serial weighted reclaim pass. | 🔴 |
+| Static PNG metadata floor | Max; no fdAT; compressed metadata 1 byte to 64 MiB. | One worker builds the cached `MandatoryComplete` metadata floors beside image work; the images' decoded size is pre-deducted from its budget. | 🟡 |
+| Initial bounded max phase | M5; M1/M2/M8/M9 gates; G0. | ≤4 workers (deft4j, no-split, initial source max, initial proven feedback) while the caller builds or reuses the floor lineage. `Shared`, `SharedExact`, and `ApngMax` can overlap eligible direct deft work with their Max seed. | 🔴 |
+| Generic single-image PNG phase | `CompleteThenBounded`; M5; G0; M6=`GenericParallel`. | One source-max worker; the caller builds the floor and its seeded Max lineage. | 🔴 |
+| Floor-seeded continuation | M7a; M5. | The caller continues the floor-seeded lineage; workers may run the deft4j-derived refinement (`CompleteThenBounded`), a pending compact split, and, under `ApngMax`, original-source Max. | 🔴 |
+| Bounded follow-up | Bounded policy; G0; refinement remaining. Source-max worker: `CompleteThenBounded` or `ApngMax`, M5, no completed or suppressing source-max route (a changed M2c parent takes the slot instead). Compact-split worker: ≥1 prepared weak-deft parent (M10c). | The caller refines the deft4j lineage beside compact split and one of source max or M2c (≤3 workers). | 🔴 |
+| Floor-seeded bounded grouping | M7 selects standalone grouping; greedy and bounded grouping [inner gate](#inner-stream-planner-gates). | ≤4 workers (bounded by hardware threads and block count) price ranges from assigned source blocks; results return in source order and the segmentation is chosen serially. The ordinary stream planner prices ranges serially. | 🟡 |
+| CLI spinner | Any reporting mode with an interactive standard error; detailed modes start it after format preflight. | Presentation only: from one second on, shows `optimizing` with the timeout countdown each second, then `concluding work` at zero. Detailed modes pause it around reports and stop it before the footer. | 🟢 |
 
-The ordinary stream planner deliberately prices bounded ranges serially; the
-parallel range-pricing step is used only by the floor-seeded grouping
-continuation. If only one hardware worker is available it falls back to serial
-pricing.
+If a worker fails to spawn, the caller runs equivalent work where appropriate
+or leaves the later serial route eligible. Route siblings share the immutable
+parsed input but own their candidate arenas and caches. An error or panic in a
+candidate-route sibling requests cooperative cancellation; every started scoped
+worker is joined before the error returns or the panic resumes, and no worker is
+killed. Grouping workers have no cancellation flag: an allocation failure marks
+range pricing unsuccessful, and a panic is held until every worker joins.
 
-Worker creation is optional. A failed archive, image-lane, route, or grouping
-spawn runs equivalent work on the caller when appropriate or leaves the normal
-later serial route eligible. Route siblings share
-immutable parsed input but own their candidate arenas and caches. An error or
-panic in a candidate-route sibling requests cooperative cancellation; all
-successfully started scoped workers are joined before the error is returned or
-the panic resumes. Grouping workers have no cancellation flag: allocation
-failure marks the range-pricing step unsuccessful, and a panic is remembered
-until every worker has joined. There is no force-kill.
-
-Completed candidates are merged in a fixed route order, and equal contenders
-retain the incumbent. The range-pricing result is deterministic because every
-started range completes and results are restored by source index. With a finite
-wall-clock deadline, however, operating-system scheduling can still change how
-far a cooperative search progresses, so timed runs are not promised to be
-bit-for-bit identical.
+Completed candidates merge in a fixed route order; ties keep the incumbent.
+Range pricing is deterministic: every started range completes, and results
+return in source-index order. With a finite deadline, operating-system
+scheduling can change how far a cooperative search gets, so timed runs need not
+be bit-for-bit identical.
 
 `Options` is immutable and reusable, so callers may run independent public API
-calls on their own threads. That caller-created concurrency is separate from
-the internal scheduler described here.
+calls on their own threads; calls with verbose or visual reporting run one at a
+time because they share standard output.
 
-## Method catalogue
+## Method catalog
+
+Each route's gates and bounds are in the
+[route-gate reference](#route-gate-reference); [Attribution](#attribution)
+expands the Provenance column.
 
 ### Wrapper and scheduling methods
 
 | Method or route | Current behavior | Indicator | Provenance |
 | --- | --- | --- | --- |
-| Original raw-candidate preservation | Keeps compatible raw Deflate source bytes as the relaxed fallback; strict repairs are the documented exception. Wrapper-level reconstruction or normalization can still change container bytes. | 🟢 | **Columbo** |
-| One-bit output selection | At equal byte length, any positive meaningful-Deflate-bit saving—including one bit—sets `bits_saved` and permits a CLI write. Padding-only changes do not. | 🟢 | **Columbo** |
-| Complete / CompleteThenBounded / Shared / SharedExact / ApngDefault / ApngMax / Established floors | Selects standalone, single-image PNG, heuristic multi-stream, exact multi-stream, multi-image APNG Default, multi-image APNG Max, or already-retained-parent deadline behavior without exposing wrapper policy as a public option. | 🟡 | **Columbo** |
-| Multi-stream fair slices and reclaim | Gives independent PNG image streams, ZIP entries, and concatenated GZIP members bounded initial opportunities, retains every complete result, and redistributes actual remaining file time among locally yielded jobs. A child slice ending is reported separately and cannot by itself set the public file-timeout result. | 🟡–🔴 | **Columbo Rust** |
-| Parallel and sequential ZIP max lineages | For nonuniform archives with optimizable work within 8 MiB input and 64 MiB decoded bounds, races exact Default and an `Established` original-source Max branch, then refines the completed Default archive. The direct branch does not rebuild ordinary work. The bounded Default sibling may use member lanes without multiplying the one file deadline or its grace. Larger or uniform archives serialize the same basins: complete Default, original-source Max for half the actual remainder, then floor refinement. A complete Max archive is selectable only when it dominates Default in both bytes and aggregate meaningful Deflate bits. | 🔴 | **Columbo** |
-| Parallel ZIP members | Runs balanced slices of at least eight similarly distributed independent members without duplicating the archive lineage. The bounded Default sibling of a nonuniform Max archive race may also use lanes for two or more independent members so it leaves more actual remainder for refinement. Exhaustive workers receive slice-local schedules, locally yielded members receive a serial reclaim pass, and reconstruction restores physical and central source order. | 🟡–🔴 | **Columbo Rust** |
-| PNG compressed-metadata scheduling | Gives small supported ancillary zlib streams a bounded early probe in non-Max runs. For bounded aggregate metadata, Max first caches complete Default floors so later image work cannot consume their opportunity. The dominant image search then owns the full remaining allowance. Reconstruction splits only the actual remainder between independent `Established` original-source and floor-seeded metadata descendants, retaining byte-and-bit dominance without double-charging decoded work. The unknown-unsafe-ancillary early return preserves the source first. | 🟡 | Original **Columbo C** probe; **Columbo Rust** floor preservation |
-| PNG invalid-exporter repair | Removes only the specification-forbidden palette-shaped `tRNS` vestige from RGBA inputs and ignores bytes after the terminating `IEND`; every decoded image/frame stream is still validated. | 🟢 | **PNG specification / Columbo Rust** |
-| APNG Default route budget | Runs the full initial planner once per multi-image stream, but reserves additive reparse/replay, endpoint-proven, and compact feedback lineages for Max. Static PNG, compressed metadata, GZIP, ZIP, raw, and zlib Default policies are unchanged. | 🟡 | **Columbo Rust** |
-| APNG Max file floor | For bounded multi-image models on 2+ CPUs, races a quiet complete Default file pipeline against original-source Max with the full configured Max allowance. `ApngMax` keeps the shared image schedule; the direct deft4j route is independently available to potentially useful streams under every Max floor, including GZIP, ZIP, and compressed PNG metadata. GZIP and streaming PNG metadata use `SharedExact` for their Default guarantee. The Max artifact replaces the floor only when both its byte length and aggregate meaningful Deflate-bit count are no worse. | 🔴 | **Columbo Rust** |
-| Exact PNG image geometry | Computes filtered IDAT/fdAT byte counts from IHDR/fcTL, including Adam7, and requires each zlib stream to decode to that exact size. | 🟢 | **PNG/APNG / Columbo** |
-| Parallel PNG Max scheduling | Races distinct bounded single-image lineages and assigns independent APNG streams to at most eight fixed lanes, with explicit memory and wall-clock headroom followed by serial weighted reclaim for locally yielded image jobs. | 🔴 | **Columbo** |
-| PNG duplicate and equivalent-frame reuse | Shares optimization for exact-compressed fdAT frames only when decoded geometry also matches, then uses bounded exact decoded comparison before reusing a better spelling across equivalent frames. IDAT remains a separate job. | 🟡 | **Columbo** |
-| PNG packet coalescing and APNG renumbering | Coalesces IDAT/fdAT packetization, saving one 12-byte chunk envelope per removed packet, and rebuilds APNG sequence numbers. | 🟢 | **PNG/APNG / Columbo** |
-| zlib effort-header normalization | Rebuilds RFC 1950 FLG with FLEVEL=3 and valid FCHECK while retaining CM/CINFO and rejecting preset dictionaries. This changes the API-selected wrapper even when the raw body is retained; the CLI still requires nonzero `bits_saved` before writing solely for compression. | 🟢 | **RFC 1950 / Columbo** |
-| GZIP member scheduling | Preflights concatenated members, optimizes them serially small-first with decoded-work-weighted slices and reclaim under shared timeout/decoded budgets, reconstructs physical source order, and optionally strips metadata. | 🟡 | **RFC 1952 / Columbo** |
+| Candidate selection and container lineages | Raw-source fallback and one-bit selection ([Overall pipeline](#overall-pipeline)); floor policies, ZIP and PNG lineages, frame reuse ([wrapper table](#wrapper-and-floor-policy-routing)). | 🟢–🔴 | **Columbo** |
+| Fair slices, member lanes, and APNG budgets | Multi-stream slices and reclaim, parallel ZIP members, `ApngDefault`, APNG Max file floor ([wrapper table](#wrapper-and-floor-policy-routing), [Multithreading](#multithreading)). | 🟡–🔴 | **Columbo Rust** |
+| PNG compressed-metadata scheduling | Bounded early probe in Default; complete Default floors and `Established` descendants in Max (PNG metadata row). | 🟡 | Original **Columbo C** probe; **Columbo Rust** floor preservation |
+| PNG invalid-exporter repair | Removes only the palette-shaped `tRNS` that PNG forbids in RGBA inputs. | 🟢 | **PNG specification / Columbo Rust** |
+| PNG geometry, packet coalescing, and APNG renumbering | Requires each IDAT/fdAT stream to decode to the filtered IHDR/fcTL size (Adam7 included); coalesces packets (12 bytes per removed chunk); renumbers APNG sequences. | 🟢 | **PNG/APNG / Columbo** |
+| zlib header normalization | Rebuilds the RFC 1950 header: FLEVEL=3, valid FCHECK, CM kept, smallest CINFO covering the largest output distance; rejects preset dictionaries. The CLI still needs nonzero `bits_saved` to write for compression alone. | 🟢 | **RFC 1950 / Columbo** |
+| GZIP member scheduling | Serial smallest-first members with decoded-work-weighted slices and reclaim, physical-order reconstruction, and optional metadata stripping. | 🟡 | **RFC 1952 / Columbo** |
 
 ### Block, Huffman, and token methods
 
 | Method or route | Current behavior | Indicator | Provenance |
 | --- | --- | --- | --- |
-| Strict length-258 normalization | Rewrites nonstandard symbol-284 length 258 and clears stale exact-source/tree reuse data. | 🟢 | **RFC 1951 / Columbo** |
-| Empty-block and adjacent-stored preparation | Removes redundant empty blocks while retaining one for an otherwise empty stream, and joins adjacent stored payloads when their combined plain length is ≤65,535 and the three-view payload model stays ≤48 MiB. | 🟢 | **Columbo** |
-| Exact source-block reuse | Reuses source bits when compatible. Stored originals require their original starting residue; fixed/dynamic originals are alignment-independent, and strict dynamic reuse requires compatible complete alphabets. When source and destination residues match, emission writes the partial edges and directly copies the aligned byte interior; other placements retain bounded bit copying. | 🟢 | **Columbo**; independently implemented portable emission hot path after reviewing general bitstream locality in **libdeflate** |
+| Strict length-258 normalization | Rewrites the non-standard symbol-284 spelling of length 258 and clears stale exact-source and tree reuse data. | 🟢 | **RFC 1951 / Columbo** |
+| Empty-block and adjacent-stored preparation | Removes redundant empty blocks (keeping one for an empty stream); joins adjacent stored payloads up to 65,535 bytes while the three-view payload model stays ≤48 MiB. | 🟢 | **Columbo** |
+| Exact source-block reuse | Reuses compatible source bits: stored originals only at their original starting residue, fixed and dynamic at any alignment, strict dynamic only with compatible complete alphabets. Same residue: byte copy; otherwise bounded bit copy. | 🟢 | **Columbo**; emission informed by the bitstream locality of **libdeflate** |
 | Stored/fixed/dynamic comparison | Prices complete legal representations with real alignment, payload, and header cost. | 🟡 | **RFC 1951 / Columbo** |
 | All-stored repack | Rechunks adjacent stored payload into legal 65,535-byte blocks without token search. | 🟢 | **RFC 1951 / Columbo** |
-| Safe payload decode and emission hot paths | The validating parser materializes matches in a bounded 258-byte scratch buffer, doubles proven overlap periods, and updates its history ring in slices. It accounts retained payload bytes incrementally while preserving exact decoded and structural model limits. Profiled decode-table entries consume match codewords with their extra fields, while final emission packs each match codeword and extra field into one buffered write. | 🟢 | General fast-Deflate concepts reviewed in **libdeflate**; independent safe **Columbo** data structures and control flow |
-| Strict/relaxed tree-shape policy | Strict completes required alphabets; relaxed permits explicitly supported empty or singleton forms and the compatibility length-258 alias. | 🟢 | **RFC 1951 / Columbo** |
-| Route-local canonical plan cache | Reuses exact-verified completed fixed/dynamic/header kernels within one planning run. Its bounded structural fingerprint omits derived state for speed, but every hit still compares tokens, frequency tables, source tree, and policy exactly. | 🟢 | **Columbo** |
-| Route-local header kernel cache | Reuses a completed zero-payload dynamic-header plan for exact trimmed literal/distance length sequences and header policy, including across different token orders. Hashes only select collision chains; full lengths and policy are verified, and each caller's payload cost is added independently with checked arithmetic. The cache is capped at 512 entries. | 🟢 | **Columbo** |
-| Length-limited Huffman families | Default tries DeflOpt-heap and Columbo order-heap variants; max adds generic, Columbo/Defluff, exact Defluff, deft4j Java-heap, and the package-first equal-payload shape under a capped, deduplicated cross-product. The DeflOpt/order heaps use an exact hole sift, moving the selected node once instead of swapping it at every level. Header feedback and short-family routes reuse route-local heap storage across equivalent builders, fixed alphabet buffers, and one candidate arena; this changes allocation only, not candidate breadth or order. Generic variant zero uses an exact sorted two-front merge. Variant one consumes reverse-ordered equal-frequency branch runs; wrapped totals fall back to its exact heap. The two mixed-tie variants maintain both child orders in paired heaps with lazy removal. | 🔴 | **DeflOpt / Defluff / deft4j / Zopfli / Columbo** as labelled in source; Zopfli identified the equality choice, with independent **Columbo** package-list integration and hot paths |
-| Reduced-depth payload-tree pair | Max only: builds exact Defluff literal/length and distance trees as one pair at maximum depths 10 and 9. These two candidates stay outside the existing tree-family cross-product, poll the route deadline, and replace the incumbent only when exact payload plus complete dynamic-header pricing wins. | 🟡 | Reduced-depth search dimension identified in **ECT**; independently written **Columbo** depth policy, pairing, gating, and exact integration |
-| Bounded-depth terminal tree floor | After the main search completes, every dynamic block is eligible for one raw-count frontier. The first depth is derived from prefix-code capacity (`2^depth >= populated symbols`); every restricted ceiling through 14 prices the deduplicated leaf-first and package-first shapes, while the completed unrestricted 15-bit parent stays independent. Max deduplicates both tie families across every feasible depth for each alphabet and exact-prices their complete cross-product, so literal/length and distance depths may differ. Separable alphabet payload sums order pairs by an admissible lower bound; a header is skipped only when payload alone cannot strictly beat the complete incumbent. The general pass polls the hard stop between pairs and blocks. At the hard boundary, a fixed rescue prices every transmitted dynamic block when the parent is at most 1 MiB compressed/decoded and 128 blocks. That deterministic frontier makes quiet, Verbose, and Visual reporting observational only: crossing the deadline a few milliseconds earlier cannot select a different rescue block. There is no corpus-trained admission band, token feedback is never redirected, and only an exact whole-stream win is selectable. | 🟡 | Bounded-depth dimension identified in **7-Zip** and equality choice in **Zopfli**; independently generalized **Columbo** feasibility rule, package-list tie policy, complete frontier, lower-bound ordering, scheduling, and exact terminal integration |
-| Compact payload-tree floor | After ordinary or Max search completes, compact Huffman streams receive one additive terminal pass comparing the raw bounded-depth frontier with independent Brotli fixed-point and classic Zopfli nearby-count seed families. Smoothed trees are exact-priced at paired maximum depths 15 through 9. A winner receives one bounded pair/quad tree-only closure and one final compact price. The route is bounded to 8 KiB compressed, 128 KiB decoded, eight blocks, and 4,096 tokens. It never changes tokens or redirects the parent search; exact whole-stream emission must strictly win. R14 prices the same smoothed families for every stream after the terminal searches. | 🟡 | Smoothers authored by **Google Brotli** (MIT) and **Google Zopfli** (Apache-2.0); bounded-depth dimension identified in **7-Zip/ECT**; independent bounded **Columbo** implementation and integration |
-| Deflate decode tables | Payload canonical tables carry code lengths and extra-bit metadata in one independently laid-out 64-bit entry. Literal/length roots use ten bits and distance roots six: one bit above the balanced width implied by the 288- and 32-symbol maximum alphabets. Deflate's separate 19-symbol code-length alphabet has a seven-bit format maximum, so a checked 128-byte single-level table stores symbol and width directly and falls back to short probes when fewer than seven physical bits remain. | 🟢 | independent **Columbo** layouts and malformed-input handling; table dimensions identified while reviewing **7-Zip** and general decode-table tradeoffs in **libdeflate** |
-| Planned bit emission | Final emission reserves the exactly priced output once, enforces that bit limit on every write, and therefore skips repeated capacity reservations. The safe 64-bit accumulator drains complete 32-bit little-endian words while retaining headroom for every legal write; aligned byte insertion flushes pending whole bytes first. Test and fixture writers without a plan retain ordinary fallible growth. | 🟢 | independent **Columbo** hot path, informed by the general buffered-emission theme in **libdeflate** |
-| Header RLE search | Generates each distinct result of the eight repeat-code masks plus balanced/residual variants, then runs feedback, deft4j-pruned headers, and in max a fixed-cost shortest RLE parse. Trees for one spelling are scored exactly from its 19-symbol histogram; the initial DeflOpt trees feed the first feedback pass directly, and owned plans are materialized only for a new winner. | 🔴 | **DeflOpt / deft4j / Columbo** as labelled in source |
-| Adjacency-quantized RLE tree | Max only: quantizes adjacent symbol frequencies into pseudo-weights, builds one RLE-friendly Huffman pair, then prices its complete header and payload against the original frequencies. | 🟡 | Zopfli/Turtledeflate-inspired pseudo-frequency shape; **Columbo** quantizer and exact scoring |
-| Exact Zopfli RLE-friendly tree | Max only: preserves useful equal-count runs, averages eligible nearby-count strides, builds one paired literal/distance tree candidate, then prices its complete header and payload against the original frequencies. It remains one candidate outside the existing tree-family cross-product; Columbo does not rerun a separate pre-smoothing topology route. | 🟡 | **Zopfli** `OptimizeHuffmanForRle` behavior; independently written **Columbo** integration and exact scoring |
-| Equal-frequency and code-length adjustments | Uses payload-neutral equal-frequency assignments and bounded length swaps when their complete header+payload cost wins. | 🔴 | **Columbo** |
-| Same-distance normalization | Coalesces or cost-repartitions adjacent matches already using one proven distance. | 🟢 | **Columbo** |
-| Cumulative short-length bands | Ordinary floors price five prefixes from symbol 260 through 260–264. Compact seeds use endpoints 257, 258, 259, 260, 262, and 264. Large no-split work uses endpoints 262, 265, 267, 269, and 270 plus one sparse family containing symbols 260–270 and 280. | 🟡 | **Columbo**, inspired by deft4j least-family pruning |
-| Match-to-literal alternatives | Emits known literals for selected existing matches when complete repricing wins; never finds a new match. | 🔴 | **Columbo**; labelled primitives retain DeflOpt/deft4j attribution |
-| Preflighted all-literals endpoint | Ordinary planning explicitly compares replacing every existing match by its known decoded literals. A one-tree estimate rejects distant candidates; dense blocks up to 80,000 decoded bytes and sparse-match blocks up to 1,000,000 bytes receive complete fixed/dynamic pricing. The expanded token vector is allocated only for a strict complete-block win. | 🟡 | all-literals comparison inspired by **libdeflate**; independent **Columbo** bounds, preflight, integration, and exact acceptance |
-| Proven-submatch resegmentation | Searches literal/match paths wholly inside an already-proved match at its original distance. | 🔴 | **Columbo** |
-| Original-match restoration | Retains original interval/distance proofs even when selected matches become literals. After the existing search finishes, a bounded shortest path restores profitable certified matches under the unchanged final trees and header RLE. Current spellings win exact payload ties, and the complete parent survives a whole-stream tie. R1 gives the work/deadline bounds; [validation](research/permanent-match-proofs-validation.md) records the controlled corpus evidence. | 🟢 | **Columbo** |
-| Strict distance completion | Strict output must send a complete distance code even when a block decodes no distance, or only one. Any complete code covering the used symbol decodes identically, so the choice is a header/payload price. R1b re-prices each finished degenerate block with uniform complete trees of depth 1–4 instead of only the planner's two one-bit codes, whose code-length symbol can force HCLEN from 14 to 18. It runs once per finished block, not inside trial planning, where the same candidates added CPU to every block search. [Validation](benchmark-miss-regression-audit.md#strict-distance-completion-on-30-september-2026) records Default, Max-guard and miss evidence. | 🟢 | **Columbo** |
-| Fixed-tree boundary slide | A block boundary changes neither the decoded bytes nor the history window, so a token can join its neighbouring block whenever that block's trees code it. With both trees fixed every header is unchanged, so a cheaper token cut saves payload bits outright. Earlier boundary routes plan fresh trees for a few sampled cuts; R1c prices every token cut between adjacent Huffman blocks against the trees actually selected, spelling a joining match as its literals when the neighbour cannot code it or codes those bytes more cheaply, then re-plans each moved block's trees and slides again under them until no block moves. Cuts inside matches were measured and add almost nothing beyond token cuts. [Validation](research/boundary-slide-validation.md). | 🟢 | **Columbo** |
-| Distance-alphabet ladder | Collapses a block's distance alphabet to a kept set of distance symbols, spelling every match outside it as its decoded literals: the distance tree loses those codes and the length tree those matches. Image data with a strong period can be carried by a few short distances while many rare far distances lengthen every code. Three ladders of kept sets are estimated from per-symbol histogram deltas without building tokens, and at most two rungs per block are priced exactly. R13 runs after R1c and slides once more after a win. Columbo cannot add the distance-1 matches a runs-only parse would find; it only removes existing matches. [Validation](research/distance-ladder-validation.md). | 🟡 | Inspired by **zenflate**'s runs-only guard; **Columbo** method |
-| Smoothed-tree finish | Prices the Brotli fixed-point and Zopfli nearby-count smoothed trees at depths 15 through 9 for every completed block, not only compact streams, and adopts each strictly smaller plan. Counts that are nearly equal produce irregular code lengths that run-length code poorly; smoothed trees trade a little payload for a cheaper header. R14 runs after R13 and slides once more after a win. [Validation](research/smoothed-tree-finish-validation.md). | 🟡 | Smoothers authored by **Google Brotli** and **Google Zopfli**; every-block comparison as in **ECT** and **zenzop**; **Columbo** placement |
-| Payload/header tradeoff | After restoration, compares full same-tree header repricing with bounded swaps that spend payload bits to simplify the transmitted length sequence. Each candidate swaps two unequal nonzero lengths within one data alphabet; reserved distance symbols are excluded. Ordinary greedy swap guards and their descendants stay unchanged. R2 gives the bounds; [validation](research/payload-header-tradeoff-validation.md) separates ordinary repricing from the new swap contribution and records runtime. | 🟡 | **Columbo** |
-| Advertised literal/length span | Keeps payload trees fixed while changing the advertised count of literal/length codes. Extra zero lengths may simplify a seam run or change the best code-length tree. Full header feedback explores all legal counts within R3's work/deadline bounds; a fixed-CL or repeat-threshold shortcut misses measured gains. The complete R2 parent remains independently selectable. [Validation](research/literal-span-validation.md) records raw, wrapper, Max and runtime controls. | 🟡 | **Columbo** |
-| Joint payload-tree and RLE search | Chooses payload lengths and their repeat instructions together under one fixed CL tree and advertised spans. This can change tree shapes and unused-code support beyond local permutations. R4 records the domain, admissible bounds, work and scratch limits; the unrestricted R3 parent remains selectable. [Validation](research/joint-tree-rle-validation.md) records exhaustive small oracles, incremental raw/container/Max savings and the measured runtime cost. | 🟡 | **Columbo** |
-| Joint code-length tree and RLE search | Optimizes the header’s CL tree and repeat spelling together for fixed data-tree length lists. Positive-run costs factor once repeat-16’s price is fixed; a Kraft DP and exact zero-run prices cover the remaining combinations. R7 records the Max-only policy, shared work cap and retention rules. [Validation](research/code-length-tree-validation.md) separates exhaustive small-tree oracles, frozen-parent gains and public-API results. | 🟡 | **Columbo** |
-| Three-symbol code-length rotations | Cycles three distinct positive lengths within a payload alphabet and fully reprices the resulting header. A joint rotation can win when none of its constituent pair swaps improves the parent. R8 records Max-only admission, deterministic menus, shared work/price caps and retention rules. [Validation](research/code-length-rotation-validation.md) includes a generated pair-swap local optimum, exhaustive pair controls, frozen Max parents and public-API comparisons. | 🟡 | **Columbo** |
-| Header-directed certified match response | Fits the cheapest spelling inside each current match to proposed payload trees, keeping each tree and its response together. A tree-only or spelling-only intermediate may tie or lose. R10 records Max-only placement, exact interval pricing, heuristic tree menus and shared caps. [Validation](research/header-response-validation.md) includes a generated interaction barrier, exhaustive single-swap controls, frozen Max gains and public-API comparisons. | 🟡 | **Columbo** |
-| Length-symbol exchange | Reassigns a used length code to an absent symbol, then repairs the payload using certified spellings. The recipient may stay unused when its placement makes the complete header cheaper. R11 prices complete headers first and uses an admissible payload bound before exact interval solving. [Validation](research/length-symbol-exchange-validation.md) includes frozen Max fixed points, unpruned controls and public comparisons. | 🟡 | **Columbo** |
-| Coupled literal/length and distance swaps | Swaps lengths in both payload alphabets as one candidate and fully reprices their shared header. The pair can improve even when every single swap ties or loses. R9 records Max-only placement, deterministic menus and shared work/price caps. [Validation](research/coupled-code-length-swaps-validation.md) includes a synthetic barrier, exhaustive single-swap controls, frozen Max parents, budget limits and public-API comparisons. | 🟡 | **Columbo** |
-| Joint payload symbol-set removal | Removes small sets of length/distance symbols together using certified local rewrites, then prices the complete payload and header with bounded feedback. R5 records the candidate menu, shared work/pricing caps, and retention rules. [Validation](research/symbol-set-validation.md) separates additional group coverage from existing single-symbol and composition searches and measures raw/container/Max results. | 🟡 | **Columbo** |
-| Alphabet-support boundary pairs | Finds coupled cuts around symbols confined to a region, allowing separate Huffman alphabets even when either cut alone loses. Adds bounded support-derived anchors to the existing alignment-aware graph and shares exact header kernels across ranges. R6 records Max-only admission, work caps and candidate retention. [Validation](research/alphabet-boundary-validation.md) distinguishes old-anchor controls, frozen Max gains, timed results and Default parity. | 🟡 | **Columbo** |
-| Header-aware proven-spelling composition | Max-only within compact M3: combines up to eight match menus in a 16-state frequency beam, deduplicates exact literal/distance frequencies plus match-extra bits, and exact-prices only multi-match combinations. | 🔴 | **Columbo** |
-| Adaptive closed-loop proven composition | On one unsplit source block of at most 1,024 decoded bytes, ranks forward spelling prefixes under the current global frequency state, reverse-repairs from the exact aggressive table, and reranks only after a strict win. At least three menus are required; two rounds share at most 24 complete prices and the completed static parent remains independent. | 🔴 | Closed-loop local/global search shape identified in **Google Guetzli**; independent existing-token **Columbo** ranking, reverse repair, gates, exact pricing, and acceptance |
-| Independent proven endpoint | Replays proven resegmentation after the ordinary candidate rather than allowing a local spelling to hide another fixed point. | 🔴 | **Columbo** |
-| Match-preserving and integrated proven feedback | Adds the compact D1/D2/M3 state orders as independent complete candidates. | 🟡 | **Columbo** |
+| Safe payload decode and emission hot paths | Bounded 258-byte match scratch, doubled overlap periods, and sliced history-ring updates in the validating parser; a decode entry consumes a codeword with its extra bits, and emission writes both at once. | 🟢 | Fast-Deflate techniques from **libdeflate**; safe **Columbo** implementation |
+| Strict/relaxed tree-shape policy | Strict completes required alphabets; relaxed permits the supported empty or singleton forms and the compatibility length-258 alias. | 🟢 | **RFC 1951 / Columbo** |
+| Route-local plan caches | Block-plan and header-plan caches ([Candidate reuse](#candidate-reuse-and-duplicate-work-control)). | 🟢 | **Columbo** |
+| Length-limited Huffman families | Default tries the DeflOpt-heap and Columbo order-heap variants; Max adds generic, Columbo/Defluff, exact Defluff, deft4j Java-heap, and the package-first equal-payload shape under a capped, deduplicated cross-product. | 🔴 | **DeflOpt / Defluff / deft4j / Zopfli / Columbo** as labeled in source; Zopfli equality choice with **Columbo** package-list integration |
+| Reduced-depth payload-tree pair | Max only: an exact Defluff tree pair at maximum depths 10 and 9, outside the tree-family cross-product; adopted only on a complete-pricing win. | 🟡 | Reduced-depth dimension from **ECT**; **Columbo** implementation |
+| Bounded-depth terminal tree floor | After the main search, each dynamic block prices deduplicated leaf-first and package-first shapes on raw counts at every depth ceiling from the first feasible (`2^depth >= populated symbols`) through 14, beside the 15-bit parent; Max prices the cross-product of both tie families over all feasible literal/length and distance depths. A payload lower bound orders pairs and skips headers that cannot strictly win. Polls the hard stop between pairs and blocks. Max: at the hard deadline, a fixed rescue prices every dynamic block when the parent is ≤1 MiB compressed and decoded with ≤128 blocks. No token feedback; only an exact whole-stream win is selectable. | 🟡 | Bounded-depth dimension from **7-Zip**, equality choice from **Zopfli**; generalized **Columbo** implementation |
+| Compact payload-tree floor | Compact Huffman streams (≤8 KiB compressed, ≤128 KiB decoded, ≤8 blocks, ≤4,096 tokens), after ordinary or Max search: one pass comparing the raw bounded-depth frontier with Brotli and Zopfli smoothed trees at paired depths 15–9; a winner gets one bounded pair/quad tree closure and a final price. Tokens fixed; exact emission must strictly win. | 🟡 | Smoothers by **Google Brotli** (MIT) and **Google Zopfli** (Apache-2.0); bounded-depth dimension from **7-Zip/ECT**; **Columbo** implementation |
+| Deflate decode tables | 64-bit payload entries (code length plus extra-bit data) with ten-bit literal/length and six-bit distance roots; a checked 128-byte single-level code-length table, with short probes when fewer than seven bits remain. | 🟢 | **Columbo**; table dimensions informed by **7-Zip** and **libdeflate** |
+| Planned bit emission | Reserves the exactly priced output once and enforces its bit limit on every write; a 64-bit accumulator drains 32-bit little-endian words, and aligned byte insertion flushes pending bytes first. Unplanned writers grow fallibly. | 🟢 | **Columbo**, informed by the buffered emission of **libdeflate** |
+| Header RLE search | Each distinct result of the eight repeat-code masks plus balanced and residual variants, then feedback, deft4j-pruned headers, and, in Max, a fixed-cost shortest RLE parse; each scored exactly from its code-length histogram. | 🔴 | **DeflOpt / deft4j / Columbo** as labeled in source |
+| Adjacency-quantized RLE tree | Max only: one RLE-friendly tree pair from quantized adjacent frequencies, priced on the true frequencies. | 🟡 | Inspired by **Zopfli**'s pseudo-frequencies, which **Turtledeflate** also uses; **Columbo** quantizer and exact scoring |
+| Exact Zopfli RLE-friendly tree | Max only: one paired tree from Zopfli's run-preserving count smoothing, outside the tree-family cross-product, priced on the true frequencies. | 🟡 | **Zopfli** `OptimizeHuffmanForRle` behavior; **Columbo** implementation |
+| Equal-frequency and code-length adjustments | Payload-neutral equal-frequency assignments and bounded length swaps, kept when their complete header-plus-payload cost wins. | 🔴 | **Columbo** |
+| Same-distance normalization | Coalesces or cost-repartitions adjacent matches that already use one proven distance ([details](#same-distance-match-run-normalization)). | 🟢 | **Columbo** |
+| Cumulative short-length bands | Prices cumulative length-symbol families (short-family, short-band, and no-split rows of [Inner token-search gates](#inner-token-search-gates)). | 🟡 | **Columbo**, inspired by deft4j least-family pruning |
+| Match-to-literal alternatives | Emits known literals for selected existing matches when complete repricing wins; never finds a new match. | 🔴 | **Columbo**; labeled primitives keep DeflOpt/deft4j attribution |
+| Preflighted all-literals endpoint | Replaces every existing match by its literals; a one-tree estimate rejects distant candidates, and tokens are expanded only for a strict complete-block win. | 🟡 | Idea from **libdeflate**; **Columbo** implementation |
+| Proven-submatch resegmentation and compositions | Literal/match paths inside a proven match at its distance, as an endpoint lineage, D1/D2/M3 state orders, and Max compositions ([details](#proven-submatch-resegmentation-and-feedback)). | 🟡–🔴 | **Columbo**; closed-loop search shape from **Google Guetzli** |
+| Terminal methods R1, R1b, R1c, and R2–R12 | Bounded post-search methods on the complete incumbent; see the [route-gate reference](#route-gate-reference). | 🟢–🟡 | **Columbo** |
+| Distance-alphabet ladder | Spells every match outside a kept set of distance symbols as literals, shrinking the distance alphabet (R13). | 🟡 | Inspired by **zenflate**'s runs-only guard; **Columbo** method |
+| Smoothed-tree finish | Adopts strictly smaller Brotli or Zopfli smoothed trees for every completed block (R14). | 🟡 | Smoothers by **Google Brotli** and **Google Zopfli**; every-block comparison as in **ECT** and **zenzop**; **Columbo** placement |
 | Terminal tree tightening | Applies bounded feedback trees and one strictly improving existing-match-to-literal replay to eligible final Huffman blocks. | 🟡 | DeflOpt-inspired primitive; **Columbo** scheduling |
-| Table replay ladder | Follows the selected table through up to four token-expansion/rebuild states, retaining the best intermediate. | 🟡 | **Columbo** |
-| Compact pair lengthening | On one dynamic block, independently searches both data alphabets: shorten one length-L code to L-1 and lengthen two other length-L codes to L+1. This preserves the Kraft sum; bounded frequency-ranked candidates may spend at most 18 payload bits and are accepted only when the complete header-plus-payload result wins. | 🟡 | **Columbo Rust** |
-| Compact quad lengthening | On one dynamic block, independently searches both data alphabets with the bounded one-shorter/four-longer equal-Kraft family, permits at most 18 extra payload bits, and prices complete header plus payload. | 🟡 | Original **Columbo C** literal/length method; **Columbo Rust** distance extension |
-| Paired balanced-tree move | Retains at most four lowest-payload-delta moves per data alphabet and exactly prices their at-most-sixteen-member cross-product, including the dynamic-header RLE run across the alphabet boundary. Default requires a non-positive combined payload delta; Max permits up to 18 extra payload bits. | 🟡 | **Columbo Rust** |
-| Compact balanced-tree cleanup | Selects the best standalone or paired tree, exhaustively finalizes only Default's winning tree, and may compose Max's tree result with compact proven feedback. The structural strict literal-only Default route runs at most four improving rounds; matched Max streams omit standalone literal pair pricing but retain distance and paired candidates. | 🟡 | **Columbo** scheduling |
+| Table replay ladder | Follows the selected table through up to four token-expansion and rebuild states, keeping the best intermediate. | 🟡 | **Columbo** |
+| Compact pair lengthening | One dynamic block, per data alphabet: one length-L code to L−1 and two others to L+1 (Kraft sum kept); bounded frequency-ranked candidates; ≤18 extra payload bits; complete header-plus-payload win. | 🟡 | **Columbo Rust** |
+| Compact quad lengthening | As pair lengthening, with one code shorter and four longer. | 🟡 | Original **Columbo C** literal/length method; **Columbo Rust** distance extension |
+| Compact balanced-tree cleanup | Exact-prices ≤16 pairs of the four lowest-payload-delta moves per alphabet (header RLE across the seam included); keeps the best standalone or paired tree, exhaustively finalizing only Default's winner. Max may combine it with compact proven feedback (M4, D3). | 🟡 | **Columbo Rust** |
 
 ### Structural and max routes
 
 | Method or route | Current behavior | Indicator | Provenance |
 | --- | --- | --- | --- |
-| Fixed/fixed 10-bit join | Removes one fixed end code and the next fixed header when adjacent selected blocks are fixed. | 🟢 | **DeflOpt** |
+| Fixed/fixed 10-bit join | Removes one fixed end-of-block code and the next fixed block header when adjacent selected blocks are fixed. | 🟢 | **DeflOpt** |
 | Shared source dynamic tree | Reuses an identical source dynamic tree over concatenated tokens and removes one header when cheaper. | 🟢 | **Columbo** |
-| Source-aligned floor | Prices all contiguous ranges over at most eight sources—36 ranges at eight blocks—and chooses the best source-boundary segmentation. | 🟡 | **Columbo** |
-| Whole-stream recode and replay | Gives a large complete merged range one extended token-preserving floor and a near-seed table replay before a shared container deadline can starve it. | 🟡 | **Columbo** |
+| Source-aligned floor | Prices all contiguous ranges over ≤8 sources (36 ranges at eight blocks) and chooses the best source-boundary segmentation. | 🟡 | **Columbo** |
+| Whole-stream recode and replay | One early extended token-preserving floor and near-seed table replay for a large merged range. | 🟡 | **Columbo** |
 | Greedy adjacent grouping | Carries a strictly winning merged block into the next adjacent comparison. | 🟡 | Original **Columbo C** block-list behavior |
-| Bounded grouping with ordered selection | Prices each legal span up to 16 once, then selects the least-cost complete ordered segmentation; optional floor-seeded range pricing uses at most four workers. | 🟡 | **Columbo** |
-| Bounded and wide collection | Folds long Huffman runs under bounded or broad token/plain limits before replay. | 🟡 | **Columbo** |
+| Bounded grouping with ordered selection | Prices each legal span of ≤16 blocks once, then selects the least-cost complete ordered segmentation. | 🟡 | **Columbo** |
+| Bounded and wide collection | Folds long Huffman runs under bounded or broad limits before replay. | 🟡 | **Columbo** |
 | Selected-plan merge cleanup | Prices every adjacent pair once on a newly selected compact Huffman plan without reparsing the whole stream. | 🟡 | **Columbo** |
-| Comparison-floor boundary reseat | Before broad source search, joins each adjacent pair in a bounded Max comparison floor only for adaptive cut discovery, exactly prices the replacement, and retains at most the strongest single strict win. | 🟡 | **Columbo** |
-| Forced-split boundary escape | In a compact Max comparison floor, retains one well-separated runner-up from the existing adaptive probes, forces that single cut, and tries one adjacent-boundary reseat. The original complete floor remains the exact acceptance bound. | 🟡 | Turtledeflate-inspired pushed-split concept; **Columbo** bounded implementation |
-| Source split family | Prices seven decoded-eighth cuts, compact max 32-token anchors, child search, and a bounded default runner-up midpoint with an optional exact inside-match sibling. | 🔴 | **Columbo** |
-| Inside-match boundary polishing | Adds exact decoded-boundary siblings inside proven matches and keeps the original distance. | 🔴 | **Columbo** |
-| Adaptive split probe | Samples, smooths, and narrows a bounded histogram search, then requires a 32-bit exact win. | 🟡 | Turtledeflate-inspired search shape; **Columbo** implementation |
-| Entropy-state boundary scout | Learns at most eight whole-stream Huffman states over the existing literal/length and distance tokens, finds a minimum-cost state path with an explicit switch charge, and offers at most sixteen strongest transitions to the exact global boundary graph. It never emits a block directly. | 🔴 | [Google Brotli](https://github.com/google/brotli) high-quality block-splitter search shape; independent **Columbo** Deflate costs, bounds, and exact acceptance |
-| Priority boundary graph | When a complete incumbent already protects source-order work, prices the independent global graph first for a compact one-block source or its first two-block replay. This recovers cut combinations before repeated per-block search can consume a finite Max budget; sufficient-time route coverage is unchanged. | 🔴 | **Columbo** |
-| Global boundary graph | Prices legal block ranges across cut anchors and eight bit residues, then chooses a complete path. | 🔴 | **Columbo** |
-| Dedicated deft4j source route | Runs the reconstructed deft4j source-state graph under M1. Every wrapper shares the same topology admission. Queue states and source-list working copies are charged to a 128 MiB route arena; there is no independent 4,096-state or 128-block ceiling, so elapsed time—not an unrelated iteration cap—controls compatible work that fits the safety budget. | 🔴 | **deft4j-inspired** where labelled in source |
-| No-split source route | Starts each block from the bounded deft4j-derived table/state seed, then runs Columbo cumulative length-family pruning and adjacent source-order merges without grouping, split, global-boundary, broad state-queue, individual one-match pruning, or iterative replay work. Source max owns the omitted individual-prune family. If the emitted result changes a boundary or token spelling, it receives one Default refinement inside the existing file grace; exact token/header-only states skip the duplicate work. | 🟡 | deft4j-derived seed; route and cumulative/merge policy **Columbo** |
-| Fragmented collection and replay | Builds a distinct seed from highly fragmented streams, capping each collected run at 4,096 tokens and 512 KiB decoded, then replays its compact 2–8-block structure. | 🔴 | **Columbo** |
-| Floor-seeded max continuation | Starts max planning from a completed rewritten floor without rebuilding the already-secured token-preserving comparison floor. | 🔴 | **Columbo** |
-| Best-first floor-seeded continuation | Continues an unfinished floor-seeded endpoint before weaker completed parents when it is the strict byte/bit best at the bounded-phase rejoin. This is dependency ordering rather than pruning: sufficient time still admits every sibling. | 🔴 | **Columbo** |
+| Comparison-floor boundary reseat | Max: uses each adjacent pair of a compact floor to find an adaptive cut; keeps the strongest strict reseat. | 🟡 | **Columbo** |
+| Forced-split boundary escape | Max: forces one well-separated runner-up adaptive cut in a compact comparison floor and tries one adjacent-boundary reseat. | 🟡 | Pushed-split concept from Turtledeflate; **Columbo** implementation |
+| Source split family | Decoded-eighth cuts, compact Max 32-token anchors, child search, and Default's runner-up midpoint. | 🔴 | **Columbo** |
+| Inside-match boundary polishing | Adds exact decoded-boundary siblings inside proven matches at the original distance. | 🔴 | **Columbo** |
+| Adaptive split probe | Bounded sample–smooth–narrow histogram search; needs a 32-bit exact win. | 🟡 | Search shape from Turtledeflate; **Columbo** implementation |
+| Entropy-state boundary scout | Learns ≤8 whole-stream Huffman states over existing tokens and offers ≤16 state transitions to the exact global boundary graph; emits no block itself. | 🔴 | Block-splitter search shape from [Google Brotli](https://github.com/google/brotli); **Columbo** Deflate costs and exact acceptance |
+| Priority and global boundary graphs | Price legal ranges across cuts and bit residues and choose a complete path; the priority form runs first on compact one- or two-block inputs. | 🔴 | **Columbo** |
+| Dedicated deft4j source route | Runs the reconstructed deft4j source-state graph (M1). | 🔴 | **deft4j-inspired** where labeled in source |
+| No-split source route | Per-block deft4j-derived seed, then length-family pruning and source-order merges (M2). | 🟡 | deft4j-derived seed; route and cumulative/merge policy **Columbo** |
+| Fragmented collection and replay | Collects a highly fragmented stream into 2–8 blocks and replays it (M11). | 🔴 | **Columbo** |
+| Floor-seeded max continuation | Max planning from a completed rewritten floor, strongest first (M7, M7a). | 🔴 | **Columbo** |
 | Source max route | Applies the broad original-source token, table, split, merge, grouping, and boundary planner. | 🔴 | **Columbo** |
-| Rewritten-seed refinement | Reparses a selected complete rewrite and runs max again unless an exact fixed point is known. | 🔴 | **Columbo** |
-| Compact split floor | Prices bounded eighth splits on eligible completed parents, preserving complete progress at deadline. Timed work first covers every cut with fast ordinary headers, exhaustively finalizes only the alignment-safe suffix of that winning topology, then continues with the exact Max sweep. Distinct parents are attempted in completed byte/meaningful-bit order, retaining original route order on an exact score tie, but remain eligible when sufficient Max time is available because split gains are not monotone in parent size. Exact completed parents and same-token/block, same-type deterministic endpoints are suppressed across phases; structurally changed descendants remain eligible. | 🟡 | **Columbo** |
-| Terminal merge | Greedily merges an eligible selected Huffman seed with deterministic floors, followed by at most two ordinary replays while time remains. | 🟡 | **Columbo** |
-| Fixed-point suppression | Avoids another max replay when an unexpired exhaustive pass reproduced the exact bytes and meaningful-bit count. | 🟢 | **Columbo** |
+| Rewritten-seed refinement | Reruns Max on the selected rewrite unless it is a known fixed point (M13). | 🔴 | **Columbo** |
+| Compact split floor | Bounded eighth splits on completed parents (M10c, M10d; [Boundary polishing](#boundary-polishing-inside-proven-matches)), in byte/meaningful-bit order (route order on ties); all stay eligible given enough Max time. | 🟡 | **Columbo** |
+| Terminal merge | Greedy merge of a selected Huffman seed with deterministic floors, then ≤2 ordinary replays while time remains. | 🟡 | **Columbo** |
+| Fixed-point suppression | Skips another Max replay when an unexpired exhaustive pass reproduced the exact bytes and meaningful-bit count. | 🟢 | **Columbo** |
 
 ## Scheduling and observability
 
-Embedded streams share their top-level file deadline and cumulative decoded
-budget. Timeout is a scheduling boundary, not a validation shortcut: later
-GZIP/ZIP members and scheduled PNG image representatives are still parsed,
-decoded, checksum-checked, and given a complete safe fallback. Exact-compressed
-fdAT duplicates reuse their already validated representative but charge the
-decoded budget once per occurrence. The unknown-unsafe-ancillary early return
-has the narrower metadata-validation behavior described in the wrapper table.
+Embedded streams share the file deadline and cumulative decoded budget. A
+timeout ends search, not validation: later GZIP and ZIP members and scheduled
+PNG image streams are still parsed, decoded, checksum-checked, and given a
+complete safe fallback, except after the unsafe-ancillary early return. fdAT
+duplicates reuse their validated representative but charge the decoded budget
+once per occurrence.
 
-`--dry-run` performs the complete optimization and reports the result without
-writing output. It combines with `--verbose`, which reports route timings,
-same-distance and balanced-tree opportunities, candidate bit gains, the
-`Pricing block boundaries` phase, selected route, and final block plan.
-Concurrent Verbose updates are cached as complete reports and written in
-physical stream order as the contiguous completed prefix advances. Visual mode similarly retains the
-final card for each optimizer trial and emits ordered, immutable cards without
-cursor rewinds. A stream waits for all possible reclaim passes and ZIP Max
-lineages before its report becomes eligible.
-Concurrent ZIP Default and direct-Max lineages remain distinctly labelled.
-Quiet, Verbose, and Visual runs use the same optimization, scheduling, and
-memory policies.
+Reporting does not change optimization: quiet, Verbose, and Visual runs use the
+same route gates, deadlines, candidate ordering, memory bounds, and worker
+parallelism. Workers buffer complete stream reports; one file-level coordinator
+writes each physical stream in source order once every earlier stream and every
+producer of that stream are final, including its reclaim passes and, in ZIP
+Max, all its archive lineages. Concurrent ZIP Default and direct-Max lineages
+are labeled separately. Visual mode keeps the final card of each optimizer
+trial and emits ordered, immutable cards without cursor rewinds.
+
+`--verbose` reports route timings, same-distance and balanced-tree
+opportunities, candidate bit gains, the `Pricing block boundaries` phase, the
+selected route, and the final block plan, and combines with `--dry-run`
+(optimize without writing). Verbose and Visual show the CLI timeout warning,
+distinguish `search slice reached` from `deadline reached`, and label a
+follow-up card `reclaimed time`; default output is one line per file. The
+spinner is under [Multithreading](#multithreading).
 
 ## Attribution
 
-These acknowledgements describe algorithmic inspiration and behavioral
-reconstruction. They do not imply directly copied source code.
+These acknowledgments describe algorithmic inspiration and behavioral
+reconstruction, not copied source code.
 
-- **DeflOpt**, by Ben Jos Walbeehm — existing-stream Deflate optimization,
+- **DeflOpt**, by Ben Jos Walbeehm: existing-stream Deflate optimization,
   especially dynamic-header transformations and the exact ten-bit fixed/fixed
-  join. Columbo's arbitrary merging and regrouping are independent methods.
-  See [Ben Jos Walbeehm's DeflOpt: what does it actually do?](https://encode.su/printthread.php?page=1&pp=30&t=455).
-- **defluff**, by Joachim Henke (`jo.henke`) — repeated Huffman optimization of
+  join; Columbo's arbitrary merging and regrouping are independent. See
+  [Ben Jos Walbeehm's DeflOpt: what does it actually do?](https://encode.su/printthread.php?page=1&pp=30&t=455)
+  and the [DeflOpt method analysis](research/deflopt-methods.md).
+- **defluff**, by Joachim Henke (`jo.henke`): repeated Huffman optimization of
   existing Deflate streams and data-section-aware feedback. See
-  [defluff — a deflate Huffman optimizer](https://encode.su/threads/1214-defluff-a-deflate-huffman-optimizer).
-- **deft4j**, by `NeRd` — existing-stream Deflate and archive optimization,
-  including minimum-code and structural behavior reconstructed by Columbo's
-  labelled deft4j route. See
-  [deft4j and JarTighten](https://encode.su/threads/4112-deft4j-amp-JarTighten-yet-another-deflate-stream-amp-Zip-optimiser).
-- **Turtledeflate**, by Ralf Willenbacher — inspiration for cumulative range
-  histograms and the sample–smooth–narrow shape of Columbo's bounded adaptive
-  split probe. Its randomized LZ77 path search is outside Columbo's scope. See
-  [Turtledeflate](https://github.com/rwillenbacher/turtledeflate).
-- **Zopfli**, by Google — a public reference for length-limited Huffman
-  construction, its package-before-leaf equality choice, header-aware
-  histogram adjustment, and block splitting. Columbo's alternate package tree
-  reuses its own pre-existing list builder and exact selector rather than
-  translating upstream code. Zopfli's LZ77 recompression is outside Columbo's
-  scope. See
-  [Zopfli](https://github.com/google/zopfli).
-- **ECT**, by Felix Hanau — identified reduced maximum Huffman depth and the
-  comparison of Brotli's newer fixed-point count smoother with Zopfli's
-  classic nearby-count smoother as useful Deflate tree-search dimensions.
-  Columbo independently retains paired depth-10/depth-9 Max candidates and a
-  bounded dual-family terminal smoothed-tree frontier over existing token
-  frequencies. It does not copy ECT source or adopt ECT's recompression,
-  match-discovery, PNG pixel-transform, or JPEG routes.
-  See [Efficient Compression Tool](https://github.com/fhanau/Efficient-Compression-Tool).
-- **libdeflate**, by Eric Biggers — inspiration for retaining an explicit
-  all-literals alternative beside iterative match paths. Columbo applies that
-  idea only to already decoded source literals, with its own bounded
-  frequency-only preflight and complete representation pricing; it does not
-  use libdeflate's match finder or parsing code. See
+  [defluff — a deflate Huffman optimizer](https://encode.su/threads/1214-defluff-a-deflate-huffman-optimizer)
+  and the [defluff method analysis](research/defluff-methods.md).
+- **deft4j**, by `NeRd`: existing-stream Deflate and archive optimization,
+  whose minimum-code and structural behavior Columbo's deft4j route
+  reconstructs. See
+  [deft4j and JarTighten](https://encode.su/threads/4112-deft4j-amp-JarTighten-yet-another-deflate-stream-amp-Zip-optimiser)
+  and the [deft4j method analysis](research/deft4j-methods.md).
+- **Turtledeflate**, by Ralf Willenbacher: cumulative range histograms and the
+  sample–smooth–narrow shape of the adaptive split probe. See
+  [Turtledeflate](https://github.com/rwillenbacher/turtledeflate) and the
+  [Turtledeflate method analysis](research/turtledeflate-methods.md).
+- **Zopfli**, by Google: length-limited Huffman construction, its
+  package-before-leaf equality choice, header-aware histogram adjustment, and
+  block splitting; Columbo's alternate package tree uses its own list builder
+  and exact selector. See [Zopfli](https://github.com/google/zopfli).
+- **ECT**, by Felix Hanau: reduced maximum Huffman depth and the choice
+  between Brotli's and Zopfli's smoothers as Deflate tree-search dimensions;
+  Columbo does not adopt ECT's recompression, match discovery, PNG pixel
+  transforms, or JPEG routes. See
+  [Efficient Compression Tool](https://github.com/fhanau/Efficient-Compression-Tool).
+- **libdeflate**, by Eric Biggers: the all-literals alternative (applied to
+  existing source matches) and the decode and emission techniques credited in
+  the method catalog; no libdeflate match finder or parser is used. See
   [libdeflate](https://github.com/ebiggers/libdeflate).
-- **zenflate**, by Imazen — inspiration for R13. Its PNG mode compares each
-  block with a runs-only parse, having found that any distance code beyond
-  distance 1 lengthens the run codes. Columbo cannot add matches, so it
-  instead removes existing matches outside a kept set of distance symbols; it
-  does not use zenflate's parsers or code. See
-  [zenflate](https://github.com/imazen/zenflate).
-- **RFC 1951**, by L. Peter Deutsch — the normative Deflate format. See
+- **zenflate**, by Imazen: the idea behind R13, from its PNG-mode comparison of
+  each block with a runs-only parse; Columbo removes existing matches instead
+  of adding distance-1 matches. See [zenflate](https://github.com/imazen/zenflate).
+- **RFC 1951**, by L. Peter Deutsch: the normative Deflate format. See
   [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951).
+
+The method catalog also credits Google Brotli, Google Guetzli, 7-Zip, and zenzop
+for the search dimensions named in its provenance column.
 
 ## Scope boundary
 
@@ -1048,12 +928,12 @@ reconstruction. They do not imply directly copied source code.
 ### Outside Columbo
 
 - Searching the 32 KiB history for new matches.
-- Choosing a new alternative distance for a match.
+- Choosing a new distance for a match.
 - Running Zopfli, libdeflate, or another recompressor.
-- Randomized LZ77 path tracing.
-- Sharing one dynamic tree between separately emitted Deflate blocks; each such
-  block must transmit its own tree, so merging is the useful legal form.
+- LZ77 path search over randomized or perturbed cost models.
+- Sharing one dynamic tree between separately emitted Deflate blocks; each block
+  must transmit its own tree, so merging is the useful legal form.
 
-Proven-submatch resegmentation and inside-match boundary polishing do not
-search history. Every generated match remains within a source-proved decoded
-interval and retains that source token's distance.
+Proven-submatch resegmentation and inside-match boundary polishing do not search
+the history window: every generated match stays within a source-proven decoded
+interval and keeps that source token's distance.

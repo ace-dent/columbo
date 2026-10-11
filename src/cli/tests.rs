@@ -140,9 +140,9 @@ fn no_gain_creates_a_missing_explicit_output_from_the_original() {
 
 #[test]
 fn no_gain_does_not_write_a_zlib_header_only_change() {
-    // Optimizing this empty stream can lower CINFO from 32 KiB to 256
-    // bytes, but its Deflate payload cannot save bytes or meaningful bits.
-    // An explicit destination must therefore receive the original bytes.
+    // Optimizing this empty stream can lower CINFO from 32 KiB to 256 bytes,
+    // but saves no bytes or meaningful bits, so the explicit destination must
+    // receive the original bytes.
     let source = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
     let directory = unique_test_directory();
     let input = directory.join("input.zlib");
@@ -258,8 +258,8 @@ fn strip_writes_padding_cleanup_even_without_a_size_or_bit_saving() {
 
 #[test]
 fn strip_only_size_savings_write_in_place_and_explicit_outputs() {
-    // This empty fixed stream cannot get smaller. Every byte saved below
-    // comes from stripping the suffix, with identical Deflate bytes and bits.
+    // This empty fixed block cannot get smaller, so every byte saved below
+    // comes from stripping the suffix.
     let stream = [0x03, 0x00];
     let suffix = b"extraneous payload";
     let mut source = stream.to_vec();

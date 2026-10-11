@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Fit certified token spellings to proposed payload trees. A tree change can
-//! lose on the current tokens yet win after matches respond to its code prices.
+//! Re-spell matches under proposed code-length swaps. A swap can lose on the
+//! current tokens yet win once every match is re-spelled, as literals and
+//! proven submatches, under the new code lengths.
 
 use super::{plan_for_advertised_lengths, token_bits, transitions_removed};
 use crate::deflate::minima::SuffixMinima;
@@ -106,8 +107,9 @@ struct MatchFamily {
     bits: u64,
 }
 
-/// Canonical widths in one length family share a code and extra-bit count.
-/// Keep length 258 in its own family; its relaxed alias is a source edge only.
+/// One family per length symbol: its lengths share one code and extra-bit
+/// count. Length 258 has its own family (symbol 285); the non-standard alias
+/// through symbol 284 is reachable only by keeping the source token.
 fn match_families<'a>(
     seed: Token,
     literal: &'a [u8],
@@ -139,9 +141,10 @@ fn match_families<'a>(
         })
 }
 
-/// Exact shortest spelling for one existing match under unchanged code prices.
-/// Missing symbols are forbidden, and every generated match stays inside this
-/// interval at the original distance. The original token wins a cost tie.
+/// Cheapest spelling of one source match under fixed code lengths. Symbols
+/// without a code are not used, and every generated match is a proven
+/// submatch: it stays inside the source match at the same distance. The
+/// source token wins a cost tie.
 fn spell(
     seed: Token,
     plain: &[u8],
@@ -155,8 +158,8 @@ fn spell(
     if !(3..=258).contains(&n) || n != seed.decoded_len() || stop.reached() {
         return None;
     }
-    // Charge array preparation and every DP edge, including absent symbols,
-    // before starting an interval. A cutoff never exposes a partial spelling.
+    // Charge array setup and every DP edge, including absent symbols, before
+    // starting a match. A cutoff never exposes a partial spelling.
     budget.spend(3 * 259 + n * (n + 1) / 2)?;
     let mut families = [MatchFamily::default(); 29];
     let mut family_count = 0;
@@ -166,7 +169,7 @@ fn spell(
     }
     let families = &families[..family_count];
     let mut costs = [INF; 259];
-    // 1 emits a literal, 3..=258 a canonical submatch, 259 the exact source.
+    // 1 emits a literal, 3..=258 a canonical submatch, 259 the source token.
     let mut choices = [0_u16; 259];
     costs[n] = 0;
     // Short families need at most four direct comparisons. Build the index
@@ -312,8 +315,8 @@ fn proposals(
                 }
                 let positions = [offset + a, offset + b];
                 let removed = transitions_removed(lengths, positions, [lb, la]);
-                // These are admission/ranking heuristics, not lower bounds:
-                // a response can recover more than the original payload tax.
+                // This filter and the ranking are heuristics, not bounds:
+                // re-spelling can recover more than the swap's payload cost.
                 if removed < 0 {
                     continue;
                 }
@@ -332,9 +335,10 @@ fn proposals(
     Some(menu)
 }
 
-/// Keep each proposed tree while fitting its certified payload. No rebuilding
-/// from the new frequencies is required. Tree-only or spelling-only steps need
-/// not improve; only an exactly priced complete block may replace its parent.
+/// For the unchanged tree and each proposed swap, keep those code lengths
+/// fixed and re-spell every match under them; the tree is not rebuilt from the
+/// new frequencies. Neither the swap nor the re-spelling needs to improve on
+/// its own: only an exactly priced complete block may replace the parent.
 pub(crate) fn plan_header_response(
     block: &ParsedBlock,
     strict: bool,
@@ -383,6 +387,8 @@ pub(crate) fn plan_header_response(
                 return None;
             }
             let payload = token_bits(&tokens, &lengths[..middle], &lengths[middle..])?;
+            // Any dynamic header costs at least 17 bits: BFINAL, BTYPE, HLIT,
+            // HDIST and HCLEN.
             if payload + 17 >= best_bits {
                 return None;
             }

@@ -4,9 +4,10 @@
 //! Raw-stream optimization orchestration and complete-candidate selection.
 //!
 //! Validate the source before scheduling optional routes, retain the required
-//! Default comparison floor, and compare emitted candidates by physical bytes
-//! followed by meaningful bits. Search policies live here; block-boundary and
-//! token-spelling algorithms live in `stream` and `search` respectively.
+//! Default comparison floor, and compare emitted candidates by bytes, then
+//! meaningful bits. Block-boundary and token-spelling algorithms live in
+//! `stream` and `search`. Route labels (D1, M0, R1, …) refer to
+//! `docs/routes-and-methods.md`.
 
 use std::thread;
 use std::time::Instant;
@@ -51,117 +52,77 @@ mod schedule;
 
 pub(crate) use schedule::optimize_raw_prefix_with_floor_and_grace;
 
-/// Long source-block chains can need one pass to establish profitable adjacent
-/// groups, then two inexpensive passes over that much simpler block layout to
-/// settle their boundaries and tables. Every round below must strictly improve
-/// the complete stream, so the extra slot cannot oscillate or grow the output.
+/// One round groups adjacent source blocks; two more settle the new layout's
+/// boundaries and tables.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
-/// Further R13/R14 passes after a pass that won, when no later Max sweep can
-/// revisit the slid blocks: Default, Max's mandatory Default endpoint, and Max
-/// once its soft deadline has passed. A win re-slides under new trees, and the
-/// first repeat finds most of what the slid blocks expose; later passes find
-/// little for their cost. While time remains, Max's own sweeps revisit R13 and
-/// R14 through R12 until neither wins, so this bound never limits Max.
+/// Extra R13/R14 passes after a winning pass when no later R12 sweep can
+/// revisit them.
 const TREE_FINISH_REPEATS: usize = 1;
-/// Bound terminal header work even inside the mandatory Default comparison
-/// floor. The swap/span passes admit at most 1,024 full header prices each;
-/// joint tree/RLE search has its own shared operation and scratch bounds.
+/// Default's size limit for R1b–R5, also used by Max's mandatory Default floor.
 const TERMINAL_HEADER_MAX_BYTES: usize = 128 * 1024;
-/// Max's terminal header methods share this larger work class. Their search
-/// budgets stay bounded independently of the surrounding decoded bytes.
-/// Stream owners also reserve terminal time throughout the admitted class.
+/// Max's size limit for the terminal header methods; also bounds
+/// [`TerminalShare::Search`].
 const MAX_TERMINAL_HEADER_MAX_BYTES: usize = 1024 * 1024;
 const TERMINAL_HEADER_MAX_BLOCKS: usize = 128;
+/// Full-header prices per R1b, R2 or R3 invocation, shared across blocks.
 const TERMINAL_HEADER_MAX_PRICES: usize = 1024;
-/// Max uses the sentinel below to resolve a proof-derived replay ceiling after
-/// its initial candidate is emitted. For an L-byte stream there are only 8L
-/// possible (byte length, meaningful-bit residue) scores no worse than it, and
-/// every accepted replay strictly improves that pair. This reaches a metric
-/// fixed point given sufficient time without an arbitrary eight-round cutoff.
+/// Sentinel: replay until a round fails to improve, bounded by
+/// [`resolved_replay_limit`].
 const MAX_RAW_REPLAY_LIMIT: usize = usize::MAX;
 const NARROW_SOURCE_LIST_MAX_BLOCKS: usize = 128;
-/// Three source blocks expose at most two adjacent-merge boundaries, so the
-/// individual-pruning walk can still cover the complete short list. Longer
-/// chains prioritize cumulative pruning first: local work on an early block can
-/// otherwise consume the route window before later alignment/merge states are
-/// visited. The complementary policy remains eligible later in Max.
+/// From this many nonempty source blocks, the no-split route prunes
+/// cumulatively first, so early blocks cannot use up the route window.
 const CUMULATIVE_NO_SPLIT_MIN_SOURCE_BLOCKS: usize = 4;
+/// A multi-block direct deft4j gain below this (2%) counts as weak.
 const WEAK_DEFT4J_GAIN_BASIS_POINTS: u64 = 200;
-/// The no-split sibling is linear in the source block list, but each bounded
-/// per-block search retains route-local candidates. Pair a 1 MiB compressed
-/// ceiling with the 128-block ceiling below so this worker stays well inside
-/// the existing 64 MiB parallel-model class. No lower size bound is needed: on
-/// compact multi-block streams it cheaply reaches later blocks that a broad
-/// source-order graph may not visit before the deadline.
+/// With [`NARROW_SOURCE_LIST_MAX_BLOCKS`], keeps the no-split route's
+/// candidates well inside [`PARALLEL_ROUTE_MAX_MODEL`].
 const NARROW_SOURCE_MAX_COMPRESSED: usize = 1_024 * 1_024;
-/// A completed compact deft4j-derived seed may expose useful eighth-position
-/// child splits after the timed route has settled its tokens and source joins.
-/// Keep this deterministic Columbo floor tightly bounded: it finishes at most
-/// seven structural prices per block and never starts another token search.
+/// Limits for the compact split floor (M10c).
 const COMPACT_SPLIT_FLOOR_MAX_COMPRESSED: usize = 16 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_DECODED: u64 = 128 * 1024;
 const TERMINAL_SOURCE_SPLIT_MAX_DECODED: u64 = 256 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_BLOCKS: usize = 4;
 const COMPACT_SPLIT_FLOOR_MAX_TOKENS: usize = 16 * 1024;
-/// A large one-block source beam competes with the completed PNG floor for the
-/// same cache and memory bandwidth. Start both only when independent
-/// same-distance repartitions are common enough to justify that competition:
-/// one opportunity per sixteen source tokens keeps prospective structural work
-/// proportional to the token graph that must be searched.
+/// A large one-block source max overlaps the completed PNG floor only with at
+/// least one repartition run per this many source tokens, since both compete
+/// for cache and memory bandwidth.
 const DENSE_REPARTITION_TOKENS_PER_RUN: usize = 16;
-/// The original Columbo C quad-lengthening move is a bounded one-block header
-/// floor. Its upper model limits avoid turning it into another general search;
-/// no corpus-derived lower size or token threshold is needed.
+/// Limits for the one-block compact balanced-tree floor (M4).
 const COMPACT_TREE_MAX_COMPRESSED: usize = 8 * 1_024;
 const COMPACT_TREE_MAX_DECODED: u64 = 128 * 1_024;
 const COMPACT_TREE_MAX_TOKENS: usize = 4_096;
 const RLE_SMOOTHED_TREE_FLOOR_MAX_BLOCKS: usize = 8;
 const DEFAULT_STRICT_TREE_ROUNDS: usize = 4;
-/// A complementary source-root beam remains cheap on very small token graphs,
-/// even when proven feedback has already improved the ordinary floor. Retain
-/// both basins through a 2,048-token graph; above it, the extra beam competes
-/// materially with the richer floor-derived route.
+/// M9: up to this many tokens, source max also runs beside M3.
 const COMPACT_COMPLEMENTARY_SOURCE_MAX_TOKENS: usize = 2_048;
-/// The compact proven-feedback route is itself limited to 4,000 tokens and
-/// exact-prices only a capped set of candidate siblings. In the upper
-/// three-eighths of that work class, run one broad source-token owner instead
-/// of two long workers. Source max retains the wider state graph, and its
-/// deterministic finalization still applies proven feedback to a winning
-/// compact header rewrite. The restart still requires either a proved
-/// same-distance repartition or enough decoded data to span RFC 1951's maximum
-/// stored-block payload; without either topology, the floor lineage retains the
-/// only structurally motivated basin. Smaller graphs retain the cheaper proven
-/// lineage unless multiple independent repartitions justify source max.
+/// M9: token band in which one source-max worker may replace two long workers
+/// on the same graph.
 const COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS: usize = 4_000;
 const COMPACT_SINGLE_SOURCE_ROUTE_MIN_TOKENS: usize =
     COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS * 5 / 8;
-/// A source graph whose tokens each cover almost a full Deflate match on
-/// average has little literal/alphabet work for every decoded byte. Within the
-/// existing 4,000-token single-route bound, 224 bytes (7/8 of 256) provides a
-/// rounded, format-independent definition of that cheap long-match topology.
+/// Mean decoded bytes per token (7/8 of 256) at or above which a graph of at
+/// most 4,000 tokens consists almost entirely of long matches.
 const NEAR_MAX_MATCH_MEAN_DECODED_PER_TOKEN: u64 = 7 * 32;
 const DEFLATE_MAX_STORED_BLOCK_PLAIN: u64 = 65_535;
-/// Parallel routes shorten a container's wall-clock search without making its
-/// peak memory proportional to every individually valid route budget. Larger
-/// streams retain the same candidates, but evaluate them serially.
+/// Limits for running routes in parallel (M5), so peak memory does not grow
+/// with every route's own budget.
 const PARALLEL_ROUTE_MAX_COMPRESSED: usize = 8 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_ROUTE_MAX_MODEL: usize = 64 * 1_024 * 1_024;
-/// A post-deadline tree rescue reparses and may re-emit its completed parent.
-/// Cap both byte traversals at one MiB and the block walk at the existing
-/// narrow-list bound; only one block receives the fixed-alphabet tree search.
+/// Limits for the bounded-depth tree rescue after the hard stop; its block
+/// limit is [`NARROW_SOURCE_LIST_MAX_BLOCKS`].
 const BOUNDED_DEPTH_RESCUE_MAX_COMPRESSED: usize = 1_024 * 1_024;
 const BOUNDED_DEPTH_RESCUE_MAX_DECODED: u64 = 1_024 * 1_024;
-/// A small ordinary floor is cheap enough to establish before launching the
-/// heavier source graphs. Above this class, overlap preserves max-search wall
-/// time unless the floor's decoded work is itself large enough to cause working
-/// set contention. The match-work check at the call site also prebuilds floors
-/// whose source graph cannot reliably finish inside the initial four-fifths.
+/// M0: `CompleteThenBounded` floors between these decoded sizes are built
+/// beside the source routes, not first, unless the source has one nonempty
+/// block or a dense match graph. Smaller floors are cheap, and larger ones
+/// would contend with concurrent routes.
 const PREBUILD_BOUNDED_FLOOR_MAX_DECODED: u64 = 768 * 1_024;
 const CONCURRENT_BOUNDED_FLOOR_MAX_DECODED: u64 = 2 * 1_024 * 1_024;
 
-/// Facts collected while decoding the source stream. Container handlers use
-/// these values to validate their checksums without inflating a second time.
+/// Facts from decoding the source stream, which containers use to check their
+/// checksums without inflating again.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RawInfo {
     pub(crate) crc32: u32,
@@ -178,42 +139,33 @@ pub(crate) struct RawOptimization {
     pub(crate) data: Vec<u8>,
     pub(crate) consumed: usize,
     pub(crate) info: RawInfo,
-    /// Largest backward distance actually emitted in `data`.
     pub(crate) output_max_distance: u16,
     pub(crate) timed_out: bool,
 }
 
-/// Decide how a caller establishes the ordinary-mode comparison floor.
-///
-/// A standalone stream uses [`DefaultFloor::Complete`] to try the ordinary
-/// route before max-only work. A single scheduled PNG image uses
-/// [`DefaultFloor::CompleteThenBounded`] for the same ordering before PNG's
-/// bounded max routes. Both finish the comparison floor even when Max's
-/// optional-search deadline expires: timeout pressure may curtail Max work, but
-/// it must never make Max worse than Default. Multi-stream containers use
-/// [`DefaultFloor::Shared`] so one member cannot consume time needed by later
-/// members. [`DefaultFloor::SharedExact`] keeps the same multi-stream schedule
-/// but retains the complete ordinary feedback endpoint before Max-only work.
-/// Multi-image APNG Default uses [`DefaultFloor::ApngDefault`] to keep the full
-/// initial planner but leave repeated replay and feedback lineages to Max.
-/// Multi-image APNG Max uses [`DefaultFloor::ApngMax`] to retain shared
-/// container scheduling while running the full Max route set. Every Max floor
-/// admits potentially useful direct deft4j source work; the floor enum no
-/// longer acts as a permanent topology gate. [`DefaultFloor::Established`]
-/// means the caller already retains the complete input stream as its comparison
-/// floor, so descendants can begin without rebuilding an ordinary candidate.
-/// [`DefaultFloor::MandatoryComplete`] is the corresponding policy for a
-/// container-level Default branch built on behalf of Max: the branch uses
-/// ordinary routes, but its raw members cannot be interrupted by Max's clock.
+/// How a caller establishes the Default comparison floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
+    /// A standalone stream runs the Default route before Max-only work. The
+    /// floor finishes even after Max's optional-search deadline, so a timeout
+    /// never makes Max worse than Default.
     Complete,
+    /// `Complete` for a single scheduled PNG image, before PNG's bounded Max
+    /// routes.
     CompleteThenBounded,
+    /// A multi-stream container member, which must not consume time needed by
+    /// later members.
     Shared,
+    /// `Shared`, but keeps the complete Default endpoint before Max-only work.
     SharedExact,
+    /// Multi-image APNG Default; leaves replay and feedback lineages to Max.
     ApngDefault,
+    /// Multi-image APNG Max; shared scheduling with the full Max route set.
     ApngMax,
+    /// The caller already retains the complete input as its floor.
     Established,
+    /// A container-level Default branch built for Max, which Max's clock
+    /// cannot interrupt.
     MandatoryComplete,
 }
 
@@ -226,16 +178,9 @@ impl DefaultFloor {
         matches!(self, Self::CompleteThenBounded)
     }
 
-    /// Whether a bounded PNG owner can run original-source Max beside the
-    /// dependent deft4j refinement inside the same assigned wall window.
-    ///
-    /// A standalone PNG owns the file window directly. Each APNG child owns a
-    /// proportional frame window assigned by the outer scheduler. Both start
-    /// the independent source root even when the direct deft4j parent is
-    /// immediately smaller: score order between complete parents does not
-    /// prove order between their eventual search endpoints. Giving both roots
-    /// a positive concurrent share makes each reachable as the allowance
-    /// grows. Other shared container members retain their serial route order.
+    /// Whether original-source Max may run beside the deft4j refinement (M10b),
+    /// even when the direct deft4j parent is smaller: parent order does not
+    /// predict endpoint order.
     fn allows_parallel_source_follow_up(self) -> bool {
         matches!(self, Self::CompleteThenBounded | Self::ApngMax)
     }
@@ -244,13 +189,8 @@ impl DefaultFloor {
         matches!(self, Self::Complete | Self::CompleteThenBounded)
     }
 
-    /// Give admitted terminal methods a positive share instead of allowing an
-    /// unfinished primary search to make their endpoint unreachable. An APNG
-    /// Max child owns a proportional image-job slice, so it can reserve the
-    /// tail of that slice without consuming a sibling frame's allowance.
-    /// An established continuation also runs in its own window; outside the
-    /// header work class it reserves the same linear finalization share.
-    /// Other shared streams keep their schedule.
+    /// How much of a Max stream's allowance to reserve for terminal methods
+    /// (G0t), so an unfinished primary search cannot starve them.
     fn terminal_share(
         self,
         options: &Options,
@@ -283,12 +223,12 @@ impl DefaultFloor {
 enum TerminalShare {
     /// Primary routes use the whole allowance.
     None,
-    /// The terminal header methods' work class. Primary work keeps four
-    /// fifths, or an APNG child nineteen twentieths of its slice.
+    /// Within the terminal header size limit: primary work keeps four fifths
+    /// (an APNG child nineteen twentieths) of its slice.
     Search,
-    /// Outside that class only linear finalization, the bounded-depth tree
-    /// floor and R1c, can use terminal time, so primary work keeps nineteen
-    /// twentieths.
+    /// Outside that limit only linear finalization (the bounded-depth tree
+    /// floor, R1c, R13 and R14) uses terminal time, so primary work keeps
+    /// nineteen twentieths.
     Finalization,
 }
 
@@ -306,11 +246,8 @@ pub(crate) fn optimize_raw(input: &[u8], options: &Options) -> Result<RawOptimiz
     Ok(optimized)
 }
 
-/// Parse one complete raw stream without running any optimization routes.
-///
-/// Detailed container inspection uses this to locate concatenated GZIP member
-/// trailers before the live header is printed. The normal optimization pass
-/// still performs its own validation and retains the decoded model it plans.
+/// Parse one complete raw stream without optimizing it, so container inspection
+/// can find concatenated GZIP member trailers.
 pub(crate) fn inspect_raw_prefix(input: &[u8], decoded_limit: u64) -> Result<(usize, RawInfo)> {
     let parsed = parse_stream(input, decoded_limit)?;
     Ok((
@@ -328,19 +265,11 @@ pub(crate) fn inspect_raw_prefix(input: &[u8], decoded_limit: u64) -> Result<(us
     ))
 }
 
-/// Parse the first raw stream in `input` once, returning its consumed length
-/// and whether a PNG Max scheduler benefits from an early transformed lineage
-/// beside its exact Default lineage.
-///
-/// A dense same-distance graph needs the reduced parent because the direct
-/// bounded graph cannot enumerate every combination. A small multi-block
-/// stream needs it for a different reason: exact Default is deliberately
-/// established serially for this work class, so it can otherwise consume a
-/// short Max allowance before any independent source route starts. Larger
-/// multi-block floors already overlap those routes internally and must not
-/// receive a redundant outer worker. The probe performs only the normal
-/// bounded parse; bytes after the stream belong to the caller's wrapper, and
-/// optimization reparses and independently validates every selectable output.
+/// Parse the first raw stream in `input`, returning its consumed length and
+/// whether PNG single-image Max should race an early transformed lineage beside
+/// its exact Default lineage. A dense same-distance graph needs the reduced
+/// parent, and a small multi-block stream would otherwise build exact Default
+/// serially.
 pub(crate) fn inspect_early_max_lineage(input: &[u8], decoded_limit: u64) -> Result<(usize, bool)> {
     let parsed = parse_stream(input, decoded_limit)?;
     let dense_match_graph =
@@ -369,12 +298,9 @@ fn early_transformed_lineage_is_useful(
         || (nonempty_blocks >= 2 && decoded_size <= PREBUILD_BOUNDED_FLOOR_MAX_DECODED)
 }
 
-/// Canonicalize Defluff's non-standard length-258 spelling before planning.
-///
-/// Merely disabling the relaxed rewrite candidate is insufficient: an alias
-/// already present in the input could otherwise survive through exact source
-/// reuse or an ordinary header rewrite. Clearing source representations makes
-/// every strict candidate encode the canonical symbol 285 token.
+/// Rewrite Defluff's length-258 alias (symbol 284) to symbol 285 before
+/// strict planning. The source representations are cleared too, so no alias
+/// survives through exact source reuse or a header rewrite.
 fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<usize> {
     let mut normalized_blocks = 0_usize;
     for block in blocks {
@@ -408,9 +334,6 @@ fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<usize> {
 }
 
 /// Optimize the first complete Deflate stream in `input`.
-///
-/// Prefix decoding is essential for concatenated GZIP members, whose trailer
-/// immediately follows a non-byte-length-delimited raw Deflate stream.
 pub(crate) fn optimize_raw_prefix(
     input: &[u8],
     options: &Options,
@@ -419,10 +342,6 @@ pub(crate) fn optimize_raw_prefix(
     optimize_raw_prefix_with_floor(input, options, decoded_limit, DefaultFloor::Complete)
 }
 
-/// Optimize one raw stream with an explicit max-mode default-floor policy.
-///
-/// This is kept crate-private because the distinction belongs to container
-/// scheduling, not to Columbo's public optimization options.
 pub(crate) fn optimize_raw_prefix_with_floor(
     input: &[u8],
     options: &Options,
@@ -450,9 +369,7 @@ fn deft4j_source_route_eligible(blocks: &[ParsedBlock]) -> bool {
             huffman += 1;
         }
     }
-    // A lone stored block has no table, token, boundary, or adjacent-merge
-    // operation for the deft4j graph to improve. Every other live topology is
-    // admitted; route-local byte accounting handles its work size.
+    // A lone stored block gives the deft4j graph nothing to improve.
     nonempty >= 2 || (nonempty == 1 && huffman == 1)
 }
 
@@ -515,14 +432,7 @@ enum BoundedPngMaxPolicy {
     GenericParallel,
 }
 
-/// Choose the bounded PNG route family from available independent work.
-///
-/// Generic streams have no specialized source sibling, so source max remains
-/// available beside the floor lineage. A multi-block source retains its broad
-/// floor continuation. A one-block source receives that continuation only when
-/// the completed ordinary floor exposed a new block boundary or token spelling.
-/// Those are search states which the original-source siblings cannot explore,
-/// so this is an algorithmic capability gate rather than a size band.
+/// Choose the bounded PNG route family (M6).
 fn bounded_png_max_policy(
     nonempty_blocks: usize,
     floor_exposes_new_states: bool,
@@ -538,13 +448,9 @@ fn bounded_png_max_policy(
     }
 }
 
-/// Whether reparsing the completed floor gives max search a genuinely new seed.
-///
-/// Compare only meaningful blocks: encoders commonly append empty flush
-/// blocks, but those cannot create token-search states. Different non-empty
-/// boundaries or different token spellings can. The latter matters even for a
-/// one-block input because a normal-floor repartition may reach a fixed point
-/// that source-order max cannot reconstruct before its deadline.
+/// Whether the completed floor changed a nonempty block boundary or token
+/// spelling, giving Max a seed that source-order search may not reach before
+/// its deadline.
 fn floor_exposes_new_search_states(source: &[ParsedBlock], floor: &[PlannedBlock]) -> bool {
     let mut source = source.iter().filter(|block| !block.plain.is_empty());
     let mut floor = floor.iter().filter(|block| !block.plain.is_empty());
@@ -587,15 +493,9 @@ fn gain_is_below(source_bits: u64, candidate_bits: u64, basis_points: u64) -> bo
     saved.saturating_mul(10_000) < source_bits.saturating_mul(basis_points)
 }
 
-/// Preserve a serial compact-split sibling unless the floor-seeded endpoint
-/// crossed the same material-gain threshold.
-///
-/// Compact split is inspected because the direct deft4j-derived route saved
-/// less than two percent. In a serial work class, giving another sub-threshold
-/// descendant all remaining time would starve the independent structural
-/// topology for the same reason that admitted it. A bounded parallel class
-/// can evaluate both, while a seeded endpoint that already saves at least the
-/// threshold remains the stronger signal on its own.
+/// Whether the floor-seeded continuation may run before a pending compact
+/// split. If they cannot overlap, it goes first only when it saves at least 2%
+/// over the floor, so it cannot starve the split.
 fn floor_seeded_priority_with_structural_sibling(
     floor_bits: u64,
     seeded_bits: u64,
@@ -607,13 +507,9 @@ fn floor_seeded_priority_with_structural_sibling(
         || !gain_is_below(floor_bits, seeded_bits, WEAK_DEFT4J_GAIN_BASIS_POINTS)
 }
 
-/// Whether a non-dominated deft4j-derived descendant should share the active
-/// floor-continuation window.
-///
-/// Only the standalone file-level owner in the bounded parallel work class
-/// admits both expanded candidate models. Container children retain their
-/// shared scheduler. Within the admitted class, both routes are necessary
-/// because parent ordering does not prove the order of later endpoints.
+/// Whether the deft4j refinement runs beside the floor-seeded continuation.
+/// Only a stream with the file-level route window and bounded parallel work
+/// can hold both expanded models.
 fn independent_deft4j_refinement_can_overlap(
     continuing_floor_seed: bool,
     owns_file_level_route_window: bool,
@@ -642,19 +538,12 @@ struct Candidate {
     plans: Vec<PlannedBlock>,
     block_report: Option<BlockReport>,
     route: &'static str,
-    /// The exhaustive full-stream planner reparsed these exact bytes and
-    /// reached a strict fixed point without exhausting its search allowance.
-    ///
-    /// This is deliberately attached to the encoded candidate rather than to
-    /// a route name: an earlier route may have emitted byte-for-byte identical
-    /// output and won the stable tie order.
+    /// The Max planner reparsed these exact bytes and reached a strict fixed
+    /// point before its stop. This describes the bytes, not the route that
+    /// emitted them.
     max_planner_is_stable: bool,
 }
 
-/// Results from the bounded follow-up workers after all started routes join.
-///
-/// Naming these fields keeps the scheduling decision readable and prevents a
-/// positional tuple from silently swapping two optional candidates.
 #[derive(Default)]
 struct BoundedFollowUpCandidates {
     source_max: Option<Candidate>,
@@ -669,11 +558,8 @@ impl Candidate {
         self
     }
 
-    /// Compare complete encodings by bytes, then by meaningful Deflate bits.
-    ///
-    /// The comparison is deliberately strict: equal candidates retain the
-    /// incumbent selected by the earlier route, preserving deterministic
-    /// routing and output bytes.
+    /// Compare by bytes, then meaningful bits. A tie keeps the earlier
+    /// incumbent, so routing and output stay deterministic.
     fn is_strictly_smaller_than(&self, incumbent: &Self) -> bool {
         is_strictly_better(
             self.data.len(),
@@ -683,7 +569,6 @@ impl Candidate {
         )
     }
 
-    /// Compare a generated candidate with the parsed source stream.
     fn is_strictly_smaller_than_source(&self, source: CandidateInput<'_>) -> bool {
         is_strictly_better(
             self.data.len(),
@@ -693,10 +578,6 @@ impl Candidate {
         )
     }
 
-    /// Replace this incumbent only when `contender` is strictly smaller.
-    ///
-    /// Returning whether the replacement happened lets callers retain route
-    /// lineage without repeating the comparison and assignment.
     fn replace_if_smaller(&mut self, contender: Self) -> bool {
         if contender.is_strictly_smaller_than(self) {
             *self = contender;
@@ -706,8 +587,8 @@ impl Candidate {
         }
     }
 
-    /// Whether another candidate proved this exact encoding to be a max-plan
-    /// fixed point.
+    /// Whether another candidate proved this exact encoding to be a Max
+    /// planner fixed point.
     fn is_encoding_stabilized_by(&self, contender: &Self) -> bool {
         contender.max_planner_is_stable
             && contender.bits == self.bits
@@ -729,8 +610,8 @@ fn candidate_progress(
     }
 }
 
-/// Run one original-source max search, with nested telemetry only in a human
-/// reporting mode and the historical hot path otherwise.
+/// Run one original-source Max search, with progress heartbeats only when
+/// reports are enabled.
 fn build_source_max_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -764,7 +645,6 @@ fn build_source_max_candidate(
     )
 }
 
-/// Add progress heartbeats to the shared concrete stop policy.
 fn build_source_max_candidate_verbose(
     source: CandidateInput<'_>,
     options: &Options,
@@ -856,17 +736,10 @@ fn compact_source_has_bounded_integrated_proven_feedback(source: CandidateInput<
             .any(|block| compact_proven_submatch_route_eligible(&block.tokens, block.plain.len()))
 }
 
-/// Whether two independent max beams can safely share the initial wall clock.
-///
-/// This uses the compact structural route's existing compressed/decoded work
-/// bounds. In that class, overlapping original-source max with floor-seeded
-/// max has a small predictable memory and cache-bandwidth cost. One-block
-/// inputs use the ordinary aggregate bound. A short multi-block list is also
-/// safe when its total decoded work stays within that bound per non-empty
-/// source block, the complete token graph stays compact, and multiple proved
-/// repartitions justify starting source max before the dependent deft4j
-/// refinement. Larger streams retain the sequential schedule so two
-/// range-materializing beams do not starve the stronger completed floor.
+/// Whether original-source Max and floor-seeded Max can share the initial
+/// phase. Within the compact split limits the overlap's memory and cache cost
+/// is small; larger streams run serially so two beams pricing many payload
+/// ranges do not starve the floor.
 fn compact_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
     if source.compressed.len() > COMPACT_SPLIT_FLOOR_MAX_COMPRESSED {
         return false;
@@ -891,29 +764,18 @@ fn compact_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
         && same_distance_opportunities(source.blocks).repartition_runs >= 2
 }
 
-/// Whether source max is cheap enough to overlap the bounded floor family.
-///
-/// Dense repartition graphs justify the independent source root because only
-/// it can combine their choices. Tiny token graphs are complementary for a
-/// simpler reason: they can cheaply test original block merges that a
-/// rewritten floor descendant can no longer reconstruct. The outer parsed
-/// model bound still limits aggregate memory and decoded work.
+/// Whether source max is cheap enough to overlap the bounded floor routes.
+/// Only source max combines the choices of a dense repartition graph, and on
+/// tiny graphs it cheaply tests original block merges that a rewritten floor
+/// cannot reconstruct.
 fn bounded_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
     compact_complementary_source_max_is_cheap(source)
         || compact_parallel_source_max_work_class(source)
 }
 
-/// Whether a source-root beam should overlap an already completed PNG floor.
-///
-/// A single large decoded block makes both beams materialize and price many of
-/// the same payload ranges. Let the stronger completed-floor lineage own that
-/// cache/memory bandwidth unless the source graph either has dense independent
-/// repartitions or consists almost entirely of long matches. The latter keeps
-/// range pricing cheap because few tokens and literal symbols represent each
-/// decoded region. Very small token graphs are also cheap enough to overlap,
-/// while shared multi-stream policies retain
-/// [`bounded_parallel_source_max_work_class`] so one member cannot remove
-/// another member's independent source route.
+/// Whether a source-max beam should overlap the completed single-image PNG
+/// floor (M8). A large one-block source overlaps only when its graph is cheap,
+/// since otherwise both beams price many of the same payload ranges.
 fn complete_png_parallel_source_max_work_class(source: CandidateInput<'_>) -> bool {
     let nonempty_blocks = source
         .blocks
@@ -976,11 +838,8 @@ fn repartition_graph_covers_source_blocks(blocks: &[ParsedBlock], repartition_ru
     let mut nonempty_blocks = 0_usize;
     for block in blocks.iter().filter(|block| !block.plain.is_empty()) {
         nonempty_blocks += 1;
-        // Source max must finish each block before it can combine choices
-        // across the list. A block outside the bounded 4,000-token work class
-        // can consume the entire phase by itself, so dense cross-block
-        // opportunities are not yet reachable and cannot justify deferring
-        // the compact dependent lineage.
+        // Source max combines choices across blocks only after finishing each
+        // block, and a block above 4,000 tokens can use the whole phase.
         if block.tokens.len() > COMPACT_SINGLE_SOURCE_ROUTE_MAX_TOKENS {
             return false;
         }
@@ -989,11 +848,6 @@ fn repartition_graph_covers_source_blocks(blocks: &[ParsedBlock], repartition_ru
 }
 
 /// Whether the direct deft4j parent can cheaply finish its dependent split.
-///
-/// The split route already enforces these compressed, decoded, and token
-/// bounds on every prepared parent. Applying the same work model before the
-/// long independent beams keeps this dependency reachable without introducing
-/// a file-name or elapsed-time gate.
 fn compact_dependent_deft4j_work_class(source: CandidateInput<'_>) -> bool {
     let Some(token_count) = source.blocks.iter().try_fold(0_usize, |total, block| {
         total.checked_add(block.tokens.len())
@@ -1006,14 +860,11 @@ fn compact_dependent_deft4j_work_class(source: CandidateInput<'_>) -> bool {
         && has_multiple_nonempty_blocks(source.blocks)
 }
 
-/// Refine the bounded route family's best deft4j lineage in place.
+/// Refine the bounded phase's best deft4j lineage in place (M10b).
 ///
-/// Keeping this stage in one helper lets the caller evaluate the independent
-/// original-source max route concurrently. Both routes preserve their own
-/// complete incumbents and share only the global cooperative deadline. When
-/// complete compact siblings already cover its parent states, this optional
-/// lineage yields at the soft boundary rather than consuming primary-route
-/// grace.
+/// A concurrent original-source Max shares only the deadline. Set
+/// `stop_at_soft_deadline` when compact split siblings already cover this
+/// lineage's parents, so it does not use the grace.
 #[allow(clippy::too_many_arguments)]
 fn refine_bounded_deft4j_lineage(
     source: CandidateInput<'_>,
@@ -1096,12 +947,8 @@ fn refine_bounded_deft4j_lineage(
             identity,
             &mut deadline.bounded_stop(stop_at_soft_deadline),
         )?;
-        // A productive no-split route can expose another independent fixed
-        // point when Default turns the deft4j parent into a smaller, genuinely
-        // new topology. Continue only when that new parent also beats the
-        // completed original-source no-split result; otherwise the earlier
-        // route already dominates this scheduling signal. This is a single
-        // changed-parent continuation, not a replay of the original source.
+        // M2c: a smaller new topology from Default may give the no-split route
+        // another fixed point.
         let continue_no_split = changed_parent_no_split_should_continue(
             exposes_new_parent,
             &refined,
@@ -1109,10 +956,8 @@ fn refine_bounded_deft4j_lineage(
             narrow_candidate,
         ) && deadline.can_start_route();
         if continue_no_split {
-            // The superior changed parent is not represented by the compact
-            // sibling that caused the surrounding refinement to yield at the
-            // soft boundary. Once started inside that boundary, let this one
-            // dependent route finalize under the ordinary file-wide grace.
+            // No compact split sibling covers this changed parent, so it may
+            // use the grace even when the rest of this lineage may not.
             let mut route_stop = deadline.hard_stop();
             let mut refinement_stop = deadline.hard_stop();
             if let Some(continued) = refine_with_no_split_route(
@@ -1126,11 +971,8 @@ fn refine_bounded_deft4j_lineage(
                 refined.replace_if_smaller(continued);
             }
         }
-        // Default can turn the source-ordered deft4j result into a genuinely
-        // new boundary/token topology. That state is not covered by source
-        // max or by Max over the unrefined deft4j parent. Continue it once
-        // through the full planner while this already-parallel phase has
-        // time; header-only rewrites deliberately stop at Default.
+        // Neither source max nor Max on the unrefined parent covers a new
+        // topology from Default; header-only rewrites stop at Default.
         if exposes_new_parent
             && refined.is_strictly_smaller_than(deft4j)
             && deadline.can_start_route()
@@ -1151,15 +993,13 @@ fn refine_bounded_deft4j_lineage(
 
 /// Completed candidates produced by the bounded first phase.
 ///
-/// Optional fields make the later comparison order explicit without relying
-/// on positional tuples. `suppress_later_source_max` distinguishes a route
-/// intentionally omitted by policy from one that has not run yet. The separate
-/// optional-route flag lets generic routes keep their final rewritten-candidate
-/// pass while the completed legacy grouping ends its route family.
+/// `suppress_later_source_max` marks source max as already run or omitted by
+/// policy. `suppress_later_optional_routes` skips the later fragmented
+/// collection and rewritten-seed routes; no route sets it.
 #[derive(Default)]
 struct BoundedPhaseCandidates {
     floor: Option<Candidate>,
-    /// The slid Default endpoint, compared only after terminal searches.
+    /// Compared only after the terminal searches.
     slid_default: Option<Candidate>,
     floor_seeded: Option<Candidate>,
     deft4j: Option<Candidate>,
@@ -1171,8 +1011,8 @@ struct BoundedPhaseCandidates {
     completed_compact_split_parent: Option<Vec<u8>>,
 }
 
-/// One complete compressed stream together with the facts needed to verify
-/// every accepted reparse/replan round.
+/// A complete compressed stream with the facts needed to verify each
+/// reparse/replan round.
 #[derive(Clone, Copy)]
 struct CandidateInput<'a> {
     compressed: &'a [u8],
@@ -1183,10 +1023,8 @@ struct CandidateInput<'a> {
 }
 
 /// Borrow a validated rewrite in the same shape as the original source.
-///
-/// `candidate.bits` remains authoritative for comparisons: reparsing proves
-/// stream identity, while the emitter's exact meaningful-bit count is what
-/// the route originally priced and selected.
+/// Comparisons use `candidate.bits`, the emitter's exact meaningful-bit count;
+/// reparsing only proves stream identity.
 fn rewritten_input<'a>(
     candidate: &'a Candidate,
     stream: &'a ParsedStream,
@@ -1203,9 +1041,6 @@ fn rewritten_input<'a>(
 }
 
 /// Route families requested for the bounded comparison phase.
-///
-/// The phase still rechecks each family's work class and route window before
-/// starting it, so a requested family may not run.
 #[derive(Clone, Copy, Default)]
 struct BoundedRoutes {
     /// Finish the exact Default endpoint before optional routes can use time.
@@ -1216,15 +1051,11 @@ struct BoundedRoutes {
     narrow: bool,
     source_max: bool,
     proven_feedback: bool,
-    /// Run admitted families on scoped workers instead of serially.
     parallel: bool,
 }
 
-/// Run the independent bounded comparison routes under one wall clock.
-///
-/// Small inputs can safely share their immutable parsed blocks across worker
-/// threads. Larger inputs use the same fixed route order serially, preventing
-/// otherwise bounded per-route arenas from adding up to an excessive peak.
+/// Run the independent bounded comparison routes under one deadline, on
+/// scoped workers within the parallel limits (M5) and serially otherwise.
 fn build_bounded_phase_candidates(
     source: CandidateInput<'_>,
     options: &Options,
@@ -1244,12 +1075,8 @@ fn build_bounded_phase_candidates(
     } = routes;
     let run_source_max = run_source_max && parallel_routes;
     let run_proven_feedback = run_proven_feedback && parallel_routes;
-    // A one-block floor descendant is the only route which can continue the
-    // floor's newly discovered token spelling. Let that primary route use the
-    // complete file window; reserving a fixed tail for source-order siblings
-    // can stop it just before a byte boundary which those siblings cannot
-    // reach. Multi-block work retains the follow-up reservation because its
-    // independent compact routes cover additional structural parents.
+    // A one-block floor descendant gets the full window; multi-block work
+    // keeps the follow-up reservation for its compact routes.
     let unique_one_block_floor_descendant = run_seeded_max
         && source
             .blocks
@@ -1257,24 +1084,12 @@ fn build_bounded_phase_candidates(
             .filter(|block| !block.plain.is_empty())
             .count()
             == 1;
-    // The direct deft4j graph and its ordinary Columbo replay are a compact,
-    // dependent lineage. On one-block inputs, finish that cheap dependency
-    // before launching the long independent beams: returning only the direct
-    // parent and waiting for every long worker can otherwise make its unique
-    // replay fixed point unreachable. A compact multi-block lineage also
-    // finishes its deterministic split descendant here; unlike source max,
-    // that split depends on the refined deft4j parent and cannot usefully run
-    // first. Larger graphs retain the parallel worker because their cost is
-    // not similarly bounded.
+    // M10a: finish the cheap direct deft4j candidate, its Default replay and
+    // (for a compact multi-block lineage) its dependent split before the long
+    // beams start.
     let repartition_runs = same_distance_opportunities(source.blocks).repartition_runs;
-    // Multiple independent same-distance repartitions create combinations
-    // that only the original-source max graph can explore. Do not spend its
-    // initial wall clock serially completing the dependent deft4j split
-    // lineage when that opportunity graph covers every non-empty source
-    // block. Sparser graphs retain the dependent lineage first: their source
-    // beam cannot combine independent choices across the full block list. The
-    // direct deft4j parent still runs beside source max, and its split
-    // descendant remains available in the later refinement stage.
+    // When repartition runs cover every nonempty block, only source max can
+    // combine them, so start it at once and defer the split.
     let source_repartition_graph_is_dense =
         repartition_graph_covers_source_blocks(source.blocks, repartition_runs);
     let prebuild_compact_split = run_seeded_max
@@ -1316,11 +1131,9 @@ fn build_bounded_phase_candidates(
                 if let Some(split) = split {
                     deft4j.replace_if_smaller(split);
                 }
-                // Exact parent identity suppresses the later copy of this
-                // completed deterministic route. If no structural cut won,
-                // its emitted endpoint has the same token/block state and is
-                // already the route's fixed point; otherwise only the input
-                // parent is complete and the split descendant remains useful.
+                // Record the completed parent so later phases skip it. If a
+                // cut won, only the input parent is complete and its split
+                // descendant stays eligible.
                 completed_compact_split_parent = if preserves_source_blocks {
                     Some(deft4j.data.clone())
                 } else {
@@ -1329,9 +1142,8 @@ fn build_bounded_phase_candidates(
             }
         }
     }
-    // Establish the bounded phase window after finishing the cheap dependency,
-    // so its reserved fifth is measured from the actual independent work that
-    // remains rather than being silently consumed by prerequisite work.
+    // Open the phase window after the prerequisite, so its reserved fifth is
+    // measured from the time that remains.
     let route_window = if (run_deft4j || run_narrow || run_source_max || run_proven_feedback)
         && !unique_one_block_floor_descendant
     {
@@ -1341,14 +1153,7 @@ fn build_bounded_phase_candidates(
     };
     let run_deft4j = run_deft4j && !prebuild_deft4j && route_window.can_start_route();
     let run_narrow = run_narrow && route_window.can_start_route();
-    // Tiny graphs retain both long roots because their complementary search
-    // is cheap and can settle in a different basin. In the capped route's
-    // upper work band, give the broader source-max graph sole ownership of
-    // source-token search rather than making two workers contend for the same
-    // deadline. Multiple independent same-distance repartition runs also keep
-    // source max: their combinations exist only in that original-source
-    // topology. Above these bounds, omit the source-root beam only when proven
-    // feedback actually covers source-token work.
+    // M9: choose source max, proven feedback or both by token count.
     let run_complementary_source_max = compact_complementary_source_max_is_cheap(source);
     let source_restart_has_distinct_topology =
         repartition_runs != 0 || source.identity.decoded_size > DEFLATE_MAX_STORED_BLOCK_PLAIN;
@@ -1416,10 +1221,6 @@ fn build_bounded_phase_candidates(
         let narrow_worker = run_narrow
             .then(|| {
                 spawn_route(scope, "columbo-no-split", deadline, || {
-                    // The no-split walk combines block-local pruning with
-                    // adjacent merges. That ordering is complementary to
-                    // source max: an early block choice changes alignment
-                    // and merge prices for every later source block.
                     build_narrow_source_candidate(
                         source,
                         options,
@@ -1455,9 +1256,8 @@ fn build_bounded_phase_candidates(
             })
             .flatten();
 
-        // A route error (or unwind) asks its siblings to stop at their next
-        // ordinary deadline check. Join every successfully spawned worker
-        // before choosing the fixed deft4j/narrow/floor error order below.
+        // Join every spawned worker before applying the fixed error order
+        // below.
         let floor = run_route_with_cancellation(deadline, || {
             build_bounded_floor_descendants_preserving_default(
                 source,
@@ -1511,8 +1311,7 @@ fn build_bounded_phase_candidates(
             None => Ok(None),
         };
 
-        // A panic still denotes an internal invariant failure. All joins are
-        // complete now, so resuming it cannot strand a sibling worker.
+        // All workers have joined, so resuming a panic cannot strand a sibling.
         let worker_deft4j = match deft4j {
             Ok(result) => result,
             Err(payload) => std::panic::resume_unwind(payload),
@@ -1542,7 +1341,7 @@ fn build_bounded_phase_candidates(
     })
 }
 
-/// Retain the deft4j/narrow/floor deadline order without overlapping arenas.
+/// Run the bounded phase serially, so route arenas never overlap.
 #[allow(clippy::too_many_arguments)]
 fn build_bounded_phase_candidates_sequential(
     source: CandidateInput<'_>,
@@ -1555,9 +1354,8 @@ fn build_bounded_phase_candidates_sequential(
     completed_floor: Option<Candidate>,
     progress: Progress,
 ) -> Result<BoundedPhaseCandidates> {
-    // A serial work class cannot overlap its exact comparison floor with the
-    // independent source routes. Establish the mandatory floor first so those
-    // optional routes can never consume the result Max promises to retain.
+    // Build the mandatory Default floor first so optional routes cannot use up
+    // its time.
     let mut completed_floor = completed_floor;
     let preserved_floor = preserve_complete_default
         .then(|| {
@@ -1669,9 +1467,7 @@ fn run_route_with_cancellation<T>(
 }
 
 /// Start one route on a named scoped worker that cancels siblings on failure.
-///
-/// `None` means the worker could not be spawned; each caller keeps its own
-/// serial fallback for that case.
+/// `None` means the worker could not be spawned; callers then run serially.
 fn spawn_route<'scope, T: Send + 'scope>(
     scope: &'scope thread::Scope<'scope, '_>,
     name: &str,
@@ -1703,12 +1499,8 @@ fn build_bounded_floor_candidate(
         .map(|candidate| candidate.named("Normal floor"))
 }
 
-/// Copy a complete caller-retained stream into the local candidate set.
-///
-/// `Established` is used only for a stream just emitted and validated by an
-/// independent Columbo lineage. Re-running Default here would rediscover a
-/// floor the caller already owns; later descendants reparse these bytes before
-/// using them, preserving the normal identity checks.
+/// Copy a caller-retained `Established` stream into the local candidate set.
+/// Descendants reparse it, so the normal identity checks still apply.
 fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> {
     let mut data = Vec::new();
     data.try_reserve_exact(source.compressed.len())
@@ -1725,11 +1517,8 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
     })
 }
 
-/// Controls whether ordinary comparison work may be interrupted.
-///
-/// A normal invocation remains governed by its configured deadline. Max uses
-/// `Mandatory` only for the Default dependency it promises to dominate; every
-/// Max-exclusive descendant continues to use the ordinary timed policy.
+/// Whether Default comparison work may be interrupted. Max uses `Mandatory`
+/// only for the Default result it must never lose.
 #[derive(Clone, Copy)]
 enum DefaultFloorWork<'a> {
     Timed(&'a Deadline),
@@ -1765,12 +1554,8 @@ impl<'a> DefaultFloorWork<'a> {
     }
 }
 
-/// Add the bounded siblings that form the complete ordinary-mode floor.
-///
-/// These routes are deliberately shared by a normal invocation and the floor
-/// established at the start of a single-stream PNG max invocation. Keeping the
-/// sequence in one helper prevents max from approximating Default with only
-/// its first route and losing a completed byte or bit saving.
+/// Complete the Default floor with D1, D2, D3 and the terminal tree floors.
+/// Max's retained Default floor shares this sequence.
 fn improve_default_floor_with_feedback(
     source: CandidateInput<'_>,
     options: &Options,
@@ -1780,10 +1565,7 @@ fn improve_default_floor_with_feedback(
 ) -> Result<Candidate> {
     debug_assert!(!options.exhaustive);
 
-    // Proven-before-feedback has a distinct compact fixed point from the
-    // ordinary endpoint ordering. Retain both as complete candidates whenever
-    // the source contains a proved match and the whole sibling is within its
-    // explicit token/plain work bounds.
+    // D1: proven-before-feedback can reach a different fixed point.
     if compact_source_has_bounded_match_preserving_feedback(source) && floor_work.can_start_route()
     {
         let step = progress.start("Columbo match-preserving feedback");
@@ -1848,12 +1630,8 @@ fn improve_default_floor_with_feedback(
     improve_with_terminal_tree_floors(source, options, floor_work, progress, candidate)
 }
 
-/// Apply terminal tree-only improvements to one already complete candidate.
-///
-/// This sequence is shared deliberately by an ordinary invocation and Max's
-/// retained Default comparison floor. Keeping every Default terminal method
-/// here prevents a newly added cleanup pass from silently making Max worse
-/// when its independent searches consume the remaining deadline.
+/// Apply the terminal tree floors to one complete candidate. Keep every
+/// Default tree-only pass here, so Max cannot fall behind Default.
 fn improve_with_terminal_tree_floors(
     source: CandidateInput<'_>,
     options: &Options,
@@ -1861,10 +1639,8 @@ fn improve_with_terminal_tree_floors(
     progress: Progress,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
-    // The fixed-point and nearby-count smoothers each use a seven-pair exact
-    // tree frontier, but keep their terminal reparse inside the same compact
-    // memory/work class. The completed output, rather than the source, decides
-    // whether its final block topology is applicable.
+    // The compact tree size limits bound the smoothers' reparse; the completed
+    // output's blocks, not the source's, decide whether the floor applies.
     let smoothed_tree_eligible = (floor_work.is_mandatory() || !options.timeout.is_zero())
         && source.compressed.len() <= COMPACT_TREE_MAX_COMPRESSED
         && source.identity.decoded_size <= COMPACT_TREE_MAX_DECODED;
@@ -1909,10 +1685,8 @@ fn improve_with_terminal_tree_floors(
         }
     }
 
-    // The compact pass above shares this frontier when its structural work
-    // bounds apply. Every other completed stream receives the general linear
-    // sibling. At the hard boundary, the explicitly bounded rescue finishes
-    // one fixed work unit while retaining the complete incumbent.
+    // Unless the compact pass covered them, price the bounded-depth trees; after
+    // the hard stop, the bounded rescue finishes one fixed unit of work.
     let mut bounded_depth_stop = floor_work.stop();
     let bounded_depth_hard_expired = bounded_depth_stop.reached();
     if !bounded_depth_covered
@@ -1950,9 +1724,9 @@ fn improve_with_terminal_tree_floors(
     Ok(candidate)
 }
 
-/// Keep restoration separate from tree closure: earlier losing topologies may
-/// receive tree closure before search is over, but this new token spelling is
-/// a terminal candidate and must not redirect their existing descendants.
+/// R1: restore source-certified matches in a completed candidate. It stays out
+/// of the tree floors because its terminal spelling must not redirect the
+/// descendants of losing topologies.
 fn improve_with_original_match_restoration(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2000,8 +1774,8 @@ fn refine_with_original_match_restoration(
     }
     let selected =
         parse_validated_rewrite(&candidate.data, original.decoded_limit, original.identity)?;
-    // Parsing discards redundant empty blocks. This pass keeps the parent's
-    // exact header/block layout, so leave normalization to existing routes.
+    // Parsing drops redundant empty blocks; this pass needs the parent's exact
+    // block layout.
     if selected.source_block_count != selected.blocks.len() {
         return Ok(None);
     }
@@ -2016,9 +1790,8 @@ fn refine_with_original_match_restoration(
         original.decoded_limit,
         original.identity,
     );
-    // Zero replays preserves the exact payload trees and header spelling. The
-    // existing builder validates emitted bytes and records their actual max
-    // distance for wrappers; a restored match can exceed the parent's distance.
+    // Zero replays keeps the exact payload trees and header. The builder
+    // records the emitted maximum distance, which a restored match can raise.
     let restored =
         build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
     Ok(restored
@@ -2026,6 +1799,8 @@ fn refine_with_original_match_restoration(
         .then(|| restored.named("Original-match restoration")))
 }
 
+/// Terminal methods R1b–R11, R1c, R13 and R14, run in that order after R1 by
+/// [`improve_with_terminal_searches`].
 #[derive(Clone, Copy)]
 enum TerminalHeaderSearch {
     StrictDistanceCompletion,
@@ -2076,19 +1851,14 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // The boundary slide, distance ladder and smoothed-tree finish are
-        // linear in the parsed tokens and blocks. Their one candidate parse
-        // costs no more than a replay round, which every candidate may already
-        // pay at any size, so they have no work class.
+        // R1c, R13 and R14 are linear and parse one candidate, costing no more
+        // than a replay round, so they have no size limit.
         if matches!(
             self,
             Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees
         ) {
             return usize::MAX;
         }
-        // The smaller class also bounds mandatory Default work. Optional Max
-        // header searches can reuse the larger parsed-stream envelope without
-        // increasing their per-invocation work, price or block-local limits.
         if exhaustive {
             return MAX_TERMINAL_HEADER_MAX_BYTES;
         }
@@ -2110,8 +1880,8 @@ impl TerminalHeaderSearch {
         }
     }
 
-    /// Max methods that run only after a sweep in which no earlier method
-    /// changed the candidate.
+    /// Max methods that run only when no earlier method in the sweep changed
+    /// the candidate.
     fn waits_for_settled_sweep(self) -> bool {
         matches!(
             self,
@@ -2123,7 +1893,6 @@ impl TerminalHeaderSearch {
         )
     }
 
-    /// Methods that run only in Max.
     fn max_only(self) -> bool {
         matches!(
             self,
@@ -2242,16 +2011,11 @@ impl TerminalHeaderSearch {
     }
 }
 
-/// Close the final Max endpoint under the existing terminal methods.
-///
-/// A later method can change the tokens, payload lengths or alphabet spans
-/// priced by an earlier method. Finishing one ordered sweep therefore does
-/// not establish a local fixed point. Revisit changed inputs while optional
-/// time remains, retaining the original single sweep in Default mode.
-/// Every accepted candidate strictly decreases (bytes, meaningful bits), so
-/// an input score uniquely identifies its generation within this descent.
-/// Remembering each method's input skips suffix work already completed on
-/// the unchanged candidate without retaining additional encoded streams.
+/// Run the terminal methods (R1, R1b–R11, R1c, R13, R14) on the final
+/// candidate. Max repeats the sweep while it improves and time remains (R12);
+/// Default runs one sweep. Every accepted candidate strictly decreases (bytes,
+/// meaningful bits), so a method's input score identifies an unchanged
+/// candidate, and the sweep skips methods already tried on it.
 fn improve_with_terminal_searches(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2304,14 +2068,9 @@ fn improve_with_terminal_searches(
                 continue;
             }
             let score = (candidate.data.len(), candidate.bits);
-            // Settle the established methods before fitting a new payload to
-            // a proposed tree, boundaries to the current trees, or a
-            // collapsed alphabet or smoothed tree to the slid blocks. Earlier
-            // adoption can redirect a later search and lose an improvement
-            // reachable from the unchanged endpoint. Default's single sweep
-            // has no later search, so its slide, ladder and smoothed-tree
-            // finish run regardless, as do Max's once no further sweep can
-            // start.
+            // Fitting payloads, boundaries or trees too early can redirect a
+            // later search. R1c, R13 and R14 still run once no later sweep can
+            // start, as in Default.
             let later_sweep_possible = options.exhaustive
                 && !(matches!(
                     search,
@@ -2357,10 +2116,8 @@ fn improve_with_terminal_searches(
                     candidate,
                 )?
             };
-            // A win slides the blocks again, which can expose another
-            // collapse or smoothing win. While time remains, Max's next sweep
-            // revisits those inputs with no round cap; when no sweep can
-            // follow, repeat the finish here a bounded number of times.
+            // A win re-slides the blocks, which can expose another R13 or R14
+            // win; repeat here when no later sweep can revisit them.
             let finish_changed = matches!(search, TerminalHeaderSearch::SmoothedTrees)
                 && finish_start
                     .is_some_and(|start| start != (candidate.data.len(), candidate.bits));
@@ -2386,9 +2143,8 @@ fn improve_with_terminal_searches(
     }
 }
 
-/// Header-driven terminal searches retain every complete parent independently.
-/// Alphabet search can split blocks; the other searches keep their boundaries.
-/// None redirects the established search lineages.
+/// Run one terminal method, keeping the candidate unless the result is
+/// strictly smaller.
 fn improve_with_terminal_header_search(
     search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
@@ -2400,10 +2156,8 @@ fn improve_with_terminal_header_search(
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
-    // The boundary slide, distance ladder and smoothed-tree finish are linear
-    // finalization, like the bounded-depth tree floor: they may start until
-    // the hard stop they poll, not only before the soft deadline that admits
-    // new search routes.
+    // R1c, R13 and R14 are linear finalization: they may start until the hard
+    // stop, not only before the soft deadline.
     let may_start = if matches!(
         search,
         TerminalHeaderSearch::BoundarySlide
@@ -2444,12 +2198,10 @@ fn improve_with_terminal_header_search(
     Ok(candidate)
 }
 
-/// R14 plans one block: the Brotli fixed-point and Zopfli nearby-count
-/// smoothed payload trees at every maximum depth from 15 through 9, priced
-/// against the true counts, when strictly smaller than the block's current
-/// bits. The compact payload-tree floor prices the same families before the
-/// terminal searches; here they follow every tree-changing method, so they
-/// cannot redirect one.
+/// R14 for one block: the Brotli fixed-point and Zopfli nearby-count smoothed
+/// payload trees at maximum depths 15 through 9, priced against the true
+/// counts, when strictly smaller than the block's current bits. Running after
+/// every tree-changing method, they cannot redirect one.
 fn plan_smoothed_tree_finish(
     block: &ParsedBlock,
     strict: bool,
@@ -2470,10 +2222,8 @@ fn plan_smoothed_tree_finish(
     })
 }
 
-/// R13 and R14 follow R1c: a collapsed distance alphabet or a smoothed tree
-/// replaces trees the slide fitted its cuts to, so a winning step is slid
-/// once more under its new trees. Each step keeps its parent unless strictly
-/// smaller.
+/// Run R13 or R14. A win replaces the trees that R1c fitted its cuts to, so
+/// the result is slid once more under its new trees.
 fn improve_with_tree_finish(
     search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
@@ -2508,8 +2258,7 @@ fn improve_with_tree_finish(
 }
 
 /// Run R13 and R14, each with its re-slide, for at most `passes` passes,
-/// stopping after a pass in which neither wins. Every step keeps its parent
-/// unless strictly smaller.
+/// stopping after a pass in which neither wins.
 fn improve_with_repeated_tree_finish(
     passes: usize,
     source: CandidateInput<'_>,
@@ -2542,19 +2291,15 @@ fn improve_with_repeated_tree_finish(
     Ok(candidate)
 }
 
-/// The validated parse of an unchanged terminal candidate.
-///
-/// Terminal methods replace a candidate only with a strictly smaller one, so
-/// consecutive methods that find nothing would otherwise reparse and revalidate
-/// identical bytes. Each entry keeps the exact bytes it validated and is reused
-/// only for an identical candidate within one terminal sequence, whose decoded
-/// limit and stream identity are fixed.
+/// The validated parse of the current terminal candidate, so consecutive
+/// methods that find nothing do not reparse identical bytes. The bytes alone
+/// are the key: decoded limit and stream identity are fixed within one
+/// terminal sequence.
 #[derive(Default)]
 struct TerminalParseCache {
     entry: Option<(Vec<u8>, ParsedStream)>,
 }
 
-/// A terminal candidate's parse, borrowed from the cache when possible.
 enum TerminalParse<'a> {
     Cached(&'a ParsedStream),
     Owned(ParsedStream),
@@ -2625,8 +2370,8 @@ fn plan_terminal_blocks(
     for (block_index, block) in blocks.iter().enumerate() {
         let alignment = (bits % 8) as u8;
         if let Some(proposed) = search.plan(block, alignment, options, &mut budget, stop) {
-            // Also reserve one original plan for every remaining source
-            // block, so falling back after a split never grows infallibly.
+            // Reserve for the remaining blocks too, so later pushes never
+            // allocate infallibly.
             let remaining = blocks.len() - block_index - 1;
             plans.try_reserve(proposed.len() + remaining).ok()?;
             bits = proposed
@@ -2641,9 +2386,8 @@ fn plan_terminal_blocks(
                 if let Some(original) = reusable_original_bits(block, alignment, options.strict) {
                     (Representation::Original(original), original.len)
                 } else if block.source_type == SourceBlockType::Stored {
-                    // Earlier savings can shift the next stored block.
-                    // Regenerate and price its padding at the actual
-                    // new alignment.
+                    // Earlier savings can change a stored block's alignment
+                    // and so its padding.
                     (
                         Representation::Stored,
                         stored_block_bits(alignment, block.plain.len()),
@@ -2682,16 +2426,14 @@ fn refine_with_terminal_header_search_cached(
         return Ok(None);
     }
     let selected = parse_cache.parse(&candidate.data, decoded_limit, identity)?;
-    // The parser discards redundant empty blocks. Preserve the parent's block
-    // source mapping here and leave empty-block normalization to established routes.
+    // Parsing drops redundant empty blocks; these methods need the exact
+    // layout.
     if selected.source_block_count != selected.blocks.len()
         || selected.blocks.len() > search.max_blocks()
     {
         return Ok(None);
     }
     let plans = match search {
-        // The slide moves tokens between neighbouring blocks, so it plans the
-        // whole stream rather than one block at a time.
         TerminalHeaderSearch::BoundarySlide => {
             super::slide::plan_boundary_slide(&selected.blocks, options, stop)
         }
@@ -2701,38 +2443,29 @@ fn refine_with_terminal_header_search_cached(
         return Ok(None);
     };
     let source = rewritten_input(candidate, &selected, decoded_limit, identity);
-    // Zero replays preserves exactly the proposed tokens and tables. The common
-    // builder validates emission and records the actual wrapper window needs.
+    // Zero replays keeps exactly the proposed tokens and tables.
     let refined = build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
     Ok(refined
         .is_strictly_smaller_than(candidate)
         .then(|| refined.named(search.name())))
 }
 
-/// Establish the exact ordinary result before starting single-PNG max routes.
-///
-/// The benchmark grants max the measured Default time plus additional search
-/// time. Reusing the finished floor both honors that contract and lets later
-/// max descendants start from its already selected blocks instead of repeating
-/// the ordinary route.
+/// The exact Default result that a Max stream keeps before its Max routes.
 struct CompleteDefaultFloor {
-    /// The ordinary base used by the established bounded max lineage.
+    /// The Default route's candidate before feedback and terminal methods; it
+    /// seeds Max's routes.
     max_seed: Candidate,
-    /// The complete Default endpoint, optionally strengthened by the bounded
-    /// Max-only terminal siblings within the existing Max allowance.
+    /// The complete Default endpoint, which R6–R9 may strengthen within the
+    /// Max allowance.
     complete: Candidate,
-    /// Default's exact endpoint, kept only as a final competitor: the result
-    /// after R1c, R13 and R14 when any wins, or with R1b when `complete`
-    /// omitted it.
+    /// Default's exact endpoint when it differs from `complete` (after R1c,
+    /// R13 and R14, or with R1b), kept only as a final competitor.
     slid: Option<Candidate>,
 }
 
-/// Default ends its single sweep with R1c's boundary slide, R13's distance
-/// ladder and R14's smoothed-tree finish. Max keeps that result only as a
-/// final competitor:
-/// boundaries fitted to the current trees can remove an improvement Max's own
-/// tree floors would find from the unslid endpoint, so the slide must not
-/// choose Max's terminal parent.
+/// Default's final R1c, R13 and R14 on `complete`, returned only when strictly
+/// smaller. It is only a final competitor: boundaries fitted to the current
+/// trees can hide an improvement that Max's own tree floors would find.
 fn slid_default_endpoint(
     source: CandidateInput<'_>,
     floor_options: &Options,
@@ -2761,17 +2494,13 @@ fn slid_default_endpoint(
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 
-/// Default's R1b–R5 finish for one of Max's mandatory endpoints.
+/// Default's R1b–R5 finish for one of Max's mandatory endpoints, returning
+/// Max's parent and Default's exact endpoint as a final competitor.
 ///
-/// Returns Max's parent and Default's exact endpoint as a final competitor.
-/// R1b, like R1c, fits the current state: it re-prices a degenerate distance
-/// alphabet with whichever uniform complete tree the current payload prefers,
-/// which changes the header that R2–R9 search from. Adopted first, it can
-/// lead them to a worse fixed point than the endpoint without it. When R1b
-/// wins, the parent therefore omits it; Max's terminal sweep applies R1b to
-/// its own final incumbent, and Default's endpoint with R1b, R1c and R13
-/// stays a final competitor, so Max never trails Default. Otherwise the
-/// parent is Default's endpoint and only its slid form competes.
+/// R1b's uniform complete distance tree changes the header that R2–R9 start
+/// from and can lead them to a worse fixed point. So when R1b wins, the parent
+/// omits it (Max's sweep applies R1b later), and Default's endpoint with R1b
+/// stays a final competitor, so Max never trails Default.
 fn finish_mandatory_default_endpoint(
     source: CandidateInput<'_>,
     floor_options: &Options,
@@ -2864,9 +2593,7 @@ fn build_complete_default_floor_candidate(
         &mut parse_cache,
         complete,
     )?;
-    // Max alone may strengthen the completed ordinary comparison endpoint.
-    // The historical seed stays independent, and this extra search consumes
-    // the caller's existing Max allowance rather than mandatory Default work.
+    // R6–R9 run under the caller's Max allowance, not as mandatory work.
     let mut complete = complete;
     for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
@@ -2892,8 +2619,8 @@ fn build_complete_default_floor_candidate(
     })
 }
 
-/// Keep APNG's Default endpoint, then admit the Max-only terminal siblings
-/// within this frame's existing allowance.
+/// Build APNG's complete Default endpoint and its slid form, then run R6–R9
+/// on the endpoint within this frame's Max allowance.
 fn build_complete_apng_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2939,10 +2666,6 @@ fn build_complete_apng_default_floor_candidate(
     Ok((complete, slid))
 }
 
-/// Reuse a completed ordinary-mode floor when PNG scheduling already made it.
-///
-/// Its retained plans have the same shape needed by each bounded continuation,
-/// so rebuilding the candidate would only consume deadline and memory.
 fn completed_or_bounded_floor(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2955,12 +2678,9 @@ fn completed_or_bounded_floor(
     }
 }
 
-/// Build the ordinary bounded floor, then continue through the historical
-/// Columbo max route seeded from that rewritten floor.
-///
-/// Both complete candidates remain independent, so timeout or non-improvement
-/// cannot discard the normal-mode floor. The caller applies the parallel model
-/// cap before selecting this route.
+/// Build the bounded Default floor, then run the Max planner seeded from it.
+/// Both candidates are kept, so a timeout or a non-improving Max run cannot
+/// discard the floor.
 fn build_bounded_floor_lineage(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2972,11 +2692,8 @@ fn build_bounded_floor_lineage(
     continue_bounded_floor_lineage(source, floor, options, route_window, true)
 }
 
-/// Continue the selected floor into max search when requested.
-///
-/// A rewrite can expose new token/table feedback even when it retains or
-/// reduces the source block count, so topology alone is not a sound dominance
-/// test for this descendant.
+/// Continue the selected floor into Max search when requested, or else, for a
+/// multi-block floor, into standalone bounded grouping.
 fn build_bounded_floor_descendants(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2990,19 +2707,12 @@ fn build_bounded_floor_descendants(
         return continue_bounded_floor_lineage(source, floor, options, route_window, false);
     }
 
-    // Inspect the plans already retained by the floor. Re-parsing merely to
-    // rediscover this topology would spend time and allocate another model.
     continue_bounded_floor_lineage(source, floor, options, route_window, true)
 }
 
-/// Build the bounded lineage while retaining the exact ordinary endpoint.
-///
-/// Medium multi-block PNG streams reach this helper from the concurrent phase:
-/// their independent Max workers continue in parallel, while this route runs
-/// the same complete sequence as Default and keeps that result separate from
-/// the historical Max seed. This closes the comparison-floor invariant
-/// without serializing work that was deliberately admitted for concurrency.
-/// The third result is the slid Default endpoint, a final competitor only.
+/// Build the floor lineage, keeping the exact Default endpoint separate from
+/// the Max seed. Returns the floor, its descendant, and the slid Default
+/// endpoint.
 #[allow(clippy::too_many_arguments)]
 fn build_bounded_floor_descendants_preserving_default(
     source: CandidateInput<'_>,
@@ -3052,9 +2762,7 @@ fn continue_bounded_floor_lineage(
         return Ok((floor, None));
     }
 
-    // Parse the finished floor once for both independent descendants. The
-    // previous implementation reparsed the same bytes separately for bounded
-    // grouping and max refinement, duplicating validation and model storage.
+    // Release the floor's plans before parsing it.
     floor.plans.clear();
     let stream = parse_validated_rewrite(&floor.data, source.decoded_limit, source.identity)?;
     let rewritten = rewritten_input(&floor, &stream, source.decoded_limit, source.identity);
@@ -3071,10 +2779,8 @@ fn continue_bounded_floor_lineage(
         .named("Columbo max refinement");
         descendant = Some(seeded);
     } else if has_multiple_nonempty_blocks(&stream.blocks) && route_window.can_start_route() {
-        // The full max planner starts from this same bounded grouping floor.
-        // Run the standalone structural form only when a broader seeded max
-        // descendant is not scheduled; doing both repeats range pricing and
-        // can starve the more capable route.
+        // The Max planner starts from the same grouping; running both repeats
+        // range pricing and can starve the Max route.
         if let Some(plans) = plan_columbo_floor_seeded_bounded_grouping(&stream.blocks, 0, options)
         {
             let grouped = build_candidate_from_plans(
@@ -3092,11 +2798,7 @@ fn continue_bounded_floor_lineage(
     Ok((floor, descendant))
 }
 
-/// Preserve source max when no specialized source route is eligible.
-///
-/// The original source and floor-seeded candidates share one deadline and at
-/// most two route arenas. The caller has already applied the parallel model
-/// cap before selecting this route.
+/// `GenericParallel` (M6): run source max beside the floor lineage.
 fn build_bounded_generic_max_candidates(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3151,8 +2853,7 @@ fn build_bounded_generic_max_candidates(
             None => Ok(None),
         };
 
-        // Both routes have rejoined. Preserve floor-before-source error
-        // precedence when independent failures happen at the same time.
+        // A floor error takes precedence over a source-max error.
         let (floor, floor_seeded) = floor?;
         let source_max = source_max?;
         Ok(BoundedPhaseCandidates {
@@ -3165,12 +2866,7 @@ fn build_bounded_generic_max_candidates(
     })
 }
 
-/// Build a bounded, source-ordered deft4j candidate without replaying it
-/// through the broader planner.
-///
-/// Its fixed-point work remains subject to the caller's Columbo deadline and
-/// memory policies. Any later cross-route replay is scheduled explicitly by
-/// the caller.
+/// Build the direct deft4j-derived source candidate (M1) without replay.
 fn build_deft4j_source_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3183,12 +2879,8 @@ fn build_deft4j_source_candidate(
         .map(|candidate| Some(candidate.named("deft4j-derived source")))
 }
 
-/// Build one direct source-order candidate without the broader split graph.
-///
-/// A winning merge or token rewrite exposes a parent that the original source
-/// planner could not inspect. Reparse that genuinely new state once through
-/// the ordinary planner; header-only rewrites are already fully priced by the
-/// first pass and do not justify repeating the work.
+/// Build the no-split source candidate (M2) with the pruning policy chosen by
+/// block count.
 fn build_narrow_source_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3267,12 +2959,9 @@ fn build_narrow_source_candidate_with_policy(
     })))
 }
 
-/// Whether emitting a route changed block boundaries or token spellings.
-///
-/// A different Huffman representation alone cannot improve when immediately
-/// fed to the smaller Default tree search: Max has already priced that same
-/// token state with a superset of header candidates. Boundary or token changes
-/// are different—they expose a new planner input and justify one replay.
+/// Whether a route changed block boundaries or token spellings, giving the
+/// Default planner a new input worth one replay. A new Huffman header alone
+/// does not: Max has already priced those tokens with a superset of headers.
 fn candidate_exposes_new_parent(candidate: &Candidate, source: CandidateInput<'_>) -> bool {
     candidate.data.as_slice() != source.compressed
         && (candidate.plans.len() != source.blocks.len()
@@ -3287,13 +2976,8 @@ fn candidate_exposes_new_parent(candidate: &Candidate, source: CandidateInput<'_
                 }))
 }
 
-/// Apply the source-ordered deft4j route to a genuinely rewritten floor state.
-///
-/// Weak gains from the original deft4j route can indicate that Columbo's
-/// ordinary bounded floor is the more useful parent in its route graph.
-/// Reparse that encoded incumbent once, validate its identity, and keep the
-/// seeded deft4j walk additive to the original deft4j candidate rather than
-/// replaying duplicate work on the original blocks.
+/// Run the deft4j route on a rewritten floor, for when the direct deft4j gain
+/// is weak.
 fn build_deft4j_seed_candidate(
     candidate: &Candidate,
     options: &Options,
@@ -3309,12 +2993,6 @@ fn build_deft4j_seed_candidate(
     build_deft4j_source_candidate(source, options, expired)
 }
 
-/// Apply the ordinary planner to boundaries and token spellings produced by
-/// the source-ordered deft4j route while the same container deadline has room.
-///
-/// This is not duplicate source work: the reparsed deft4j candidate contains
-/// merged blocks and expanded token states that the original normal floor
-/// cannot see. The original floor remains an independent comparison below.
 fn refine_with_default_planner(
     candidate: &Candidate,
     options: &Options,
@@ -3326,12 +3004,8 @@ fn refine_with_default_planner(
         .map(|(candidate, _)| candidate)
 }
 
-/// Apply Default and report whether its result exposes a new planner state.
-///
-/// The signal is computed against the already parsed input while both models
-/// are live. Callers can then admit one dependent Max continuation without
-/// reparsing the parent merely to distinguish topology changes from cheaper
-/// headers over otherwise identical blocks and tokens.
+/// Replan a rewritten candidate with the Default planner and report whether the
+/// result changed blocks or tokens.
 fn refine_with_default_planner_and_change(
     candidate: &Candidate,
     options: &Options,
@@ -3349,7 +3023,6 @@ fn refine_with_default_planner_and_change(
     Ok((refined, exposes_new_parent))
 }
 
-/// Apply the narrow source-order route to a complete rewritten candidate.
 fn refine_with_no_split_route(
     candidate: &Candidate,
     options: &Options,
@@ -3377,13 +3050,9 @@ fn changed_parent_no_split_should_continue(
         && completed_no_split.is_some_and(|no_split| refined.is_strictly_smaller_than(no_split))
 }
 
-/// Decide whether a completed no-split result owns the next dependent step.
-///
-/// Encoded score alone cannot dominate this dependency: even a smaller sibling
-/// may have a different token/tree topology, while a tied second no-split pass
-/// can expose a better terminal tree fixed point. The completed source and all
-/// sibling candidates remain retained regardless of whether this continuation
-/// improves.
+/// Whether a completed no-split candidate gets one no-split continuation
+/// (M2c). Sibling sizes do not decide this, since a smaller sibling may have a
+/// different topology.
 fn changed_narrow_parent_should_continue(
     exposes_new_parent: bool,
     narrow: &Candidate,
@@ -3392,14 +3061,9 @@ fn changed_narrow_parent_should_continue(
     exposes_new_parent && narrow.is_strictly_smaller_than_source(source)
 }
 
-/// Finish a small deft4j-derived seed with Columbo's structural split floor.
-///
-/// The timed source route can settle its token spellings just before the
-/// deadline, leaving no opportunity to price the seven inexpensive
-/// eighth-position cuts already used elsewhere by Columbo. This route performs
-/// no token search, merge search, or replay. Its explicit size, topology, and
-/// token limits make it safe to finish deterministically after the shared
-/// deadline, while the caller keeps the unsplit candidate as a fallback.
+/// A compact completed parent, reparsed for the compact split floor (M10c).
+/// The split runs no token search, merge search or replay, so its limits make
+/// it safe to finish after the deadline.
 struct CompactSplitSeed {
     data: Vec<u8>,
     bits: u64,
@@ -3527,11 +3191,8 @@ fn build_prepared_compact_source_split_floors(
     let mut candidate = None;
     let mut attempted = false;
     for seed in seeds {
-        // A selected parent is already a complete incumbent. Price its split
-        // descendants cooperatively so the hard file boundary forwards every
-        // completed useful cut instead of waiting for an untimed full sweep.
-        // Later independent parents still begin only inside the soft schedule;
-        // a larger Max budget naturally evaluates all of them.
+        // The first parent always runs and polls the hard stop, keeping every
+        // completed cut. Later parents start only before the soft deadline.
         if attempted && !deadline.can_start_route() {
             break;
         }
@@ -3550,12 +3211,9 @@ fn build_prepared_compact_source_split_floors(
 }
 
 fn ordered_compact_split_seeds(seeds: [Option<&CompactSplitSeed>; 3]) -> Vec<&CompactSplitSeed> {
-    // A smaller completed parent is the strongest general prior for a useful
-    // split descendant: it already carries the best known token spellings and
-    // table choices, while the split route adds only new structural cuts.
-    // Split pricing is not monotone, so retain every distinct parent when the
-    // deadline permits; ordering merely ensures that a bounded run evaluates
-    // its most promising complete lineage first.
+    // Smaller parents carry the best known spellings and tables, so try them
+    // first. Split pricing is not monotone, so every distinct parent still
+    // runs while the deadline allows.
     let mut seeds: Vec<_> = seeds.into_iter().flatten().collect();
     seeds.sort_by_key(|seed| (seed.data.len(), seed.bits));
     seeds
@@ -3610,13 +3268,9 @@ fn refine_with_compact_source_split_floor_until(
     )
 }
 
-/// Finish a compact source-max parent after ordinary timed routes complete.
-///
-/// Unlike the earlier deft4j-derived floor, this terminal dependency admits a
-/// single parent block: splitting that block is how a second payload regime is
-/// discovered. The separate 256-KiB decoded cap remains a small fixed memory
-/// bound while covering compact token graphs whose long matches expand beyond
-/// the early route's 128-KiB scheduling class.
+/// Split a compact source-max parent after the ordinary timed routes (M10d).
+/// Unlike M10c, it accepts a one-block parent, whose split can find a second
+/// Huffman regime, and up to 256 KiB decoded.
 fn refine_with_terminal_source_split_floor_until(
     candidate: &Candidate,
     options: &Options,
@@ -3668,11 +3322,8 @@ fn compact_source_split_floor_eligible_with_limits(
         .is_some_and(|tokens| tokens <= COMPACT_SPLIT_FLOOR_MAX_TOKENS)
 }
 
-/// Apply Columbo's bounded pair/quad balanced-tree moves to one dynamic block.
-///
-/// The source-level gate is an upper work bound. This post-route helper neither
-/// changes tokens nor replays the result; the encoded incumbent remains an
-/// independent fallback if every legal tree move loses.
+/// Apply Columbo's bounded pair/quad balanced-tree moves to one dynamic block
+/// (D3 and M4), without changing tokens or replaying.
 fn refine_with_compact_balanced_tree_floor(
     candidate: &Candidate,
     options: &Options,
@@ -3690,9 +3341,7 @@ fn refine_with_compact_balanced_tree_floor(
     let Some(seed) = block.original_dynamic.as_ref() else {
         return Ok(None);
     };
-    // Default's bounded feedback floors gain broadly from the cheap literal
-    // pair move. Matched Max streams omit that standalone family, but still
-    // price distance moves and the bounded paired cross-alphabet search.
+    // Max omits the standalone literal pair move for streams with matches.
     let price_literal_pair = !options.exhaustive
         || block
             .distance_frequencies
@@ -3709,10 +3358,9 @@ fn refine_with_compact_balanced_tree_floor(
     let Some(mut dynamic) = dynamic else {
         return Ok(None);
     };
-    // Default ranks the bounded move family with its ordinary header grid,
-    // then gives only the winning tree one exhaustive header finalization.
-    // Max already prices every prospective tree exhaustively. This retains
-    // the useful header tail without repeating that work for losing moves.
+    // Default ranks the moves with its ordinary header grid, then gives only
+    // the winning tree an exhaustive header finalization; Max already prices
+    // every tree exhaustively.
     if !options.exhaustive {
         if let Some(finalized) = plan_for_explicit_lengths(
             &block.tokens,
@@ -3754,13 +3402,9 @@ fn refine_with_compact_balanced_tree_floor(
     .map(|candidate| Some(candidate.named("Columbo compact balanced-tree floor")))
 }
 
-/// Apply the complete feasible restricted-depth frontier to a completed
-/// Huffman stream. This is a terminal sibling, so a locally attractive tree
-/// can never redirect or replace the established search lineage unless the
-/// fully emitted stream is strictly smaller. If the hard stop closes during a
-/// block, its best completed tree is retained and later blocks reuse their
-/// originals, preserving a complete stream prefix rather than losing the
-/// whole terminal pass.
+/// Price every feasible bounded-depth payload tree for each dynamic block of a
+/// completed stream. If the stop is reached during a block, that block keeps
+/// its best completed tree and later blocks keep their original codes.
 fn refine_with_bounded_depth_tree_floor(
     candidate: &Candidate,
     options: &Options,
@@ -3826,14 +3470,9 @@ fn refine_with_bounded_depth_tree_floor(
     Ok((rebuilt.bits < candidate.bits).then(|| rebuilt.named("Bounded-depth tree floor")))
 }
 
-/// Finish the exact mixed-depth tree floor after the hard search boundary.
-///
-/// Payload/header search has a fixed Deflate-alphabet frontier per dynamic
-/// block once frequencies are known. Price every block so reaching the hard
-/// boundary a few milliseconds earlier or later cannot change which terminal
-/// floor quiet, Verbose, or Visual mode receives. One-MiB compressed/decoded
-/// limits and the existing 128-block narrow-list bound cap total work; no file
-/// family or measured corpus band participates in admission.
+/// Run the bounded-depth tree floor to completion after the hard stop (Max
+/// only). Ignoring the stop makes the result independent of stop timing; the
+/// size and block limits bound the work.
 fn refine_with_bounded_depth_tree_rescue(
     candidate: &Candidate,
     options: &Options,
@@ -3918,13 +3557,12 @@ fn bounded_depth_rescue_sizes_are_bounded(compressed_bytes: usize, decoded_bytes
         && decoded_bytes <= BOUNDED_DEPTH_RESCUE_MAX_DECODED
 }
 
-/// Apply raw restricted-depth and RLE-smoothed payload trees to a completed
-/// compact Huffman stream.
+/// Apply bounded-depth and RLE-smoothed payload trees to a completed compact
+/// Huffman stream. The first result says whether the blocks qualified, in
+/// which case the bounded-depth trees are already priced.
 ///
-/// Keeping this out of the central block planner is deliberate: tree prices
-/// influence later token feedback, so replacing an intermediate winner can
-/// lose a better downstream fixed point. This terminal sibling preserves the
-/// completed parent and is accepted only after exact whole-stream emission.
+/// This stays out of the block planner: tree prices steer later token
+/// feedback, so replacing an intermediate winner can lose a better fixed point.
 fn refine_with_compact_payload_tree_floor(
     candidate: &Candidate,
     options: &Options,
@@ -4021,13 +3659,8 @@ fn refine_with_compact_payload_tree_floor(
     ))
 }
 
-/// Stabilize one balanced-tree rewrite through proven-feedback's fixed point.
-///
-/// A new Huffman header changes match-to-literal prices; the resulting token
-/// feedback can in turn expose a second header win. The compact route enforces
-/// its own 4,000-token/80-KiB work bounds and applies balanced-tree cleanup to
-/// its own final seed, so one composition closes this dependency without
-/// rerunning max.
+/// Run compact proven feedback on one balanced-tree rewrite, whose new header
+/// changes match and literal prices.
 fn refine_with_compact_proven_feedback(
     candidate: &Candidate,
     options: &Options,
@@ -4040,14 +3673,9 @@ fn refine_with_compact_proven_feedback(
     build_compact_proven_feedback_candidate(source, options, &mut never_expires)
 }
 
-/// Close the bounded tree-shape dependency exposed by a winning payload-tree
-/// floor.
-///
-/// The fixed-point smoother can expose a profitable pair/quad Kraft move that
-/// the parent tree did not contain. Price that already-bounded tree-only floor
-/// once, then reapply smoothing without rerunning token feedback or the
-/// ordinary/Max planner. Further rounds produce diminishing corpus gains for
-/// a measurable Default slowdown, so they remain a rejected expansion.
+/// After a winning payload-tree floor, price one balanced-tree pass (the
+/// smoothed tree can allow a profitable pair/quad Kraft move), then smooth
+/// again. More rounds slow Default for little gain.
 fn refine_with_compact_payload_tree_balanced_closure(
     candidate: &Candidate,
     options: &Options,
@@ -4067,7 +3695,6 @@ fn refine_with_compact_payload_tree_balanced_closure(
     Ok(Some(closed.named("Compact payload-tree balanced closure")))
 }
 
-/// Apply the full Columbo max planner to a complete rewritten candidate.
 fn refine_with_max_planner(
     candidate: &Candidate,
     options: &Options,
@@ -4081,13 +3708,9 @@ fn refine_with_max_planner(
         .map(|candidate| candidate.named("Columbo max refinement"))
 }
 
-/// Apply one linear, deterministic merge cleanup to a selected max seed.
-///
-/// The timed route may end immediately after producing a substantially better
-/// block list. Reparse that completed stream and price only adjacent merges
-/// with bounded table floors. If time remains, at most two ordinary replays
-/// may stabilize the smaller list. Optional probes observe the caller's
-/// deadline; complete candidate emission and validation still finish.
+/// Apply one linear merge cleanup to a selected seed: price only adjacent
+/// merges with bounded table floors, then settle the smaller list with at most
+/// two Default replays while time remains.
 fn refine_with_terminal_merge(
     candidate: &Candidate,
     options: &Options,
@@ -4116,8 +3739,9 @@ fn refine_with_terminal_merge(
     .map(|candidate| Some(candidate.named("Columbo terminal merge")))
 }
 
-/// Build one complete-stream candidate and follow strict improvements through
-/// a small number of reparse/replan rounds.
+/// Build one complete-stream candidate, follow strict improvements through up
+/// to `replay_limit` reparse/replan rounds, and compare the endpoint-proven
+/// lineage.
 fn build_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4127,8 +3751,8 @@ fn build_candidate(
     build_candidate_with_proven_policy(source, options, replay_limit, true, expired)
 }
 
-/// Run the full initial APNG stream planner once, without entering its
-/// additive reparse/replay or independent endpoint-proven lineages.
+/// Run the initial stream planner once, without replay or the endpoint-proven
+/// lineage (APNG Default).
 fn build_apng_default_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4140,15 +3764,9 @@ fn build_apng_default_candidate(
     build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
 }
 
-/// Build the compact proven-before-feedback comparison candidate.
-///
-/// The bounded floor and full search are separate replay fixed points in
-/// default mode: either immediate plan can reach the smaller final stream. Max
-/// mode runs only the floor here because its later source-max route covers the
-/// remaining full search; repeating the sibling first would consume time
-/// reserved for that broader route. The 4,000-token/80-KiB eligibility band is
-/// enforced by `compact_proven_submatch_route_eligible` before this helper
-/// is called.
+/// Build the compact proven-before-feedback candidate (D1, M3). Default runs
+/// both the bounded floor and the full search; Max runs only the floor,
+/// because source max covers the full search.
 fn build_compact_proven_feedback_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4168,9 +3786,8 @@ fn build_compact_proven_feedback_candidate(
     let mut floor_plan =
         improve_plan_with_integrated_proven_floor(block, 0, &route_options, true, floor_base);
     let floor_bits_before_composition = floor_plan.bits;
-    // Max may mix several locally valid match spellings before replay. Keep
-    // this attached to M3's already-complete compact floor: the floor remains
-    // a fallback, while the beam inherits its useful table as the cost seed.
+    // Max's header-aware beam starts from the complete compact floor, which
+    // supplies its initial code costs and stays as the fallback.
     if options.exhaustive && !expired.reached() {
         floor_plan = improve_plan_with_header_aware_proven_composition(
             block, 0, options, expired, floor_plan,
@@ -4184,10 +3801,8 @@ fn build_compact_proven_feedback_candidate(
     } else {
         "Columbo proven-feedback floor"
     };
-    // Stabilize the cheap floor before starting its heavier full-search
-    // sibling. Besides securing an early complete candidate for shared
-    // deadlines, this avoids making a later local search consume time needed
-    // by the floor's distinct replay fixed point.
+    // Settle the cheap floor first, so the full search cannot use the floor's
+    // time.
     let mut candidate = build_compact_proven_seed_candidate(
         source,
         floor_plan,
@@ -4199,9 +3814,8 @@ fn build_compact_proven_feedback_candidate(
     if options.exhaustive || expired.reached() {
         return Ok(Some(candidate));
     }
-    // Start the default-only sibling from its own ordinary price. This retains
-    // the full search's established tie order while the floor above remains an
-    // independent complete candidate.
+    // The full search starts from its own ordinary price, which keeps its tie
+    // order.
     let searched_plan =
         plan_block_with_integrated_proven_search(block, 0, &route_options, &mut *expired);
     let searched = build_compact_proven_seed_candidate(
@@ -4216,11 +3830,8 @@ fn build_compact_proven_feedback_candidate(
     Ok(Some(candidate))
 }
 
-/// Stabilize both replay endpoints reachable from one compact seed.
-///
-/// Ordinary replay and repeated proven-before-feedback replay can each win.
-/// Keeping this small helper shared by both seed lineages makes that necessary
-/// comparison explicit without rebuilding the seed plan itself.
+/// Settle both replay endpoints (ordinary and proven-before-feedback) reachable
+/// from one compact seed.
 fn build_compact_proven_seed_candidate(
     source: CandidateInput<'_>,
     plan: PlannedBlock,
@@ -4229,10 +3840,6 @@ fn build_compact_proven_seed_candidate(
     route: &'static str,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
-    // The first proven-before-feedback pass exposes two distinct replay fixed
-    // points. Ordinary replays can stabilize a better table for some streams,
-    // while preserving the integrated ordering through every replay wins on
-    // others. Both are compact, bounded siblings of the same initial plan.
     let mut candidate = build_candidate_from_plans(
         source,
         vec![plan.clone()],
@@ -4252,9 +3859,8 @@ fn build_compact_proven_seed_candidate(
     )?
     .named(route);
     candidate.replace_if_smaller(integrated);
-    // Balanced-tree cleanup follows each seed lineage independently. Comparing
-    // the pre-cleanup candidates first can hide a locally dearer seed whose
-    // table exposes the smaller completed tree endpoint.
+    // Comparing before the cleanup can hide a locally dearer seed whose table
+    // leads to a smaller tree endpoint.
     if let Some(tree) = refine_with_compact_balanced_tree_floor(
         &candidate,
         options,
@@ -4266,11 +3872,9 @@ fn build_compact_proven_seed_candidate(
     Ok(candidate)
 }
 
-/// Build a compact multi-block proven-before-feedback comparison candidate.
-///
-/// This recreates the integrated floor used before proven resegmentation was
-/// separated into an endpoint lineage, but retains it as an additive complete
-/// stream. The caller enforces the four-block/16-KiB-token work bound.
+/// Build the compact multi-block integrated proven-feedback candidate (D2):
+/// proven resegmentation runs inside each block's floor and search, before
+/// table feedback, rather than as a separate endpoint lineage.
 fn build_compact_integrated_proven_feedback_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4297,10 +3901,8 @@ fn build_compact_integrated_proven_feedback_candidate(
         expired,
     )?
     .named("Columbo integrated proven feedback");
-    // Ordinary replay is the cheaper historical endpoint and already recovers
-    // many compact multi-block wins. Only follow the second integrated replay
-    // fixed point when that completed candidate did not improve the incumbent;
-    // this keeps the route adaptive without using corpus- or time-based gates.
+    // Ordinary replay is cheaper and finds many compact multi-block wins, so
+    // try integrated replay only when it did not beat the incumbent.
     if !candidate.is_strictly_smaller_than(incumbent) && !expired.reached() {
         let integrated = build_candidate_from_plans(
             source,
@@ -4338,16 +3940,12 @@ fn build_candidate_with_proven_policy(
         return Ok(candidate);
     }
 
-    // Stabilize proven-submatch resegmentation as an independent lineage.
-    // Selecting an immediate local win inside `plan_stream` can change the
-    // parent token state of later replay and hide a better established fixed
-    // point. Compare the completed route and its endpoint branch as complete
-    // emitted streams.
+    // Run proven-submatch resegmentation as a separate lineage from the
+    // endpoint. A local win inside `plan_stream` would change the tokens later
+    // replays start from and can hide a better fixed point.
     let endpoint_proven = {
-        // Reparse the completed ordinary candidate so any retained original
-        // representations refer to these exact bytes. Re-emitting its plan
-        // list against the earlier source would be invalid after an accepted
-        // replay, because original-bit references are generation-local.
+        // Original-bit references are invalid after an accepted replay, so
+        // reparse these exact bytes.
         let replayed =
             parse_validated_rewrite(&candidate.data, source.decoded_limit, source.identity)?;
         let proven_source =
@@ -4371,11 +3969,8 @@ fn build_candidate_with_proven_policy(
     Ok(candidate)
 }
 
-/// Build an additive max candidate after its caller retained the complete
-/// ordinary-mode floor.
-///
-/// This avoids rebuilding the same token-preserving floor inside source max;
-/// the planner still carries a complete structural fallback of its own.
+/// Build a Max candidate when the caller already keeps the complete Default
+/// floor, so source max need not rebuild it.
 fn build_candidate_from_established_floor(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4402,10 +3997,8 @@ fn build_candidate_from_established_floor(
     )
 }
 
-/// Build the direct source-max candidate with nested human-facing telemetry.
-///
-/// Keeping this separate from `build_candidate` means ordinary and quiet
-/// routes do not take clocks or maintain progress state in their hot loops.
+/// Build the source-max candidate with progress reporting. It is separate so
+/// quiet runs do not read clocks or update progress state in hot loops.
 fn build_candidate_with_progress(
     source: CandidateInput<'_>,
     options: &Options,
@@ -4443,6 +4036,9 @@ enum ReplayPlanner {
     Fragmented,
 }
 
+/// Resolve [`MAX_RAW_REPLAY_LIMIT`] to eight rounds per emitted byte. Accepted rounds never
+/// grow the byte length, and each length has at most eight meaningful-bit scores, so this bounds
+/// the strict improvements. The emitted length can exceed the source's after strict repair.
 fn resolved_replay_limit(requested: usize, emitted_bytes: usize) -> usize {
     if requested == MAX_RAW_REPLAY_LIMIT {
         emitted_bytes.saturating_mul(8).max(1)
@@ -4451,12 +4047,9 @@ fn resolved_replay_limit(requested: usize, emitted_bytes: usize) -> usize {
     }
 }
 
-/// Emit an explicitly selected structural seed and stabilize strict replays.
-///
-/// Most callers obtain their first plans from [`plan_stream`]. Alternate
-/// collection strategies intentionally need to preserve a locally dearer seed,
-/// so accepting the initial plan list here prevents the ordinary planner from
-/// replacing it before its new block boundaries have been reparsed.
+/// Emit the given plans, then replay up to `replay_limit` rounds while each
+/// round strictly improves. Caller-supplied plans let a route keep a locally
+/// dearer seed until its new block boundaries are reparsed.
 fn build_candidate_from_plans(
     source: CandidateInput<'_>,
     plans: Vec<PlannedBlock>,
@@ -4487,11 +4080,6 @@ fn build_candidate_from_plans_with_progress(
     progress: Option<&RouteProgress>,
 ) -> Result<Candidate> {
     let (mut data, mut bits) = emit_plans(source.compressed, &plans, options.strict)?;
-    // `data.len() == ceil(bits / 8)`. At a fixed byte length there are at most
-    // eight meaningful-bit scores, and accepted rounds never increase byte
-    // length. Eight times the emitted length therefore bounds every possible
-    // strict score improvement, even when strict repair initially grows an
-    // incompatible source stream.
     let replay_limit = resolved_replay_limit(replay_limit, data.len());
     let initial_loses = !is_strictly_better(
         data.len(),
@@ -4500,10 +4088,6 @@ fn build_candidate_from_plans_with_progress(
         source.meaningful_bits,
     );
 
-    // A merged stream has token and block boundaries which did not exist in
-    // its input. Re-parsing makes those boundaries available to the next
-    // planning round. Each accepted round must improve the complete stream,
-    // so this cannot oscillate even before the explicit cap is reached.
     let mut data_is_validated = false;
     let mut output_max_distance = None;
     let mut max_planner_is_stable = false;
@@ -4572,10 +4156,8 @@ fn build_candidate_from_plans_with_progress(
         };
         let (replay_data, replay_bits) = emit_plans(&data, &replay_plans, options.strict)?;
         if !is_strictly_better(replay_data.len(), replay_bits, data.len(), bits) {
-            // A completed exhaustive full replay from the current bytes is
-            // precisely the work performed by the later rewritten-seed route.
-            // Record the fixed point only while the allowance is still live;
-            // a deadline-truncated planner has not proved stability.
+            // A completed Max replay that reproduces the current bytes lets
+            // M13 skip repeating it; a deadline-truncated one proves nothing.
             max_planner_is_stable = matches!(replay_planner, ReplayPlanner::Full)
                 && options.exhaustive
                 && replay_bits == bits
@@ -4614,17 +4196,12 @@ fn build_candidate_from_plans_with_progress(
         data = replay_data;
         bits = replay_bits;
         plans = replay_plans;
-        // The accepted rewrite has not itself been parsed yet. The next loop
-        // iteration or the final check below must validate this new stream.
         data_is_validated = false;
         output_max_distance = None;
     }
 
-    // The last accepted replay is not necessarily followed by another loop
-    // iteration: the replay cap or deadline may stop immediately after it.
-    // Validate that final selectable stream as well. A known-losing generated
-    // stream is skipped because the caller will retain the already-validated
-    // source bytes instead.
+    // The loop may stop right after an accepted replay. A known-losing relaxed
+    // stream is skipped, since the caller keeps the validated source bytes.
     if (!initial_loses || options.strict) && !data_is_validated {
         let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
         output_max_distance = Some(replayed.max_distance);
@@ -4647,8 +4224,8 @@ fn build_candidate_from_plans_with_progress(
 }
 
 /// Retain a parsed source when the mandatory plan list cannot be allocated.
-/// Strict mode must rewrite incompatible Huffman alphabets, so it reports an
-/// allocation failure rather than silently ignoring the requested transform.
+/// Strict mode must rewrite incompatible Huffman alphabets, so it reports the
+/// allocation failure instead.
 fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Candidate> {
     if options.strict {
         return Err(Error::internal("could not allocate Deflate plan"));
@@ -4679,12 +4256,8 @@ fn parse_validated_rewrite(
     Ok(stream)
 }
 
-/// Verify every generated stream before using it as input to another round.
-///
-/// These checks used to be debug assertions. Keeping them in release builds is
-/// inexpensive—the parser has already computed every value—and makes an
-/// emitter or planner bug fail closed instead of allowing changed decoded data
-/// to become the next optimization seed.
+/// The parser has already computed every compared value, so this check is
+/// cheap even in release builds.
 fn validate_replayed_stream(
     stream: &ParsedStream,
     expected_bytes: usize,
@@ -4772,10 +4345,8 @@ fn capture_source_block_report(
     source_block_count: usize,
     enabled: bool,
 ) -> Option<BlockReport> {
-    // The parser intentionally collapses pathological runs of empty blocks.
-    // In that case it no longer has an exact block-for-block view of source
-    // bytes, so omit details instead of presenting the compact model as the
-    // original stream.
+    // The parser collapses runs of empty blocks; do not present that model as
+    // the source.
     if !enabled || blocks.len() != source_block_count {
         return None;
     }

@@ -22,81 +22,113 @@ remain private to the crate.
 | `src/progress/` | Coordinate physical stream order and render verbose or visual route reports. |
 | `src/terminal/` | Share terminal capability checks, text formatting, and spinner behavior between the library and CLI. |
 
-The library owns optimization, while the CLI owns filesystem changes. Shared
-terminal code is compiled privately into both targets so the library does not
-need to expose CLI implementation details as public API.
+The library performs optimization, while the CLI performs filesystem changes.
+Shared terminal code is compiled privately into both targets so the library does
+not need to expose CLI implementation details as public API.
 
 ## Deflate engine
 
-`optimize.rs` validates the complete input, retains the required Default
-comparison floor, and selects a complete emitted candidate. A timeout limits
-optional search; it does not bypass validation or produce partial output. Its
-child module `optimize/schedule.rs` runs one raw stream's route phases in a fixed
-order. Each phase reads a shared route context and updates the complete
-candidates carried between phases. Route builders and eligibility rules remain
-in `optimize.rs`.
+`optimize.rs` holds the route builders, eligibility rules, and candidate
+comparison. Its child module `optimize/schedule.rs` validates one raw stream,
+then runs the route phases in a fixed order: each phase reads a shared route
+context and updates the complete candidates carried between phases. Max
+retains the Default comparison floor. A timeout limits optional search; it
+never skips validation or produces partial output.
 
 | Module | Responsibility |
 | --- | --- |
 | `bitstream` | Read and write least-significant-bit-first Deflate fields. |
 | `parse`, `model` | Validate the stream and retain decoded bytes, source symbols, and block metadata. |
-| `huffman` | Construct code lengths, canonical codes, and decoding tables. |
-| `header` | Construct dynamic headers and account for payload and header bits. |
-| `block` | Price and emit original, stored, fixed, or dynamic block representations. |
-| `minima` | Share short range-minimum lookups between match-spelling searches. |
-| `search` | Explore token spellings justified by the input's existing matches. |
-| `stream` | Plan block merges, splits, and boundary changes. |
+| `huffman` | Construct length-limited code lengths, canonical codes, and decoding tables. |
+| `header` | Construct dynamic headers and count header and payload bits. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11). |
+| `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache. |
+| `minima` | Share range-minimum lookups between searches over match-length families. |
+| `search` | Change token spelling within existing matches. |
+| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6). |
 | `source_recode` | Run the deft4j-derived source-order recoding and merge route. |
-| `restore` | Restore original match choices after other routes settle. |
-| `joint` | Search payload code lengths and header run-length encoding together. |
-| `symbol_set` | Price removal of small sets of payload symbols. |
-| `distance_band` | Collapse a block's distance alphabet to a kept set of distance symbols. |
+| `restore` | Restore original match choices after other routes settle (R1). |
+| `joint` | Search payload code lengths and header run-length encoding together (R4). |
+| `symbol_set` | Price removal of small sets of payload symbols (R5). |
+| `slide` | Slide block boundaries under the transmitted Huffman trees (R1c). |
+| `distance_band` | Collapse a block's distance alphabet to a kept set of distance symbols (R13). |
 | `stop` | Apply shared deadlines, grace periods, and cooperative cancellation. |
+| `optimize` | Build, schedule, and compare complete candidates, as described above. |
 
 The engine never discovers new LZ77 matches. Keep source-proof checks, fallible
 allocation, work limits, exact candidate pricing, and tie order visible when
-changing a search. Similar-looking routes may deliberately differ in these
-policies; their research provenance is described in [routes and methods](routes-and-methods.md).
+changing a search. Similar routes can differ in these policies by design;
+[routes and methods](routes-and-methods.md) describes each route and its
+provenance.
+
+## Terms
+
+Code comments and the route documentation rely on these project terms.
+
+- **Route**: one optimization strategy that builds a complete candidate, such
+  as the ordinary planner, the deft4j-derived source route, or a terminal method.
+- **Candidate**: a complete emitted stream that competes with the incumbent.
+  Candidates are ranked by byte length, then meaningful bits; an exact tie
+  keeps the incumbent.
+- **Meaningful bits**: a Deflate stream's bit length through its final block,
+  excluding the padding in the last byte.
+- **Floor**: a complete candidate retained before optional search, which later
+  routes must beat. Max keeps the Default comparison floor so that, given
+  enough time, it never returns a worse result than Default.
+- **Lineage**: a sequence of candidates derived from one starting candidate.
+  Each lineage is retained independently until the final comparison.
+- **Spelling**: the choice of tokens (literals, matches, and how a match is
+  split) that encode the same decoded bytes.
+- **Proven submatch**: a shorter match at an existing match's distance, inside
+  that match's decoded interval; the source match proves those bytes repeat.
+- **Sweep**: one ordered pass of the terminal methods (R1–R14) over the
+  incumbent. Max repeats the sweep (R12) while it improves and time remains.
+- **Default / Max**: the two search modes. Max (`--max`, `Options::exhaustive`)
+  adds slower routes.
+- **Strict mode**: `--strict 1`, the default (`Options::strict`). Output uses
+  complete Huffman alphabets and the standard length-258 code, symbol 285.
+- **Deadline and grace**: the soft deadline stops new routes from starting;
+  active work may continue for a grace of 10% of the timeout plus one second,
+  until the hard stop.
+- **Route labels**: D1–D3, G0, R1–R14, M0–M13, S0, and their suffixed variants
+  name gates and routes in the
+  [route-gate reference](routes-and-methods.md#route-gate-reference).
 
 ## Tests, tooling, and documentation
 
-Every unit suite lives in its module's `tests.rs` and is loaded with
-`#[cfg(test)] mod tests;`, regardless of suite size. Implementation files keep
-their descriptive names, while a sibling directory holds the tests: for example,
-`src/format/gzip.rs` and `src/format/gzip/tests.rs`. The format coordinator
-uses `src/format/mod.rs` and `src/format/tests.rs`. Library-root unit tests live
-in `src/tests.rs`. This preserves access to private implementation details
-without exporting test-only APIs. Keep helpers and methods used by a single
-suite in its `tests.rs`. Put fixtures, assertions, and accessors used by multiple
-suites in the owning module's `test_support.rs`, loaded with a `#[cfg(test)]`
-module declaration. Import shared helpers from that module explicitly. For
-example, header fixtures live in `src/deflate/header/test_support.rs`, and CLI
-helpers live in `src/cli/test_support.rs`.
+Every unit suite, whatever its size, lives in its module's `tests.rs`, loaded
+with `#[cfg(test)] mod tests;`, so tests can reach private items without
+test-only exports. A named implementation file keeps its name, and a sibling
+directory holds its tests and child modules: for example, `src/format/gzip.rs`
+and `src/format/gzip/tests.rs`. Group roots keep `mod.rs`, with tests beside
+it: `src/format/mod.rs` and `src/format/tests.rs`. Library-root unit tests live
+in `src/tests.rs`. Helpers used by one suite stay in its `tests.rs`. Fixtures,
+assertions, and accessors shared by several suites go in the module's
+`test_support.rs`, also under `#[cfg(test)]`, and are imported explicitly: for
+example, `src/deflate/header/test_support.rs` and `src/cli/test_support.rs`.
 
-Implementation files contain test-module declarations and the minimal
-instrumentation that must observe production code. The parser's test-only
-trailing-empty-block counter and its `ParsedStream` field observe parser work.
-The file writer also has test-only checkpoints after snapshot comparison and
-publication for deterministic concurrent-edit, force-kill, and sync-failure
-tests. Fixture data and standalone test helpers belong in test files.
+Implementation files hold only test-module declarations and the minimal
+test-only instrumentation that must observe production code, such as the
+parser's trailing-empty-block counter (a `ParsedStream` field) and the file writer's
+checkpoints after snapshot comparison and publication, which make the
+concurrent-edit, force-kill, and sync-failure tests deterministic.
 
 `tests/public_api.rs` exercises the library as an external consumer.
-`tests/local_corpus.rs` holds opt-in public-API regressions backed by local files.
-`tests/test_sanitize_binary_paths.py` checks path audits and atomic binary
-redaction. `tests/test_build_distribution.py` checks concurrent packaging and
-failure cleanup with synthetic executables and a fake compiler. Both use
-temporary directories, and neither requires private fixtures. Build and
-packaging scripts live in `utils/`.
+`tests/cli_output.rs` runs the CLI executable to check report streams and
+`--out` validation. `tests/local_corpus.rs` holds opt-in public-API regressions
+backed by local files. `tests/test_sanitize_binary_paths.py` checks path audits
+and atomic binary redaction. `tests/test_build_distribution.py` checks
+concurrent packaging and failure cleanup with synthetic executables and a fake
+compiler. Both use temporary directories, and neither requires private
+fixtures. Build and packaging scripts live in `utils/`.
 
 See [file safety](file-safety.md) for the write protocol, interruption behavior,
 and the limits of the portable filesystem implementation.
 
-Use lowercase `snake_case` for Rust modules and Python test files. Shell scripts
-and documentation use descriptive hyphenated names. Keep named implementation
-files such as `zip.rs` when adding tests or child modules in the sibling `zip/`
-directory. Existing group roots such as `src/format/mod.rs` retain `mod.rs`.
+Use lowercase `snake_case` for Rust modules and Python test files, and
+descriptive hyphenated names for shell scripts and documentation.
 
-`docs/` contains contributor material and benchmark summaries; `docs/research/`
-contains method analysis and existing reference material. Private corpus files
-and exploratory outputs are intentionally outside the tracked project. See the
-[contributor guide](CONTRIBUTING.md) for test commands and publication boundaries.
+`docs/` contains contributor material, design notes, and benchmark summaries;
+`docs/research/` contains method analysis and existing reference material.
+Private corpus files and exploratory outputs stay outside the tracked project.
+See the [contributor guide](CONTRIBUTING.md) for test commands and publication
+boundaries.

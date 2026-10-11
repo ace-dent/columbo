@@ -82,7 +82,7 @@ fn assert_certified(source: &ParsedStream, output: &ParsedStream) {
     assert_eq!(plain(source), plain(output));
 }
 
-/// Single-edge accounting retained independently from the batched charge.
+/// Reference: charge one edge at a time, to check the batched `Budget::edges`.
 fn reference_edge(budget: &mut Budget<'_, '_>) -> Option<()> {
     if budget.remaining == 0 || (budget.remaining & 255 == 0 && budget.stop.reached()) {
         budget.remaining = 0;
@@ -170,9 +170,7 @@ fn reference_restore_interval(
     while at < n {
         let token = choices[at]?;
         let end = at + token.decoded_len();
-        // A newly chosen match is unavailable from the selected proofs iff it
-        // crosses a literal gap. Continuous same-distance matches were already
-        // coalescible without the original certificate.
+        // Same restored-match rule as in `restore_interval`.
         restored |= distance(token).is_some()
             && existing[at..end]
                 .iter()
@@ -551,8 +549,8 @@ fn restoration_handles_window_extremes_and_stored_alignment() {
                 assert_eq!(output.meaningful_bits, plans.iter().map(|p| p.bits).sum());
                 assert!(output.meaningful_bits <= parent.meaningful_bits);
                 if d == 513 && length == 3 {
-                    // Four saved payload bits are absorbed by stored
-                    // padding; the caller must retain the complete tie.
+                    // Stored-block padding absorbs the four saved payload
+                    // bits, so the complete streams tie.
                     assert_eq!(output.meaningful_bits, parent.meaningful_bits);
                 }
             }

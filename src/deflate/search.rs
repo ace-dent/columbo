@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Proven-LZ77 structural searches.
+//! Token-spelling searches over the input's existing LZ77 matches.
 //!
 //! These routes never search the history window or choose a new distance. They
-//! selectively spell an existing match as its already-decoded literals,
-//! resegment one match into literals and same-distance submatches, or move
-//! boundaries inside an adjacent run already proven at one distance, then
-//! rebuild the Huffman representation. Equal-cost token transformations are
-//! useful intermediate states because their changed frequencies can make the
-//! next tree smaller.
-//!
-//! Names identify recovered primitives precisely. DeflOpt and Defluff labels
-//! apply only to behavior mapped to those programs; bounded floors, cumulative
-//! length-family bands, match groups, queues, and repeated replay are Columbo
-//! compositions, even when they use a recovered primitive internally.
+//! spell an existing match as literals, split it into literals and proven
+//! submatches, or move boundaries inside a run of adjacent matches at one
+//! distance, then rebuild the Huffman codes. Equal-cost spellings are useful
+//! intermediate states: their changed frequencies can make the next tree
+//! smaller. Items named after DeflOpt, Defluff or deft4j follow those programs.
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -41,11 +35,8 @@ use super::model::{
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
 
-/// A transformed token vector is temporary, but it can be much larger than
-/// its source: one compact match may become 258 literal `Token` values. Give a
-/// single optional candidate the same byte ceiling as the persistent parser
-/// model, and allocate it fallibly. The parsed source remains separately
-/// accounted by the same policy in `parse`.
+/// Byte limit for one temporary token candidate: expanding one match can
+/// produce up to 258 literal tokens.
 const MAX_TOKEN_CANDIDATE_BYTES: usize = MAX_PARSED_MODEL_BYTES;
 const MANDATORY_FLOOR_MAX_TOKENS: usize = 50_000;
 const MANDATORY_FLOOR_MAX_PLAIN: usize = 10_000_000;
@@ -59,13 +50,9 @@ const TABLE_REPLAY_PASSES: usize = 4;
 const ALL_LITERAL_DENSE_MAX_PLAIN: usize = 80_000;
 const ALL_LITERAL_SPARSE_MAX_PLAIN: usize = 1_000_000;
 const ALL_LITERAL_SPARSE_MAX_MATCHES: u64 = 256;
-/// The exhaustive deficit DP can require 257 layers. Default mode keeps the
-/// exact cost search for ordinary runs, but uses a legal minimum-token fallback
-/// once a run would make this cheap candidate family disproportionate.
+/// Most shortened matches (DP layers) for which Default solves a same-distance
+/// repartition exactly; above it Default uses `append_minimum_token_fallback`.
 const DEFAULT_SAME_DISTANCE_MAX_DP_ACTIVE: usize = 16;
-/// Default mode exact-prices one combined candidate from a short ranked list.
-/// Compact blocks may also try a few single-match siblings, while max mode
-/// widens to every match in the explicitly bounded full-graph band.
 const DEFAULT_PROVEN_SUBMATCH_TARGETS: usize = 8;
 const DEFAULT_PROVEN_SUBMATCH_INDIVIDUAL_TRIALS: usize = 4;
 const COMPACT_PROVEN_SUBMATCH_TOKENS: usize = 4_000;
@@ -89,27 +76,20 @@ const PROVEN_COMPOSITION_MAX_SPELLINGS: usize = 4;
 const PROVEN_COMPOSITION_BEAM_WIDTH: usize = 16;
 const PROVEN_COMPOSITION_PAYLOAD_WINDOW: i64 = 24;
 const PROVEN_COMPOSITION_EXACT_LIMIT: usize = 32;
-/// The adaptive sibling exact-prices at most fifteen forward/reverse prefixes
-/// in its first round. A second round is admitted only after a strict win and
-/// shares this overall cap, so no-gain compact blocks pay for one bounded pass.
 const PROVEN_CLOSED_LOOP_MAX_PLAIN: usize = 1_024;
+/// The second round runs only after a strict win and shares the exact-price
+/// limit, so a block without a gain is priced at most fifteen times.
 const PROVEN_CLOSED_LOOP_ROUNDS: usize = 2;
 const PROVEN_CLOSED_LOOP_EXACT_LIMIT: usize = 24;
-/// These source-tree probes are part of the deadline-independent compact floor.
-/// Keep only a small, ranked set so a many-frame container cannot spend its
-/// shared budget rebuilding every nearly identical local candidate.
-/// Ranked single-match trials are a Columbo extension. deft4j expands every
-/// eligible match together in its strict and no-larger recode operations.
+/// Ranked single-match trials in the compact floor; the small limit stops a
+/// many-frame container from spending its shared budget on nearly identical
+/// candidates.
 const COLUMBO_SINGLE_MATCH_TRIALS: usize = 8;
 
-/// Source-only diagnostics for adjacent matches that reuse one distance.
-///
-/// These values describe the parsed input, not the number of candidates later
-/// visited by merged and replayed routes. Keeping that distinction prevents
-/// verbose corpus measurements from depending on search order or timeout.
-/// Adjacent source blocks are treated as one token stream, so an empty block
-/// is not an artificial barrier; stored bytes and other literals naturally
-/// terminate a match run.
+/// Diagnostics for adjacent matches at one distance, measured on the parsed
+/// input so verbose reports do not depend on search order or timeout. Runs
+/// cross source-block boundaries: an empty block does not end a run, but
+/// stored bytes and literals do.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SameDistanceOpportunities {
     pub(crate) runs: usize,
@@ -220,11 +200,8 @@ fn record_same_distance_opportunity(
     }
 }
 
-/// Add one deterministic same-distance run candidate to an existing plan.
-///
-/// This wrapper deliberately uses the ordinary header policy even when called
-/// from a max-mode structural floor. The full search invokes the shared inner
-/// helper with its own policy and deadline.
+/// Add one same-distance run candidate to an existing plan, always with Default
+/// planning, even from a Max floor.
 pub(crate) fn improve_plan_with_same_distance_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -271,9 +248,6 @@ fn consider_same_distance_runs(
         return;
     };
 
-    // Price the canonical candidate first. Its planned token storage is
-    // reference-counted, so relaxed mode can derive an alias sibling lazily
-    // without retaining or eagerly allocating a second large token vector.
     let Some(candidate) = plan_tokens(block, repacked, alignment, options, stop) else {
         return;
     };
@@ -300,13 +274,11 @@ fn consider_same_distance_runs(
     }
 }
 
-/// Repartition every maximal adjacent run that uses one semantic distance.
+/// Repartition every maximal run of adjacent matches with the same distance.
 ///
-/// If a run decodes `S` bytes, `ceil(S / 258)` is both legal and no larger
-/// than its source match count. The first source match proves the distance is
-/// valid at the run start; every later byte follows the same backward relation,
-/// including overlapping copies. Moving only those internal boundaries is
-/// therefore lossless and never searches the history window.
+/// A run that decodes `S` bytes needs only `ceil(S / 258)` matches. Every byte
+/// of the run copies from the same distance (overlapping copies included), so
+/// moving internal boundaries is lossless.
 fn repack_same_distance_runs(
     tokens: &[Token],
     decoded_bytes: usize,
@@ -331,9 +303,6 @@ fn repack_same_distance_runs(
                 .checked_mul(output_matches)?
                 .checked_sub(run.decoded_bytes)?;
             debug_assert!(deficit <= 257);
-            // A run of at most 258 bytes becomes one canonical match directly;
-            // an already-minimal all-258 run is unchanged. Neither case needs
-            // to allocate or traverse the deficit DP.
             let active = output_matches.min(deficit);
             if run.decoded_bytes > 258
                 && deficit != 0
@@ -408,10 +377,8 @@ fn repack_same_distance_runs(
 
 /// Append a legal minimum-token partition without running the cost DP.
 ///
-/// The total deficit is at most 257, so at most two shortened matches are
-/// needed when each match may contribute up to 255 deficit bytes (length 3).
-/// Exact stream pricing still decides whether this bounded default candidate
-/// is useful.
+/// The total deficit is at most 257 and each match can absorb up to 255
+/// (length 3), so at most two matches are shortened.
 fn append_minimum_token_fallback(
     output: &mut Vec<Token>,
     source: Token,
@@ -443,12 +410,9 @@ struct SameDistancePartitioner {
 }
 
 impl SameDistancePartitioner {
-    /// Build a DP over the deficit from an all-length-258 partition.
-    ///
-    /// With the minimum number of output matches the total deficit is at most
-    /// 257 bytes, regardless of run length. At most `deficit` matches can have
-    /// a non-zero deficit, so long runs add no DP depth. Each state queries
-    /// one suffix minimum per length family instead of scanning every length.
+    /// Build a DP over the deficit (bytes short of an all-258 partition). The
+    /// total deficit is at most 257 bytes and at most `deficit` matches are
+    /// shorter than 258, so long runs add no DP depth.
     fn new(
         literal_lengths: &[u8],
         max_active: usize,
@@ -461,8 +425,8 @@ impl SameDistancePartitioner {
         choices.try_reserve_exact(choice_count).ok()?;
         choices.resize(choice_count, u16::MAX);
 
-        // Iterate families in ascending deficit order, preserving the first
-        // choice on equal costs. Canonical length 258 is its own family.
+        // Visit length symbols in ascending deficit order, keeping the first
+        // choice on equal costs. Length 258 (symbol 285) is its own family.
         let families: [_; DEFLATE_LENGTH_BASE.len()] = std::array::from_fn(|offset| {
             let index = DEFLATE_LENGTH_BASE.len() - 1 - offset;
             let first = DEFLATE_LENGTH_BASE
@@ -475,7 +439,7 @@ impl SameDistancePartitioner {
         });
 
         // Reverse the deficit axis so a suffix minimum's lowest position
-        // chooses the smallest token deficit, just like the direct scan.
+        // chooses the smallest token deficit.
         let mut previous = [u64::MAX; 259];
         let mut current = [u64::MAX; 259];
         let mut minima = SuffixMinima::new(max_deficit);
@@ -624,13 +588,6 @@ enum ProvenSubmatchRestriction {
     SourceSymbol,
 }
 
-/// Add subranges already proved by each existing match.
-///
-/// This is not match finding: every generated match retains the source
-/// distance and stays inside the source match's decoded interval. Default mode
-/// exact-prices one bounded set of rare, header-expensive, transition-adjacent
-/// or boundary-near matches. Max mode widens compact blocks to every match and
-/// repeats only strict winners until their token spelling stabilizes.
 pub(crate) fn proven_submatch_route_eligible(
     tokens: &[Token],
     plain_len: usize,
@@ -647,7 +604,6 @@ pub(crate) fn proven_submatch_route_eligible(
             .any(|token| matches!(token, Token::Match { .. }))
 }
 
-/// Whether the complete proven-feedback sibling has tightly bounded work.
 pub(crate) fn compact_proven_submatch_route_eligible(tokens: &[Token], plain_len: usize) -> bool {
     tokens.len() <= COMPACT_PROVEN_SUBMATCH_TOKENS
         && plain_len <= MAX_PROVEN_SUBMATCH_FULL_PLAIN
@@ -656,6 +612,10 @@ pub(crate) fn compact_proven_submatch_route_eligible(tokens: &[Token], plain_len
             .any(|token| matches!(token, Token::Match { .. }))
 }
 
+/// Re-spell existing matches as literals and proven submatches.
+///
+/// Default prices a bounded set of target matches. Max widens compact blocks to
+/// every match and repeats while the spelling keeps changing.
 fn consider_proven_submatches(
     block: &ParsedBlock,
     alignment: u8,
@@ -710,10 +670,9 @@ fn consider_proven_submatches(
         ) else {
             return;
         };
-        // The source edge intentionally wins estimated payload ties. Build a
-        // second, source-symbol-free path so exact header pricing can still
-        // accept a tie or small payload penalty that removes an expensive
-        // code-length entry.
+        // The source token wins estimated-cost ties. A second rewrite set avoids
+        // the source's length symbol, so exact pricing can accept a tie or a
+        // small payload loss that drops that symbol from the header.
         let Some(mut symbol_free_rewrites) = build_proven_submatch_rewrites(
             &targets,
             &block.plain,
@@ -725,9 +684,8 @@ fn consider_proven_submatches(
             return;
         };
 
-        // A few single-match siblings keep one locally useful resegmentation
-        // from being hidden by other graph choices. The combined candidate
-        // below remains the main default route.
+        // Pricing a few single-match rewrites alone stops one useful rewrite
+        // from being masked by the others.
         let compact_for_trials =
             compact_proven_submatch_route_eligible(&pass_tokens, block.plain.len());
         let individual_limit = if compact_for_trials {
@@ -787,10 +745,9 @@ fn consider_proven_submatches(
             return;
         }
 
-        // Per-symbol target caps deliberately keep one common symbol from
-        // starving other opportunities. This separate candidate still removes
-        // the highest symbol from every occurrence when that complete
-        // header-oriented rewrite fits its explicit bound.
+        // Per-symbol target caps stop one common symbol from crowding out the
+        // others, so a separate candidate rewrites every match of the highest
+        // length symbol.
         if !stop.reached() {
             consider_highest_length_symbol_elimination(
                 block,
@@ -814,11 +771,9 @@ fn consider_proven_submatches(
     }
 }
 
-/// Continue one complete block through Columbo's proven-submatch endpoint.
-///
-/// The stream optimizer runs this as an independent candidate lineage. Keeping
-/// it separate prevents an immediate local resegmentation win from replacing a
-/// different token spelling that reaches a better fixed point after replay.
+/// Run the proven-submatch search on a completed block plan. The stream
+/// optimizer runs this as a separate lineage, so a quick local win cannot
+/// replace a spelling that reaches a better fixed point after replay.
 pub(crate) fn improve_plan_with_proven_submatches(
     block: &ParsedBlock,
     alignment: u8,
@@ -830,11 +785,10 @@ pub(crate) fn improve_plan_with_proven_submatches(
     best
 }
 
-/// Compose a bounded menu of already-proven match spellings under Max's
-/// complete header pricing.
+/// Max only: combine per-match proven spellings with a beam search and price
+/// the best combinations with complete headers.
 ///
-/// This is an additive compact route: it starts from a completed incumbent,
-/// never searches history, and keeps only frequency-distinct beam states.
+/// Beam states must have distinct frequencies.
 pub(crate) fn improve_plan_with_header_aware_proven_composition(
     block: &ParsedBlock,
     alignment: u8,
@@ -935,9 +889,8 @@ fn consider_proven_submatch_rewrite_family(
         }
     }
 
-    // With one rewrite, the combined candidate is exactly the individual
-    // candidate already priced above. Avoid rebuilding the same Huffman table
-    // twice in the deadline-independent default floor.
+    // A single rewrite was already priced above, unless single-match trials
+    // are off.
     if should_price_combined_proven_submatch_candidate(rewrites.len(), individual_limit) {
         if stop.reached() {
             return None;
@@ -1102,7 +1055,7 @@ fn consider_header_aware_proven_composition(
         states = next;
     }
 
-    // `states` is either the single root or a beam step sorted by this key.
+    // `states` is the root or a beam step sorted by `proven_composition_state_key`.
     for state in states
         .iter()
         .filter(|state| state.rewrite_count >= 2)
@@ -1177,13 +1130,12 @@ fn build_current_proven_composition_menus(
     )
 }
 
-/// Re-rank the compact proven-spelling menu after every strict exact win.
+/// Closed-loop search over the proven-spelling menus, adapted from Guetzli.
 ///
-/// The search shape is independently adapted from Guetzli's closed loop: rank
-/// local changes under the current global model, exact-price change batches,
-/// then sweep backwards from the aggressive endpoint. Columbo never relaxes
-/// decoded identity, and this additive sibling can replace its completed
-/// incumbent only on a strict complete-block bit win.
+/// Rank single-match changes under the current codes, apply them one at a time
+/// and exactly price each prefix, then undo them in ranked order from the
+/// all-applied endpoint. After a strict win, rebuild the menus from the winner
+/// and repeat.
 #[allow(clippy::too_many_arguments)]
 fn consider_closed_loop_proven_composition(
     block: &ParsedBlock,
@@ -1193,9 +1145,8 @@ fn consider_closed_loop_proven_composition(
     stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
 ) {
-    // This route buys its observed marginal win on tiny Huffman-sensitive
-    // blocks. Keeping it in that regime prevents its exact-pricing probes from
-    // displacing later Max work under a shared container deadline.
+    // Tiny blocks only, so exact pricing does not delay later Max work under a
+    // shared container deadline.
     if block.plain.len() > PROVEN_CLOSED_LOOP_MAX_PLAIN || !block.source_splits.is_empty() {
         return;
     }
@@ -2073,9 +2024,10 @@ fn solve_proven_submatch(
     )
 }
 
-/// Choose the cheapest spelling inside one existing match while excluding
-/// every length symbol in a set. Bit zero names symbol 257. All submatches
-/// retain the source distance and stay inside its decoded interval.
+/// Find the cheapest spelling of one source match as literals and proven
+/// submatches, never using a length symbol in `forbidden_length_symbols` (bit
+/// 0 is symbol 257). Costs are estimated from the given code lengths. Returns
+/// `None` if the source token itself is the best spelling.
 pub(super) fn solve_proven_submatch_avoiding(
     source: Token,
     decoded: &[u8],
@@ -2099,8 +2051,8 @@ pub(super) fn solve_proven_submatch_avoiding(
         return None;
     }
 
-    // Every submatch retains the source distance and uses the same trees.
-    // Build and price each length once; the DP only adds its suffix cost.
+    // Every submatch keeps the source distance, so each length is built and
+    // priced once.
     let mut matches = [None; 259];
     for (length, slot) in matches
         .iter_mut()
@@ -2447,9 +2399,7 @@ fn consider_unique_proven_submatch_tokens(
     if let Some(planned_tokens) =
         consider_proven_submatch_tokens(block, tokens, alignment, options, stop, best)
     {
-        // Capacity is preflighted once per pass. If an unusual allocator
-        // failure still prevents retaining the exact identity witness, exact
-        // pricing remains correct; only duplicate suppression is lost.
+        // If this push cannot allocate, only duplicate detection is lost.
         if priced_candidates.try_reserve(1).is_ok() {
             priced_candidates.push(planned_tokens);
         }
@@ -2470,8 +2420,7 @@ fn consider_proven_submatch_tokens(
         *best = candidate;
     }
 
-    // Generated length 258 is canonical. Relaxed mode retains the explicit
-    // non-standard sibling only when complete exact pricing proves it smaller.
+    // Non-strict mode also prices the length-258 alias (symbol 284).
     if !options.strict
         && !stop.reached()
         && canonical_tokens.iter().any(|token| {
@@ -2492,18 +2441,10 @@ fn consider_proven_submatch_tokens(
     Some(canonical_tokens)
 }
 
-/// Complete the cheap token-preserving floor even when a container's shared
-/// search deadline has already elapsed.
-///
-/// This is intentionally much smaller than [`plan_block_with_search`]: it
-/// prices same-distance runs and a bounded set of match-to-literal rewrites
-/// against the source, best, and fixed trees. Compact block lists may request
-/// Columbo's `extended` feedback-tree/replay floor. Proven-submatch
-/// resegmentation is evaluated separately at stream scope so its replay fixed
-/// point cannot displace this floor. There are no beams, match-group
-/// combinations, or newly discovered LZ77 matches. The bound lets ZIP/APNG
-/// give every member one useful pass before optional search time is
-/// concentrated on harder streams.
+/// Plan a block with the cheap floor: same-distance runs and match-to-literal
+/// expansions, plus the feedback-tree and replay floor if `extended`. It runs
+/// even after a container's shared search deadline, so every ZIP member or
+/// APNG frame gets one useful pass.
 pub(crate) fn plan_block_with_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -2516,13 +2457,8 @@ pub(crate) fn plan_block_with_floor(
     improve_plan_with_floor(block, alignment, &floor_options, extended, base)
 }
 
-/// Add the bounded token-preserving floor to an already-priced base block.
-///
-/// Callers that compose several deterministic candidate families can price
-/// the ordinary stored/fixed/dynamic representations once, then pass that
-/// complete plan through each family. Every comparison remains strict, so
-/// the earlier candidate still wins a tie exactly as it did when the families
-/// each built their own identical base plan.
+/// Apply the cheap floor to an already-priced base plan. Comparisons are
+/// strict: the earlier candidate wins a tie.
 pub(crate) fn improve_plan_with_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -2533,12 +2469,9 @@ pub(crate) fn improve_plan_with_floor(
     improve_plan_with_floor_policy(block, alignment, options, extended, false, best)
 }
 
-/// Compose proven-submatch resegmentation inside the bounded source floor.
-///
-/// The ordinary stream planner uses this only when a preceding same-distance
-/// repartition makes the transformations dependent. A separate compact route
-/// may also use it to preserve the historical integrated-before-feedback fixed
-/// point without letting a local token choice displace the ordinary lineage.
+/// Run the cheap floor with proven-submatch resegmentation inside it, for when
+/// a preceding same-distance repartition makes the two dependent. Callers keep
+/// it as a separate lineage.
 pub(crate) fn improve_plan_with_integrated_proven_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -2649,16 +2582,11 @@ fn improve_plan_with_floor_policy(
         consider_all_literals(block, &floor_options, &mut never_expired, &mut best);
     }
 
-    // Columbo reserves its exact-Defluff-tree/hybrid-tree feedback seeds and
-    // terminal replay for compact block lists. Applying this composite floor
-    // to every photographic block would overrun the caller's budget before
-    // grouping.
+    // The rest is only for compact block lists; on every large image block it
+    // would exhaust the caller's budget before grouping.
     if !extended {
         return best;
     }
-    // Columbo's bounded cumulative symbol bands are inspired by deft4j's
-    // repeated least-family pruning, but are not named deft4j states. Each band
-    // replaces source matches whose length symbol falls in one selected prefix.
     consider_compact_short_bands(
         block,
         alignment,
@@ -2685,9 +2613,9 @@ fn improve_plan_with_floor_policy(
         &mut best,
     );
 
-    // One replay is enough to carry a strict intermediate expansion into a
-    // finished adjacent merge and to repack its terminal header. The replay
-    // remains bounded by the same token/model limits as the first pass.
+    // Replay once from the winner, under the same limits, to carry a strict
+    // intermediate expansion into a finished adjacent merge and repack its
+    // header.
     if best.tokens != block.tokens {
         if let Some(replay_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len()) {
             if let Some(replay_block) = try_transformed_block(block, replay_tokens) {
@@ -2729,15 +2657,9 @@ fn improve_plan_with_floor_policy(
     best
 }
 
-/// Add Columbo's deft4j-tree hybrid to one already-priced block.
-///
-/// The ordinary source-boundary floor uses this on at most 28 merged ranges;
-/// fragmented replay admits at most 66. It applies the recovered deft4j tree
-/// builder to both alphabets and keeps its two whole-block recodes, but omits
-/// Columbo's ranked single-match trials. For zero or one used distance symbol,
-/// deft4j's payload caller bypasses that builder, so this floor remains a
-/// Columbo/deft4j hybrid. The work is deadline-independent and only removes
-/// source-supplied matches.
+/// Apply deft4j's tree builder and its two whole-block recodes to an
+/// already-priced block, without the ranked single-match trials. The work is
+/// deadline-independent.
 pub(crate) fn improve_plan_with_deft4j_tree_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -2763,11 +2685,8 @@ pub(crate) fn improve_plan_with_deft4j_tree_floor(
     best
 }
 
-/// Price Columbo's six cumulative length-symbol-band candidates.
-///
-/// The original Columbo C implementation introduced this bounded family after
-/// studying deft4j's least-family pruning. It is a Columbo extension rather
-/// than a reconstruction of deft4j's ordered state graph.
+/// For each end in `COMPACT_SHORT_BAND_ENDS`, expand every match whose length
+/// symbol is in 257..=end; inspired by deft4j's least-family pruning.
 fn consider_compact_short_bands(
     block: &ParsedBlock,
     alignment: u8,
@@ -2798,14 +2717,9 @@ fn consider_compact_short_bands(
     }
 }
 
-/// Apply Columbo's bounded feedback/replay floor to a finished Huffman plan.
-///
-/// Stream search compares several complete block layouts. A cheaper layout can
-/// reach the deadline before its final blocks receive optional feedback, so a
-/// per-source floor alone is not composable: the best header for each selected
-/// block may live in a different candidate. This bounded terminal pass prices
-/// one exact-Defluff-tree, one Columbo/Defluff hybrid tree, and one strict
-/// DeflOpt-style token spelling. Defluff itself has no terminal replay.
+/// Apply a bounded feedback and replay pass to a finished Huffman plan. A
+/// cheaper block layout can reach the deadline before its last blocks get
+/// optional feedback, so the selected blocks get this pass.
 pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) {
     if plan.tokens.len() > MANDATORY_FLOOR_MAX_TOKENS
         || plan.plain.len() > MANDATORY_FLOOR_MAX_PLAIN
@@ -2831,9 +2745,8 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     let seeds = feedback_tree_seeds(&block, options.strict);
     consider_feedback_seed_trees(&block, &floor_options, &seeds, plan);
 
-    // This Columbo terminal pass applies DeflOpt's strict table-replay
-    // primitive: write every strictly cheaper existing match as literals, then
-    // rebuild once. It cannot discover a new LZ77 match.
+    // DeflOpt's strict table replay: expand strictly dearer matches, then
+    // rebuild once.
     let Some((literal_lengths, distance_lengths)) = plan_lengths(plan) else {
         return;
     };
@@ -2849,9 +2762,9 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     let Some(transformed) = try_transformed_block(&block, tokens) else {
         return;
     };
-    // Huffman representations do not depend on the incoming bit alignment.
-    // Ignore a stored result here because its padding was priced at the dummy
-    // alignment; the stream planner has already retained the valid stored form.
+    // Huffman costs do not depend on the bit alignment. Ignore a stored result:
+    // its padding was priced at the dummy alignment, and the stream planner
+    // already kept the valid stored form.
     let mut candidate = plan_block(&transformed, 0, &floor_options, &mut SearchStop::never());
     let seeds = feedback_tree_seeds(&transformed, options.strict);
     consider_feedback_seed_trees(&transformed, &floor_options, &seeds, &mut candidate);
@@ -2860,14 +2773,11 @@ pub(crate) fn tighten_terminal_plan(plan: &mut PlannedBlock, options: &Options) 
     }
 }
 
-/// Replay the complete bounded floor once from an already-selected plan.
+/// Replay the extended cheap floor once from an already-selected plan, with its
+/// current codes as the source codes.
 ///
-/// Rebuilding a table can make a second set of existing matches strictly
-/// dearer than their decoded literals. Container streams may exhaust their
-/// shared deadline before the ordinary search reaches that second state, so
-/// the stream planner uses this helper once for its complete merged range.
-/// The current Huffman tree is retained as a seed, matching a parse of the
-/// emitted plan; no replacement or newly discovered LZ77 match is introduced.
+/// Rebuilt codes can make more matches strictly dearer than their literals, a
+/// state container streams may not reach before their shared deadline.
 pub(crate) fn replay_extended_floor(
     plan: &PlannedBlock,
     alignment: u8,
@@ -2889,13 +2799,9 @@ pub(crate) fn replay_extended_floor(
         .then_some(replay)
 }
 
-/// Follow the selected Huffman table through a short fixed-point ladder.
-///
-/// Each pass spells only the existing matches that are no cheaper than their
-/// decoded literals under the current table, then rebuilds that table. A
-/// non-winning pass remains a useful intermediate because its frequencies can
-/// make the following pass smaller. Four passes cover useful states observed in
-/// the original Columbo C implementation; the ladder itself is a Columbo route.
+/// Follow the selected Huffman codes through a short fixed-point ladder of
+/// expand-and-rebuild passes; a pass that does not win can still lead to a
+/// smaller next pass. `TABLE_REPLAY_PASSES` was chosen from measurements.
 pub(crate) fn replay_table_ladder(
     plan: &PlannedBlock,
     alignment: u8,
@@ -2949,9 +2855,8 @@ pub(crate) fn replay_table_ladder(
     best
 }
 
-/// Reconstruct the parsed metadata for a selected plan without copying its
-/// immutable payload. Keeping its current tree as the source tree lets replay
-/// price that exact table against each transformed token stream.
+/// Rebuild the parsed metadata for a selected plan, with its current codes as
+/// the source codes.
 fn parsed_block_from_plan(plan: &PlannedBlock) -> Option<ParsedBlock> {
     let (literal_lengths, distance_lengths) = plan_lengths(plan)?;
     let mut original_literal_lengths = [0_u8; 286];
@@ -2981,7 +2886,8 @@ fn parsed_block_from_plan(plan: &PlannedBlock) -> Option<ParsedBlock> {
     })
 }
 
-/// Add the five cumulative short-length candidates to an existing base plan.
+/// Try the five cumulative short-length bands 260..=260 through 260..=264
+/// (lengths 6 to 10).
 pub(crate) fn improve_plan_with_short_family_floor(
     block: &ParsedBlock,
     options: &Options,
@@ -3007,9 +2913,9 @@ pub(crate) fn improve_plan_with_short_family_floor(
     best
 }
 
-/// Additive frequency effects of expanding exact length symbols 260..=264.
-/// Keeping this summary per source block lets stream grouping score many
-/// ranges without repeatedly copying or rescanning their token vectors.
+/// Frequency changes from expanding the matches of each length symbol
+/// 260..=264. The summary is additive, so stream grouping can score many ranges
+/// without rescanning their tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShortFamilyStats {
     literal_additions: [[u32; 256]; 5],
@@ -3093,9 +2999,9 @@ pub(crate) fn score_short_family_frequencies(
     let mut distance_lengths = [0_u8; 30];
     let mut heap_scratch = DefloptHeapScratch::default();
 
-    // Stage zero prices the unchanged grouped token stream. Each later stage
-    // cumulatively expands one more exact short-length symbol, matching the
-    // five concrete token candidates materialized after segmentation.
+    // Stage 0 is the unchanged token stream; each later stage also expands the
+    // next short-length symbol, matching the five token candidates built after
+    // segmentation.
     for stage in 0..=5 {
         if stage != 0 {
             let family = stage - 1;
@@ -3242,14 +3148,10 @@ fn consider_deft4j_trees(
 ) {
     let mut distance_frequencies = block.distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
-    // Emulate the reference OpenJDK `PriorityQueue` heap operations. deft4j's
-    // comparator has no secondary tie key, and `PriorityQueue` does not specify
-    // equal-weight ordering; this implementation fixes the recovered reference
-    // heap behavior and prices it once.
+    // Emulate OpenJDK `PriorityQueue` heap order: deft4j's comparator has no
+    // tie key, so equal weights follow the reference heap.
     let literal = make_lengths_deft4j_java_heap(&block.literal_frequencies, 15);
-    // Columbo's compact floor applies deft4j's raw `HuffmanTree` mechanics to
-    // both alphabets. deft4j's payload caller bypasses that tree for zero or
-    // one used distance symbol, so this remains a Columbo/deft4j hybrid.
+    // Unlike deft4j, also use it for zero or one used distance symbol.
     let distance = make_lengths_deft4j_java_heap(&distance_frequencies, 15);
     if let Some(dynamic) =
         plan_for_explicit_lengths(&block.tokens, &literal, &distance, options.exhaustive)
@@ -3264,10 +3166,9 @@ fn consider_deft4j_trees(
         }
     }
 
-    // deft4j's recode pipeline prunes matches under its freshly rebuilt data
-    // trees before rebuilding once more. Retain both strict and tied local
-    // forms: a tie can change the next Huffman frequencies even though the
-    // supplied LZ77 parse and decoded bytes remain unchanged.
+    // deft4j's recode prunes matches under these trees, then rebuilds. Try both
+    // the strict and the tie-including forms: a tie changes the next
+    // frequencies.
     let strict = expand_matches(&block.tokens, &block.plain, &literal, &distance, false);
     let non_larger = expand_matches(&block.tokens, &block.plain, &literal, &distance, true);
     if let Some(tokens) = strict {
@@ -3295,13 +3196,8 @@ fn consider_deft4j_trees(
     }
 }
 
-/// Rebuild a deft4j-pruned token state with Columbo's ordinary candidates and
-/// deft4j's deterministic heap, retaining whichever complete block wins.
-///
-/// deft4j deliberately builds twice: its first tree decides which
-/// existing matches to spell literally, and the changed frequencies feed a
-/// second deft4j tree. Moving the transformed block into Columbo's planner
-/// after pricing that second tree avoids another large token-vector clone.
+/// Rebuild a deft4j-pruned token state with Columbo's ordinary planner and
+/// with deft4j's deterministic heap, keeping whichever complete block wins.
 fn consider_deft4j_rebuild(
     source: &ParsedBlock,
     tokens: Vec<Token>,
@@ -3348,11 +3244,7 @@ pub(crate) fn plan_block_with_search(
     )
 }
 
-/// Continue the full token search from an already completed ordinary plan.
-///
-/// Stream split discovery prices the unsplit block before it ranks any
-/// boundaries. Passing that exact plan back here avoids rebuilding the same
-/// exhaustive Huffman representation when the token search begins.
+/// Run the full token search from an already priced ordinary plan.
 pub(crate) fn plan_block_with_complete_base_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -3370,11 +3262,9 @@ pub(crate) fn plan_block_with_complete_base_search(
     )
 }
 
-/// Search one compact block with proven resegmentation before table feedback.
-///
-/// This preserves a distinct fixed point from the ordinary endpoint ordering.
-/// Max mode runs it as an independent comparison candidate, so the locally
-/// smaller seed cannot displace the completed normal route.
+/// Search one compact block with proven resegmentation before the table
+/// feedback ladder. This order can reach a different fixed point, so Max runs
+/// it as a separate candidate.
 pub(crate) fn plan_block_with_integrated_proven_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -3394,11 +3284,8 @@ pub(crate) fn plan_block_with_integrated_proven_search(
     )
 }
 
-/// Continue a completed integrated floor through the same proven-first search.
-///
-/// This preserves the historical ordering as an additive comparison route:
-/// the bounded floor establishes feedback-tree seeds, then the full search may
-/// extend them without replacing the ordinary stream lineage.
+/// Continue a completed integrated floor through the same proven-first search,
+/// as a separate comparison route.
 pub(crate) fn plan_block_with_complete_integrated_proven_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -3419,13 +3306,9 @@ pub(crate) fn plan_block_with_complete_integrated_proven_search(
     )
 }
 
-/// Search one complete source block without stream-split or iterative siblings.
-///
-/// The direct source route uses the same table-feedback ladder as the ordinary
-/// block planner, but deliberately leaves match-group beams, the ordered state
-/// queue, and post-search replay to their independent candidates. This keeps a
-/// long source-block chain moving forward instead of spending its entire wall
-/// budget on the first locally interesting block.
+/// Search one source block without match groups, the ordered state queue or
+/// replay, so a long chain of source blocks does not spend its time on the
+/// first promising block.
 pub(crate) fn plan_block_with_narrow_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -3450,9 +3333,8 @@ pub(crate) fn plan_block_with_narrow_search(
     )
 }
 
-/// Continue the narrow whole-block route from an independently completed
-/// exact candidate while retaining the original source tokens as another
-/// transformation parent.
+/// Run the narrow search with `seed` as the incumbent if it beats the ordinary
+/// plan; token transformations still start from the source tokens.
 pub(crate) fn plan_block_with_seeded_narrow_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -3479,11 +3361,10 @@ pub(crate) fn plan_block_with_seeded_narrow_search(
 }
 
 enum SearchBase {
-    /// Price the ordinary representation before trying token transforms.
     Price,
-    /// Price the ordinary representation and retain this independent sibling.
+    /// An independent candidate, kept if it beats the ordinary plan.
     Additional(PlannedBlock),
-    /// This is the already-priced ordinary representation for the same block.
+    /// An already-priced ordinary plan of the same block.
     Complete(PlannedBlock),
 }
 
@@ -3528,9 +3409,7 @@ fn plan_block_with_search_policy(
         }
         SearchBase::Complete(base) => base,
     };
-    // Columbo's two feedback seeds are a bounded comparison floor: one is
-    // Defluff's exact builder, while the other combines Columbo's generic tree
-    // with Defluff's limiter. Price both before optional byte-seeking work.
+    // Price the two feedback seeds before optional work.
     let feedback_seeds = feedback_tree_seeds(block, options.strict);
     consider_feedback_seed_trees(block, options, &feedback_seeds, &mut best);
     if stop.reached() {
@@ -3546,10 +3425,9 @@ fn plan_block_with_search_policy(
             return best;
         }
     }
-    // Defluff normalizes the noncanonical 258 alias on input. Columbo also
-    // offers a broader opt-in reverse candidate whenever symbol 284 plus five
-    // extra bits may beat symbol 285; unlike Defluff, it does not require
-    // existing ordinary symbol-284 traffic.
+    // Like Defluff, normalize the non-standard length-258 alias (symbol 284)
+    // on input. Non-strict mode also tries the reverse whenever symbol 285 is
+    // used, since symbol 284 plus five extra bits may be cheaper.
     let has_258_alias = block.literal_frequencies[284] != 0
         && block.tokens.iter().any(|token| {
             matches!(
@@ -3583,15 +3461,10 @@ fn plan_block_with_search_policy(
             count.saturating_add(u64::from(frequency))
         });
     if match_count == 0 {
-        // Every remaining family only spells existing matches as literals.
-        // Feedback-tree pricing above is the only useful work on an already
-        // literal-only token stream.
         return best;
     }
 
-    // libdeflate's explicit all-literals alternative motivates retaining this
-    // endpoint. Columbo supplies the bounded frequency preflight and complete
-    // existing-stream pricing; it never searches for a replacement match.
+    // Also try the all-literals endpoint, as libdeflate does.
     if all_literal_endpoint_is_bounded(block.plain.len(), match_count) && !stop.reached() {
         consider_all_literals(block, options, stop, &mut best);
     }
@@ -3623,11 +3496,9 @@ fn plan_block_with_search_policy(
         );
     }
 
-    // Feed every locally no-larger match expansion into the table rebuilt for
-    // that exact token state. Compact streams can need several strict wins in
-    // succession; restarting each pass from the seed table stalls that ladder
-    // after its first recode. The token count only grows, and these small caps
-    // keep both ordinary and exhaustive searches predictable.
+    // Each pass expands every match whose literals cost no more under the
+    // current codes, then rebuilds the codes. Passes continue from the previous
+    // codes, not the seed, so several strict wins can follow in a row.
     let pass_limit = 12;
     let fixed_seed = fixed_lengths();
     for (mut literal_lengths, mut distance_lengths) in seeds {
@@ -3635,11 +3506,9 @@ fn plan_block_with_search_policy(
             break;
         }
 
-        // DeflOpt's first match-expansion pass uses strict wire cost. Keep
-        // that state as a sibling of the non-larger ladder below: expanding
-        // its zero-delta matches at the same time can change frequencies and
-        // skip a smaller rebuilt table. This is one bounded candidate per
-        // seed and still only spells existing matches as decoded literals.
+        // DeflOpt's first expansion pass uses strict cost. Price it separately:
+        // expanding equal-cost matches too changes the frequencies and can miss
+        // a smaller rebuilt table.
         let is_fixed_seed = literal_lengths == fixed_seed.0 && distance_lengths == fixed_seed.1;
         if !is_fixed_seed {
             if let Some(strictly_expanded) = expand_matches(
@@ -3679,10 +3548,7 @@ fn plan_block_with_search_policy(
             };
             let next_lengths = plan_lengths(&candidate);
             if candidate.bits < best.bits {
-                // The winning plan and the next ladder state both own this
-                // token sequence. Make only that necessary duplicate, and do
-                // so fallibly; the completed winner remains valid if another
-                // pass cannot be allocated.
+                // The winner and the next pass both need these tokens.
                 let Some(next_seed_tokens) =
                     try_clone_token_candidate(&candidate.tokens, block.plain.len())
                 else {
@@ -3692,8 +3558,6 @@ fn plan_block_with_search_policy(
                 best = candidate;
                 seed_tokens = next_seed_tokens;
             } else {
-                // A non-winning candidate is consumed directly by the next
-                // pass instead of cloning its expanded token vector.
                 seed_tokens = match Arc::try_unwrap(candidate.tokens) {
                     Ok(tokens) => tokens,
                     Err(tokens) => {
@@ -3706,8 +3570,6 @@ fn plan_block_with_search_policy(
                 };
             }
 
-            // Keep the transformation as an intermediate even when rebuilding
-            // its table did not immediately beat the global best.
             let Some((next_literal, next_distance)) = next_lengths else {
                 break;
             };
@@ -3719,8 +3581,8 @@ fn plan_block_with_search_policy(
         }
     }
 
-    // A strict fixed-table expansion applies Defluff's fixed-block comparison:
-    // replace a source match only when its literals are strictly cheaper.
+    // Defluff's fixed-code comparison: expand a source match only when its
+    // literals are strictly cheaper under the fixed codes.
     let (fixed_literal, fixed_distance) = fixed_seed;
     if let Some(tokens) = expand_matches(
         &block.tokens,
@@ -3745,11 +3607,8 @@ fn plan_block_with_search_policy(
         match_group_search(block, alignment, options, stop, &mut best);
     }
 
-    // Literal-heavy encoder blocks often contain only one or two marginal
-    // matches. Testing those matches independently is linear in their count
-    // and is part of the ordinary structural floor, not just byte-hunting
-    // max mode. Keep the default route bounded by both parsed size and the
-    // number of existing matches; it never invents a replacement match.
+    // Literal-heavy blocks often have only one or two marginal matches, so
+    // small blocks also try each match alone.
     let try_individual_prune = policy.individual_prune
         && if options.exhaustive {
             block.tokens.len() <= 4_000
@@ -3760,11 +3619,8 @@ fn plan_block_with_search_policy(
         && options.exhaustive
         && block.tokens.len() <= 12_000
         && block.plain.len() <= 80_000;
-    // Individual pruning is a greedy local route. Keep the state immediately
-    // before it so the bounded ordered queue can also explore the sibling in
-    // which those matches remain intact. This mirrors an alternate in the
-    // original Columbo C scheduler without widening the queue or creating a
-    // new LZ77 match. A failed clone simply retains the established path.
+    // Individual pruning is greedy. Keep the state before it so the ordered
+    // queue can also explore the variant in which those matches stay intact.
     let pre_individual = (try_ordered_queue && try_individual_prune && match_count != 0)
         .then(|| try_clone_planned_block(&best))
         .flatten();
@@ -3775,12 +3631,9 @@ fn plan_block_with_search_policy(
     if try_ordered_queue && !stop.reached() {
         let alternate = pre_individual.filter(|alternate| alternate.tokens != best.tokens);
         let mut seen = HashSet::new();
-        // Queue edges only expand matches to literals; they cannot reconstruct
-        // a match removed by the greedy individual-prune floor. Search the
-        // intact root first because its reachable graph is therefore a strict
-        // superset. If time remains, continue from the smaller pruned root.
-        // Both beams share exact visited state, so converged descendants are
-        // priced once rather than once per lineage.
+        // Queue edges only expand matches, so they cannot restore a match that
+        // individual pruning removed. Search the intact root first, since it
+        // reaches a superset of states.
         if let Some(mut intact) = alternate {
             ordered_state_queue(block, alignment, options, stop, &mut intact, &mut seen);
             if intact.bits < best.bits {
@@ -3793,10 +3646,8 @@ fn plan_block_with_search_policy(
     }
 
     if policy.replay && options.exhaustive && best.tokens != block.tokens && !stop.reached() {
-        // Columbo's original C --max scheduler replays completed winning token
-        // states through the default ladder. Use a non-exhaustive child round
-        // to avoid recursive route multiplication while retaining that
-        // fixed-point behavior.
+        // Replay winning token states through the Default search, which avoids
+        // recursive route multiplication.
         let mut replay_options = options.clone();
         replay_options.exhaustive = false;
         let Some(mut replay_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len())
@@ -3833,13 +3684,12 @@ struct QueueState {
 }
 
 enum QueueTable {
-    /// The incumbent can carry a specialized or exact source table, while the
-    /// queue historically begins from its ordinary representation.
+    /// The root's codes are replanned, since the incumbent may use special or
+    /// source codes.
     Unknown,
-    /// A child already owns the ordinary table built by `plan_tokens`.
+    /// The ordinary table built by `plan_tokens`.
     Lengths { literal: Vec<u8>, distance: Vec<u8> },
-    /// A stored child has no Huffman descendants, but still occupies its
-    /// historical beam slot at the next depth.
+    /// A stored child still takes its beam slot at the next depth.
     NoCodes,
 }
 
@@ -3864,12 +3714,7 @@ fn ordered_state_queue(
         bits: best.bits,
         table: QueueTable::Unknown,
     }];
-    // Every edge expands at least one match of length three or more. Seed the
-    // shared exact history with this root so a later alternate queue cannot
-    // reprice it or any child already visited here. A linear history made every
-    // new state rescan up to hundreds of earlier multi-thousand-token vectors,
-    // wasting most of a max route on duplicate detection. `HashSet` still
-    // confirms full token equality after hashing, so collisions cannot
+    // `HashSet` compares full token sequences, so a hash collision cannot
     // suppress a distinct candidate.
     seen.reserve(BEAM * DEPTH * CHILDREN);
     for state in &current {
@@ -3948,8 +3793,8 @@ fn ordered_state_queue(
                     })
                 });
                 if improves_best {
-                    // The queue keeps its own tokens and table below, so the
-                    // complete plan can become the incumbent without cloning.
+                    // The queue keeps its own tokens and codes below, so the
+                    // plan can become the incumbent without a clone.
                     *best = plan;
                 }
                 if let Some(table) = table {
@@ -3978,11 +3823,8 @@ struct FeedbackTreeSeed {
     distance: Vec<u8>,
 }
 
-/// Build Columbo's two bounded strict-feedback seeds.
-///
-/// The exact seed reproduces Defluff's complete two-queue/package-list
-/// builder. The hybrid seed retains Columbo's generic ordinary tree and uses
-/// only Defluff's package-list limiter when that tree exceeds the depth limit.
+/// Build the two feedback seed trees: Defluff's exact builder, and Columbo's
+/// ordinary tree with only Defluff's package-merge limiter.
 fn feedback_tree_seeds(block: &ParsedBlock, min_distance_codes: bool) -> [FeedbackTreeSeed; 2] {
     let mut distance_frequencies = block.distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, min_distance_codes);
@@ -4023,12 +3865,10 @@ fn consider_feedback_seed_trees(
     }
 }
 
-/// Apply Columbo's Defluff-derived two-generation rescan topology.
-///
-/// One seed uses Defluff's exact tree builder and the other is a
-/// Columbo/Defluff hybrid. Defluff supplies the strict fresh/adjusted rescan
-/// shape, but Columbo sends each token set through its broader planner instead
-/// of scoring Defluff's supplied tables and exact four-pass header directly.
+/// Defluff-style two-generation rescan for each feedback seed: expand matches
+/// that the seed tree cannot code or codes more cheaply as literals, rebuild
+/// the tree with the same builder, then rescan the original tokens under it.
+/// Columbo's planner, not Defluff's tables, prices each token set.
 fn consider_columbo_defluff_derived_rescan(
     block: &ParsedBlock,
     alignment: u8,
@@ -4052,9 +3892,7 @@ fn consider_columbo_defluff_derived_rescan(
 
         let adjusted_literal = (seed.builder)(&fresh_literal_frequencies, 15, 0);
         let adjusted_distance = (seed.builder)(&fresh_distance_frequencies, 15, 0);
-        // Defluff rescans the original tokens under its adjusted tree. A zero
-        // mark second pass is meaningful only to the exact explicit-tree
-        // scorer; the broad planner already considered the unchanged source.
+        // A rescan that marks no match gives the already priced source.
         if let Some(adjusted_tokens) = expand_defluff_matches(
             &block.tokens,
             &block.plain,
@@ -4116,13 +3954,8 @@ fn expand_defluff_matches(
     })
 }
 
-/// Price the bounded cumulative length families used by the direct no-split
-/// route on large, moderately tokenized source blocks.
-///
-/// These candidates are structural match removals, not fixture heuristics:
-/// they cover progressively longer short-match alphabets plus one sparse
-/// longer-match set. Each candidate is rebuilt and must strictly beat the
-/// complete incumbent before it can affect output.
+/// Price length-symbol bands for the narrow search on large source blocks:
+/// five cumulative bands 257..=end and one sparse set, `LONG_FAMILIES`.
 fn consider_large_source_bands(
     block: &ParsedBlock,
     alignment: u8,
@@ -4218,8 +4051,7 @@ fn match_group_search(
             }
         }
 
-        // Ordered-queue searches retain combinations of the locally cheapest
-        // length/distance families. Test the first few prefixes directly.
+        // Also expand the first few prefixes of the ranked groups together.
         let combined_cap = if options.exhaustive { 5 } else { 3 };
         for count in 2..=combined_cap.min(groups.len()) {
             if stop.reached() {
@@ -4355,9 +4187,8 @@ fn plan_tokens(
     Some(plan_owned_block(candidate, alignment, options, stop))
 }
 
-/// Build the owned block needed to price one optional token transformation.
-/// Large vectors and source metadata are copied fallibly; exact original bits
-/// are cleared because they describe the pre-transformation token stream.
+/// Build the block needed to price one optional token transformation. The
+/// original bit count is cleared because it describes the source tokens.
 pub(super) fn try_transformed_block(
     source: &ParsedBlock,
     tokens: Vec<Token>,
@@ -4425,10 +4256,7 @@ fn deduplicate_seeds(seeds: &mut Vec<(Vec<u8>, Vec<u8>)>) {
     }
 }
 
-/// Allocate one optional token candidate within an explicit byte ceiling.
-/// Returning `None` is deliberately non-fatal: every caller already has a
-/// complete source or best plan to keep when a transformation is too large or
-/// the allocator cannot satisfy it.
+/// `None` is not an error: callers keep their complete plan.
 fn new_token_candidate_with_limit(
     token_count: usize,
     decoded_bytes: usize,
@@ -4464,12 +4292,8 @@ fn all_literal_endpoint_is_bounded(plain_len: usize, match_count: u64) -> bool {
             && match_count <= ALL_LITERAL_SPARSE_MAX_MATCHES)
 }
 
-/// Exact-price the all-literals endpoint before allocating its token vector.
-///
-/// The ordinary dynamic planner depends only on symbol frequencies and match
-/// extra bits. An all-literals stream has no extras, so its fixed and dynamic
-/// representations can be decided from the decoded bytes alone. The much
-/// larger token vector is retained only if that complete block is a strict win.
+/// Exactly price the all-literals endpoint from its byte frequencies, building
+/// its tokens only for a strict win.
 fn consider_all_literals(
     block: &ParsedBlock,
     options: &Options,
@@ -4487,9 +4311,8 @@ fn consider_all_literals(
     literal_frequencies[256] = 1;
     let distance_frequencies = [0_u32; 30];
 
-    // One tree and one greedy header are enough to reject endpoints that are
-    // nowhere near the incumbent. Leave a small header-sized margin so the
-    // complete planner can still recover rare sub-byte and one-byte wins.
+    // A one-tree, greedy-header estimate rejects endpoints far from the
+    // incumbent; the 256-bit margin leaves rare small wins to the full planner.
     let Some(estimated_bits) = estimate_boundary_block_bits(
         &literal_frequencies,
         &distance_frequencies,
@@ -4544,12 +4367,8 @@ fn consider_all_literals(
     };
 }
 
-/// Expand exactly the matches selected by `should_expand`.
-///
-/// The first pass computes the exact resulting token count with checked
-/// arithmetic. Only then do we reserve the complete vector fallibly and make
-/// a second, allocation-free pass to populate it. A malformed internal
-/// token/plain pairing is treated like any other unusable optional candidate.
+/// Expand exactly the matches selected by `should_expand` into literals;
+/// `None` if nothing is selected or on failure.
 pub(super) fn expand_selected_matches<F>(
     source: &[Token],
     plain: &[u8],
@@ -4723,10 +4542,8 @@ fn individual_prune_search(
     stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
 ) {
-    // Exact source bits can remain the block winner even though deleting one
-    // costly match and rebuilding the table would improve it. In that case
-    // there is no tree on `best`, so use the decoded source tree as the cost
-    // seed rather than silently skipping the ordinary prune route.
+    // If the original encoding is still the incumbent, `best` has no codes, so
+    // use the source's decoded codes.
     let seed_lengths = individual_prune_seed_lengths(block, best);
     let Some((literal_lengths, distance_lengths)) = seed_lengths else {
         return;
@@ -4786,8 +4603,7 @@ fn individual_prune_from_lengths(
             if trials.len() < trial_limit {
                 trials.insert(position, trial);
             } else if position < trial_limit {
-                // Capacity is already reserved. Remove the current worst
-                // candidate before inserting the newly ranked one.
+                // Drop the worst trial first to stay within the reservation.
                 trials.pop();
                 trials.insert(position, trial);
             }

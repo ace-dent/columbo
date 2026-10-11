@@ -30,7 +30,7 @@ fn spinner_line_is_bold_and_warns_during_the_final_three_seconds() {
 }
 
 #[test]
-fn spinner_line_has_no_style_when_colour_is_disabled() {
+fn spinner_line_has_no_style_when_color_is_disabled() {
     let mut line = Vec::new();
     write_spinner_line(&mut line, "⠋", 2, SpinnerStyle::Ansi { color: false }, 0).unwrap();
     assert_eq!(

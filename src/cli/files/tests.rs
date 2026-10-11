@@ -308,8 +308,8 @@ fn non_regular_inputs_are_rejected() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-/// The production checkpoint is compiled only into the test executable.
-/// Its environment is set only in a dedicated child running one exact test.
+/// Test hook called after publication, before the directory sync.
+/// `COLUMBO_TEST_WRITE_PHASE` is set only in the `interrupted_writer_child` process.
 pub(super) fn after_install() -> io::Result<()> {
     match std::env::var("COLUMBO_TEST_WRITE_PHASE").as_deref() {
         Ok("installed") => wait_to_be_killed(),

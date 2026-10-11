@@ -180,8 +180,8 @@ fn budgets_and_stops_preserve_completed_parents() {
     // returned plan must be complete, proven and strictly below the parent.
     let mut retained_after_stop = false;
     let mut cutoffs: Vec<_> = (1..16).map(|step| calls * step / 16).collect();
-    // Candidate generation dominates the stop probes on this witness.
-    // Also sample the tail densely to exercise completed prices/feedback.
+    // Candidate generation makes most of the stop checks on this fixture.
+    // Also sample the tail densely to exercise completed pricing and feedback.
     let mut tail = 1;
     while tail < calls {
         cutoffs.push(calls - tail);

@@ -1,13 +1,14 @@
 # File safety
 
-The library operates on byte slices and returns an output buffer. The CLI owns
-all input and output filesystem operations. It reads input through a read-only
-handle and finishes optimization in memory before staging any output bytes.
+The library operates on byte slices and returns an output buffer. The CLI
+performs all input and output filesystem operations. It reads input through a
+read-only handle and finishes optimization in memory before staging any output
+bytes.
 
 An explicit `--out` destination is checked before reading or optimizing input.
 Missing parents, non-file destinations, read-only files, and access failures
 produce an error and exit status 1. An existing regular output is opened for
-writing without creating or truncating it, solely to check effective access;
+writing without creating or truncating it, only to check effective access;
 this also applies when `--out` names the input. Symlink destinations are checked
 without opening their targets, because publication replaces the link itself.
 The CLI creates and removes an empty private staging directory and file beside
@@ -16,7 +17,7 @@ metadata but writes no payload bytes and performs no syncs. Dry runs ignore
 `--out` and perform no probe.
 
 The check does not reserve the destination or guarantee future disk space or
-permissions. Publication retains its own error handling for later changes and
+permissions; publication still handles errors from later changes and
 filesystem-specific restrictions.
 
 ## Publishing an output
@@ -43,10 +44,10 @@ uses a hard link instead of rename. That atomically refuses to overwrite a file
 created by another writer. Filesystems without hard-link support return an
 error; there is no fallback that exposes a partial destination.
 
-Syncing a file alone does not persist its containing directory entry. The
-additional directory sync follows the documented [Unix fsync
-requirements](https://man7.org/linux/man-pages/man2/fsync.2.html). Replacement
-uses Rust's [same-filesystem rename](https://doc.rust-lang.org/std/fs/fn.rename.html).
+The directory syncs follow the [Unix fsync
+requirements](https://man7.org/linux/man-pages/man2/fsync.2.html): syncing a
+file does not persist its directory entry. Replacement uses Rust's
+[same-filesystem rename](https://doc.rust-lang.org/std/fs/fn.rename.html).
 
 ## Interruption and errors
 
@@ -56,7 +57,7 @@ uses Rust's [same-filesystem rename](https://doc.rust-lang.org/std/fs/fn.rename.
 | Staging or pre-commit syncing fails | The existing destination remains unchanged. Cleanup closes the file before removing staging data. |
 | The process is killed before publication | The original remains in place. A private staging directory may remain. |
 | The process is killed immediately after publication | The destination contains the complete replacement, with ordinary Unix access bits already applied. |
-| The final directory sync fails | The error explicitly says output was installed but durability is uncertain. The CLI does not attempt a rollback. |
+| The final directory sync fails | The error says output was installed but durability is uncertain. The CLI does not attempt a rollback. |
 | Staging cleanup fails after publication | The complete output remains installed; leftover staging data does not turn a successful publication into a failed write. |
 
 A force kill cannot run destructors or signal cleanup. An abandoned directory
@@ -90,11 +91,11 @@ may have different failure and atomicity semantics.
 Replacing a symlink replaces the link entry and leaves its target untouched.
 Replacing one hard-link name leaves other names referring to the previous
 inode. Ordinary Unix access bits are preserved for regular destinations;
-set-user-ID, set-group-ID, and sticky bits are not copied. Ownership, ACLs,
-extended attributes, and Windows security descriptors are not preserved by
-this portable replacement implementation. Staging on Windows inherits directory
-security settings. Use an explicit output path and an appropriate native
-installation step when those metadata policies must be retained.
+set-user-ID, set-group-ID, and sticky bits are not copied. This portable
+implementation does not preserve ownership, ACLs, extended attributes, or
+Windows security descriptors; staging on Windows inherits directory security
+settings. When that metadata must be kept, use an explicit output path and a
+native installation step.
 
 ## Validation
 

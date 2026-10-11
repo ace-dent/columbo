@@ -8,9 +8,7 @@ use crate::deflate::bitstream::BitWriter;
 const DEFAULT_DECODE_ROOT_BITS: u8 = 9;
 
 impl Huffman {
-    /// Build the same canonical representation plus the parser's two-level
-    /// decode table. Planner and emitter trees use `build()` so they do not pay
-    /// this allocation cost.
+    /// Build the code with a two-level decode table but no value metadata.
     fn build_decoder(lengths: &[u8]) -> Option<Self> {
         Self::build_decoder_with_root_bits(lengths, DEFAULT_DECODE_ROOT_BITS)
     }
@@ -123,12 +121,8 @@ fn tree_exceeds_limit(frequencies: &[u32], max_bits: u8) -> bool {
     unconstrained_huffman_max_depth(frequencies) > usize::from(max_bits)
 }
 
-/// Build Columbo's legacy order-key heap extension.
-///
-/// This intentionally is not labelled as DeflOpt parity: DeflOpt 2.07 breaks
-/// frequency ties by subtree height, whereas the original Columbo C
-/// implementation retained this earlier order-key interpretation as an
-/// additive candidate.
+/// Build Columbo's heap variant that breaks frequency ties by creation order,
+/// not by subtree height as DeflOpt 2.07 does.
 fn make_lengths_order_heap(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
     make_lengths_order_heap_into(frequencies, &mut lengths, max_bits, variant);
@@ -516,7 +510,7 @@ fn fixed_trees_have_rfc_1951_lengths() {
 
 #[test]
 fn builders_preserve_inactive_symbols_and_depth_limit() {
-    // Fibonacci-like weights force an over-depth ordinary tree at 4 bits.
+    // Fibonacci-like weights make the unlimited tree deeper than 4 bits.
     let frequencies = [1, 1, 2, 3, 5, 8, 13, 0];
     assert!(tree_exceeds_limit(&frequencies, 4));
 
@@ -579,9 +573,9 @@ fn zopfli_package_tie_is_distinct_without_changing_payload_cost() {
 fn length_families_match_original_columbo_c_on_overflow() {
     let frequencies = [1, 1, 2, 3, 5, 8, 13, 0];
 
-    // These vectors come directly from the original Columbo `huffman.c`.
-    // In particular, the generic builder intentionally preserves its
-    // odd-overflow result even though a complete bounded tree is available.
+    // Expected vectors come from Columbo's C `huffman.c`. The generic
+    // builder keeps its odd-overflow result even though a complete code
+    // within the limit exists.
     assert_eq!(make_lengths(&frequencies, 4, 0), [4, 4, 4, 4, 4, 4, 4, 0]);
     assert_eq!(
         make_lengths_columbo_defluff_limited(&frequencies, 4, 0),

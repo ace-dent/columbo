@@ -107,7 +107,7 @@ fn route_families_require_max_and_a_matching_source_topology() {
         };
         let eligibility = RouteEligibility::new(&context);
         // The source is small enough for parallel Max routes, but its only
-        // non-empty block is stored, so no source-graph family applies.
+        // nonempty block is stored, so no source-graph family applies.
         assert_eq!(eligibility.parallel_routes, exhaustive);
         assert!(!eligibility.deft4j);
         assert!(!eligibility.narrow_source);

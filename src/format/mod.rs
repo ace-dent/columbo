@@ -13,8 +13,8 @@ use deadline::{scale_duration, SearchDeadline};
 
 use crate::{Error, ErrorKind, Format, Optimization, Options, Result};
 
-/// Allocate a vector without letting an attacker-controlled capacity turn an
-/// otherwise recoverable wrapper error into an allocation panic or abort.
+/// Allocate a vector fallibly, so a capacity taken from untrusted input yields
+/// a wrapper error instead of an allocation panic or abort.
 pub(super) fn try_vec_with_capacity<T>(capacity: usize, message: &'static str) -> Result<Vec<T>> {
     let mut output = Vec::new();
     output
@@ -23,16 +23,14 @@ pub(super) fn try_vec_with_capacity<T>(capacity: usize, message: &'static str) -
     Ok(output)
 }
 
-/// Fallibly copy wrapper bytes whose length ultimately comes from the input.
 pub(super) fn try_copy_bytes(source: &[u8], message: &'static str) -> Result<Vec<u8>> {
     let mut output = try_vec_with_capacity(source.len(), message)?;
     output.extend_from_slice(source);
     Ok(output)
 }
 
-/// Reserve before extending a wrapper output. `Vec::extend_from_slice` may
-/// otherwise invoke the infallible allocation path when strict mode is allowed
-/// to grow a stream beyond its input-sized initial reservation.
+/// Fallibly append to a wrapper output, which can outgrow its input-sized
+/// reservation (for example in strict mode).
 pub(super) fn try_append_bytes(
     output: &mut Vec<u8>,
     source: &[u8],
@@ -72,9 +70,9 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
             crate::progress::format_detected(options, detected, reporting.then_some(1));
             super::deflate::optimize_raw(input, options)
                 .and_then(|raw| {
-                    // Raw Deflate has no signature or checksum. An arbitrary
-                    // file can begin with a short valid stream by accident;
-                    // accepting a suffix therefore requires explicit --raw.
+                    // Raw Deflate has no signature or checksum, and any file
+                    // can begin with a short valid stream by accident, so
+                    // accepting trailing data requires --raw.
                     if requested == Format::Auto && raw.consumed != input.len() {
                         return Err(Error::unsupported_format(
                             "raw Deflate with trailing data requires --raw",
@@ -95,9 +93,9 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
                     .with_removed_data(removed))
                 })
                 .map_err(|error| {
-                    // Failure to recognize malformed raw input is a format
-                    // error. Resource and internal failures keep their kind
-                    // so callers can distinguish them from damaged data.
+                    // Undetected input that is not valid raw Deflate is a
+                    // format error. Resource and internal errors keep their
+                    // kind so callers can tell them apart from damaged data.
                     if requested == Format::Auto && error.kind() == ErrorKind::InvalidInput {
                         Error::unsupported_format("unsupported or invalid input format")
                     } else {
@@ -134,8 +132,8 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
     };
     crate::progress::finish_file(options);
     result.map(|mut optimized| {
-        // Stripping is a requested rewrite even when normalization saves no
-        // bytes, or strict compatibility makes the retained stream larger.
+        // --strip requests a rewrite even when it saves no bytes or strict
+        // mode makes the stream larger.
         if options.strip_metadata && optimized.data != input {
             optimized.require_rewrite();
         }
@@ -167,11 +165,8 @@ pub(crate) fn deflate_stream_count(
     }
 }
 
-/// Apply the bomb-resistance policy once at the top-level input boundary.
-///
-/// Container children must share this reduced cumulative allowance rather
-/// than each deriving a fresh ratio from its own compressed slice. Otherwise
-/// a many-member archive could multiply the minimum allowance.
+/// Apply the expansion-ratio limit once, to the whole input, so container
+/// members share one allowance instead of each getting the minimum.
 fn options_with_input_expansion_limit(input_bytes: usize, options: &Options) -> Options {
     let mut effective = options.clone();
     if let Some(ratio) = options.max_expansion_ratio {

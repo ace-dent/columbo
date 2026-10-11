@@ -51,8 +51,8 @@ pub(crate) fn plural_u64<'a>(count: u64, singular: &'a str, plural: &'a str) -> 
     }
 }
 
-/// Round a remaining timeout up so a fresh 30-second allowance displays 30,
-/// not 29, while an expired deadline remains at zero during route grace.
+/// Round the remaining time up to whole seconds, so a fresh 30-second timeout
+/// shows 30, not 29, and an expired deadline shows 0 during the grace period.
 pub(crate) fn countdown_seconds(remaining: Duration) -> u64 {
     remaining
         .as_secs()
@@ -64,17 +64,17 @@ pub(crate) fn countdown_seconds(remaining: Duration) -> u64 {
 pub(crate) enum SpinnerStyle {
     /// Erase the line with ANSI, optionally styling the frame.
     Ansi { color: bool },
-    /// Return the carriage and pad over the previous frame with spaces, for
-    /// a console that would print escape sequences literally.
+    /// Return to the line start and pad over the previous frame with spaces,
+    /// for a console that would print escape sequences literally.
     Plain,
 }
 
-/// Render one overwrite-in-place spinner frame without allocating a line.
+/// Write one spinner frame over the current line without allocating.
 ///
-/// Styling deliberately uses only standard ANSI attributes and 16-colour
-/// foreground codes. Resetting just the foreground keeps the whole line bold
-/// while the spinner and final countdown change colour. A plain frame is
-/// padded to `previous_width` columns. Returns the frame's own width.
+/// Styling uses only standard ANSI attributes and 16-color foreground codes.
+/// Resetting just the foreground keeps the whole line bold while the spinner
+/// and final countdown change color. A plain frame is padded to
+/// `previous_width` columns. Returns the frame's own width.
 pub(crate) fn write_spinner_line(
     output: &mut dyn Write,
     frame: &str,

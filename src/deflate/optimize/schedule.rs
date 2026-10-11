@@ -7,12 +7,12 @@
 //! [`select_candidate`] runs the route phases in a fixed order. Every phase
 //! reads the immutable [`RouteContext`] and updates the complete lineages in
 //! [`RouteState`]. The order is part of the output contract: equal candidates
-//! keep the earlier incumbent, and each optional route checks its deadline at
-//! the point where it would start.
+//! keep the earlier incumbent, and each optional route checks its deadline
+//! where it would start.
 //!
-//! Route algorithms, eligibility rules, and candidate builders remain in the
-//! parent module. This module decides only which of them run, when, on which
-//! worker, and which complete result each lineage retains.
+//! Route algorithms, eligibility rules and candidate builders live in the
+//! parent module; this module decides which run, when, on which worker, and
+//! what each lineage retains.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,7 +76,6 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
 
     let started = Instant::now();
     let mut parsed = parse_stream(input, decoded_limit.min(options.max_decoded_bytes))?;
-    // Avoid even an extra clock read in ordinary speed-first runs.
     let reporting = reports_enabled(options);
     let parse_elapsed = if reporting {
         started.elapsed()
@@ -102,9 +101,8 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     progress.routes();
     let deadlines = StreamDeadlines::new(started, grace, options, default_floor, &parsed);
 
-    // Prefix callers need the exact bytes occupied by the first stream. Any
-    // unused high bits in its final byte belong to that stream's byte-level
-    // representation and are retained when the source wins.
+    // Unused high bits in the final byte belong to the source bytes and are
+    // retained when the source wins.
     let original = &input[..parsed.consumed];
     let decoded_limit = decoded_limit.min(options.max_decoded_bytes);
     let identity = StreamIdentity {
@@ -154,10 +152,8 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     } else if let Some(max_distance) = candidate.output_max_distance {
         max_distance
     } else {
-        // A known-losing child normally avoids a redundant validation parse,
-        // but an outer route can still select its bytes over an older source.
-        // Validate that uncommon final selection now and retain the metric
-        // from the exact bytes that the container will wrap.
+        // A known-losing child skipped its validation parse, but an outer
+        // route selected its bytes, so validate them now.
         parse_validated_rewrite(&candidate.data, decoded_limit, identity)?.max_distance
     };
     debug_assert!(output_max_distance <= parsed.max_distance);
@@ -172,10 +168,8 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
         timed_out,
     );
 
-    // Planning is complete. Drop model storage before copying a winning source
-    // stream, then reuse the generated output allocation where possible. This
-    // keeps the no-growth guarantee from briefly requiring two source-sized
-    // outputs plus the full parsed model.
+    // Drop the model and reuse the output allocation, so keeping the source
+    // never holds two source-sized outputs plus the parsed model at once.
     drop(blocks);
     drop(std::mem::take(&mut candidate.plans));
     if keep_original {
@@ -209,7 +203,6 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     })
 }
 
-/// Immutable inputs shared by every scheduling phase for one raw stream.
 #[derive(Clone, Copy)]
 struct RouteContext<'a> {
     source: CandidateInput<'a>,
@@ -221,7 +214,6 @@ struct RouteContext<'a> {
 }
 
 impl<'a> RouteContext<'a> {
-    /// Report a complete candidate against the parsed source stream.
     fn report(&self, candidate: &Candidate) -> CandidateProgress {
         candidate_progress(
             candidate,
@@ -234,18 +226,14 @@ impl<'a> RouteContext<'a> {
         candidate.map(|candidate| self.report(candidate))
     }
 
-    /// Ordinary floor work governed by the primary deadline.
     fn timed(&self) -> DefaultFloorWork<'a> {
         DefaultFloorWork::Timed(self.deadline)
     }
 }
 
-/// The primary route deadline and the complete file allowance.
-///
-/// When a stream reserves terminal search, optional routes use a shorter
-/// primary window without grace, and the full allowance governs only
-/// terminal work and final timeout reporting. Otherwise both deadlines cover
-/// the same allowance and the primary deadline governs everything.
+/// The primary route deadline and the complete file allowance. When a stream
+/// reserves terminal time (G0t), optional routes use a shorter primary window
+/// and the full allowance governs only terminal work and timeout reporting.
 struct StreamDeadlines {
     primary: Deadline,
     terminal: Deadline,
@@ -268,14 +256,9 @@ impl StreamDeadlines {
             parsed.source_block_count,
         );
         let reserve_terminal = share != TerminalShare::None;
-        // A multi-image APNG child keeps nineteen twentieths of its assigned
-        // slice for primary work; its smaller terminal share grows with time
-        // and cannot consume another frame's slice. A stream owning the file
-        // clock keeps four fifths for primary work. No phase grace may consume
-        // either terminal search share; finalization alone retains the
-        // original grace. Linear finalization needs only a short window, so
-        // its primary work keeps the phase grace and still ends before the
-        // complete allowance's hard boundary by one twentieth.
+        // The search share gives primary work no grace, so it cannot eat into
+        // the terminal share. The finalization share keeps it, since primary
+        // work still ends one twentieth before the full hard stop.
         let primary = match share {
             TerminalShare::None => Deadline::with_grace(started, options.timeout, grace),
             TerminalShare::Finalization => {
@@ -297,10 +280,8 @@ impl StreamDeadlines {
         }
     }
 
-    /// The deadline governing terminal work and final timeout reporting.
-    ///
-    /// A primary phase yield forwards the incumbent without marking the file
-    /// timed out. Only the full allowance governs terminal work and reporting.
+    /// The deadline governing terminal work and final timeout reporting; a
+    /// primary-phase yield does not mark the file timed out.
     fn terminal_work(&self) -> &Deadline {
         if self.reserve_terminal {
             &self.terminal
@@ -310,10 +291,8 @@ impl StreamDeadlines {
     }
 }
 
-/// Route families admitted by the parsed source and the floor policy.
-///
-/// These are pure topology and size checks. Deadline checks stay at each
-/// route's start, so elapsed time never changes which families are eligible.
+/// Route families eligible for the parsed source and floor policy. Only
+/// topology and size count; deadlines are checked when each route starts.
 struct RouteEligibility {
     compact_tree: bool,
     compact_proven_feedback: bool,
@@ -344,17 +323,9 @@ impl RouteEligibility {
                     &source.blocks[0].tokens,
                     source.blocks[0].plain.len(),
                 ),
-            // The direct source graph is a Max quality route, not a PNG-only
-            // specialization. Container scheduling may decide when it runs,
-            // but no accepted Huffman/stored topology is permanently excluded:
-            // otherwise a longer timeout could never recover a compatible
-            // deft4j endpoint.
+            // M1 applies under every floor policy, so a longer timeout can
+            // always reach the deft4j endpoint.
             deft4j: options.exhaustive && deft4j_source_route_eligible(source.blocks),
-            // Bounded PNG routes share the parsed stream and one deadline.
-            // Streams without a specialized source sibling run source max
-            // beside the floor lineage; multi-block floors may also receive one
-            // deterministic Columbo grouping pass. Standalone streams keep the
-            // same route order without overlapping their larger working sets.
             narrow_source: bounded_png_max
                 && narrow_source_route_eligible(source.blocks, source.compressed.len()),
             parallel_routes: options.exhaustive
@@ -371,13 +342,13 @@ impl RouteEligibility {
 /// at the assignment says otherwise.
 #[derive(Default)]
 struct RouteState {
-    /// The exact ordinary endpoint that Max promises never to lose.
+    /// The exact Default endpoint that Max must never lose.
     complete_default: Option<Candidate>,
-    /// That endpoint after Default's final boundary slide. It is compared
-    /// only after Max's terminal searches, so it guarantees the Default
-    /// result without choosing their parent.
+    /// Default's exact endpoint where it differs from `complete_default`
+    /// (after its final R1c, R13 and R14, or with R1b). It is compared only
+    /// after Max's terminal searches, so it never becomes their parent.
     slid_default: Option<Candidate>,
-    /// The ordinary comparison floor, which also seeds Max's historical routes.
+    /// The Default comparison floor, which also seeds Max's routes.
     floor: Option<Candidate>,
     floor_seeded: Option<Candidate>,
     deft4j: Option<Candidate>,
@@ -388,9 +359,8 @@ struct RouteState {
     compact_split: Option<Candidate>,
     split_seeds: CompactSplitSeeds,
     completed_compact_split_parent: Option<Vec<u8>>,
-    /// The direct deft4j route saved less than the material-gain threshold on
-    /// a multi-block bounded PNG. This admits both the deft4j floor seed and
-    /// compact split inspection.
+    /// The direct deft4j route saved less than 2% on a multi-block
+    /// single-image PNG, enabling the deft4j floor seed and compact split.
     weak_deft4j: bool,
     integrated_compact_source_max: bool,
     suppress_later_source_max: bool,
@@ -424,7 +394,6 @@ impl CompactSplitSeeds {
         *self = Self::default();
     }
 
-    /// Price every prepared parent's compact split descendants.
     fn build(&self, context: &RouteContext<'_>) -> Result<Option<Candidate>> {
         build_prepared_compact_source_split_floors(
             self.as_refs(),
@@ -491,12 +460,12 @@ fn prepare_source_blocks(
     Ok(())
 }
 
-/// Run every admitted route family and return the selected complete candidate.
+/// Run every eligible route family and return the selected complete candidate.
 ///
 /// The bounded phases (through [`close_no_split_lineage`]) build independent
 /// Max lineages beside the ordinary floor. [`establish_comparison_floor`] then
-/// fixes the incumbent, and each later phase may only replace it with a
-/// strictly smaller complete candidate before the terminal searches run.
+/// fixes the incumbent, which each later phase may only replace with a
+/// strictly smaller complete candidate.
 fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> Result<Candidate> {
     let mut state = RouteState::default();
     let guaranteed_floor = build_guaranteed_floor(context, &mut state)?;
@@ -520,10 +489,8 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
     run_complementary_no_split(context, &eligibility, &mut candidate)?;
     run_compact_balanced_tree(context, &eligibility, &mut candidate)?;
 
-    // Standalone Complete work reaches this point with the historical Max seed
-    // still driving every heuristic lineage. Compare the independently retained
-    // complete Default endpoint only after those routes finish, so adding the
-    // quality floor cannot redirect Max into a different rewritten-seed basin.
+    // Compare `Complete`'s retained Default endpoint only now, so it cannot
+    // redirect the rewritten-seed refinement.
     if let Some(complete_default) = state.complete_default.take() {
         candidate.replace_if_smaller(complete_default);
     }
@@ -537,15 +504,9 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
     Ok(candidate)
 }
 
-/// Build the comparison floor that some policies need before bounded routes.
-///
-/// A single scheduled PNG promises that max retains the complete ordinary
-/// result. Prebuild compact, very large, one-block, or match-dense floors;
-/// their exact Default route either is a cheap dependency or cannot reliably
-/// finish inside the concurrent phase's reserved four-fifths. Medium
-/// multi-block floors instead remain in the existing parallel phase, where
-/// their completed ordinary candidate is still retained while max preserves
-/// enough wall time for independent source routes.
+/// Build the comparison floor that some policies need before the bounded
+/// routes (M0). `Established` copies the caller's stream; for
+/// `CompleteThenBounded`, see [`super::PREBUILD_BOUNDED_FLOOR_MAX_DECODED`].
 fn build_guaranteed_floor(
     context: &RouteContext<'_>,
     state: &mut RouteState,
@@ -588,9 +549,9 @@ fn build_guaranteed_floor(
                 state.slid_default = floors.slid;
                 floors.max_seed
             }
-            // APNG's initial planner and terminal transformations define its
-            // exact Default endpoint. A replay-bounded seed is a different
-            // lineage; a smaller seed does not dominate its terminal children.
+            // APNG's initial planner and terminal methods define its exact
+            // Default endpoint. The replay-bounded seed is a separate lineage:
+            // a smaller seed does not dominate its terminal children.
             DefaultFloor::ApngMax => {
                 let (complete, slid) = build_complete_apng_default_floor_candidate(
                     source,
@@ -614,7 +575,6 @@ fn build_guaranteed_floor(
     Ok(floor)
 }
 
-/// Run the bounded comparison routes and retain each returned lineage.
 fn run_bounded_phase(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -644,9 +604,6 @@ fn run_bounded_phase(
     let bounded = options.exhaustive && default_floor.is_bounded();
     let step = bounded.then(|| progress.start("Bounded comparison routes"));
     let candidates = if bounded {
-        // A one-block topology probe has already finished this exact floor.
-        // Reuse it; multi-block streams build the same floor concurrently with
-        // their independent source routes inside the bounded phase.
         match png_policy {
             BoundedPngMaxPolicy::GenericParallel => build_bounded_generic_max_candidates(
                 source,
@@ -685,14 +642,12 @@ fn run_bounded_phase(
             }
         }
     } else {
-        // Every policy that prebuilds a floor is bounded, and only bounded
-        // Max consumes it.
+        // Every policy that prebuilds a floor is bounded.
         debug_assert!(guaranteed_floor.is_none());
         BoundedPhaseCandidates::default()
     };
     state.floor = candidates.floor;
-    // A prebuilt endpoint already supplied its slid copy; the bounded phase
-    // builds one only when no endpoint was prebuilt.
+    // The bounded phase builds a slid copy only when no endpoint was prebuilt.
     state.slid_default = candidates.slid_default.or(state.slid_default.take());
     state.floor_seeded = candidates.floor_seeded;
     state.deft4j = candidates.deft4j;
@@ -720,13 +675,8 @@ fn run_bounded_phase(
     Ok(())
 }
 
-/// Price the compact proven-feedback sibling and merge it into the floor.
-///
-/// A compact one-block stream has one additional fixed point when proven
-/// resegmentation feeds later table feedback before the normal endpoint
-/// ordering. Price that bounded sibling before the general source-max graph
-/// can consume the shared deadline. The completed normal floor remains an
-/// independent fallback.
+/// Price the compact proven-feedback candidate (M3) if the bounded phase did
+/// not, and merge it into the floor before source max runs.
 fn run_proven_feedback_floor(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -750,13 +700,9 @@ fn run_proven_feedback_floor(
     if let Some(step) = step {
         step.finish(context.report_optional(state.proven_feedback.as_ref()));
     }
-    // The completed compact routes provide a direct scheduling signal for
-    // source max. If proven-before-feedback supplies only a bit-level win,
-    // continue that state order in the one expensive beam to seek the next
-    // byte boundary. Once that bounded lineage already wins a byte, retain it
-    // and spend the beam on complementary ordinary states instead. A tie also
-    // selects ordinary states. Larger blocks use the integrated order
-    // independently inside the stream planner.
+    // S0: only when proven feedback ties the floor's bytes but wins bits does
+    // later source max use the integrated proven order to look for the next
+    // byte. Larger blocks use that order inside the stream planner.
     state.integrated_compact_source_max = state
         .proven_feedback
         .as_ref()
@@ -770,13 +716,9 @@ fn run_proven_feedback_floor(
     Ok(())
 }
 
-/// Decide whether compact split applies and prepare its distinct parents.
-///
-/// Prepare the exact structural siblings before choosing which route gets the
-/// remaining time. A weak direct gain admits compact-split inspection, but it
-/// does not prove that any parent satisfies that route's bounded topology and
-/// work model. Retaining these prepared seeds also avoids reparsing the same
-/// candidates after the scheduling decision.
+/// Decide whether compact split (M10c) applies and prepare its distinct
+/// parents. This precedes choosing which route gets the remaining time, since
+/// only a prepared parent shows that it meets the split's limits.
 fn prepare_compact_split_seeds(context: &RouteContext<'_>, state: &mut RouteState) -> Result<()> {
     let source = context.source;
     let (decoded_limit, identity) = (source.decoded_limit, source.identity);
@@ -790,9 +732,8 @@ fn prepare_compact_split_seeds(context: &RouteContext<'_>, state: &mut RouteStat
                 )
         });
     if state.weak_deft4j {
-        // Split pricing is not monotone in the parent stream's encoded size:
-        // independently rewritten block topologies can have opposite local
-        // ordering after new cuts are inserted. Preserve each distinct parent.
+        // Split pricing is not monotone in the parent's encoded size, so keep
+        // each distinct parent.
         let completed = state.completed_compact_split_parent.as_deref();
         let normal_parent = state
             .floor
@@ -824,21 +765,15 @@ fn prepare_compact_split_seeds(context: &RouteContext<'_>, state: &mut RouteStat
         };
     }
     if let Some(floor) = &mut state.floor {
-        // The later deft4j refinement needs only the encoded floor for its
-        // strict comparison. Release transformed floor plans before it
-        // reparses another complete candidate.
+        // Later phases need only the floor's bytes.
         floor.plans.clear();
     }
     Ok(())
 }
 
-/// Finish deterministic cleanup on a completed floor-seeded Max parent.
-///
-/// A completed floor-seeded max route may end at a different header/token
-/// fixed point from source max. Finish the same bounded tree cleanup on that
-/// exact parent before releasing it. This is deterministic finalization of an
-/// already completed candidate, so it remains valid after the soft deadline
-/// and cannot discard the parent when no balanced-tree improvement exists.
+/// Run compact split and balanced-tree cleanup (M10c, M4) on the completed
+/// floor-seeded Max parent. The cleanup is deterministic, so it may run after
+/// the soft deadline.
 fn finish_floor_seeded_tree(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -853,10 +788,8 @@ fn finish_floor_seeded_tree(
     let (decoded_limit, identity) = (source.decoded_limit, source.identity);
     if eligibility.compact_tree {
         if let Some(seeded) = &mut state.floor_seeded {
-            // A one-block source may become a multi-block floor after the max
-            // descendant. Those new boundaries admit the same deterministic
-            // split floor used for compact source lists, and the original
-            // one-block routes cannot reconstruct that parent state.
+            // A one-block source may have become a multi-block floor, which
+            // the compact split can use but the one-block routes cannot.
             if let Some(split) = refine_with_compact_source_split_floor_until(
                 seeded,
                 options,
@@ -884,14 +817,8 @@ fn finish_floor_seeded_tree(
     Ok(())
 }
 
-/// Continue the strongest unfinished floor-seeded lineage.
-///
-/// Continue the strongest unfinished dependent lineage before starting
-/// refinements from weaker parents. This is a score-ordered search rule, not a
-/// size or corpus gate: the retained incumbent protects every other complete
-/// result. It also avoids waiting for an independent source worker and then
-/// spending the final allowance refining a candidate already behind the
-/// floor-seeded endpoint.
+/// Continue the floor-seeded lineage before weaker parents when it leads and is
+/// not a Max fixed point (M7a).
 fn continue_floor_seeded(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -905,11 +832,8 @@ fn continue_floor_seeded(
         progress,
     } = *context;
     let (decoded_limit, identity) = (source.decoded_limit, source.identity);
-    // An admitted compact split is an independent bounded sibling, but merely
-    // being eligible does not predict that it will improve its parent. When
-    // the parsed model permits route parallelism, overlap it with this
-    // continuation so neither speculative route can starve the other. A
-    // serial work class retains the material-gain priority rule below.
+    // With parallel routes, run a pending compact split beside this
+    // continuation so neither starves the other.
     let compact_split_pending = state.split_seeds.any();
     let overlap_compact_split = compact_split_pending && eligibility.parallel_routes;
     let continue_best = state.floor_seeded.as_ref().is_some_and(|seeded| {
@@ -932,24 +856,16 @@ fn continue_floor_seeded(
             .flatten()
             .all(|other| !other.is_strictly_smaller_than(seeded))
     }) && deadline.can_start_route();
-    // An encoded-size lead does not dominate the endpoint of a different
-    // planner topology. In the bounded parallel work class, keep the
-    // independent deft4j-derived refinement live beside the best floor-seeded
-    // continuation. Otherwise a long fixed-point continuation can consume
-    // every larger deadline without ever admitting the complementary route.
-    // This uses the same at-most-three-worker envelope as the historical
-    // source/deft4j/compact phase and does not add wall-clock budget.
+    // Run the deft4j refinement beside the continuation, which could otherwise
+    // use up any longer deadline. This stays within three workers.
     let overlap_deft4j = independent_deft4j_refinement_can_overlap(
         continue_best,
         default_floor.uses_bounded_png_routes(),
         eligibility.parallel_routes,
         state.weak_deft4j || state.deft4j.is_some(),
     );
-    // APNG children have no serial time after a continuation that uses their
-    // whole assigned window. Keep the independent original-source root live
-    // beside that continuation; otherwise every larger allowance merely lets
-    // the same dependent planner run longer and can never reach the omitted
-    // basin. Standalone PNG keeps its existing bounded route envelope here.
+    // An APNG child has no time left after a continuation that uses its
+    // whole window, so run original-source Max beside it.
     let overlap_source_max = continue_best
         && default_floor == DefaultFloor::ApngMax
         && eligibility.parallel_routes
@@ -997,10 +913,8 @@ fn continue_floor_seeded(
         step.finish(context.report_optional(state.deft4j.as_ref()));
     }
     if floor_seeded_changed && state.weak_deft4j {
-        // Continuation can emit a new topology. Refresh only that changed
-        // parent; the normal and direct deft4j seeds above remain exact and
-        // must not be reparsed. Exact identity with either seed proves that
-        // its structural work is already represented.
+        // Prepare the changed parent unless it matches the normal or deft4j
+        // seed.
         let seeds = &state.split_seeds;
         let completed = state.completed_compact_split_parent.as_deref();
         let refreshed = state
@@ -1028,7 +942,7 @@ fn floor_seeded_parent(state: &RouteState) -> &Candidate {
         .expect("continuation requires a floor-seeded candidate")
 }
 
-/// Continue the floor-seeded parent beside an original-source max worker.
+/// Continue the floor-seeded parent beside an original-source Max worker.
 fn continue_beside_source_max(
     context: &RouteContext<'_>,
     state: &mut RouteState,
@@ -1057,9 +971,7 @@ fn continue_beside_source_max(
                     )
                 });
             let Some(source_worker) = source_worker else {
-                // Thread exhaustion retains the prior score-ordered
-                // continuation. A later serial source route remains eligible
-                // if that continuation finishes in time.
+                // Source max can still run serially later.
                 let refined = refine_with_max_planner(
                     seeded,
                     options,
@@ -1135,8 +1047,7 @@ fn continue_beside_deft4j_refinement(
                     )
                 });
             let Some(refinement_worker) = refinement_worker else {
-                // Retain both complete parents and let the ordinary serial
-                // phase below run the independent refinement.
+                // The serial phase below runs the refinement.
                 return Ok((None, None, false));
             };
             let split_worker = overlap_compact_split
@@ -1162,8 +1073,6 @@ fn continue_beside_deft4j_refinement(
             join_route(refinement_worker)?;
             let split = match split_worker {
                 Some(worker) => join_route(worker)?,
-                // A failed split-worker spawn retains the bounded synchronous
-                // fallback used by the prior schedule.
                 None if overlap_compact_split => split_seeds.build(context)?,
                 None => None,
             };
@@ -1204,9 +1113,6 @@ fn continue_beside_compact_split(
                 || split_seeds.build(context),
             );
             let Some(split_worker) = split_worker else {
-                // Thread exhaustion must not discard the independent
-                // structural sibling. Finish it on this thread and retain the
-                // complete seeded parent as the fallback.
                 return split_seeds.build(context).map(|split| (None, split));
             };
             let refined = refine_with_max_planner(
@@ -1230,8 +1136,8 @@ fn continue_beside_compact_split(
     Ok(refined)
 }
 
-/// Run the bounded follow-up routes, then finish compact split serially if no
-/// concurrent route attempted it.
+/// Run the bounded follow-up routes (M10b, M2c), then finish compact split
+/// serially if no concurrent route attempted it.
 fn run_bounded_refinement(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -1248,23 +1154,15 @@ fn run_bounded_refinement(
     let run_bounded_refinement = default_floor.is_bounded() && deadline.can_start_route();
     let compact_split_work_possible = run_bounded_refinement
         && (state.split_seeds.any()
-            // Refinement can expose a distinct eligible parent even when none
-            // of the early encodings qualify. Use the same bounded source work
-            // model that admits that dependency; larger ineligible streams
-            // should not display an idle compact-split route.
+            // Refinement can expose an eligible parent even when no early
+            // candidate qualifies.
             || (state.weak_deft4j && compact_dependent_deft4j_work_class(source)))
-        // If no early split ran, the hard-deadline fallback below may still
-        // finish one parent after the soft route window closes.
+        // The hard-deadline fallback below may still finish one parent.
         || (state.weak_deft4j && !state.compact_split_attempted && !deadline.expired());
     let compact_split_step =
         compact_split_work_possible.then(|| progress.start("Columbo compact split floor"));
-    // The direct no-split walk is not idempotent across an emitted token or
-    // block rewrite: its new parent can expose another cumulative-pruning or
-    // adjacent-merge choice. Continue that dependency once when it is a
-    // non-dominated complete result. This is score ordered rather than tied to
-    // a corpus shape, and source max remains available later if time remains.
-    // Prefer the dependent continuation to a simultaneous source-max worker so
-    // the bounded phase retains its existing three-worker memory envelope.
+    // M2c takes the source-max worker's slot, keeping the bounded phase within
+    // three workers; source max remains eligible later.
     let continue_best_narrow = run_bounded_refinement
         && state.narrow.as_ref().is_some_and(|narrow| {
             changed_narrow_parent_should_continue(
@@ -1275,8 +1173,8 @@ fn run_bounded_refinement(
         })
         && deadline.can_start_route();
     let narrow_step = continue_best_narrow.then(|| progress.start("Columbo no-split continuation"));
-    // Refinement needs only the encoded streams. Release retained route token
-    // plans before reparsing them so the models do not overlap at peak memory.
+    // Release the token plans before reparsing, so the models do not overlap
+    // at peak memory.
     for candidate in [&mut state.deft4j, &mut state.narrow, &mut state.source_max]
         .into_iter()
         .flatten()
@@ -1336,11 +1234,9 @@ fn run_bounded_refinement(
     if let Some(step) = refinement_step {
         step.finish(context.report_optional(state.deft4j.as_ref()));
     }
-    // This structural cleanup normally runs in the deft4j lineage beside
-    // source max. If that concurrent phase could not run, finish it serially
-    // only while the file's critical deadline remains. The deadline-aware
-    // variant retains the completed parent if an active split trial runs out
-    // of grace instead of beginning unbounded work after the hard stop.
+    // If no concurrent phase ran compact split, finish it serially before the
+    // hard deadline; the `_until` variant keeps the parent if a split trial
+    // runs out of grace.
     if state.weak_deft4j && !state.compact_split_attempted && !deadline.expired() {
         let completed = state.completed_compact_split_parent.as_deref();
         state.compact_split = match state.deft4j.as_ref() {
@@ -1366,7 +1262,7 @@ fn run_bounded_refinement(
     Ok(())
 }
 
-/// Follow-up workers admitted beside the deft4j-derived refinement.
+/// Workers that run beside the deft4j-derived refinement.
 #[derive(Clone, Copy)]
 struct FollowUpRoutes {
     source_max: bool,
@@ -1374,8 +1270,8 @@ struct FollowUpRoutes {
     compact_split: bool,
 }
 
-/// Refine the deft4j lineage on this thread while admitted siblings run on
-/// scoped workers. Every started worker joins before any error is returned.
+/// Refine the deft4j lineage on this thread while the requested siblings run
+/// on scoped workers. Every started worker joins before any error is returned.
 fn run_concurrent_follow_up(
     context: &RouteContext<'_>,
     state: &mut RouteState,
@@ -1458,10 +1354,9 @@ fn run_concurrent_follow_up(
         if refinement.is_err() {
             deadline.cancel_routes();
         }
-        // A genuinely different refined topology is another split parent.
-        // Price it while source max is still running when soft time remains,
-        // or unconditionally when it strictly improves every early parent.
-        // Exact encoded identity proves duplicate work.
+        // A different refined topology is another split parent. Price it
+        // while source max runs, if soft time remains or it strictly beats
+        // every early parent.
         let dependent_split = if refinement.is_ok() && weak_deft4j {
             deft4j.as_ref().and_then(|deft4j| {
                 let duplicates_early_seed = split_seeds
@@ -1502,8 +1397,6 @@ fn run_concurrent_follow_up(
             None => Ok(None),
         }?;
         let attempted_compact_split = routes.compact_split || dependent_split.is_some();
-        // A failed worker spawn falls back to the same bounded pass on this
-        // thread while source max is still joined.
         let early_split = match compact_worker {
             Some(worker) => join_route(worker),
             None => split_seeds.build(context),
@@ -1543,8 +1436,8 @@ fn continue_no_split(
     )
 }
 
-/// Close a changed no-split lineage only when another candidate would
-/// otherwise discard it, then fold it into the deft4j lineage.
+/// Fold the no-split candidate into the deft4j lineage, first running the
+/// terminal tree floors on a changed topology that would otherwise lose.
 fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) -> Result<()> {
     let RouteContext {
         source,
@@ -1553,16 +1446,10 @@ fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) ->
         ..
     } = *context;
     if let Some(deft4j) = &mut state.deft4j {
-        // Keep only the encoded incumbent for comparison and later routes;
-        // refinement can otherwise retain another expanded token graph.
         deft4j.plans.clear();
     }
     if let Some(mut narrow) = state.narrow.take() {
-        // A changed no-split topology can lose the immediate encoded-size
-        // comparison yet win after the bounded terminal tree closure. Close
-        // that branch only when another completed candidate would otherwise
-        // discard it; a no-split winner receives the same work once at Max's
-        // ordinary terminal stage.
+        // A winner gets the tree floors later, at Max's terminal stage.
         let narrow_would_be_retained = [
             state.floor.as_ref(),
             state.floor_seeded.as_ref(),
@@ -1587,13 +1474,9 @@ fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) ->
     Ok(())
 }
 
-/// Select the incumbent every later route must strictly improve.
-///
-/// Bounded max routes deliberately retain their historical ordinary seed: a
-/// smaller complete Default floor can occupy a different search basin.
-/// Compare that independent floor only after those descendants finish, so max
-/// gets both the established Default result and its original routes without
-/// recomputing the shared base candidate.
+/// Select the incumbent every later route must strictly improve. The complete
+/// Default endpoint joins the comparison here, after the bounded Max routes,
+/// because seeding them from it can lead to a different local optimum.
 fn establish_comparison_floor(
     context: &RouteContext<'_>,
     state: &mut RouteState,
@@ -1619,9 +1502,8 @@ fn establish_comparison_floor(
     let mut candidate = if let Some(floor) = state.floor.take() {
         floor
     } else if options.exhaustive {
-        // Max mode finishes the genuine normal-mode route first. Its best
-        // complete candidate remains the comparison floor even when the Max
-        // deadline has already curtailed optional search.
+        // Max finishes the Default route first; it stays the floor even when
+        // the deadline cuts optional search.
         match default_floor {
             DefaultFloor::Complete => {
                 let floors = build_complete_default_floor_candidate(
@@ -1650,11 +1532,8 @@ fn establish_comparison_floor(
             }
         }
     } else if default_floor == DefaultFloor::ApngDefault {
-        // An APNG image stream is one part of a larger file-level Default run.
-        // Keep its full initial planner, but leave repeated replay and the
-        // independent endpoint-proven lineage to Max. Applying those additive
-        // routes to every frame made Default scale with route count rather
-        // than useful savings.
+        // Leave replay and the endpoint-proven lineage to Max, so APNG
+        // Default cost does not grow with every frame's route count.
         build_apng_default_candidate(source, options, &mut deadline.hard_stop())?
     } else if default_floor == DefaultFloor::MandatoryComplete {
         build_candidate(
@@ -1674,11 +1553,8 @@ fn establish_comparison_floor(
     if let Some(step) = initial_step {
         step.finish(Some(context.report(&candidate)));
     }
-    // The APNG-specific fast shared floor is complete and validated, but
-    // repeating optional compact feedback siblings for every frame can turn
-    // individually bounded routes into an unbounded file-wide Default cost.
-    // Standalone, metadata, and other shared callers retain their existing
-    // fixed points; Max covers the broader APNG feedback families.
+    // Default adds D1–D3 and the terminal tree floors, except for
+    // `ApngDefault`, for the same per-frame reason; Max runs them for APNG.
     if !options.exhaustive && default_floor != DefaultFloor::ApngDefault {
         let floor_work = if default_floor == DefaultFloor::MandatoryComplete {
             DefaultFloorWork::Mandatory
@@ -1691,13 +1567,9 @@ fn establish_comparison_floor(
     Ok(candidate)
 }
 
-/// Close a different topology's losing branch before comparing it.
-///
-/// Encoded size does not dominate a different token/tree topology before its
-/// bounded tree-only closure. Close only a losing branch here: a winning
-/// contender receives the same terminal work once at the end of Max, so this
-/// preserves the independent search basin without duplicating its
-/// finalization on the common path.
+/// Run the terminal tree floors on a losing contender before comparing it,
+/// since a different topology may win only after them. A winner gets the same
+/// work at the end of Max.
 fn close_losing_topology(
     context: &RouteContext<'_>,
     incumbent: &Candidate,
@@ -1715,7 +1587,9 @@ fn close_losing_topology(
     )
 }
 
-/// Compare the floor-seeded and deft4j-derived topologies with the incumbent.
+/// Compare the floor-seeded and deft4j-derived topologies with the incumbent,
+/// first building the deft4j candidate (M1) for `Complete`, which has no
+/// bounded phase.
 fn merge_independent_topologies(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -1731,37 +1605,25 @@ fn merge_independent_topologies(
     } = *context;
     if eligibility.deft4j && default_floor == DefaultFloor::Complete && deadline.can_start_route() {
         let deft4j_step = progress.start("deft4j-derived source route");
-        // Complete streams run no bounded phase, so this is the first deft4j
-        // candidate for the lineage.
         state.deft4j = build_deft4j_source_candidate(source, options, &mut deadline.hard_stop())?;
         deft4j_step.finish(context.report_optional(state.deft4j.as_ref()));
     }
 
     if let Some(seeded) = state.floor_seeded.take() {
-        // The retained Default floor may be immediately smaller while a
-        // distinct floor-seeded topology reaches a better terminal tree fixed
-        // point.
         let seeded = close_losing_topology(context, candidate, seeded)?;
         candidate.replace_if_smaller(seeded);
     }
 
     if let Some(mut deft4j) = state.deft4j.take() {
         deft4j.plans.clear();
-        // The deft4j-derived source graph is another independent topology;
-        // encoded-size dominance is sound only after its bounded tree-only
-        // closure has been priced.
         let deft4j = close_losing_topology(context, candidate, deft4j)?;
         candidate.replace_if_smaller(deft4j);
     }
     Ok(())
 }
 
-/// Run the fragmented collection route as an additive Max sibling.
-///
-/// A 4,096-token collection can start slightly larger but converge to a better
-/// fragmented-stream layout after strict replays. It is additive to the
-/// normal-mode comparison floor, and starts only while the soft deadline still
-/// permits a new independent route.
+/// Run the fragmented collection route (M11). A 4,096-token collection can
+/// start slightly larger but reach a better layout after strict replays.
 fn run_fragmented_collection(
     context: &RouteContext<'_>,
     state: &RouteState,
@@ -1808,34 +1670,27 @@ fn run_fragmented_collection(
     Ok(())
 }
 
-/// Run original-source max and the rewritten-seed refinement.
-///
-/// Returns a compact source-max parent whose structural split is deferred
-/// until every ordinary timed route has finished.
+/// Run original-source Max (M12) and the rewritten-seed refinement (M13).
+/// Returns a compact source-max parent whose split (M10d) is deferred.
 fn run_max_source_routes(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
     state: &mut RouteState,
     candidate: &mut Candidate,
 ) -> Result<Option<Candidate>> {
-    // The encoded floor is all we need for comparison. Releasing its copied
-    // tokens before max search keeps peak memory predictable.
+    // Comparison and the replay seed need only the encoded bytes.
     candidate.plans.clear();
     let (deferred_split_parent, source_max_stabilized_incumbent) =
         merge_source_max(context, eligibility, state, candidate)?;
-    // A winning source restart can own another full plan graph. Only its
-    // encoded bytes are needed as the optional replay seed.
     candidate.plans.clear();
     refine_rewritten_seed(context, state, candidate, source_max_stabilized_incumbent)?;
     Ok(deferred_split_parent)
 }
 
-/// Compare the original-source max lineage with the incumbent.
-///
-/// Generic max also explores source-boundary and table families outside
-/// deft4j's source-ordered graph. Run it before a rewritten seed can spend the
-/// remainder on one large merged block. Returns the deferred split parent and
-/// whether source max proved the incumbent's exact encoding stable.
+/// Compare the original-source Max lineage with the incumbent (M12). It runs
+/// before a rewritten seed can spend the remaining time on one large merged
+/// block. Returns the deferred split parent and whether source max proved the
+/// incumbent's exact encoding stable.
 fn merge_source_max(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -1870,11 +1725,8 @@ fn merge_source_max(
     let Some(mut max_candidate) = source_max else {
         return Ok((None, false));
     };
-    // Preserve only a compact encoded parent for deferred structural
-    // finalization. Running that work here can consume live time from later
-    // Max siblings; postponing it keeps the established route schedule
-    // unchanged. The exact-parent check avoids repeating a split lineage
-    // already completed during the bounded phase.
+    // M10d: save a compact parent to split after the timed routes, so the
+    // split cannot take their time.
     let mut deferred_split_parent = None;
     if default_floor.owns_terminal_stream_time()
         && max_candidate.data.len() <= COMPACT_SPLIT_FLOOR_MAX_COMPRESSED
@@ -1889,9 +1741,8 @@ fn merge_source_max(
         deferred_split_parent = Some(parent);
     }
 
-    // A locally smaller proven-feedback endpoint can hide the bounded
-    // balanced-tree header win reachable from source max. Finish that cheap
-    // lineage-specific cleanup before comparing complete streams.
+    // M4: a smaller proven-feedback endpoint can hide the balanced-tree win
+    // reachable from source max, so run that cleanup before comparing.
     if eligibility.compact_tree {
         let tree_step = progress.start("Columbo source-max balanced-tree floor");
         let mut tree = refine_with_compact_balanced_tree_floor(
@@ -1912,21 +1763,14 @@ fn merge_source_max(
             max_candidate.replace_if_smaller(tree);
         }
     }
-    // In particular, a newly retained Default floor can be smaller than this
-    // source-max parent while the latter still reaches the best payload-tree
-    // fixed point.
     let max_candidate = close_losing_topology(context, candidate, max_candidate)?;
     let stabilized = candidate.is_encoding_stabilized_by(&max_candidate);
     candidate.replace_if_smaller(max_candidate);
     Ok((deferred_split_parent, stabilized))
 }
 
-/// Retain one additive Max pass from the selected rewritten seed.
-///
-/// Rewritten match choices and boundaries can expose later max
-/// transformations, so retain one additive seeded pass after both
-/// source-shaped routes. Its incumbent remains available if this final route
-/// times out or fails to improve it.
+/// Run one Max pass from the selected rewritten seed (M13), whose match choices
+/// and boundaries can expose further Max transformations.
 fn refine_rewritten_seed(
     context: &RouteContext<'_>,
     state: &RouteState,
@@ -1941,10 +1785,6 @@ fn refine_rewritten_seed(
         ..
     } = *context;
     let seed_selected = options.strict || candidate.is_strictly_smaller_than_source(source);
-    // `build_candidate` has already run the same max planner on every accepted
-    // rewrite until it either stopped improving or hit its replay cap. If
-    // source max proved these exact bytes stable, reparsing them here can only
-    // repeat that final no-improvement round.
     let max_seed_is_stable = candidate.max_planner_is_stable || source_max_stabilized_incumbent;
     if seed_selected && max_seed_is_stable {
         progress.skipped(
@@ -1972,14 +1812,8 @@ fn refine_rewritten_seed(
     Ok(())
 }
 
-/// Price the complementary no-split pruning policy as its own topology.
-///
-/// The topology-selected no-split lineage owns the early bounded window: short
-/// lists keep individual pruning, while long lists first ensure that
-/// cumulative search reaches every source block. With time still available,
-/// retain the complementary pruning policy as its own topology rather than
-/// folding a locally smaller block choice into (and potentially redirecting)
-/// the established no-split candidate.
+/// Price the complementary no-split pruning policy (M2 late; see
+/// [`super::CUMULATIVE_NO_SPLIT_MIN_SOURCE_BLOCKS`]) as its own topology.
 fn run_complementary_no_split(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -2018,6 +1852,7 @@ fn run_complementary_no_split(
     Ok(())
 }
 
+/// Run the final balanced-tree cleanup (M4) on the selected candidate.
 fn run_compact_balanced_tree(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -2042,15 +1877,10 @@ fn run_compact_balanced_tree(
     Ok(())
 }
 
-/// Price the saved compact source-max parent's structural split.
-///
-/// Source max can finish on a different block/tree endpoint from the
-/// deft4j-derived parent priced earlier. Immediate encoded size does not
-/// dominate that dependency: one child split can give locally distinct payload
-/// regimes separate trees. Price this saved compact parent only after all
-/// ordinary timed routes have finished. The `_until` variant uses any
-/// remaining allowance or its deterministic one-block hard-deadline rescue,
-/// while the incumbent remains available on failure or non-win.
+/// Price the split of the saved compact source-max parent (M10d) after every
+/// ordinary timed route. Source max can end at a different endpoint from the
+/// deft4j parent split earlier. The `_until` variant uses any remaining
+/// allowance, or its deterministic one-block rescue after the hard stop.
 fn run_deferred_source_max_split(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -2061,9 +1891,8 @@ fn run_deferred_source_max_split(
     let split_step = context
         .progress
         .start("Columbo source-max compact split floor");
-    // A primary phase yield is not a file timeout. Preserve its cheap coarse
-    // rescue only while the terminal share is still available; do not let
-    // exhaustive split pricing spend that reserved share.
+    // After a primary-phase yield, allow only the cheap coarse rescue, so
+    // exhaustive split pricing cannot spend the terminal share.
     let mut split_stop =
         if deadlines.reserve_terminal && deadline.expired() && deadlines.terminal.can_start_route()
         {
@@ -2085,7 +1914,7 @@ fn run_deferred_source_max_split(
     Ok(())
 }
 
-/// Apply the terminal tree floors and source-certified restorations.
+/// Apply the terminal tree floors (Max only), then the terminal methods.
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -2100,18 +1929,13 @@ fn finish_terminal_searches(
     } = *context;
     let terminal_work = DefaultFloorWork::Timed(deadlines.terminal_work());
 
-    // Default runs these floors inside `improve_default_floor_with_feedback`
-    // so Max can retain the exact same completed comparison endpoint. Max
-    // applies them again only to its final incumbent, where they remain
-    // additive and cannot discard that endpoint.
+    // Default runs these floors inside `improve_default_floor_with_feedback`;
+    // Max applies them again only to its final incumbent.
     if options.exhaustive {
         candidate =
             improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
     }
 
-    // Restore source-certified choices only after the established lineages
-    // finish. The same terminal pass is included in Max's mandatory Default
-    // endpoint, without changing the historical seed used by its searches.
     let restoration_work = if default_floor == DefaultFloor::MandatoryComplete {
         DefaultFloorWork::Mandatory
     } else {

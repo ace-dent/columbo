@@ -1,24 +1,24 @@
 # DeflOpt Benchmark
 
-This living report compares Columbo against paired `deflopt`
-references. Each case records file byte deltas and Deflate bitstream
-bit deltas. Negative numbers mean Columbo is smaller. DeflOpt parity
-is a default-mode requirement; max is an additional quality route and
-must never be worse than the completed default result.
+This living report compares Columbo with paired DeflOpt references.
+Each row records the difference in file bytes and in meaningful
+Deflate bits; negative numbers mean Columbo is smaller. Default mode
+must reach DeflOpt parity. Max must never be worse than the completed
+Default result.
 
-The two standard modes are plain default Columbo and `--max` with
-a timeout equal to the measured default runtime rounded up plus five
-seconds, subject to Columbo's 10-second minimum. The runner completes
-default and then timed max for every other corpus file, checks the
-requested quality gates, and then repeats both modes for the
-complementary files. A new Columbo binary alternates the first file
-offset. ZIP comparisons always pass `--strip` so their wrapper
-metadata policy matches DeflOpt; other formats preserve metadata.
+Each file runs in Default, then with `--max` and a timeout of the
+measured Default runtime, rounded up to a whole second, plus five
+seconds (at least Columbo's 10-second minimum). The runner first
+completes both modes for every other corpus file and checks the
+requested quality gates, then runs the remaining files.
+Each new Columbo binary starts with the other half of the corpus.
+ZIP comparisons pass `--strip` so that their wrapper metadata policy
+matches DeflOpt; other formats preserve metadata.
 
-Prior-result regression annotations are state-local: they are created
-only when a row replaces an older result in the same state file. A
-fresh state has no prior-row baseline, so the annotation count below
-does not replace the independent historical-state audit.
+Prior-result regression annotations are local to one state file: a
+row receives one only when it replaces an older result in the same
+state. A fresh state has no earlier rows, so the annotation count
+below does not replace the separate historical-state audit.
 
 - completed rows: 1914
 - misses: 4
@@ -55,8 +55,8 @@ source/reference pairs in the fixed private corpus:
 | gzip | 7 | 14 |
 | zlib | 0 | 0 |
 
-The corpus contains 960 physical DeflOpt references. The following
-3 are excluded because their source fixtures are classified as known defective:
+The corpus contains 960 DeflOpt reference files. These
+3 are excluded because their source fixtures are known to be defective:
 
 - `png/PngSuite/deflopt/cm7n0g04-deflopt.png`
 - `png/PngSuite/deflopt/xcsn0g01-deflopt.png`
@@ -64,10 +64,9 @@ The corpus contains 960 physical DeflOpt references. The following
 
 ## State-carried Prior-result Regression Annotations
 
-These annotations were attached while replacing prior rows in the
-same state. Each row lost more than 10% of a previous
-Columbo advantage over the same DeflOpt reference. They do not
-replace the independent historical-state audit.
+Each row below replaced an earlier row in the same state and lost
+more than 10% of Columbo's earlier advantage over the same
+DeflOpt reference.
 
 | format | mode | file | metric | previous saved | current saved | advantage lost |
 | --- | --- | --- | --- | ---: | ---: | ---: |
@@ -78,11 +77,9 @@ replace the independent historical-state audit.
 
 ## Max vs Default
 
-The max trial uses the measured default runtime, rounded up to a whole
-second, plus five seconds, with the current 10-second minimum. It
-should never return a larger file or a longer Deflate bitstream than
-default Columbo for the same source.
-Comparisons include only rows from the same Columbo binary.
+Max should never return a larger file or a longer Deflate stream than
+Default for the same source. Comparisons use only rows from the same
+Columbo binary.
 
 | format | compared rows | max worse | byte worse | bit worse |
 | --- | ---: | ---: | ---: | ---: |
@@ -101,12 +98,13 @@ Comparisons include only rows from the same Columbo binary.
 
 ## Strict-policy Differences
 
-These standard-mode rows are slightly larger than DeflOpt because
-Columbo defaults to strictly compliant Deflate alphabets. Each
-file was independently rerun with `--strict 0`; the relaxed
-result matched or beat the same DeflOpt reference in both file
-bytes and meaningful Deflate bits. This explains the source of
-the difference but does not resolve the strict-output miss.
+These rows are slightly larger than DeflOpt because Columbo's
+default strict output avoids forms that only `--strict 0` permits,
+such as empty or singleton Huffman alphabets. Each file was rerun
+with `--strict 0`, and the relaxed result matched or beat the same
+DeflOpt reference in both file bytes and meaningful Deflate bits.
+This explains the difference, but the strict row still counts as a
+miss.
 
 | format | mode | file | strict bytes | strict bits | relaxed bytes | relaxed bits |
 | --- | --- | --- | ---: | ---: | ---: | ---: |

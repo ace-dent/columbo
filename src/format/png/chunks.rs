@@ -7,20 +7,15 @@ use crate::checksum::crc32_update;
 use crate::{Error, Result};
 
 pub(super) const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-/// Every APNG frame owns and validates an independent zlib stream. Bound that
-/// invocation count separately from the generic chunk count because an empty
-/// frame consumes almost no decoded-byte budget.
+/// Frames need their own limit because an empty frame uses almost no
+/// decoded-size budget.
 const MAX_APNG_FRAMES: usize = 16_384;
-/// Compressed ancillary chunks are each decoded and checksum-validated even
-/// when the optional search deadline is exhausted. Keep zero-length metadata
-/// streams from multiplying that mandatory parser setup indefinitely.
+/// Bounds decoding of retained compressed metadata, which runs even after the
+/// deadline.
 const MAX_COMPRESSED_METADATA_STREAMS: usize = 4_096;
-/// Twelve-byte empty chunks otherwise amplify into several independent Rust
-/// model records. This remains far beyond practical PNG/APNG use while
-/// keeping parser bookkeeping and mandatory CRC work comfortably bounded.
+/// An empty chunk is only 12 bytes but costs several model records.
 const MAX_PNG_CHUNKS: usize = 65_536;
 
-/// A validated chunk borrowing both its payload and original encoding.
 #[derive(Clone, Copy)]
 pub(super) struct Chunk<'a> {
     pub(super) kind: [u8; 4],
@@ -29,10 +24,7 @@ pub(super) struct Chunk<'a> {
     pub(super) discard_on_output: bool,
 }
 
-/// Validated container structure and the collected independent image streams.
-///
-/// Only the PNG rewriter accesses the fields; format dispatch passes the model
-/// from preflight to optimization without parsing the container again.
+/// Validated PNG structure and image streams, parsed once in preflight.
 pub(in crate::format) struct ParsedPng<'a> {
     pub(super) chunks: Vec<Chunk<'a>>,
     pub(super) datastream_len: usize,
@@ -40,7 +32,7 @@ pub(in crate::format) struct ParsedPng<'a> {
     pub(super) idat_decoded_size: u64,
     pub(super) fdat_frames: Vec<Vec<u8>>,
     pub(super) fdat_decoded_sizes: Vec<u64>,
-    /// The first chunk whose contract a rewrite would break; see
+    /// The first chunk that a rewrite would invalidate; see
     /// `is_rewrite_sensitive_ancillary`.
     pub(super) rewrite_sensitive_chunk: Option<[u8; 4]>,
     pub(super) has_vestigial_rgba_trns: bool,
@@ -86,8 +78,9 @@ struct ParseState {
     saw_cabx: bool,
 }
 
-/// Validate chunk structure and CRCs before collecting image stream payloads.
-/// The zlib and Deflate layers validate compressed data during optimization.
+/// Validate chunk structure, CRCs, ordering and known chunk contents, and
+/// collect the IDAT and fdAT image streams. The zlib and Deflate layers
+/// validate compressed data during optimization.
 pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>> {
     if !input.starts_with(SIGNATURE) {
         return Err(Error::new("invalid PNG signature"));
@@ -149,21 +142,18 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
         }
 
         validate_palette(kind, data, &mut state)?;
-        // Metadata whose semantics or placement are invalid is useful to no
-        // output that explicitly strips it. Still validate chunk boundaries,
-        // type bytes, and CRC above: --strip is not a general PNG repair mode.
+        // Chunks that --strip removes cannot affect the output, so only their
+        // length, type and CRC are checked: --strip is not a PNG repair mode.
         let discard_on_output = if strip_chunk {
             false
         } else {
             validate_ancillary(kind, data, &mut state)?
         };
         has_vestigial_rgba_trns |= discard_on_output;
-        // iDOT records byte offsets into Apple's original IDAT layout for
-        // parallel decoding. Rewritten image data invalidates them, and a
-        // decoder without iDOT decodes the same image, so drop it rather than
-        // preserving the whole source.
+        // Apple's iDOT holds offsets into the source IDAT layout for parallel
+        // decoding; rewriting invalidates them, and decoders do not need it.
         let discard_on_output = discard_on_output || kind == *b"iDOT";
-        // fcTL begins the next fdAT zlib stream; IEND closes the final one.
+        // fcTL ends the previous frame's fdAT zlib stream; IEND ends the last.
         if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
             fdat_frames
                 .try_reserve(1)
@@ -211,9 +201,8 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
                 return Err(Error::new("bad APNG fdAT chunk"));
             }
             state.sequence_expected += 1;
-            // A sequence-number-only chunk may occur between real fdAT
-            // packets, but it cannot by itself satisfy the frame-data
-            // requirement.
+            // An fdAT chunk holding only a sequence number is allowed, but
+            // it does not count as frame data.
             state.frame_has_data |= data.len() > 4;
             fdat.try_reserve(data.len() - 4)
                 .map_err(|_| Error::internal("could not allocate PNG frame stream"))?;
@@ -234,9 +223,8 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
         position = after;
         if kind == *b"IEND" {
             state.saw_iend = true;
-            // IEND terminates the PNG datastream. Tolerate an enclosing file's
-            // suffix on input, but leave it outside the chunk model so the
-            // output policy can preserve it or explicitly strip it.
+            // Data after IEND stays outside the chunk model; the output keeps
+            // it unless --strip removes it.
             break;
         }
     }
@@ -298,11 +286,9 @@ fn validate_ihdr(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<(
     Ok(())
 }
 
-/// Return the exact number of filtered scanline bytes carried by IDAT.
-///
-/// This is also a security boundary for parallel Max: each branch receives
-/// this value as its decode ceiling, so a small malicious zlib stream cannot
-/// make two workers retain unexpectedly large payload models.
+/// Exact size of IDAT's filtered scanlines, filter-type bytes included. It is
+/// the image streams' decode limit, so a small malicious stream cannot make
+/// parallel workers hold large models.
 fn png_image_decoded_size(state: &ParseState) -> Result<u64> {
     png_decoded_size(
         state.width,
@@ -389,14 +375,12 @@ fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Resul
     Ok(())
 }
 
-/// Validate ancillary semantics and report whether a known-invalid chunk must
-/// be omitted from every successful output.
+/// Validate ancillary chunk contents and placement, and return whether a
+/// known-invalid chunk must be dropped from every output.
 ///
-/// Some exporters leave an indexed palette's tRNS behind after converting the
-/// image data and IHDR to RGBA. PLTE itself is a valid suggested palette for
-/// color type 6, but tRNS is forbidden because RGBA already carries alpha.
-/// Tolerate only that narrow, structurally consistent signature. The chunk is
-/// never allowed to influence pixel interpretation and is never preserved.
+/// Some exporters convert an indexed image to RGBA (color type 6) but keep the
+/// palette's tRNS, which PNG forbids there. Only that pattern is accepted, and
+/// its tRNS is always dropped.
 fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<bool> {
     let mut discard_on_output = false;
     macro_rules! once_before_image {
@@ -545,9 +529,8 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
         state.saw_time = true;
     }
     if kind == *b"caBX" {
-        // Content Credentials are bound to the PNG datastream and cannot be
-        // updated by a Deflate optimizer. PNG additionally permits only one
-        // caBX and requires it to precede IDAT.
+        // caBX holds Content Credentials (C2PA). Only one is allowed, and it
+        // must precede IDAT.
         if state.saw_cabx || state.saw_idat {
             return Err(Error::new("invalid PNG caBX"));
         }
@@ -577,12 +560,9 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
     Ok(discard_on_output)
 }
 
-/// Validate the decimal notation registered for PNG extension chunks.
-///
-/// `sCAL` requires a value greater than zero, but converting untrusted text to
-/// `f64` would incorrectly reject valid extreme exponents through overflow or
-/// underflow. The sign and nonzero decimal digits establish positivity without
-/// imposing an artificial numeric range.
+/// Whether a PNG floating-point string (as in `sCAL`) is greater than zero.
+/// Checks the sign and a nonzero mantissa digit rather than converting to
+/// `f64`, which would reject valid extreme exponents.
 fn valid_positive_png_float(value: &[u8]) -> bool {
     if value.is_empty() {
         return false;
@@ -714,7 +694,7 @@ fn validate_animation_control(kind: [u8; 4], data: &[u8], state: &mut ParseState
             {
                 return Err(Error::new("invalid APNG fcTL chunk"));
             }
-            // The default image uses IDAT, validated separately below.
+            // This fcTL describes the default image, whose data is IDAT.
             state.frame_has_data = true;
             state.current_fdat_decoded_size = None;
         } else {
@@ -769,10 +749,8 @@ pub(super) fn append_chunk(output: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) -> 
     append_chunk_parts(output, kind, &[data])
 }
 
-/// Append one chunk whose data is the concatenation of `parts`.
-///
-/// Writing the parts directly avoids assembling a temporary data buffer, such
-/// as an APNG sequence number followed by a complete compressed frame.
+/// Append one chunk whose data is the concatenation of `parts`, without a
+/// temporary buffer.
 pub(super) fn append_chunk_parts(
     output: &mut Vec<u8>,
     kind: [u8; 4],
@@ -845,11 +823,9 @@ fn is_unknown_unsafe_ancillary(kind: [u8; 4]) -> bool {
     kind[0] & 0x20 != 0 && !is_known_ancillary(kind) && kind[3] & 0x20 == 0
 }
 
+/// Whether a chunk keeps the source unchanged unless --strip removes it. caBX
+/// and dSIG authenticate the original bytes, which Columbo cannot re-sign.
 fn is_rewrite_sensitive_ancillary(kind: [u8; 4]) -> bool {
-    // caBX and dSIG authenticate original datastream bytes. Columbo cannot
-    // rebuild either after changing critical chunks, so default mode takes the
-    // same conservative path used for an unrecognized unsafe-to-copy ancillary
-    // chunk. iDOT is dropped instead; see `parse`.
     matches!(&kind, b"caBX" | b"dSIG") || is_unknown_unsafe_ancillary(kind)
 }
 

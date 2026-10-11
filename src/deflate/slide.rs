@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Slide block boundaries under the transmitted Huffman trees.
+//! Slide block boundaries under the transmitted Huffman trees (R1c).
 //!
-//! A boundary changes neither the decoded bytes nor the shared history window,
-//! so a token may join its neighbouring block whenever that block's trees can
-//! code it. Holding both trees fixed leaves every header unchanged: a cheaper
-//! cut saves payload bits outright. Boundary searches elsewhere plan fresh
-//! trees for a few sampled cuts; this pass prices every token cut against the
-//! trees actually selected, so it finds the shifts those samples pass over.
-//! A joining match the neighbour cannot code, or codes expensively, may be
-//! spelled as its decoded literals instead; equal bytes need no match proof.
-//! Each moved block is then re-planned with fresh trees, keeping whichever of
-//! its transmitted and re-planned codes is cheaper. New trees can make further
-//! cuts profitable, so the slide repeats under them until no block moves.
+//! A boundary changes neither the decoded bytes nor the history window, so a
+//! token may join its neighboring block whenever that block's trees can code
+//! it. Unlike the boundary searches in `stream`, which plan fresh trees for a
+//! few sampled cuts, this pass prices every token cut under the current trees.
+//! Moved blocks are then re-planned, and the slide repeats under any new trees
+//! until no block moves.
 
 use std::sync::Arc;
 
@@ -28,13 +23,8 @@ use super::model::{
 use super::restore::token_cost;
 use super::stop::SearchStop;
 
-/// Every accepted move strictly lowers the payload, so sweeps terminate; the
-/// cap only bounds work on a long chain of interacting boundaries.
 const MAX_SWEEPS: usize = 16;
-/// Every round after the first follows a strictly cheaper re-plan, so rounds
-/// terminate; the cap only bounds work.
 const MAX_ROUNDS: usize = 16;
-/// Poll the stop between boundaries and within long block pairs.
 const STOP_POLL_TOKENS: usize = 1 << 16;
 
 type Trees<'a> = (&'a [u8], &'a [u8]);
@@ -70,8 +60,8 @@ struct Slot<'a> {
     plain: Arc<Vec<u8>>,
     code: Code<'a>,
     payload: u64,
-    /// The block's bits other than its payload under `code`: block header,
-    /// trees and end-of-block code.
+    /// Bits under `code` besides the payload: block header, trees and
+    /// end-of-block code.
     overhead: u64,
     /// Whether a sweep moved the block since it was last planned.
     moved: bool,
@@ -125,9 +115,9 @@ fn payload_bits(tokens: &[Token], (literal, distances): Trees<'_>) -> Option<u64
 
 /// A token's payload bits in one block, and whether it is spelled as literals.
 ///
-/// A token keeps its own spelling in its own block. A joining match takes the
-/// cheaper of its own spelling and its decoded bytes as literals, when the
-/// block's trees code either; an equal price keeps the match.
+/// A token keeps its spelling in its own block. A joining match takes the
+/// cheaper codable spelling, its own or its decoded literals; a tie keeps the
+/// match.
 fn price(token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool) -> Option<(u64, bool)> {
     let own = token_cost(token, trees.0, trees.1);
     if !joining || matches!(token, Token::Literal(_)) {
@@ -143,7 +133,6 @@ fn price(token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool) -> Option<
     }
 }
 
-/// Two adjacent Huffman blocks with the trees each transmits.
 struct Pair<'a> {
     left: &'a [Token],
     left_plain: &'a [u8],
@@ -154,8 +143,8 @@ struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
-    /// Every token in order with its decoded bytes and whether it starts in
-    /// the left block. An item is `None` if a token overruns its block.
+    /// Every token in order with its decoded bytes and whether it comes from
+    /// the left block; `None` if a token overruns its block.
     fn walk(&self) -> impl Iterator<Item = Option<(Token, &'a [u8], bool)>> + 'a {
         let side = |tokens: &'a [Token], plain: &'a [u8], from_left: bool| {
             tokens.iter().scan(0_usize, move |at, &token| {
@@ -199,11 +188,10 @@ impl<'a> Pair<'a> {
     }
 }
 
-/// Find the cheapest cut of two adjacent blocks under their fixed trees.
+/// Find the cheapest cut of two adjacent blocks under their current trees.
 ///
-/// A feasible cut leaves both blocks nonempty and every token on a side that
-/// can price it. Returns the new left token count and both payloads when that
-/// cut is strictly cheaper; ties keep the cut nearest the current one.
+/// Returns the new left token count and both payloads only when that cut is
+/// strictly cheaper; ties keep the cut nearest the current one.
 fn cheaper_cut(pair: &Pair<'_>, stop: &mut SearchStop<'_>) -> Option<(usize, u64, u64)> {
     let current = pair.left.len();
     // The current cut must lie inside the scanned range to be compared.
@@ -259,8 +247,6 @@ fn cheaper_cut(pair: &Pair<'_>, stop: &mut SearchStop<'_>) -> Option<(usize, u64
     (cut != current).then_some((cut, left_bits, right_bits))
 }
 
-/// Plan a moved block's new tokens as Columbo plans any block, with fresh
-/// trees and header.
 fn replan(
     block: &ParsedBlock,
     slot: &Slot<'_>,
@@ -303,14 +289,12 @@ fn split_pair<T: Copy>(left: &[T], right: &[T], cut: usize) -> Option<(Vec<T>, V
     Some((first, second))
 }
 
-/// Move Huffman block boundaries to cheaper token cuts under fixed trees,
-/// re-plan each moved block, and repeat under the new trees until no block
-/// moves.
+/// Run the slide with re-planning.
 ///
-/// Stored blocks and their boundaries stay in place. Every Huffman block keeps
-/// at least one token, so the parse that follows retains the block layout
-/// later terminal methods require. The caller must compare the complete
-/// emission because stored padding can absorb a saving.
+/// Stored blocks and their boundaries stay in place, and every Huffman block
+/// keeps at least one token, preserving the block layout later terminal methods
+/// need. The caller must compare the complete emission because stored padding
+/// can absorb a saving.
 pub(crate) fn plan_boundary_slide(
     blocks: &[ParsedBlock],
     options: &Options,
@@ -319,9 +303,8 @@ pub(crate) fn plan_boundary_slide(
     plan_slide(blocks, options, true, MAX_ROUNDS, stop)
 }
 
-/// The slide itself. Without `refit`, every moved block keeps its transmitted
-/// trees, so the result is exactly the fixed-tree optimum the tests check and
-/// one round reaches it.
+/// Run the slide. Without `refit`, moved blocks keep their transmitted trees,
+/// so one round suffices; tests check that result by brute force.
 fn plan_slide(
     blocks: &[ParsedBlock],
     options: &Options,
@@ -338,7 +321,8 @@ fn plan_slide(
     for block in blocks {
         let code = match block.source_type {
             SourceBlockType::Stored => Code::Stored,
-            // Fixed trees cannot change, so the strict policy is decided here.
+            // The slide prices with the transmitted trees, so they must pass
+            // the strict policy here.
             _ if reusable_original_bits(block, 0, strict).is_none() => return None,
             SourceBlockType::Fixed => Code::Transmitted((
                 &FIXED_LITERAL_CODE_LENGTHS[..],
@@ -367,10 +351,7 @@ fn plan_slide(
         });
     }
 
-    // Each round fits the boundaries to the current trees, then re-plans the
-    // blocks it moved. A strictly cheaper re-plan changes some trees, which
-    // can make further cuts profitable; otherwise the cuts are already
-    // optimal for the trees that stay.
+    // Another round helps only after a re-plan changes some trees.
     let mut plans = None;
     for _ in 0..max_rounds {
         if !sweep(&mut slots, stop)? {
@@ -385,8 +366,8 @@ fn plan_slide(
     plans
 }
 
-/// Sweep every boundary between two Huffman blocks, repeating while a sweep
-/// moves one, at most `MAX_SWEEPS` times. Returns whether any block moved.
+/// Sweep every boundary between two Huffman blocks until none moves, at most
+/// `MAX_SWEEPS` times. Returns whether any block moved.
 fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
     let mut changed = false;
     'sweeps: for _ in 0..MAX_SWEEPS {
@@ -437,11 +418,9 @@ fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
     Some(changed)
 }
 
-/// Plan every block at its actual alignment. Unchanged blocks keep their
-/// original bits; moved blocks keep their code with an adjusted bit count.
-/// With `refit`, each block moved since it was last planned is re-planned,
-/// and a strictly cheaper plan becomes its code; a tie keeps the code. Also
-/// returns whether any block took a re-planned code.
+/// Plan every block at its actual alignment. With `refit`, each block moved
+/// since it was last planned is re-planned and adopts a strictly cheaper plan;
+/// also returns whether any block did.
 fn assemble(
     blocks: &[ParsedBlock],
     slots: &mut [Slot<'_>],
@@ -470,8 +449,6 @@ fn assemble(
             (Representation::Original(original), original.len)
         } else {
             let current = slot.planned(block, alignment)?;
-            // The block's trees were fitted to its old contents. Re-plan it
-            // and keep the cheaper; a tie keeps its trees.
             let moved = std::mem::take(&mut slot.moved);
             match (refit && moved).then(|| replan(block, slot, alignment, options, stop)) {
                 Some(Some(replanned)) if replanned.bits < current.1 => {

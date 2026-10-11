@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-/// Each table describes the contribution of a byte at one position in an
-/// eight-byte CRC fold.
+/// Slicing-by-8 CRC-32 tables: entry `[k][b]` is the CRC contribution of byte
+/// `b` followed by `k` zero bytes.
 const CRC32_POSITION_TABLES: [[u32; 256]; 8] = make_crc32_position_tables();
 
 const fn make_crc32_position_tables() -> [[u32; 256]; 8] {
@@ -33,7 +33,7 @@ const fn make_crc32_position_tables() -> [[u32; 256]; 8] {
     tables
 }
 
-/// Update a PNG/GZIP/ZIP CRC-32 value.
+/// Extend a CRC-32 value (PNG, gzip, ZIP) with `bytes`; start from 0.
 pub(crate) fn crc32_update(mut crc: u32, mut bytes: &[u8]) -> u32 {
     crc = !crc;
 
@@ -59,6 +59,7 @@ pub(crate) fn crc32_update(mut crc: u32, mut bytes: &[u8]) -> u32 {
     !crc
 }
 
+/// Sum and weighted sum (weights 4, 3, 2, 1) of four bytes.
 #[inline(always)]
 fn adler_quartet(a: u8, b: u8, c: u8, d: u8) -> (u32, u32) {
     let first = u32::from(a);
@@ -68,15 +69,15 @@ fn adler_quartet(a: u8, b: u8, c: u8, d: u8) -> (u32, u32) {
     (total, first + second + third + total)
 }
 
-/// Update a ZLIB Adler-32 value.
+/// Extend a zlib Adler-32 value with `bytes`; start from 1.
 pub(crate) fn adler32_update(adler: u32, bytes: &[u8]) -> u32 {
     const MOD_ADLER: u32 = 65_521;
     let (mut low, mut high) = (adler & 0xffff, adler >> 16);
 
-    // Limiting each inner batch avoids overflow without applying a modulus for
-    // every byte. Four independent prefix sums cover each sixteen-byte group;
-    // shifting their moments by 12, 8, 4, and 0 positions reconstructs the
-    // exact sequential Adler recurrence without one byte-long dependency chain.
+    // Batches of 5,552 bytes (zlib's NMAX) keep both sums within `u32`
+    // between modulo reductions. Each 16-byte group is summed as four
+    // independent quartets to shorten the dependency chain; the 12, 8, 4 and
+    // 0 multiples of their sums restore the exact byte-by-byte recurrence.
     for batch in bytes.chunks(5_552) {
         let mut groups = batch.chunks_exact(16);
         for group in &mut groups {

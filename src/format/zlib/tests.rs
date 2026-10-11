@@ -75,7 +75,7 @@ fn rejects_preset_dictionary_header() {
 
 #[test]
 fn rejects_a_window_exponent_reserved_by_rfc_1950() {
-    // 0x88 0x1c has CM=8 and a valid FCHECK, but CINFO=8 is reserved.
+    // 0x88 0x1c has CM=8 and a valid FCHECK, but RFC 1950 forbids CINFO=8.
     let input = [0x88, 0x1c, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
     let error = optimize(&input, &Options::default()).unwrap_err();
     assert_eq!(error.message(), "invalid zlib header");
@@ -85,7 +85,7 @@ fn rejects_a_window_exponent_reserved_by_rfc_1950() {
 fn output_window_normalization_does_not_hide_an_invalid_source_window() {
     // A stored block supplies 257 zero bytes of history. The following
     // fixed block copies three bytes from distance 257, just beyond a
-    // 256-byte advertised window. This synthetic stream needs no corpus.
+    // 256-byte advertised window.
     let mut input = vec![0x78, 0x01, 0x00, 0x01, 0x01, 0xfe, 0xfe];
     input.resize(input.len() + 257, 0);
     input.extend_from_slice(&[0x03, 0x06, 0x00, 0x00]);

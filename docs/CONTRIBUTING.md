@@ -13,7 +13,7 @@ Keep each Pull Request focused on a single logical change. Small, atomic changes
 
 Avoid combining unrelated fixes, refactoring, formatting, documentation changes, or new features in the same Pull Request. If changes can be reviewed and accepted independently, please submit them as separate Pull Requests.
 
-Where possible, keep the diff limited to files and lines directly relevant to the change. This helps reviewers understand the intent and reduces the chance of unrelated changes blocking an otherwise useful contribution.
+Where possible, limit the diff to files and lines directly relevant to the change. This shows reviewers the intent and reduces the chance that unrelated changes block an otherwise useful contribution.
 
 ### AI-assisted contributions
 
@@ -62,7 +62,7 @@ Use `//!` for crate or module documentation at the start of the file. Use `///`
 for descriptions of public and private items, including constants, functions,
 types, fields, and variants. Use `//` for implementation notes inside function
 bodies, including notes on local declarations, and for file-level license
-headers. 
+headers.
 
 ### Private corpus regressions
 
@@ -76,10 +76,10 @@ cargo test --all-targets -- --include-ignored
 ```
 
 `tests/local_corpus.rs` contains the public-API corpus regressions; four additional
-raw-optimizer regressions live in `src/deflate/optimize/tests.rs`. An explicitly
-requested corpus test fails if its fixture is missing rather than silently
-passing. The relative fixture names in these tests describe the expected local
-layout under `tests/fixtures/`.
+raw-optimizer regressions live in `src/deflate/optimize/tests.rs`. A corpus
+test run with `--ignored` or `--include-ignored` fails if its fixture is missing
+rather than passing silently. The relative fixture names in these tests describe
+the expected local layout under `tests/fixtures/`.
 
 Corpus files may be copyrighted and must not be added to the public repository.
 Keep `tests/fixtures/`, `work/`, `target/`, and `benchmark-results/` local; Git
@@ -97,11 +97,10 @@ Use this script for distributable binaries; ordinary local Cargo builds can
 retain compiler or checkout paths in diagnostics. The script reports required
 toolchains, targets, and tools when they are unavailable.
 
-Each packaging invocation stages its executable and archive in a private,
-temporary directory under `target/dist/`. Concurrent architecture builds cannot
-overwrite each other's staged files, and failed packaging preserves the previous
-release archive. The path audit checks filesystem strings and both UTF-16 byte
-orders, including Windows wide strings.
+Each run stages its executable and archive in a private temporary directory
+under `target/dist/`, so concurrent builds cannot overwrite each other's files
+and a failed run keeps the previous release archive. The path audit also checks
+UTF-16 strings in both byte orders, such as Windows wide strings.
 
 
 ## Contributor License Agreement (CLA)

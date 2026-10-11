@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Restore original match choices after the selected tokens and trees settle.
+//! Restore source matches (R1) after the selected tokens and Huffman codes
+//! settle.
 //!
-//! The original parse is the authority for each interval and distance. A
-//! literal rewrite never creates a certificate, and this pass neither searches
-//! history nor changes a Huffman tree. All plans refer to the selected parent.
+//! Only source matches prove which intervals repeat at which distance; the
+//! pass neither searches history nor changes a Huffman code.
 
 use super::block::{reusable_original_bits, stored_block_bits};
 use super::huffman::{FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS};
@@ -15,18 +15,19 @@ use super::model::{
 };
 use super::stop::SearchStop;
 
-/// Bound the complete reparse/model walk, not just each individual DP. These
-/// limits also apply when Max finishes its mandatory Default comparison floor.
+/// Whole-pass size limits, also applied when Max completes its Default
+/// comparison floor.
 pub(crate) const MAX_RESTORATION_BYTES: usize = 128 * 1024;
 pub(crate) const MAX_RESTORATION_BLOCKS: usize = 128;
 const MAX_BLOCK_TOKENS: usize = 16 * 1024;
-/// Coalesced same-distance runs can be much longer than a Deflate match. Bound
-/// the DP to 4 KiB of decoded positions and the stream to 2^20 edge
-/// evaluations, so a long literalized run cannot cause unbounded work in the
-/// fixed-tree pass.
+/// Merged same-distance runs can be much longer than one match, so each
+/// interval search and the whole pass are bounded.
 const MAX_INTERVAL_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_EDGES: usize = 1 << 20;
 
+/// Decoded interval covered by consecutive source matches at one distance,
+/// which proves that its bytes repeat at that distance. `seed` is the first
+/// match.
 #[derive(Clone, Copy)]
 struct Certificate {
     start: usize,
@@ -88,7 +89,8 @@ struct Budget<'a, 'b> {
 }
 
 impl Budget<'_, '_> {
-    /// Charge every admitted edge, stopping at the original probe boundaries.
+    /// Charge `count` edges, checking the stop every 256; `None` when the
+    /// budget or time runs out.
     fn edges(&mut self, mut count: usize) -> Option<()> {
         if count <= (self.remaining & 255) {
             self.remaining -= count;
@@ -172,8 +174,8 @@ fn submatch(seed: Token, length: u16) -> Option<Token> {
     })
 }
 
-/// One canonical length family and its sliding suffix-cost minimum.
-/// The window is at most 32 positions wide even for a 4 KiB certificate.
+/// The lengths of one length symbol, with a sliding minimum (at most 32
+/// positions wide) of the suffix costs they reach.
 #[derive(Clone, Copy, Default)]
 struct MatchFamily {
     first: usize,
@@ -185,8 +187,8 @@ struct MatchFamily {
 }
 
 impl MatchFamily {
-    /// Advance one decoded position backward. New positions win cost ties,
-    /// preserving the direct scan's preference for the shortest match.
+    /// Move one position backward and return the cheapest end position. New
+    /// positions win cost ties, so the shortest match wins.
     fn minimum(&mut self, start: usize, costs: &[u64]) -> usize {
         let first = start + self.first;
         if self.first == self.last {
@@ -211,8 +213,9 @@ impl MatchFamily {
     }
 }
 
-/// Exact shortest path inside one clipped certificate under fixed code prices.
-/// The current edge is considered first so payload ties retain its spelling.
+/// Cheapest tokenization of one certificate interval, clipped to the block,
+/// with the block's code lengths fixed. The current token is tried first so
+/// it wins cost ties.
 fn restore_interval(
     plain: &[u8],
     current: &[Token],
@@ -296,8 +299,8 @@ fn restore_interval(
             if family.first > n - start {
                 break;
             }
-            // Charge all lengths in this family, including equal-cost edges.
-            // A cutoff discards this incomplete interval as before.
+            // Charge every length of this symbol, although only the minimum
+            // is evaluated. Running out discards the interval.
             budget.edges(family.last.min(n - start) - family.first + 1)?;
             let end = family.minimum(start, &costs);
             let total = family.cost.saturating_add(costs[end]);
@@ -321,9 +324,9 @@ fn restore_interval(
     while at < n {
         let token = choices[at]?;
         let end = at + token.decoded_len();
-        // A newly chosen match is unavailable from the selected proofs iff it
-        // crosses a literal gap. Continuous same-distance matches were already
-        // coalescible without the original certificate.
+        // A new match counts as restored only if it covers a selected
+        // literal; merging contiguous same-distance matches needs no
+        // certificate.
         restored |= distance(token).is_some()
             && existing[at..end]
                 .iter()
@@ -406,11 +409,12 @@ fn restore_block(
     Some((result, saving))
 }
 
-/// Build an additive, fixed-tree candidate using only original match proofs.
-/// Both block lists must be validated encodings of the same decoded stream.
-/// On interruption, completed interval repairs survive and the remaining
-/// blocks retain their parent encoding. The caller must compare the complete
-/// emission because later stored padding can absorb a local payload saving.
+/// Build an extra candidate from `selected` that restores matches proven by
+/// `original`, keeping every Huffman code fixed.
+///
+/// Both block lists must encode the same decoded data. If stopped, finished
+/// rewrites are kept. The caller must compare the complete emitted stream,
+/// because later stored-block padding can absorb a local saving.
 pub(crate) fn plan_original_match_restoration(
     original: &[ParsedBlock],
     selected: &[ParsedBlock],

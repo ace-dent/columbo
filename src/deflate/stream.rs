@@ -3,21 +3,16 @@
 
 //! Stream-level Deflate block planning.
 //!
-//! Deflate block boundaries do not affect the decoded bytes or the 32 KiB
-//! history window. A boundary may therefore be removed or moved without
-//! changing the decoded stream. At a token boundary the spelling is unchanged;
-//! inside a proven match, each selected edge emits a canonical fragment at the
-//! original distance (or one or two known literals). Columbo uses that freedom
-//! to reduce the number of headers and to give locally different data separate
-//! Huffman tables. It never discovers new LZ77 matches here.
+//! Block boundaries affect neither the decoded bytes nor the 32 KiB history
+//! window, so a boundary may be removed or moved freely. A cut inside a match
+//! splits it into fragments at the original distance; a fragment shorter than
+//! three bytes becomes literals. This removes block headers and gives locally
+//! different data separate Huffman codes; no new LZ77 matches are found.
 //!
-//! Stream-level attribution is intentionally narrow: DeflOpt contributes only
-//! the exact fixed/fixed 10-bit coalescing rule. Columbo contributes arbitrary
-//! merging, regrouping, eighth probes, boundary dynamic programming, exact
-//! candidate acceptance, and timed routing. Max mode also contains Columbo's
-//! independent, speed-bounded implementation of a coarse boundary-search
-//! concept described by Turtledeflate. The deft4j-derived greedy merge lives
-//! in `source_recode`.
+//! Attribution: from DeflOpt come the fixed/fixed coalescing rule and the
+//! heap code-length builder that the entropy-state scout uses. Max
+//! mode also runs an independent, bounded form of Turtledeflate's coarse
+//! boundary search. The deft4j-derived greedy merge is in `source_recode`.
 
 mod alphabet;
 pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
@@ -52,62 +47,48 @@ use super::search::{
 use super::source_recode::plan_source_block;
 use super::stop::SearchStop;
 
-/// The original Columbo C implementation tries its default long-merge route in
-/// this encoded-size range. The gate avoids quadratic work on very large
-/// streams while covering the common encoder-flush case.
+/// Default mode regroups source blocks only for encoded streams of
+/// `DEFAULT_LONG_MERGE_MIN..=DEFAULT_LONG_MERGE_MAX` bytes, the common
+/// encoder-flush case. The upper bound avoids quadratic work.
 const DEFAULT_LONG_MERGE_MIN: u64 = 16_000;
 const DEFAULT_LONG_MERGE_MAX: u64 = 100_000;
 const MAX_REGROUP_SOURCE_BLOCKS: usize = 8;
 const MAX_FRAGMENTED_REPLAY_BLOCKS: usize = 12;
 const MAX_MERGED_TOKENS: usize = 250_000;
 const MAX_MERGED_PLAIN: usize = 64_000_000;
-/// Small container streams can reach the same fixed point inside their normal
-/// proportional search slice. Reserve the deadline-independent full-range
-/// replay for larger joined payloads, where that slice is otherwise too short.
+/// Minimum decoded size for the deadline-independent whole-stream replay;
+/// smaller streams reach its result within their normal search slice.
 const WHOLE_STREAM_RECODE_MIN_PLAIN: usize = 100_000;
 const WHOLE_STREAM_REPLAY_MARGIN_BITS: u64 = 256;
-/// Columbo's inexpensive long-run floor collects a bounded Huffman prefix
-/// before planning it. This covers encoder-flush streams without feeding a
-/// quadratic number of source-pair cuts into the general boundary DP.
+/// Limits for one collected run of adjacent Huffman blocks, so the source-pair
+/// cuts given to the boundary DP do not grow quadratically.
 const COLLECTED_RUN_MAX_TOKENS: usize = 8_192;
 const COLLECTED_RUN_MAX_PLAIN: usize = 512 * 1_024;
 const FRAGMENTED_COLLECT_MAX_TOKENS: usize = 4_096;
 const FRAGMENTED_COLLECT_MIN_SOURCE_BLOCKS: usize = 64;
 const WIDE_COLLECT_MIN_SOURCE_BLOCKS: usize = 128;
-/// The original Columbo C block-list pass is a linear adjacent walk. Keep this
-/// port bounded to ordinary encoder block counts; extremely fragmented streams
-/// use the 8,192-token collection floor above instead.
+/// Largest source-block count for the greedy walk and other per-block passes;
+/// more fragmented streams rely on the collected-run floor.
 const MAX_GREEDY_SOURCE_BLOCKS: usize = 128;
 const MAX_BOUNDED_GROUP_SPAN: usize = 16;
-/// The bounded-grouping score rows are independent. Four workers cover the
-/// useful wall-clock gain without letting this optional route consume every
-/// hardware thread or multiply its small row table without bound.
+/// Keeps the optional bounded-grouping route from taking every hardware thread.
 const MAX_BOUNDED_GROUP_WORKERS: usize = 4;
-/// Optional structural routes may copy payloads while the parsed source is
-/// still live. Two 48 MiB retained-payload partitions leave 32 MiB of a 128 MiB
-/// envelope for the bounded DP table and Huffman metadata. Boundary DP itself
-/// keeps the source token parse unchanged; token-spelling searches run in the
-/// sequential/replay passes rather than once per cut and alignment.
+/// Payload-copy limits for optional structural routes, which copy while the
+/// parsed source is live. Two 48 MiB copies leave 32 MiB of a 128 MiB envelope
+/// for the bounded DP table and Huffman metadata.
 const MAX_GROUPED_MODEL_BYTES: usize = 48 * 1024 * 1024;
 const MAX_COMPOSITE_MODEL_BYTES: usize = 48 * 1024 * 1024;
-/// Concept inspired by Turtledeflate's `turtledeflate_create_global_histogram`
-/// and `turtledeflate_get_partial_histogram` at commit 756f844. Both use
-/// 256-token cumulative checkpoints. This is an independent Rust
-/// implementation: Columbo reconstructs and subtracts two prefixes instead of
-/// subtracting an aligned middle and scanning both edges.
+/// Token interval between cumulative histogram checkpoints, as in
+/// Turtledeflate's `turtledeflate_create_global_histogram` (independent
+/// implementation; see `docs/research/turtledeflate-methods.md`).
 const RANGE_HISTOGRAM_INTERVAL: usize = 256;
-/// Columbo independently implements the sample/smooth/narrow concept used by
-/// Turtledeflate's `turtledeflate_best_block_split`, with a much smaller fixed
-/// budget before handing one cut to its exact planner.
+/// Limits of the adaptive split search ([`add_adaptive_split_cut`]).
 const ADAPTIVE_SPLIT_MIN_TOKENS: usize = 513;
 const ADAPTIVE_SPLIT_INTERVALS: usize = 7;
 const ADAPTIVE_SPLIT_CENTER_RADIUS: usize = 1;
 const ADAPTIVE_SPLIT_FINAL_WIDTH: usize = 16;
 const ADAPTIVE_SPLIT_MAX_PROBES: usize = 128;
-/// Brotli's high-quality block splitter assigns a complete symbol stream to a
-/// small set of learned entropy-code states, charging every state transition.
-/// Columbo uses that search shape only to discover token-boundary anchors; its
-/// existing exact boundary graph still prices and accepts every emitted block.
+/// Limits of the entropy-state boundary scout ([`entropy_state_boundary_cuts`]).
 const ENTROPY_SCOUT_MIN_TOKENS: usize = ADAPTIVE_SPLIT_MIN_TOKENS;
 const ENTROPY_SCOUT_MAX_TOKENS: usize = MAX_MERGED_TOKENS;
 const ENTROPY_SCOUT_TOKENS_PER_PROTOTYPE: usize = 512;
@@ -118,58 +99,48 @@ const ENTROPY_SCOUT_SWITCH_BITS: u64 = 128;
 const ENTROPY_SCOUT_SCORE_RADIUS: usize = 64;
 const ENTROPY_SCOUT_MIN_EDGE_TOKENS: usize = 16;
 const ENTROPY_SCOUT_MAX_CUTS: usize = 16;
-/// Forced lookahead may add one block to an already-selected comparison floor.
-/// Keeping the parent at seven blocks preserves the existing eight-block
-/// structural and boundary-reseat ceiling.
+/// The forced split adds one block, which must stay within the boundary-reseat
+/// limit.
 const FORCED_SPLIT_MAX_PARENT_BLOCKS: usize = MAX_REGROUP_SOURCE_BLOCKS - 1;
-/// Seven decoded-eighth probes can each contribute the legacy snapped boundary
-/// and one exact inside-match sibling. Compact max mode adds at most fourteen
-/// 32-token anchors, so 32 retains the complete bounded set.
+/// Holds every source-split cut: seven decoded-eighth cuts, their seven
+/// inside-match siblings and at most fourteen 32-token anchors.
 const MAX_SOURCE_SPLIT_CUTS: usize = 32;
-/// Default mode spends at most this many token visits on the seven optional
-/// inside-match siblings. This is a work bound rather than a corpus-size gate:
-/// max mode always admits them, while default retains its seven legacy cuts
-/// first when the extra structural scans would exceed the balanced allowance.
 const DEFAULT_INSIDE_MATCH_TOKEN_WORK: usize = 32 * 1_024;
 const SOURCE_EIGHTH_SPLITS: usize = 7;
-/// Compact max blocks admit every 32-token split anchor. Their inexpensive
-/// proven-first sibling can therefore be completed separately, leaving the one
-/// full max beam to cover ordinary token states without duplicating work.
+/// Max mode adds a split anchor every 32 tokens to source blocks of at most
+/// this many tokens.
 pub(crate) const COMPACT_SOURCE_SPLIT_MAX_TOKENS: usize = 512;
-/// A marginal adaptive split can unlock another whole-stream replay whose cost
-/// dwarfs the saving. Require four bytes at the Deflate level before allowing
-/// this optional route to alter the established max result.
+/// Four bytes: a marginal adaptive split can trigger a whole-stream replay that
+/// costs far more than it saves.
 const ADAPTIVE_SPLIT_MIN_EXACT_SAVINGS_BITS: u64 = 32;
-/// Boundary DP is an optional max route. Capping its cut count keeps the dense
-/// eight-alignment state table small on adversarially fragmented streams.
+/// Keeps the boundary DP's dense eight-alignment state table small on
+/// adversarially fragmented streams.
 const MAX_BOUNDARY_DP_CUTS: usize = 2_048;
-/// Only near-tied first splits justify an extra child refinement in default
-/// mode; a wider gap is very unlikely to be recovered by one added header.
+/// Only near-tied first splits justify an extra child refinement in Default
+/// mode; one added header rarely recovers a wider gap.
 const NESTED_RUNNER_UP_MARGIN_BITS: u64 = 64;
 
 /// How much adjacent-source work the linear pending-block planner may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdjacentMergeSearch {
-    /// Retain only exact fixed-block joins.
+    /// Keep only exact fixed-block joins.
     Disabled,
-    /// Search tiny neighbours; this is the inexpensive ordinary fallback.
+    /// Search merges with small neighbors; the cheap ordinary fallback.
     Local,
     /// Rebuild every eligible adjacent Huffman pair in a long source run.
     LongRun,
 }
 
-/// Which per-source search is composed by the sequential stream walk.
+/// Per-source search used by the sequential stream walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceBlockSearch {
-    /// Ordinary planning, including the independent source-split family.
+    /// Ordinary planning, including source splits.
     Full {
         /// The completed compact proven lineage beat the normal floor.
         integrated_compact_proven: bool,
     },
-    /// One source-ordered whole-block ladder with an explicit local-pruning
-    /// policy. Keeping the two policies distinct preserves their different
-    /// downstream alignments and merge prices; splits and iterative work
-    /// remain with sibling routes.
+    /// One whole-block search per source block, with or without individual
+    /// match pruning; no splits or iterative work.
     Narrow { individual_prune: bool },
     /// Deterministic table floors only, for a selected terminal seed.
     Floor,
@@ -190,14 +161,9 @@ fn search_split_before_whole_block(
     exhaustive && best_split_bits.is_some_and(|bits| bits < unsplit_floor_bits)
 }
 
-/// Prefer the global boundary graph while a complete incumbent already
-/// protects source-order work and the graph has a compact, useful topology.
-///
-/// One source block, or the two blocks produced by its first split, has a
-/// tightly bounded cut graph. Multiple same-distance repartition runs mean
-/// that distant cut combinations can improve together, whereas the linear
-/// source-order route considers each block independently. Broader block lists
-/// retain the ordinary order because their boundary graph grows much faster.
+/// Whether to run the global boundary graph before the source-order search once
+/// a complete incumbent exists: with several same-distance repartition runs,
+/// distant cuts can pay off together.
 fn established_boundary_graph_priority(blocks: &[ParsedBlock]) -> bool {
     if blocks.is_empty() || blocks.len() > 2 {
         return false;
@@ -218,10 +184,8 @@ fn established_boundary_graph_priority(blocks: &[ParsedBlock]) -> bool {
         && same_distance_opportunities(blocks).repartition_runs >= 2
 }
 
-/// Identifies the cheap pre-grouped layout selected for the first replay.
-///
-/// The kind is retained alongside the slice so a completed collected-layout
-/// replay is not repeated later in the stream route.
+/// The cheap pre-grouped layout selected for the first replay; its kind
+/// prevents repeating a completed collected-layout replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GroupedLayout {
     Greedy,
@@ -241,10 +205,8 @@ fn cheapest_grouped_layout(
 
 /// Plan all blocks in a raw Deflate stream, beginning at `start_alignment`.
 ///
-/// Splits and merges are flattened into ordinary [`PlannedBlock`] values. This
-/// keeps stream search out of the emitter and makes every returned block useful
-/// on its own. `stop` is deliberately borrowed from the caller so all block,
-/// header, and stream searches share one deadline.
+/// Splits and merges become ordinary [`PlannedBlock`] values, so the emitter
+/// needs no stream-level logic.
 pub(crate) fn plan_stream(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -263,12 +225,9 @@ pub(crate) fn plan_stream(
     )
 }
 
-/// Plan an additive max descendant after its caller has retained a complete
-/// normal-mode candidate.
-///
-/// The source route still establishes a structural fallback and fills its
-/// canonical plan cache, but it need not repeat the full token-preserving floor
-/// that the incumbent already completed.
+/// Plan a Max candidate after the caller has kept a complete ordinary
+/// candidate. Skips the full token-preserving floor that the incumbent already
+/// covers, but still builds a structural fallback.
 pub(crate) fn plan_stream_from_established_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -288,10 +247,8 @@ pub(crate) fn plan_stream_from_established_floor(
     )
 }
 
-/// Plan a stream while exposing coarse progress for one long max route.
-///
-/// The ordinary entry point above supplies a disabled reporter, keeping all
-/// standard and non-verbose callers on the same search path.
+/// Plan a stream while reporting coarse progress for one long Max route.
+/// Progress reporting does not change the search path.
 pub(crate) fn plan_stream_with_progress(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -309,30 +266,19 @@ pub(crate) fn plan_stream_with_progress(
         "source block",
         "source blocks",
     );
-    // Stored-only streams have a linear structural floor: adjacent
-    // chunks can be repacked up to RFC 1951's 65,535-byte limit without any
-    // Huffman or token search. Secure that result before consulting a shared
-    // container deadline so a large ZIP cannot optimize only its first member.
+    // Build the linear stored-only floor before consulting a shared container
+    // deadline, so a large ZIP cannot optimize only its first member.
     let stored_floor = repack_all_stored_blocks(blocks, start_alignment);
 
-    // A container can call us after its file-wide budget is already spent so
-    // the stream is still parsed and validated. Retain its exact source bytes
-    // through `build_candidate`'s fallback unless the stored repack above is
-    // available; starting token recodes for dozens of later APNG frames would
-    // turn a bounded timeout into unbounded work. Strict mode must still
-    // rewrite incompatible dynamic alphabets.
+    // Once a container's file-wide budget is spent, only the stored repack may
+    // apply; `None` makes `build_candidate` keep the source bytes. Strict mode
+    // must still rewrite incompatible dynamic alphabets.
     let floor_time_available = !stop.reached();
     if !floor_time_available && !options.strict {
         return stored_floor.map(|floor| finish_plan(floor, options));
     }
     let source_bytes = encoded_source_bytes(blocks);
     let reuse_established_floor = comparison_floor_secured;
-    // Stored-only streams deserve an inexpensive floor before any Huffman
-    // search. General-purpose encoders often flush incompressible input in
-    // 16 KiB stored chunks; repacking those bytes into RFC 1951's 65,535-byte
-    // maximum removes headers without changing or rediscovering any match.
-    // Build this first so it remains available even if pricing the literal
-    // alternatives consumes the caller's search deadline.
     let prepared = prepare_blocks(blocks);
     let blocks = prepared.as_deref().unwrap_or(blocks);
     let allow_regroup = floor_time_available
@@ -380,9 +326,8 @@ pub(crate) fn plan_stream_with_progress(
     let collected_floor = collected_blocks.as_deref().and_then(|collected| {
         direct_structural_plan(collected, start_alignment, options, &mut plan_cache)
     });
-    // Price a wide collection as an additive candidate. It is effective for
-    // uniform runs, while the bounded collection above keeps several local
-    // tables for streams such as row-flushed PNG data.
+    // A wide collection suits uniform runs; the bounded one above keeps several
+    // local tables, as row-flushed PNG data needs.
     let wide_collected_blocks = if allow_regroup
         && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS
         && (options.exhaustive || blocks.len() >= WIDE_COLLECT_MIN_SOURCE_BLOCKS)
@@ -400,9 +345,7 @@ pub(crate) fn plan_stream_with_progress(
         .as_deref()
         .and_then(|wide| direct_structural_plan(wide, start_alignment, options, &mut plan_cache));
 
-    // Search whichever cheap grouping has the best complete direct price.
-    // Keeping this choice separate from the emitted fallback means all other
-    // layouts remain available as strict no-growth candidates.
+    // Every layout still competes as a floor below.
     let selected_grouping = cheapest_grouped_layout([
         greedy_blocks
             .as_deref()
@@ -418,9 +361,9 @@ pub(crate) fn plan_stream_with_progress(
             .map(|(blocks, bits)| (GroupedLayout::Collected, blocks, bits)),
     ]);
 
-    // Secure a complete deadline-independent path before token-spelling or
-    // split searches. On a shared container deadline this also guarantees
-    // that every stream receives useful structural optimization.
+    // Secure a complete deadline-independent floor before spelling or split
+    // searches, so every stream under a shared container deadline gets
+    // structural optimization.
     let mut fallback = if floor_time_available && !reuse_established_floor && !stop.reached() {
         mandatory_token_floor_plan(blocks, start_alignment, options, &mut plan_cache)?
     } else {
@@ -486,10 +429,8 @@ pub(crate) fn plan_stream_with_progress(
         }
     }
 
-    // Search the most promising pre-grouped list before the original long
-    // list can consume the deadline. Columbo's original C block-list route
-    // does the same: it first commits cheap adjacent structure, then replays
-    // the selected groups.
+    // Search the selected grouped layout before the long source list can use
+    // up the deadline.
     let mut collected_search_completed = false;
     if let Some((kind, grouped)) = selected_grouping {
         progress.phase(
@@ -521,12 +462,8 @@ pub(crate) fn plan_stream_with_progress(
         }
     }
 
-    // A completed comparison floor already protects the source-order basin.
-    // On a large decoded block with a compact token graph and multiple proved
-    // repartitions, the independent boundary DP is the only route which can
-    // combine distant cut anchors. Price it before the full token beam can
-    // consume the shared max deadline, and remember that the later generic
-    // boundary stage has already been covered.
+    // Only the boundary DP can combine distant cut anchors, so run it before
+    // the full token beam can use up the Max deadline.
     let prioritize_boundary_graph = options.exhaustive
         && comparison_floor_secured
         && allow_regroup
@@ -552,13 +489,12 @@ pub(crate) fn plan_stream_with_progress(
         }
     }
 
-    // The ordinary source-order route remains an additive candidate. It is
-    // both the best path for unfragmented streams and a way to retain source
-    // boundaries when the cheap grouping was locally misleading.
+    // The source-order route stays a candidate: it suits unfragmented streams
+    // and keeps source boundaries where the cheap grouping misleads.
     let fallback_merge_search = if default_long_run {
-        // For a long encoder-flush chain, this pending-block fold subsumes the
-        // ordinary sequential plan: every merge is optional and must beat the
-        // exact separate cost before it is retained.
+        // On a long encoder-flush chain, this fold subsumes the ordinary
+        // sequential plan: a merge is kept only if it beats the exact separate
+        // cost.
         AdjacentMergeSearch::LongRun
     } else if allow_regroup {
         AdjacentMergeSearch::Disabled
@@ -593,11 +529,8 @@ pub(crate) fn plan_stream_with_progress(
             }
         }
     }
-    // A selected small Huffman plan has already paid for its token searches.
-    // Before the dense boundary graph can consume the remaining max budget,
-    // greedily price its new adjacent block pairs once. This captures the
-    // common first replay win without emitting, reparsing, and repeating the
-    // complete stream route.
+    // One greedy merge pass over the selected plan captures the common
+    // first-replay win before the boundary graph uses the remaining Max budget.
     if options.exhaustive && source_search_selected {
         if let Some(candidate) =
             plan_selected_huffman_merge_floor(&fallback, start_alignment, options, &mut plan_cache)
@@ -621,12 +554,8 @@ pub(crate) fn plan_stream_with_progress(
         return Some(finish_plan(fallback, options));
     }
 
-    // While the shared deadline still permits optional work, always price the
-    // bounded collect-before-plan floor. A regular encoder-flush chain can need
-    // several source blocks under one table before its first pairwise merge
-    // pays for itself. Savings found by the greedy adjacent walk do not
-    // dominate that different grouping, even when those savings happen to be
-    // large elsewhere.
+    // Also replay the collected layout: an encoder-flush chain can need several
+    // source blocks under one table before any pairwise merge pays off.
     if allow_regroup && blocks.len() > MAX_REGROUP_SOURCE_BLOCKS {
         if !collected_search_completed {
             if let Some(collected_blocks) = collected_blocks.as_deref() {
@@ -661,21 +590,17 @@ pub(crate) fn plan_stream_with_progress(
             return Some(finish_plan(fallback, options));
         }
 
-        // Default-mode cross-source DP edges are deliberately limited to a
-        // short run. Above that limit the remaining cut set can only revisit
-        // individual source blocks at different alignments; it cannot improve
-        // on either complete plan above. Returning here avoids quadratic work
-        // over hundreds of encoder-flush blocks. Max mode still admits
-        // arbitrary cross-source edges and therefore keeps the broader DP.
+        // Default allows cross-source partial edges only on short source lists,
+        // so here the remaining cuts cannot improve on the plans above; stop to
+        // avoid quadratic work.
         if !options.exhaustive {
             return Some(finish_plan(fallback, options));
         }
     }
 
     if !allow_regroup {
-        // Per-source split probes are already part of the linear fallback.
-        // Outside the long-merge range there are no default cross-source DP
-        // candidates, so avoid multiplying those probes by alignment states.
+        // Without regrouping there are no cross-source DP candidates, and the
+        // linear fallback already has the per-source split probes.
         return Some(finish_plan(fallback, options));
     }
     if boundary_search_completed {
@@ -701,11 +626,6 @@ pub(crate) fn plan_stream_with_progress(
     }
 }
 
-/// Price Columbo's global block-boundary graph exactly once.
-///
-/// Both the ordinary route tail and the established-floor priority path use
-/// this helper. Keeping graph construction, progress reporting, and DP pricing
-/// together prevents route reordering from duplicating the expensive work.
 #[allow(clippy::too_many_arguments)]
 fn plan_global_boundary_graph(
     blocks: &[ParsedBlock],
@@ -762,14 +682,7 @@ fn plan_global_boundary_graph(
     Some(candidate)
 }
 
-/// Run the direct source-order route used when broad split search is a poor
-/// use of a bounded max budget.
-///
-/// Every original Huffman block receives one cumulative whole-block search and
-/// profitable adjacent pairs are retried greedily. The route is additive to
-/// [`plan_stream`]: it deliberately omits grouping, individual pruning, split
-/// probes, boundary DP, and iterative state queues so a long regular chain can
-/// finish within its own wall-clock slice.
+/// Run the no-split source route (M2) with cumulative pruning.
 pub(crate) fn plan_source_no_split_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -779,13 +692,8 @@ pub(crate) fn plan_source_no_split_route(
     plan_source_no_split_route_with_pruning(blocks, start_alignment, options, false, stop)
 }
 
-/// Run the complementary source-order walk with individual pruning enabled.
-///
-/// Keeping it distinct from the cumulative walk preserves the different
-/// alignments and adjacent-merge prices produced by local pruning rather than
-/// discarding either topology by immediate encoded-size comparison. Max gives
-/// short source lists this policy first and longer lists the cumulative policy
-/// first; sufficient remaining time admits the complementary walk.
+/// Run [`plan_source_no_split_route`] with individual pruning, which changes
+/// alignments and adjacent-merge prices, so the two are separate routes.
 pub(crate) fn plan_source_individual_no_split_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -828,13 +736,9 @@ fn plan_source_no_split_route_with_pruning(
     }
 }
 
-/// Build Columbo's proven-submatch candidate as an independent stream lineage.
-///
-/// Each block begins from its complete ordinary representation, then may
-/// resegment only ranges already proved by an existing match. The caller
-/// stabilizes this seed through the established planner separately, so a
-/// locally smaller resegmentation cannot displace a different route whose
-/// later replay reaches the better fixed point.
+/// Build the proven-submatch candidate as a separate lineage, so a locally
+/// smaller resegmentation cannot displace a route whose replay ends better.
+/// Returns `None` when no block improves.
 pub(crate) fn plan_proven_submatch_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -856,10 +760,9 @@ pub(crate) fn plan_proven_submatch_route(
 
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        // The caller reparses the completed ordinary route first. Its original
-        // representation is therefore the selected Huffman table, and this
-        // cheap structural price can branch from it without repeating the
-        // ordinary floor or retaining stale source-bit references.
+        // The caller reparses the completed ordinary route first, so this cheap
+        // plan branches from the selected table without repeating the ordinary
+        // floor.
         let base = plan_block(block, alignment, &floor_options, &mut *stop);
         if !proven_submatch_route_eligible(&base.tokens, block.plain.len(), options.exhaustive) {
             append_output_plan(&mut plans, &mut output_bits, base, true)?;
@@ -880,11 +783,8 @@ pub(crate) fn plan_proven_submatch_route(
     changed.then(|| finish_plan(plans, options))
 }
 
-/// Build the historical proven-before-feedback floor as an independent route.
-///
-/// Keeping this complete source-generation candidate separate prevents its
-/// locally smaller token spelling from hiding the ordinary replay fixed point.
-/// The optimizer admits it only for a compact, explicitly bounded block list.
+/// Build the proven-before-feedback floor as a separate route, so its locally
+/// smaller spelling cannot hide the ordinary replay's fixed point.
 pub(crate) fn plan_integrated_proven_source_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -920,12 +820,9 @@ pub(crate) fn plan_integrated_proven_source_route(
     Some(finish_plan(plans, options))
 }
 
-/// Greedily merge an already-selected Huffman seed using deterministic floors.
-///
-/// Unlike the timed no-split route, this cleanup performs no byte-seeking
-/// search and has no recursive replay. It is safe to finish after the main
-/// deadline because its work is linear in the selected block list and every
-/// accepted merge strictly reduces the complete candidate's bit count.
+/// Greedily merge adjacent blocks of a selected Huffman seed using
+/// deterministic floors. The work is linear in the block count, so it may
+/// finish after the main deadline.
 pub(crate) fn plan_terminal_merge_route(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -950,12 +847,8 @@ pub(crate) fn plan_terminal_merge_route(
     (total_bits(&candidate) < total_bits(&fallback)).then(|| finish_plan(candidate, options))
 }
 
-/// Merge adjacent blocks in one newly selected compact Huffman plan.
-///
-/// This is a bounded Columbo cleanup, not a recursive search: it retains the
-/// selected token spellings and prices each adjacent pair once with ordinary
-/// table floors. Existing plans remain the comparison floor, so an allocation
-/// failure or non-improvement leaves the selected route unchanged.
+/// Greedily merge adjacent blocks of a selected compact Huffman plan with the
+/// bounded floor. Returns `None` unless the result is smaller.
 fn plan_selected_huffman_merge_floor(
     plans: &[PlannedBlock],
     start_alignment: u8,
@@ -1017,13 +910,9 @@ fn plan_selected_huffman_merge_floor(
     (output_bits < total_bits(plans)).then_some(output)
 }
 
-/// Reconsider one boundary between adjacent blocks in a selected Max plan.
-///
-/// The comparison floor has already paid for the token spellings on both sides.
-/// Join each bounded pair only for histogram cut discovery, exact-price its
-/// best new adaptive cut, and retain at most the strongest single reseat. All
-/// surrounding blocks are alignment-independent, so a shorter replacement
-/// cannot invalidate their established prices.
+/// Move one boundary of a selected Max plan to the adaptive histogram cut with
+/// the largest exact saving. All blocks are alignment-independent, so later
+/// prices stay valid.
 fn plan_selected_huffman_boundary_reseat(
     plans: &[PlannedBlock],
     start_alignment: u8,
@@ -1118,14 +1007,9 @@ fn plan_selected_huffman_boundary_reseat(
     (total_bits(&output) < total_bits(plans)).then_some(output)
 }
 
-/// Test one deliberately non-greedy split before one bounded boundary reseat.
-///
-/// Turtledeflate's pushed-split route can cross a locally losing state before
-/// boundary movement finds a better complete partition. Columbo admits only a
-/// much smaller experiment: select the largest eligible block in a compact Max
-/// comparison floor, force the well-separated second basin already observed by
-/// the adaptive histogram probes, then run the existing single-reseat pass.
-/// The original complete floor remains the exact acceptance bound.
+/// Try one forced split, then one boundary reseat: a bounded form of
+/// Turtledeflate's pushed split, which may pass through a worse state to reach
+/// a better partition.
 fn plan_forced_split_boundary_escape(
     plans: &[PlannedBlock],
     start_alignment: u8,
@@ -1228,11 +1112,8 @@ fn parsed_from_selected_plan(plan: &PlannedBlock) -> ParsedBlock {
     }
 }
 
-/// Compose the deterministic per-block tree floor with the selected layout.
-///
-/// A shorter Huffman block can shift padding in a later stored block. Tighten
-/// only the alignment-independent suffix after the last such block; all-Huffman
-/// streams naturally admit the complete plan list.
+/// Apply [`tighten_terminal_plan`] after the last alignment-dependent block: a
+/// shorter Huffman block could shift a later stored block's padding.
 fn finish_plan(mut plans: Vec<PlannedBlock>, options: &Options) -> Vec<PlannedBlock> {
     let first_safe = plans
         .iter()
@@ -1244,11 +1125,8 @@ fn finish_plan(mut plans: Vec<PlannedBlock>, options: &Options) -> Vec<PlannedBl
     plans
 }
 
-/// Price a prepared block list without token-spelling or split searches.
-///
-/// This complete linear pass is intentionally deadline-independent. It is the
-/// inexpensive comparison floor that makes a useful collected grouping
-/// available before optional byte-seeking work begins.
+/// Price a prepared block list without spelling or split searches. This linear
+/// pass ignores the deadline.
 fn direct_structural_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1269,16 +1147,12 @@ fn direct_structural_plan(
     Some(plans)
 }
 
-/// Apply one bounded token-preserving pass to each ordinary source block.
+/// Apply the cheap per-block floor (see `search::plan_block_with_floor`) to
+/// each source block.
 ///
-/// Very fragmented streams are handled by collection first; running even a
-/// small token pass hundreds of times would spend the container deadline on
-/// bookkeeping. For normal block counts this Columbo floor gives every
-/// ZIP/APNG member strict source/fixed, same-distance, exact-Defluff-tree, and
-/// hybrid-tree feedback candidates before optional search. Proven-submatch
-/// resegmentation is deliberately evaluated as an independent stream lineage,
-/// because its locally best token spelling can converge to a worse replay
-/// fixed point.
+/// Lists over [`MAX_GREEDY_SOURCE_BLOCKS`] blocks get only the structural plan:
+/// a token pass over hundreds of blocks would spend the container deadline on
+/// bookkeeping.
 fn mandatory_token_floor_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1292,10 +1166,9 @@ fn mandatory_token_floor_plan(
     plans.try_reserve_exact(blocks.len()).ok()?;
     let mut output_bits = 0_u64;
     let extended = blocks.len() <= MAX_REGROUP_SOURCE_BLOCKS;
-    // A same-distance repartition changes the token boundaries on which
-    // proven-submatch resegmentation operates. Preserve that dependent
-    // composition in the source floor; streams without this source fact keep
-    // proven resegmentation in the independent endpoint lineage.
+    // A same-distance repartition changes the token boundaries that
+    // proven-submatch resegmentation works on, so the floor composes the two.
+    // Otherwise proven resegmentation stays in its own lineage.
     let compose_repartition_proven = same_distance_opportunities(blocks).repartition_runs != 0;
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
@@ -1313,10 +1186,9 @@ fn mandatory_token_floor_plan(
         } else {
             improve_plan_with_floor(block, alignment, &floor_options, extended, base)
         };
-        // Columbo's five cumulative symbol-260..264 bands are inspired by
-        // repeated deft4j least-family pruning, but are not deft4j states.
-        // Price them before a container deadline can divert optional splitting
-        // toward a locally attractive two-block layout.
+        // Price the cumulative length-symbol bands (260..=264) before a
+        // deadline can steer optional splitting to a locally attractive
+        // two-block layout.
         plan = improve_plan_with_short_family_floor(block, &floor_options, plan);
         append_output_plan(&mut plans, &mut output_bits, plan, true)?;
     }
@@ -1349,12 +1221,8 @@ fn plan_block_with_short_family_floor_cached(
     improve_plan_with_short_family_floor(block, &floor_options, base)
 }
 
-/// Repacketize an all-stored stream using the largest legal stored payloads.
-///
-/// A stored block carries no Huffman or LZ77 decisions, so its boundary is
-/// pure serialization overhead. Keeping this as a separate linear floor also
-/// avoids cloning one `Token::Literal` per byte merely to join large random
-/// inputs; only the bytes required by the winning stored plans are copied.
+/// Repack an all-stored stream into the largest legal stored blocks (65,535
+/// bytes each, except the last).
 fn repack_all_stored_blocks(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1415,13 +1283,9 @@ fn repack_all_stored_blocks(
     Some(plans)
 }
 
-/// Find the best bounded grouping at original block boundaries.
-///
-/// Range templates are priced directly, while merged ranges add a small set
-/// of bounded token spellings. With at most eight source blocks there are only
-/// 36 contiguous ranges. Pricing them first prevents a byte-seeking search on
-/// the first large block from consuming the deadline before a profitable
-/// three-block merge is seen.
+/// Find the cheapest grouping of Huffman source blocks at their original
+/// boundaries by pricing every contiguous range (36 for eight blocks), before
+/// deep search can use up the deadline.
 fn source_aligned_huffman_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1454,9 +1318,8 @@ fn source_aligned_huffman_floor_with_limit(
 
     let composite = Composite::new(blocks)?;
     let mut structural_options = options.clone();
-    // Keep every candidate non-exhaustive. The merged recodes below are
-    // deterministic and deadline-independent; max mode retains their result
-    // as an upper bound before beginning deeper searches.
+    // Deterministic and deadline-independent; Max keeps the result as an upper
+    // bound for deeper searches.
     structural_options.exhaustive = false;
 
     struct Node {
@@ -1465,9 +1328,8 @@ fn source_aligned_huffman_floor_with_limit(
         plan: SourceAlignedPlan,
     }
 
-    // Most range candidates can keep only their representation and borrow the
-    // original composite payload during reconstruction. A token recode owns a
-    // different spelling, so retain that complete plan only when it wins.
+    /// A template rebuilds its payload from the composite; a recode has its own
+    /// spelling, so it keeps its complete plan.
     enum SourceAlignedPlan {
         Template(PlanTemplate),
         Recode(PlannedBlock),
@@ -1505,11 +1367,9 @@ fn source_aligned_huffman_floor_with_limit(
                 continue;
             }
 
-            // Huffman blocks have no alignment padding, so one direct price is
-            // valid at every incoming bit offset. Exact source blocks may keep
-            // their original fixed/dynamic bits for the same reason. A merged
-            // range also feeds the additive recode families below, so retain
-            // its ordinary plan instead of rebuilding it in every helper.
+            // Huffman blocks have no alignment padding, so one price (including
+            // an exact source block's original bits) is valid at every bit
+            // offset.
             let mut recode_base = None;
             let mut singleton_same_distance = None;
             let template = if end_index - start_index > 1 {
@@ -1546,9 +1406,9 @@ fn source_aligned_huffman_floor_with_limit(
             let mut candidate_is_stored = matches!(template.representation, Representation::Stored);
             let mut candidate_plan = SourceAlignedPlan::Template(template);
 
-            // A singleton edge can participate in the globally best source
-            // segmentation, so carry its normalized token spelling in this
-            // DP instead of relying on the separate all-singleton floor.
+            // A singleton range can be part of the best segmentation, so carry
+            // its same-distance spelling in this DP, not only in the
+            // all-singleton floor.
             if let Some(recode) = singleton_same_distance {
                 if !matches!(recode.representation, Representation::Stored)
                     && recode.bits < candidate_bits
@@ -1559,24 +1419,16 @@ fn source_aligned_huffman_floor_with_limit(
                 }
             }
 
-            // Same-distance runs can cross an erased source boundary, while
-            // deft4j rebuilds a merged range before pruning matches. Price
-            // those candidates, and Columbo's separate cumulative-family
-            // bands, only after forming the range: per-source tables cannot
-            // reproduce the merged state. Every helper enforces model limits.
+            // Same-distance runs can cross an erased source boundary, and
+            // deft4j rebuilds a merged range before pruning matches, so price
+            // those candidates and the short-length bands on the merged range.
+            // Each helper enforces its own model limits.
             if let Some((range, base)) = recode_base {
                 let is_large_whole_stream = start_index == 0
                     && end_index == blocks.len()
                     && range.plain.len() >= WHOLE_STREAM_RECODE_MIN_PLAIN;
-                // All four recode families start from the same ordinary
-                // stored/fixed/dynamic price. Build it once and clone only
-                // the small representation metadata; tokens and decoded
-                // bytes remain shared through their `Arc`s. Each helper
-                // still receives an independent base, preserving the old
-                // candidate and tie order below.
-                // The complete large-stream floor starts with this same
-                // normalization, so do not build and replay an identical
-                // standalone seed for that one range.
+                // The whole-stream floor already starts with same-distance
+                // normalization.
                 let same_distance = (!is_large_whole_stream)
                     .then(|| {
                         try_clone_planned_block(&base).map(|base| {
@@ -1597,13 +1449,10 @@ fn source_aligned_huffman_floor_with_limit(
                         base,
                     )
                 });
-                // A container shares one deadline across all of its
-                // streams. Give a large complete merged stream one
-                // extended token-preserving pass now, so an earlier frame
-                // cannot prevent its best whole-stream spelling from
-                // being seen.
-                // Limiting this to the full range avoids multiplying that
-                // work across every possible source-aligned subrange.
+                // A container shares one deadline across its streams, so a
+                // large whole-stream range gets one deadline-independent
+                // extended floor pass; an earlier frame then cannot hide its
+                // best whole-stream spelling.
                 let (short_family, whole_stream) = if is_large_whole_stream {
                     let short_family = try_clone_planned_block(&base).map(|base| {
                         improve_plan_with_short_family_floor(&range, &structural_options, base)
@@ -1637,12 +1486,10 @@ fn source_aligned_huffman_floor_with_limit(
                     .into_iter()
                     .flatten()
                 {
-                    // A changed tree can expose another strict spelling
-                    // win. Complete every near-tied full-stream seed before
-                    // comparing it: a temporarily dearer table can be the
-                    // intermediate state needed by the bounded ladder. The
-                    // same 256-bit beam used by the state queue prevents a
-                    // weak seed from consuming later frames' shared time.
+                    // A changed tree can expose another spelling win, so replay
+                    // every near-tied whole-stream seed: a costlier table can
+                    // be the intermediate state the ladder needs. The margin
+                    // keeps weak seeds from using later frames' shared time.
                     if is_large_whole_stream
                         && recode.bits
                             <= replay_seed_bits.saturating_add(WHOLE_STREAM_REPLAY_MARGIN_BITS)
@@ -1669,9 +1516,8 @@ fn source_aligned_huffman_floor_with_limit(
             }
 
             if candidate_is_stored {
-                // Stored output pads to a byte boundary, so its price depends
-                // on the prefix alignment. The general eight-state DP handles
-                // that case; this one-dimensional Huffman floor does not.
+                // Stored output's price depends on the prefix alignment; only
+                // the eight-state boundary DP handles that.
                 continue;
             }
             let bits = prefix.checked_add(candidate_bits)?;
@@ -1714,14 +1560,9 @@ fn source_aligned_huffman_floor_with_limit(
     Some(plans)
 }
 
-/// Bounded replay planner for an alternate fragmented-stream seed.
-///
-/// The ordinary planner deliberately explores broad token and boundary state.
-/// Once a 4,096-token seed has exposed useful coarse boundaries, replay needs a
-/// different profile: repack/transform each complete block, price every source
-/// boundary merge, and test the seven decoded eighths. Repeating these exact,
-/// linear-sized stages after emission makes nested cuts available without
-/// spending the seed's deadline on the original hundreds of source blocks.
+/// Bounded replay planner for the fragmented collection (M11): recode each
+/// block, price source-boundary merges and test decoded-eighth splits. Repeated
+/// replays reach nested cuts.
 pub(crate) fn plan_fragmented_replay(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1764,12 +1605,8 @@ pub(crate) fn plan_fragmented_replay(
     Some(best)
 }
 
-/// Price one direct decoded-eighth split per block without deep token search.
-///
-/// Fragmented replay and the compact post-deft4j route share this exact
-/// structural floor so neither rebuilds or subtly reimplements its cut logic.
-/// Accepted children become ordinary source blocks after emission, so a later
-/// bounded replay can split them again or merge either child with a neighbour.
+/// Price the best direct decoded-eighth split of each block, without deep token
+/// search.
 pub(crate) fn plan_compact_source_split_floor(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1786,12 +1623,8 @@ pub(crate) fn plan_compact_source_split_floor(
     )
 }
 
-/// Plan the compact split floor while forwarding the best complete prefix.
-///
-/// Every trial prices a complete pair of blocks before checking the deadline
-/// again. Once it expires, untouched blocks retain their ordinary base plan,
-/// so the caller receives a complete candidate containing every split already
-/// proved useful rather than losing the whole route at the timer edge.
+/// Plan the compact split floor until the deadline; untouched blocks then keep
+/// their base plan, so the result is still a complete candidate.
 pub(crate) fn plan_compact_source_split_floor_until(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1802,10 +1635,8 @@ pub(crate) fn plan_compact_source_split_floor_until(
     if stop.reached() && stop.permits_bounded_finalization() {
         return plan_compact_source_split_rescue(blocks, start_alignment, options, &mut plan_cache);
     }
-    // Coarse to fine: cover every structural cut first with the fast ordinary
-    // Huffman planner, then spend the remaining allowance exhaustively pricing
-    // the same topology. The preliminary result is a complete valid stream,
-    // while sufficient Max time still reaches the exact historical sweep.
+    // Coarse to fine: price every cut non-exhaustively, then exhaustively while
+    // time remains.
     let mut quick_options = options.clone();
     quick_options.exhaustive = false;
     let mut priority = plan_compact_source_split_floor_cached(
@@ -1841,14 +1672,8 @@ pub(crate) fn plan_compact_source_split_floor_until(
     }
 }
 
-/// Finish one bounded structural probe when an admitted compact route reaches
-/// its hard boundary before evaluating a cut.
-///
-/// The largest eligible block offers the widest opportunity to separate two
-/// Huffman regimes. Price all of its at-most-fourteen eighth cuts with the
-/// ordinary header planner, then exhaustively price only the best topology.
-/// This retains broad structural evidence while replacing the old six-trial
-/// exhaustive rescue with one exact child pair.
+/// Run one bounded split probe when a compact route reaches its hard deadline
+/// before trying any cut.
 fn plan_compact_source_split_rescue(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -1951,13 +1776,8 @@ fn plan_compact_source_split_rescue(
     Some(output)
 }
 
-/// Exhaustively finalize only the alignment-independent suffix selected by
-/// the fast structural sweep.
-///
-/// Dynamic and fixed blocks do not depend on their starting bit offset. Once
-/// the last stored or exact-original block is behind us, a shorter header can
-/// therefore be adopted without invalidating any later plan. This prices the
-/// winning topology first instead of exhaustively finalizing every losing cut.
+/// Exhaustively replan the alignment-independent suffix of the fast sweep's
+/// winning layout, after its last stored or exact-original block.
 fn finalize_compact_split_header_suffix(
     plans: &mut [PlannedBlock],
     start_alignment: u8,
@@ -2028,12 +1848,9 @@ fn plan_compact_source_split_floor_cached(
     let mut output_bits = 0_u64;
     for block in blocks {
         let alignment = ((u64::from(start_alignment) + output_bits) & 7) as u8;
-        // Deadline-limited finalization starts from the exact completed
-        // parent representation whenever its alignment is unchanged. The
-        // broader max route has already priced that base; rebuilding its full
-        // table search here duplicates work and can consume the entire hard
-        // grace before the first genuinely new split. Untimed callers retain
-        // the complete base search.
+        // Timed finalization reuses the parent's valid original bits: repeating
+        // the Max route's table search could use the whole grace period before
+        // the first split.
         let base = if prioritize_inside_match_cuts {
             reusable_original_bits(block, alignment, options.strict).map(|original| PlannedBlock {
                 tokens: Arc::clone(&block.tokens),
@@ -2046,9 +1863,6 @@ fn plan_compact_source_split_floor_cached(
             None
         }
         .unwrap_or_else(|| plan_block_cached(block, alignment, options, plan_cache));
-        // Each source block contributes either itself or two children. Reserve
-        // that tiny upper bound fallibly so even optional replay work respects
-        // the optimizer's allocation-failure contract.
         let mut winner = Vec::new();
         winner.try_reserve_exact(2).ok()?;
         winner.push(base);
@@ -2113,22 +1927,17 @@ fn plan_compact_source_split_floor_cached(
     Some(output)
 }
 
-/// Remove semantic no-ops and collect adjacent stored chunks while their
-/// combined payload still fits a single RFC 1951 stored block.
-///
-/// `None` means either that no preparation is useful or that this optional
-/// route could not allocate its metadata; both cases use the original blocks.
+/// Remove empty blocks (keeping one if all are empty) and join adjacent stored
+/// blocks while they fit one RFC 1951 stored block. `None` means use the
+/// original blocks.
 fn prepare_blocks(blocks: &[ParsedBlock]) -> Option<Vec<ParsedBlock>> {
-    // Prepared blocks, the sequential winner, and a collected alternative can
-    // all be live briefly. Budget three conservative complete payload views.
+    // Prepared blocks, the sequential winner and a collected alternative can
+    // be live at once, so budget three payload copies.
     if payload_storage_bytes(blocks)?.checked_mul(3)? > MAX_GROUPED_MODEL_BYTES {
         return None;
     }
     let keep_one_empty = !blocks.iter().any(|block| !block.plain.is_empty());
 
-    // Most streams need no preparation at all. Avoid duplicating the fairly
-    // rich per-block metadata unless an empty block can actually be removed or
-    // a neighbouring stored pair can actually be joined.
     let removes_empty = if keep_one_empty {
         blocks.len() > 1
     } else {
@@ -2186,16 +1995,9 @@ fn payload_storage_bytes(blocks: &[ParsedBlock]) -> Option<usize> {
     })
 }
 
-/// Model the greedy Huffman-only shape of Columbo's original C block-list pass.
-///
-/// Each source block and adjacent merged pair is priced with the ordinary
-/// token-preserving planner. A strictly cheaper merge replaces the pending
-/// pair and is immediately compared with its next neighbour. This greedy
-/// shape matters: photographic streams commonly settle into groups of four to
-/// eleven source blocks, while collecting the entire run under one table is
-/// measurably worse. Unlike the complete original pass, this structural floor
-/// excludes stored-block accumulation and its additional fixed/shared-tree
-/// candidates.
+/// Group adjacent Huffman source blocks with a greedy walk priced by the
+/// bounded floor. Unlike the source-order walk, it adds no fixed-join or
+/// shared-tree merge candidates.
 fn greedy_huffman_blocklist(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -2207,15 +2009,14 @@ fn greedy_huffman_blocklist(
         || blocks
             .iter()
             .any(|block| block.source_type == SourceBlockType::Stored)
-        // The linear walk retains the parsed source and at most one complete
-        // grouped view. Candidate pairs are bounded subsets of that view.
+        // The walk keeps the parsed source and at most one grouped copy.
         || payload_storage_bytes(blocks)?.checked_mul(2)? > MAX_GROUPED_MODEL_BYTES
     {
         return None;
     }
 
-    // This is a structural floor, not a second max search. The exhaustive
-    // header families remain available when the chosen groups are replayed.
+    // A structural floor, not a second Max search: the exhaustive header
+    // search runs when the chosen groups are replayed.
     let mut structural_options = options.clone();
     structural_options.exhaustive = false;
 
@@ -2246,8 +2047,8 @@ fn greedy_huffman_blocklist(
             plan_cache,
         );
         let mut separate_bits = pending_plan.bits.checked_add(current_plan.bits)?;
-        // Two fixed plans are emitted as one fixed run elsewhere, so compare a
-        // rebuilt dynamic block with that exact ten-bit-cheaper floor.
+        // Adjacent fixed plans are later joined, 10 bits shorter
+        // (`try_join_fixed_plans`); a merge must beat that total.
         if is_fixed_plan(&pending_plan) && is_fixed_plan(&current_plan) {
             separate_bits = separate_bits.checked_sub(10)?;
         }
@@ -2274,8 +2075,6 @@ fn greedy_huffman_blocklist(
                 );
                 if merged_plan.bits < separate_bits {
                     let mut merged = merged;
-                    // Carry a strict intermediate token winner into the next
-                    // adjacent comparison, matching Columbo's original C list.
                     merged.replace_tokens(merged_plan.tokens.clone());
                     pending = PendingBlock::Owned(merged);
                     pending_cache = Some((alignment, merged_plan));
@@ -2296,12 +2095,8 @@ fn greedy_huffman_blocklist(
     Some(grouped)
 }
 
-/// Replan an already-rewritten Columbo floor with bounded Huffman grouping.
-///
-/// The general stream planner evaluates several unrelated layouts and token
-/// searches. A selected floor needs only this grouping pass: its independent
-/// range-score rows run on at most four workers, then the unchanged ordered
-/// suffix DP selects and emits one deterministic complete candidate.
+/// Replan a rewritten floor candidate with bounded Huffman grouping only. Range
+/// pricing runs in parallel; the result is deterministic.
 pub(crate) fn plan_columbo_floor_seeded_bounded_grouping(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -2326,14 +2121,9 @@ enum BoundedRangePricing {
     Parallel,
 }
 
-/// Find useful source-boundary groups with a small lookahead.
-///
-/// Greedy adjacent merging models Columbo's original C block list, but a first
-/// pair can be neutral even when three or more neighbours profit from one
-/// shared table. At each source position, price at most sixteen complete
-/// groups, commit the strict best saving, and continue after it. This keeps the
-/// pass linear in practical group count while retaining the important
-/// lookahead.
+/// Group source blocks with a bounded lookahead, which finds groups a greedy
+/// walk misses: a neutral first pair whose three or more blocks profit from one
+/// shared table.
 fn bounded_huffman_grouping(
     blocks: &[ParsedBlock],
     options: &Options,
@@ -2345,8 +2135,7 @@ fn bounded_huffman_grouping(
         || blocks
             .iter()
             .any(|block| block.source_type == SourceBlockType::Stored)
-        // Range pricing is transient; reconstruction retains only the source
-        // plus one complete winning grouped view.
+        // Pricing is transient; only the source and one grouped copy are kept.
         || payload_storage_bytes(blocks)?.checked_mul(2)? > MAX_GROUPED_MODEL_BYTES
     {
         return None;
@@ -2375,10 +2164,8 @@ fn bounded_huffman_grouping(
         source_extra_bits.push(token_extra_bits(&block.tokens));
     }
 
-    // Price every bounded range once. Range costs are independent of their
-    // neighbours because all candidates here are Huffman blocks, so a small
-    // suffix DP can choose the best complete segmentation instead of making
-    // an irreversible greedy choice at each source boundary.
+    // All candidates are Huffman blocks, so a range's price does not depend on
+    // its neighbors.
     let range_bits = match pricing {
         BoundedRangePricing::Serial => bounded_range_prices(
             blocks,
@@ -2419,10 +2206,9 @@ fn bounded_huffman_grouping(
                 plan_cache,
             );
             let predicted = range_bits[start][end - start]?;
-            // The frequency score prices a concrete paired-tree candidate.
-            // If materializing that token spelling failed under memory
-            // pressure, abandon this optional layout instead of letting its
-            // missing range hide a later profitable group.
+            // The score prices a concrete paired-tree candidate, so a costlier
+            // plan means building it failed under memory pressure; abandon this
+            // optional layout.
             if plan.bits > predicted {
                 return None;
             }
@@ -2443,9 +2229,9 @@ type BoundedRangePrices = [Option<u64>; MAX_BOUNDED_GROUP_SPAN + 1];
 
 /// Price independent start rows concurrently, preserving source-row order.
 ///
-/// Thread creation is optional: a failed spawn is evaluated immediately on
-/// the caller. Once any worker starts, every handle is joined before an
-/// allocation failure is returned or the first worker panic is resumed.
+/// A failed spawn runs its rows on the calling thread. Every started worker is
+/// joined before an allocation failure is returned or the first worker panic
+/// is resumed.
 fn parallel_bounded_range_prices(
     blocks: &[ParsedBlock],
     source_plans: &[PlannedBlock],
@@ -2597,8 +2383,8 @@ fn bounded_range_prices(
             }
 
             if end > start + 1 {
-                // Every parsed source block owns an end-of-block symbol. A
-                // grouped range emits only one, at the end of the range.
+                // Each source histogram counts its own end-of-block symbol; a
+                // group emits only one.
                 literal_frequencies[256] = literal_frequencies[256].checked_sub(1)?;
                 range_stats.add_assign(source_stats.get(end - 1)?)?;
             }
@@ -2610,9 +2396,8 @@ fn bounded_range_prices(
                 continue;
             }
 
-            // Short-family token changes have additive frequency effects.
-            // Score each possible range from these fixed-size summaries, then
-            // materialize and fully plan only the range that is selected.
+            // Short-family effects are additive, so score ranges from these
+            // summaries and fully plan only the selected ones.
             prices[end - start] = score_short_family_frequencies(
                 &literal_frequencies,
                 &distance_frequencies,
@@ -2626,12 +2411,8 @@ fn bounded_range_prices(
     Some(range_bits)
 }
 
-/// Choose the least-cost complete segmentation from bounded range prices.
-///
-/// Entry `prices[start][span]` is the cost of one block covering that source
-/// range. Span one is always the complete per-source fallback; absent longer
-/// entries simply are not legal edges. Working backward makes the otherwise
-/// local range choices globally optimal within the fixed lookahead window.
+/// Choose the cheapest segmentation from `prices[start][span]` (`None`: group
+/// not allowed), returning each start's group end. Ties keep the shorter group.
 fn choose_bounded_boundaries(
     prices: &[[Option<u64>; MAX_BOUNDED_GROUP_SPAN + 1]],
 ) -> Option<Vec<usize>> {
@@ -2671,18 +2452,9 @@ fn same_block_layout(left: &[ParsedBlock], right: &[ParsedBlock]) -> bool {
         })
 }
 
-/// Collect adjacent Huffman blocks into bounded runs before rebuilding them.
-///
-/// This is deliberately a source-order fold, not a search over combinations:
-/// a block is appended only while both cost guards remain satisfied. Stored
-/// blocks break a run so this candidate retains the original Columbo C
-/// planner's Huffman-run grouping; stored accumulation is handled separately
-/// by [`prepare_blocks`].
+/// Collect adjacent Huffman blocks into runs within the token and decoded-byte
+/// limits, in one source-order pass; stored blocks end a run.
 fn collect_huffman_runs(blocks: &[ParsedBlock], wide: bool) -> Option<Vec<ParsedBlock>> {
-    // Very long encoder-flush chains benefit from one broad source-order
-    // collection before replay. It remains bounded by the same 250k-token /
-    // 64MB limits as an ordinary adjacent merge, and the result still has to
-    // beat the complete sequential fallback.
     let (token_limit, plain_limit) = if wide {
         (MAX_MERGED_TOKENS, MAX_MERGED_PLAIN)
     } else {
@@ -2724,8 +2496,7 @@ fn collect_huffman_runs_with_limits(
                 .last_mut()
                 .expect("the append predicate observed a pending block");
             if !try_append_parsed_block(pending, block) {
-                // Allocation failure only disables this optional grouping. The
-                // unmerged source block remains a complete, lossless fallback.
+                // On allocation failure, keep the block unmerged.
                 if collected.len() >= MAX_BOUNDARY_DP_CUTS {
                     return None;
                 }
@@ -2744,12 +2515,9 @@ fn collect_huffman_runs_with_limits(
     Some(collected)
 }
 
-/// Build the independent 4,096-token candidate used by max-mode replay.
-///
-/// On some highly fragmented encoder streams, the ordinary 8,192-token floor
-/// wins immediately while a slightly larger 4,096-token layout exposes match
-/// pruning and split choices that win after several strict replays. Returning
-/// its complete initial plan lets `optimize` replay it independently.
+/// Build the 4,096-token collected candidate (M11). It is replayed as its own
+/// lineage because on highly fragmented streams it can overtake the 8,192-token
+/// floor after several replays.
 pub(crate) fn fragmented_collect_seed(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -2780,8 +2548,8 @@ pub(crate) fn fragmented_collect_seed(
     direct_structural_plan(&collected, start_alignment, options, &mut plan_cache)
 }
 
-/// One owned merged block is large but short-lived. Keeping it inline avoids an
-/// additional infallible heap allocation solely to represent borrowed-or-owned.
+/// The owned variant is large but short-lived; keeping it inline avoids an
+/// extra infallible heap allocation.
 #[allow(clippy::large_enum_variant)]
 enum PendingBlock<'a> {
     Borrowed(&'a ParsedBlock),
@@ -2797,10 +2565,9 @@ impl PendingBlock<'_> {
     }
 }
 
-/// Build the source-order result with one selected compact max state order.
-///
-/// The routing bit comes from an already-completed whole-stream comparison;
-/// it changes search order only and never rejects either complete floor.
+/// Build the source-order result with full per-source search.
+/// `integrated_compact_proven` selects the compact Max state order; it changes
+/// search order only.
 #[allow(clippy::too_many_arguments)]
 fn sequential_plan_with_compact_policy(
     blocks: &[ParsedBlock],
@@ -2892,8 +2659,8 @@ fn sequential_plan_with_source_search(
             && pending_block.plain.len() + current.plain.len() <= MAX_MERGED_PLAIN
             && !stop.reached();
 
-        // A fixed/fixed join is exact and needs no Huffman search. Keep it as a
-        // candidate even on streams outside the long-merge range.
+        // A fixed/fixed join is exact and needs no Huffman search, so it
+        // applies even when merge search is disabled.
         let fixed_join_eligible = pending_plans.len() == 1
             && current_plans.len() == 1
             && is_fixed_plan(&pending_plans[0])
@@ -2941,9 +2708,6 @@ fn sequential_plan_with_source_search(
             }
         }
 
-        // Identical decoded trees need no rebuild. Reuse the first header and
-        // score its codes over the concatenated tokens, removing one complete
-        // dynamic header in a single inexpensive candidate.
         if let Some(merged_block) = (merge_search_enabled && shared_tree)
             .then_some(())
             .and(merged.as_ref())
@@ -2971,8 +2735,6 @@ fn sequential_plan_with_source_search(
             let mut merged = merged
                 .take()
                 .expect("every accepted adjacent candidate owns a merged block");
-            // Carry a winning single-block token replay into the next adjacent
-            // merge, just as the original Columbo C pending-block loop does.
             if winner.len() == 1 {
                 merged.replace_tokens(winner[0].tokens.clone());
             }
@@ -3042,9 +2804,8 @@ fn plan_source_with_search(
             vec![plan]
         }
         SourceBlockSearch::Floor => {
-            // Once the terminal route spends its allowance, finish the
-            // complete candidate with the ordinary table selector instead of
-            // starting another extended floor on every remaining block.
+            // After the deadline, use the ordinary table selector rather than
+            // an extended floor on every remaining block.
             let plan = if stop.reached() {
                 lookup_block_cached(block, alignment, options, plan_cache).unwrap_or_else(|| {
                     plan_block(block, alignment, options, &mut SearchStop::always())
@@ -3070,10 +2831,9 @@ fn append_output_plans(
         .iter()
         .rposition(|plan| !plan_is_alignment_independent(plan));
     for (index, plan) in plans.into_iter().enumerate() {
-        // Removing a fixed EOB/header shifts every following block by two bits.
-        // Fixed and dynamic payloads are alignment-independent, but a stored
-        // block's padding (including copied original stored bits) is not. Never
-        // invalidate the alignment at which a later stored plan was priced.
+        // A fixed join removes 10 bits and shifts every later block, so never
+        // join while a stored plan, whose padding depends on alignment,
+        // follows.
         let suffix_is_alignment_independent =
             last_alignment_sensitive.map_or(true, |last| last <= index);
         append_output_plan(output, output_bits, plan, suffix_is_alignment_independent)?;
@@ -3081,12 +2841,8 @@ fn append_output_plans(
     Some(())
 }
 
-/// Append one complete plan, optionally joining it to a fixed predecessor.
-///
-/// The caller decides whether later plans were priced at an alignment that a
-/// ten-bit fixed join would invalidate. Reserve room for the separate right
-/// plan before attempting the optional join, which leaves both payloads
-/// unchanged if preparation fails.
+/// Append one plan, joining it to a fixed predecessor if `allow_fixed_join`.
+/// Space is reserved first, so a failure leaves both plans unchanged.
 fn append_output_plan(
     output: &mut Vec<PlannedBlock>,
     output_bits: &mut u64,
@@ -3126,12 +2882,11 @@ fn blocks_share_dynamic_tree(left: &ParsedBlock, right: &ParsedBlock) -> bool {
     }
 }
 
-/// Test Columbo's bounded one-boundary split route for one source block.
+/// Plan one source block, trying bounded single-boundary splits.
 ///
-/// Default mode uses Columbo's seven decoded eighths. `--max` also retains
-/// Columbo's compact 32-token probes and tries one Turtledeflate-inspired
-/// adaptive probe before exact Columbo replanning. Children use the direct
-/// block planner in default mode because they are not pending merge candidates.
+/// Default tries the seven decoded-eighth cuts. Max also tries 32-token cuts on
+/// compact blocks and a Turtledeflate-inspired adaptive cut, then refines split
+/// children with token search.
 fn plan_source_with_splits(
     block: &ParsedBlock,
     alignment: u8,
@@ -3157,8 +2912,6 @@ fn plan_source_with_splits(
         lookup_block_cached(block, alignment, options, plan_cache)
             .unwrap_or_else(|| plan_block(block, alignment, options, &mut *stop))
     } else {
-        // Default mode retains its established whole-block token search before
-        // the seven inexpensive eighth probes.
         match lookup_block_cached(block, alignment, options, plan_cache) {
             Some(base) => {
                 plan_block_with_complete_base_search(block, alignment, options, base, stop)
@@ -3216,10 +2969,8 @@ fn plan_source_with_splits(
     cuts.dedup_by_key(|cut| cut.plain);
     cuts.truncate(MAX_SOURCE_SPLIT_CUTS);
 
-    // Whole-block max search includes several match-state beams. On compact
-    // blocks it can consume the complete deadline before a useful late split
-    // (the 10th or 11th 32-token probe is common in sprite data) is reached.
-    // Price every bounded boundary with direct structural planning first.
+    // Price every cut structurally first: the whole-block Max beam search can
+    // use up the deadline before a useful split is reached.
     let mut ranked_splits = Vec::new();
     if ranked_splits.try_reserve_exact(cuts.len()).is_err() {
         return best;
@@ -3249,11 +3000,8 @@ fn plan_source_with_splits(
 
     ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.plain, split.token));
 
-    // Adaptive discovery samples at most 128 histogram positions and prices
-    // only one structural boundary. Run that bounded discriminator before
-    // either child token search or the unsplit state beam: both expensive
-    // routes repeatedly rebuild Huffman candidates, while this route can
-    // cheaply expose a boundary absent from the seven fixed eighths.
+    // The adaptive probe is cheap (at most 128 histogram samples, one priced
+    // cut), so it runs before the costlier searches.
     if options.exhaustive && !stop.reached() {
         if let Some(candidate) = plan_adaptive_split(
             &composite, start, end, &cuts, alignment, options, plan_cache, stop,
@@ -3266,10 +3014,6 @@ fn plan_source_with_splits(
         }
     }
 
-    // Refine the strongest exactly priced split first only in the medium-work
-    // scheduling class described by `search_split_before_whole_block`.
-    // Outside that class the complete whole-block candidate remains the more
-    // efficient first use of the route budget.
     let mut refined_splits = 0;
     if search_split_before_whole_block(
         options.exhaustive,
@@ -3291,17 +3035,11 @@ fn plan_source_with_splits(
         }
     }
 
-    // All direct structural candidates are now safe. Continue with the core
-    // whole-block token-spelling family before optional discovery work.
-    //
-    // Compact max blocks receive a separate inexpensive proven-first sibling
-    // before this route, and already priced every 32-token boundary above.
-    // Spend their one full beam on the ordinary state order, which can reach a
-    // different endpoint, then reprice only the bounded proven/short floors
-    // against that completed incumbent. Larger blocks use the integrated order
-    // here because their completed normal comparison route already supplies
-    // the ordinary lineage. This covers both state families without running
-    // two full beams.
+    // Compact Max blocks have a separate proven-first route, so unless
+    // `integrated_compact_proven` is set they use the ordinary state order plus
+    // the bounded proven and short-length floors. Larger blocks use the
+    // integrated order: their completed comparison route covers the ordinary
+    // one.
     if options.exhaustive && !stop.reached() {
         let searched_base = match complete_base {
             Some(base)
@@ -3327,10 +3065,9 @@ fn plan_source_with_splits(
     }
 
     if !options.exhaustive {
-        // A locally second-best first split can expose the best stream after
-        // its larger child is split again. The winning first split already gets
-        // this opportunity through whole-stream replay, so following only its
-        // runner-up avoids repeating that work in default mode.
+        // A near-tied runner-up first split can win after its larger child is
+        // split again. Whole-stream replay already does this for the winning
+        // split.
         if ranked_splits.len() >= 2
             && ranked_splits[1].0
                 <= ranked_splits[0]
@@ -3348,10 +3085,8 @@ fn plan_source_with_splits(
             if stop.reached() {
                 return best;
             }
-            // Compact sources retain the exact sibling in default mode. On
-            // larger sources, pricing both candidates can consume the shared
-            // route deadline and prevent the established token-boundary floor
-            // from completing.
+            // Default tries the inside-match midpoint only on small sources;
+            // pricing both cuts on larger ones could use up the deadline.
             for inner in midpoint_cuts(&composite, child_start, child_end)
                 .into_iter()
                 .take(if include_inside_match_cuts(false, block.tokens.len()) {
@@ -3392,10 +3127,8 @@ fn plan_source_with_splits(
         return best;
     }
 
-    // With the complete structural and whole-block floors secured, refine
-    // promising split children while time remains. Ranking by direct cost
-    // makes max mode deterministic and gives plausible boundaries the first
-    // search slots.
+    // Refine split children while time remains, cheapest direct price first;
+    // the ranking keeps Max mode deterministic.
     for (_, split) in ranked_splits.into_iter().skip(refined_splits) {
         if stop.reached() {
             break;
@@ -3460,9 +3193,8 @@ fn plan_adaptive_split(
     }
 
     let boundaries = [start, split, end];
-    // The histogram route already discovered this cut and exact structural
-    // planning validates it. Feeding it into the older child token-search
-    // ladder repeats expensive work for negligible observed gain.
+    // Structural planning is enough to validate this cut; child token search
+    // costs far more for little gain.
     plan_structural_ranges(composite, &boundaries, alignment, options, plan_cache, stop)
 }
 
@@ -3472,7 +3204,8 @@ fn adaptive_split_is_worth_replay(candidate_bits: u64, established_bits: u64) ->
         .is_some_and(|required_bits| required_bits <= established_bits)
 }
 
-/// Return the legacy snapped midpoint and an exact inside-match sibling.
+/// Return the decoded midpoint snapped down to a token boundary, and the exact
+/// midpoint when it falls inside a match.
 fn midpoint_cuts(composite: &Composite, start: Cut, end: Cut) -> [Option<Cut>; 2] {
     if end.plain <= start.plain + 1 {
         return [None, None];
@@ -3496,7 +3229,6 @@ fn midpoint_cuts(composite: &Composite, start: Cut, end: Cut) -> [Option<Cut>; 2
     [snapped, exact]
 }
 
-/// Directly plan consecutive ranges while carrying their exact bit alignment.
 fn plan_structural_ranges(
     composite: &Composite,
     boundaries: &[Cut],
@@ -3530,8 +3262,8 @@ fn is_fixed_plan(plan: &PlannedBlock) -> bool {
     }
 }
 
-/// Prepare both buffers before appending, retaining unique storage between
-/// joins. Shared source buffers are copied only when first made mutable.
+/// Join a fixed plan onto a fixed predecessor, dropping one 7-bit end-of-block
+/// code and one 3-bit block header (10 bits).
 fn try_join_fixed_plans(left: &mut PlannedBlock, right: &PlannedBlock) -> Option<()> {
     if !try_prepare_shared_append(&mut left.tokens, right.tokens.len())
         || !try_prepare_shared_append(&mut left.plain, right.plain.len())
@@ -3631,7 +3363,9 @@ struct Composite<'a> {
     token_plain_offsets: Vec<usize>,
     /// Top-level and inherited source boundaries in decoded coordinates.
     source_plain_splits: Vec<usize>,
-    /// Strided cumulative counts over parsed symbols and payload extra bits.
+    /// Cumulative symbol counts and extra bits every
+    /// [`RANGE_HISTOGRAM_INTERVAL`] tokens; `None` if over the model memory
+    /// limit or unallocatable.
     frequency_checkpoints: Option<Vec<FrequencyCheckpoint>>,
     sources: Vec<SourceSpan>,
 }
@@ -3645,10 +3379,8 @@ impl<'a> Composite<'a> {
             .iter()
             .try_fold(0_usize, |total, block| total.checked_add(block.plain.len()))?;
 
-        // At this point the sequential fallback may already retain a grouped
-        // payload. Conservatively budget three complete payload views for the
-        // concatenated composite, DP edge/range plans, and the
-        // reconstructed winner.
+        // Budget three payload copies: the composite, the DP edge and range
+        // plans, and the reconstructed winner.
         let payload_bytes = token_count
             .checked_mul(std::mem::size_of::<Token>())?
             .checked_add(plain_count)?;
@@ -3776,10 +3508,8 @@ impl<'a> Composite<'a> {
         })
     }
 
-    /// Reconstruct cumulative counts at an arbitrary token boundary.
-    ///
-    /// A stored checkpoint supplies the long prefix; at most 255 following
-    /// tokens need to be counted directly.
+    /// Cumulative counts before token `end`, from the nearest checkpoint plus
+    /// at most 255 counted tokens.
     fn prefix_frequencies(&self, end: usize) -> Option<FrequencyCheckpoint> {
         if end > self.tokens.len() {
             return None;
@@ -3797,10 +3527,7 @@ impl<'a> Composite<'a> {
         Some(frequencies)
     }
 
-    /// Use the cheaper of a direct scan and two indexed prefixes. The index
-    /// bounds work for long ranges, while direct scans avoid recounting an
-    /// overlapping prefix for short ranges. Near the memory ceiling, a direct
-    /// scan also preserves the route without exceeding its model budget.
+    /// Count a token range's symbols, plus one end-of-block symbol.
     fn range_frequencies(&self, start: usize, end: usize) -> Option<FrequencyCheckpoint> {
         if start > end || end > self.tokens.len() {
             return None;
@@ -3821,12 +3548,8 @@ impl<'a> Composite<'a> {
         Some(frequencies)
     }
 
-    /// Return a canonical cut at one decoded offset.
-    ///
-    /// Exact token boundaries retain their ordinary next-token index. A
-    /// strictly interior offset is accepted only inside a proven match and
-    /// records that containing token's index. Integer offsets cannot fall
-    /// inside a one-byte literal.
+    /// Return the [`Cut`] at one decoded offset. An offset inside a token is
+    /// valid only inside a match.
     fn cut_at_plain(&self, plain: usize) -> Option<Cut> {
         if plain > self.plain.len() {
             return None;
@@ -3876,11 +3599,7 @@ impl<'a> Composite<'a> {
         }
     }
 
-    /// Conservative token count for a materialized decoded range.
-    ///
-    /// Each partial match endpoint can expand one source token into at most
-    /// two literals. The same-token case is intentionally overcharged by one;
-    /// this is only a work-limit guard.
+    /// Upper bound on a materialized range's token count, for work limits.
     fn range_token_count_upper_bound(&self, start: Cut, end: Cut) -> Option<usize> {
         if !self.cut_is_valid(start) || !self.cut_is_valid(end) || start.plain >= end.plain {
             return None;
@@ -3891,11 +3610,8 @@ impl<'a> Composite<'a> {
             .checked_add(usize::from(!self.cut_is_token_boundary(end)))
     }
 
-    /// Materialize one selected boundary edge without rewriting unused cuts.
-    ///
-    /// Complete tokens retain their exact source spelling. A partial match
-    /// fragment of at least three bytes becomes one canonical match at the
-    /// original distance; a one- or two-byte fragment becomes known literals.
+    /// Build the tokens of one decoded range. Complete tokens keep their
+    /// spelling; partial matches are split as described in the module docs.
     fn materialize_range_tokens(&self, start: Cut, end: Cut) -> Option<Arc<Vec<Token>>> {
         if !self.cut_is_valid(start) || !self.cut_is_valid(end) || start.plain >= end.plain {
             return None;
@@ -3934,6 +3650,8 @@ impl<'a> Composite<'a> {
     }
 }
 
+/// A cut at decoded offset `plain`. `token` is the index of the next token, or
+/// of the match that contains the offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Cut {
     token: usize,
@@ -4067,15 +3785,10 @@ fn code_or_unseen(lengths: &[u8], symbol: usize, unseen: u8) -> u8 {
         .unwrap_or(unseen)
 }
 
-/// Discover several interacting block-boundary anchors with a learned
-/// entropy-state path.
-///
-/// Google Brotli's high-quality splitter initializes and refines a bounded set
-/// of entropy codes, then uses a shortest path with a block-switch charge to
-/// label the complete symbol stream. This independent Deflate adaptation uses
-/// paired literal/length and distance code costs over already-proven tokens.
-/// It returns token boundaries only; Columbo's exact boundary graph remains
-/// the sole acceptance test and retains its complete pre-scout candidate.
+/// Suggest token-boundary cuts for the boundary DP from an entropy-state path:
+/// an independent Deflate adaptation of Brotli's block splitter that refines a
+/// few paired literal/length and distance codes, then labels tokens by a
+/// shortest path charging each code switch.
 fn entropy_state_boundary_cuts(
     composite: &Composite<'_>,
     strict: bool,
@@ -4301,7 +4014,8 @@ fn ranked_entropy_state_cuts(
     Some(cuts)
 }
 
-/// Append one source-proven match fragment without searching for a distance.
+/// Append a fragment of a source match at the same distance, or as literals
+/// when it is shorter than three bytes.
 fn append_proven_match_fragment(
     output: &mut Vec<Token>,
     source: Token,
@@ -4336,11 +4050,7 @@ fn append_proven_match_fragment(
     Some(())
 }
 
-/// Candidate boundaries include Columbo's seven eighth-position probes.
-///
-/// DeflOpt 2.07 does not split blocks. Columbo retains its legacy snapped
-/// token-boundary probe and now adds an exact sibling when the decoded target
-/// lies inside a proven match.
+/// Choose the cut anchors for the boundary graph.
 fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> Option<Vec<Cut>> {
     let mut cuts = Vec::new();
     add_cut(&mut cuts, composite, 0)?;
@@ -4370,10 +4080,8 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
         }
     }
 
-    // The default long-merge candidate first joins a Huffman run and then
-    // applies the same eighth probes to that combined token stream. Computing
-    // cuts over the combined decoded range allows a profitable boundary to
-    // move away from every original encoder flush point.
+    // Eighth cuts over each joined Huffman run let a boundary move away from
+    // every original encoder flush point.
     if allow_regroup && composite.sources.len() <= MAX_REGROUP_SOURCE_BLOCKS {
         for (run_start, run_end) in huffman_runs(&composite.sources)? {
             let first = composite.sources[run_start];
@@ -4388,8 +4096,8 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
                 false,
             )?;
 
-            // Pair/group cuts make the union useful when the winning stream
-            // retains some source boundaries but regroups their neighbours.
+            // Pair and group cuts help when the winning stream keeps some
+            // source boundaries but regroups their neighbors.
             for start in run_start..run_end {
                 for end in start + 2..=run_end {
                     let first = composite.sources[start];
@@ -4408,15 +4116,13 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
         }
     }
 
-    // Preserve every established token-boundary candidate before admitting
-    // optional exact siblings. Otherwise interior cuts can consume the dense
-    // graph's fixed anchor budget and suppress an older route.
+    // Collect every token-boundary anchor first, so inside-match cuts cannot
+    // crowd them out of the cut budget.
     cuts.sort_unstable_by_key(|cut| cut.plain);
     cuts.dedup_by_key(|cut| cut.plain);
 
-    // Splitting proven matches is additive but expands the dense boundary
-    // graph. Default retains it for compact composites; larger streams reserve
-    // it for max so the shared deadline cannot starve the established route.
+    // Inside-match cuts enlarge the boundary graph, so Default adds them only
+    // for compact composites.
     let mut inside_cuts = Vec::new();
     if include_inside_match_cuts(exhaustive, composite.tokens.len()) {
         for source in &composite.sources {
@@ -4490,9 +4196,8 @@ fn add_eighth_cuts(
     let plain_len = plain_end - plain_start;
     for eighth in 1..8 {
         let target = plain_start + plain_len * eighth / 8;
-        // Columbo's original C probe chooses the boundary before the token
-        // containing the target. Its inclusive end test also keeps the
-        // strictly preceding boundary for an exact token endpoint.
+        // Cut before the token containing the target; a target on a token
+        // boundary counts as the inclusive end of the earlier token.
         let insertion = composite.token_plain_offsets[token_start..=token_end]
             .partition_point(|&offset| offset < target);
         if insertion == 0 {
@@ -4551,8 +4256,7 @@ fn push_cut(cuts: &mut Vec<Cut>, composite: &Composite, cut: Cut) -> Option<()> 
     if !composite.cut_is_valid(cut) || cuts.iter().any(|existing| existing.plain == cut.plain) {
         return Some(());
     }
-    // Returning `None` only abandons this optional boundary search. The
-    // complete sequential plan built before it remains available.
+    // `None` abandons only this optional boundary search.
     if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
         return None;
     }
@@ -4580,16 +4284,13 @@ struct AdaptiveSplitSearch {
     secondary: Option<AdaptiveSplit>,
 }
 
-/// Add one max-only cut using Columbo's independent, bounded implementation of
-/// the coarse-to-fine concept in Turtledeflate's
-/// `turtledeflate_best_block_split` at commit 756f844.
+/// Add one Max-only cut from an independent, bounded implementation of
+/// Turtledeflate's coarse-to-fine `turtledeflate_best_block_split` (see
+/// `docs/research/turtledeflate-methods.md`).
 ///
-/// Both methods sample evenly spaced costs, smooth neighbouring samples,
-/// narrow around the best basin, and scan the terminal interval. Columbo uses
-/// eight samples, a three-point filter, a 16-token terminal window, and hard
-/// probe/deadline caps. It omits Turtledeflate's alternate edge-basin stack;
-/// the caller accepts the cut only after exact token-preserving replanning and
-/// a material complete-plan win.
+/// It samples evenly spaced split costs, smooths neighboring samples, narrows
+/// around the best local minimum and scans the final interval, within probe and
+/// deadline caps.
 fn add_adaptive_split_cut(
     cuts: &mut Vec<Cut>,
     composite: &Composite,
@@ -4609,11 +4310,8 @@ fn add_adaptive_split_cut(
     Some(())
 }
 
-/// Return one well-separated runner-up from the existing adaptive probes.
-///
-/// This does not spend a second probe budget. It is used only by the bounded
-/// forced-lookahead experiment, whose exact complete-plan comparison decides
-/// whether the deliberately non-greedy boundary is useful.
+/// Return a well-separated runner-up local minimum from the adaptive probes,
+/// for [`plan_forced_split_boundary_escape`].
 fn secondary_adaptive_split_cut(
     composite: &Composite,
     start: Cut,
@@ -4662,9 +4360,8 @@ fn adaptive_histogram_split_search(
 
         let left = composite.range_frequencies(start.token, token)?;
         let mut right = whole.checked_sub(&left)?;
-        // Both complete range histograms contain one end-of-block count. Their
-        // difference contains none, while the prospective right child needs
-        // exactly one.
+        // Both range histograms count one end-of-block symbol, so their
+        // difference has none; the right child needs one.
         right.literal[256] = 1;
         let left_bits = estimate_histogram_range_bits(
             &left,
@@ -4716,8 +4413,7 @@ where
     let mut probes = 0_usize;
     let mut cache = Vec::<AdaptiveSplit>::new();
     cache.try_reserve_exact(ADAPTIVE_SPLIT_MAX_PROBES).ok()?;
-    // Always retain the original midpoint. Besides being a useful probe, it
-    // makes a completely flat score choose two balanced children.
+    // Always probe the midpoint, so a flat score picks balanced children.
     cached_adaptive_split_score(original_midpoint, &mut probes, &mut cache, score, stop)?;
 
     while range_end - range_start > ADAPTIVE_SPLIT_FINAL_WIDTH {
@@ -4856,6 +4552,8 @@ fn huffman_runs(sources: &[SourceSpan]) -> Option<Vec<(usize, usize)>> {
     Some(runs)
 }
 
+/// A block's representation and bits without its payload; `instantiate`
+/// rebuilds the block from a composite range.
 #[derive(Clone)]
 struct PlanTemplate {
     representation: Representation,
@@ -4864,8 +4562,6 @@ struct PlanTemplate {
 }
 
 impl PlanTemplate {
-    /// Retain a lightweight structural template while another candidate
-    /// family takes ownership of the complete base plan.
     fn try_from_planned(plan: &PlannedBlock) -> Option<Self> {
         Some(Self {
             representation: plan.representation.try_clone()?,
@@ -4948,9 +4644,7 @@ fn boundary_dp(
     graph.resolve(composite, cuts)
 }
 
-/// The same eight-alignment shortest-path kernel serves the established
-/// boundary search and the bounded alphabet-anchor sibling. Only their
-/// candidate cuts and edge-pricing budgets differ.
+/// Shortest-path search over cut anchors, with one state per bit alignment.
 struct BoundaryGraph {
     states: Vec<[Option<DpNode>; 8]>,
     start_alignment: u8,
@@ -4990,7 +4684,7 @@ impl BoundaryGraph {
                 continue;
             };
             // A finished edge may update its first reachable state even if
-            // pricing consumed the last allowance, as in the original DP.
+            // pricing used up the last of the allowance.
             if visited && stop.reached() {
                 return None;
             }
@@ -5060,9 +4754,7 @@ fn edge_allowed(
         return false;
     };
     if rest.is_empty() {
-        // The original Columbo C default route tests one boundary at a time:
-        // a candidate is a prefix or suffix, not an arbitrary middle slice.
-        // --max may combine several remembered cuts through the full DP.
+        // Default allows one new boundary per source block: a prefix or suffix.
         return exhaustive || start.plain == first.plain_start || end.plain == first.plain_end;
     }
 
@@ -5089,16 +4781,12 @@ fn edge_allowed(
         return false;
     }
 
-    // Cross-boundary partial ranges are the regroup search. Bound that search
-    // to short source runs; source-aligned fixed/shared-tree joins stay cheap.
+    // Cross-source partial ranges are the regroup search; bound it to short
+    // source lists. Otherwise allow only cheap whole-source joins.
     if exhaustive || (allow_regroup && composite.sources.len() <= MAX_REGROUP_SOURCE_BLOCKS) {
         if exhaustive {
             return true;
         }
-        // Default mode follows the original Columbo C implementation's
-        // single-split merge route. At least one end of a cross-source segment
-        // stays anchored to an original boundary; free-floating middle ranges
-        // belong to the broader --max DP.
         return sources
             .iter()
             .any(|source| start.plain == source.plain_start || end.plain == source.plain_end);
@@ -5112,10 +4800,6 @@ fn edge_allowed(
             .all(|source| source.source_type == SourceBlockType::Fixed)
 }
 
-/// Return the contiguous source-span range touched by a token interval.
-///
-/// Source spans are ordered and non-overlapping, so two binary searches avoid
-/// allocating and filtering a fresh index vector for every boundary-DP edge.
 fn overlapping_source_range(composite: &Composite, start: Cut, end: Cut) -> std::ops::Range<usize> {
     let first = composite
         .sources
@@ -5126,11 +4810,8 @@ fn overlapping_source_range(composite: &Composite, start: Cut, end: Cut) -> std:
     first..past_last
 }
 
-/// One boundary-DP edge with its alignment-independent Huffman work cached.
-///
-/// The old loop rebuilt and recopied the same range for every reachable bit
-/// alignment. Only stored padding and exact stored-source reuse vary across
-/// those eight states.
+/// One boundary-DP edge, priced once. Only stored padding and reuse of a
+/// stored source block vary with alignment.
 struct PreparedEdge {
     plain_len: usize,
     source_type: SourceBlockType,
@@ -5145,9 +4826,7 @@ impl PreparedEdge {
             original.block_type != SourceBlockType::Stored || original.alignment == alignment
         });
 
-        // Prefer a strictly cheaper shared tree without first copying a
-        // dynamic base table. If that optional allocation fails, the complete
-        // ordinary plan below remains available.
+        // Prefer a strictly cheaper shared tree before copying the base table.
         let mut shared_clone_failed = false;
         if let Some(shared) = self.shared_dynamic.as_ref() {
             let theoretical_base_bits =
@@ -5168,8 +4847,8 @@ impl PreparedEdge {
         let (representation, bits) =
             self.reusable
                 .at_alignment(self.plain_len, alignment, original);
-        // A failed base-table clone can select a dearer allocation-free
-        // fallback. Give the shared table one chance against that fallback.
+        // A failed base-table clone can fall back to a costlier plan; give the
+        // shared table one more chance against it.
         if !shared_clone_failed {
             if let Some(shared) = self
                 .shared_dynamic
@@ -5202,11 +4881,9 @@ fn prepare_edge(
     plan_cache: &mut CanonicalPlanCache,
     stop: &mut SearchStop<'_>,
 ) -> Option<PreparedEdge> {
-    // Boundary planning preserves complete tokens. An edge ending or beginning
-    // inside one proven match deterministically materializes only that endpoint
-    // fragment at the original distance (or as one or two known literals).
-    // Broader match-to-literal searches remain in the sequential and replay
-    // passes so memory does not grow with cuts × alignments.
+    // Edges split only a match that an edge end cuts. Match-to-literal searches
+    // stay in the sequential and replay passes, so memory does not grow with
+    // cuts × alignments.
     if let Some(source_index) = exact_source(composite, start, end) {
         let block = &blocks[source_index];
         let reusable = plan_cache
@@ -5222,8 +4899,8 @@ fn prepare_edge(
     }
 
     let range = make_range(composite, start, end)?;
-    // Keep ordinary fixed/dynamic pricing ahead of the optional shared-table
-    // probe, preserving the established deadline priority.
+    // Price the ordinary fixed/dynamic plans before the optional shared-table
+    // probe, so they keep deadline priority.
     let reusable = plan_cache
         .lookup_reusable(&range, options)
         .unwrap_or_else(|| plan_reusable_block(&range, options, &mut *stop));
@@ -5247,7 +4924,9 @@ fn prepare_edge(
     })
 }
 
-/// Retain only exact-source metadata needed by the eight aligned selectors.
+/// Return the block's original bits when reusable at their own alignment under
+/// the strict policy; [`PreparedEdge::plan`] checks stored originals'
+/// alignment.
 fn usable_original(block: &ParsedBlock, strict: bool) -> Option<OriginalBits> {
     let original = block.original?;
     reusable_original_bits(block, original.alignment, strict)
@@ -5312,6 +4991,8 @@ fn make_range(composite: &Composite, start: Cut, end: Cut) -> Option<ParsedBlock
     })
 }
 
+/// When every block transmits the same dynamic trees, price `tokens` with the
+/// first block's header.
 fn shared_dynamic_plan(
     blocks: &[ParsedBlock],
     tokens: &[Token],
@@ -5330,11 +5011,6 @@ fn shared_dynamic_plan(
     score_existing_dynamic(tokens, first, strict)
 }
 
-/// Append one parsed block without repeatedly copying the accumulated prefix.
-///
-/// Preparation and collection are optional planning routes, so an allocation
-/// failure simply leaves the blocks separate. All length/frequency arithmetic
-/// and reservations are completed before the model itself is changed.
 fn try_combine_frequencies(
     left_literal: &[u32; 286],
     left_distance: &[u32; 30],
@@ -5345,8 +5021,7 @@ fn try_combine_frequencies(
     for (combined, &right) in literal.iter_mut().zip(right_literal) {
         *combined = combined.checked_add(right)?;
     }
-    // Each source histogram includes an end-of-block symbol, while the joined
-    // block emits only one.
+    // The joined block has one end-of-block symbol, not two.
     literal[256] = literal[256].checked_sub(1)?;
 
     let mut distance = *left_distance;
@@ -5356,6 +5031,8 @@ fn try_combine_frequencies(
     Some((literal, distance))
 }
 
+/// Append `right` to `left` in place. Returns `false`, leaving `left`'s
+/// contents unchanged, on overflow or allocation failure.
 fn try_append_parsed_block(left: &mut ParsedBlock, right: &ParsedBlock) -> bool {
     debug_assert!(left.source_splits.windows(2).all(|pair| pair[0] < pair[1]));
     debug_assert!(right.source_splits.windows(2).all(|pair| pair[0] < pair[1]));
@@ -5382,8 +5059,6 @@ fn try_append_parsed_block(left: &mut ParsedBlock, right: &ParsedBlock) -> bool 
         return false;
     }
 
-    // Combine the authoritative per-block histograms instead of rescanning
-    // the right token buffer immediately before copying it.
     let Some((literal_frequencies, distance_frequencies)) = try_combine_frequencies(
         &left.literal_frequencies,
         &left.distance_frequencies,
@@ -5438,11 +5113,9 @@ fn try_append_parsed_block(left: &mut ParsedBlock, right: &ParsedBlock) -> bool 
     true
 }
 
-/// Make a shared immutable vector uniquely mutable and reserve an append.
-///
-/// `Arc::make_mut` performs an infallible clone. This explicit equivalent uses
-/// `try_reserve_exact`, allowing optional merge routes to fail closed while
-/// preserving the source payload unchanged.
+/// Fallible `Arc::make_mut` plus reserve: make a shared vector uniquely mutable
+/// with room for `additional` more elements. Failure leaves its contents
+/// unchanged.
 fn try_prepare_shared_append<T: Clone>(shared: &mut Arc<Vec<T>>, additional: usize) -> bool {
     let Some(required) = shared.len().checked_add(additional) else {
         return false;
@@ -5541,9 +5214,8 @@ fn merged_source_type(left: SourceBlockType, right: SourceBlockType) -> SourceBl
     if left == right {
         left
     } else {
-        // Dynamic is the common provenance for mixed source types. The DP does
-        // not currently admit stored/Huffman pairs, but this remains the least
-        // surprising fallback if that policy changes.
+        // Mixed source types count as Dynamic; in the boundary DP, which never
+        // joins stored and Huffman blocks, that means fixed/dynamic mixes.
         SourceBlockType::Dynamic
     }
 }

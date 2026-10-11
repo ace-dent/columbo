@@ -306,7 +306,7 @@ fn two_block_slides_match_an_exhaustive_cut_oracle() {
 }
 
 #[test]
-fn a_match_the_neighbour_cannot_code_joins_it_as_literals() {
+fn a_match_the_neighbor_cannot_code_joins_it_as_literals() {
     // The left tree codes only `a` and end-of-block, so the leading match of
     // the right block can join it only as three `a` literals. Rare literals
     // on the right make that match's own length code expensive there.
@@ -467,8 +467,8 @@ fn iterated_slide_equals_repeated_slides_and_reaches_a_fixed_point() {
             }
         }
 
-        // The same rounds run one at a time, each from a fresh parse of the
-        // previous emission, end at the same stream.
+        // Running the same rounds one at a time, each from a fresh parse of the
+        // previous emission, ends at the same stream.
         let mut reference = data.clone();
         let mut calls = 0;
         while let Some(plans) = plan_slide(

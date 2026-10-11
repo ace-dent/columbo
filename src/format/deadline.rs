@@ -7,13 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::Options;
 
-/// Scale an optional-search allowance without panicking on caller-supplied
-/// extreme durations.
-///
-/// Container schedulers only pass finite fractions in `0.0..=1.0`. Keeping
-/// the guards here still matters because [`Options`] is a public API and may
-/// contain `Duration::MAX`; rounding that value through `f64` and feeding it
-/// directly to `Duration::from_secs_f64` can otherwise overflow and panic.
+/// Scale an allowance by `factor` without panicking: a public [`Options`] may
+/// hold `Duration::MAX`, which would overflow `Duration::from_secs_f64`.
 pub(super) fn scale_duration(duration: Duration, factor: f64) -> Duration {
     if !factor.is_finite() || factor <= 0.0 {
         return Duration::ZERO;
@@ -30,9 +25,8 @@ pub(super) fn scale_duration(duration: Duration, factor: f64) -> Duration {
     }
 }
 
-/// A container may hold many independent Deflate streams, but `--timeout`
-/// applies to the file as a whole. Raw optimizers remain self-contained and
-/// thread-safe; the wrapper passes each one only the search time still left.
+/// File-wide search deadline shared by a container's Deflate streams. Each raw
+/// optimizer call gets at most the time left.
 #[derive(Clone, Copy)]
 pub(super) struct SearchDeadline {
     started: Instant,
@@ -62,12 +56,12 @@ impl SearchDeadline {
         self.started.elapsed() >= self.timeout
     }
 
-    /// Give grace only to a call that owns the file's actual remainder.
+    /// Grace period for one raw optimizer call.
     ///
-    /// Proportional child slices are scheduling boundaries, not independent
-    /// user timeouts. Multiplying the one-second grace by every container
-    /// stream would starve later streams and exceed the documented file-wide
-    /// allowance.
+    /// A call that receives all the remaining file time also receives the rest
+    /// of the file's grace. A shorter slice receives the file's grace scaled by
+    /// its share of the file timeout, so the streams' graces together stay
+    /// within the file's.
     pub(super) fn grace_for_call(&self, call_timeout: Duration) -> Duration {
         let elapsed = self.started.elapsed();
         let soft_remaining = self.timeout.saturating_sub(elapsed);

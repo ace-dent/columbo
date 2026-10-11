@@ -478,10 +478,9 @@ fn removes_a_classic_data_descriptor_and_preserves_the_member() {
 
 #[test]
 fn preserves_encrypted_entries_that_use_data_descriptors() {
-    // The bytes are deliberately opaque: encrypted entries must not be
-    // parsed or normalized without a password. Bit 3 also selects the
-    // meaning of ZipCrypto's password-check byte, so it is part of the
-    // encrypted representation rather than disposable bookkeeping.
+    // The payload is arbitrary: encrypted entries are not parsed without a
+    // password. Bit 3 selects ZipCrypto's password-check byte, so it is part
+    // of the encrypted representation.
     let payload = [0x5a; 24];
     let mut input = single_entry_archive(8, &payload, 0x1234_5678, 100, true, false);
     put_le16(&mut input, 6, FLAG_ENCRYPTED | FLAG_DATA_DESCRIPTOR);
@@ -574,9 +573,8 @@ fn zero_through_four_byte_members_always_use_store_in_both_modes() {
 #[test]
 fn equal_sized_four_byte_store_normalization_is_recommended() {
     // One literal plus an overlapping three-byte match encodes "AAAA" in
-    // 30 meaningful bits and four physical Deflate bytes. Store ties the
-    // physical payload size, so the wrapper rule—not a claimed saving—
-    // makes this rewrite mandatory.
+    // 30 meaningful bits and four Deflate bytes. Storing ties the payload
+    // size, so the always-store rule, not a saving, forces this rewrite.
     let deflate = [0x73, 0x04, 0x02, 0x00];
     let decoded = b"AAAA";
     let input = single_entry_archive(
@@ -1005,8 +1003,8 @@ fn bounded_default_floor_parallelizes_independent_members() {
         ParallelMemberPolicy::AnyIndependentWork,
     ));
 
-    // The broader floor policy never bypasses the retained-input or
-    // aggregate-decoded-memory bounds.
+    // `AnyIndependentWork` still respects the input and total decoded size
+    // limits.
     assert!(!should_parallelize_members(
         PARALLEL_MAX_ARCHIVE_INPUT + 1,
         expanded_size,
@@ -1062,8 +1060,8 @@ fn strip_removes_classic_zip_comments_and_supported_extras() {
     optimize(&result.data, &Options::default()).unwrap();
 }
 
-/// Insert unowned bytes before the central directory and relocate every
-/// affected indexed local header without changing any member payload.
+/// Insert unreferenced bytes at `offset`, before the central directory, and
+/// update the local header and central directory offsets to match.
 fn insert_unowned_bytes(input: &[u8], offset: usize, bytes: &[u8]) -> Vec<u8> {
     let parsed = preflight(input, false, u64::MAX).unwrap();
     assert!(offset <= parsed.central_offset);

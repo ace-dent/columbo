@@ -12,6 +12,7 @@ use crate::deflate::model::{
 use crate::deflate::stop::SearchStop;
 use crate::Options;
 
+/// A match token with its canonical length and distance codes.
 pub(crate) fn matched(length: u16, distance: u16) -> Token {
     let symbol = DISTANCE_BASE
         .iter()

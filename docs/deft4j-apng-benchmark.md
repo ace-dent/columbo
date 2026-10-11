@@ -1,17 +1,19 @@
 # Steam Stickers APNG deft4j Timed Benchmark
 
-This separate APNG-only report compares Columbo `--max` against the
-timed `deft4j` references in `steam-stickers_apng`. These cases are
-intentionally excluded from the main deft4j and PNG benchmarks.
-The timeout is read from each reference filename, then two seconds are
-added and the result is clamped to 10..180 seconds.
-A state-carried regression receives up to two serial confirmation runs.
-Only a retry that is no larger in either size metric is retained.
+This APNG-only report compares Columbo `--max` with the timed deft4j
+references in `steam-stickers_apng`. These cases are excluded from the
+main deft4j and PNG benchmarks. Each timeout is the deft4j time encoded
+in the reference filename plus two seconds, clamped to 10–180 seconds.
 
-Prior-result regression annotations are state-local: they are created
-only when a row replaces an older result in the same state file. A
-fresh state has no prior-row baseline, so the annotation count below
-does not replace the independent historical-state audit.
+A row that loses more than 10% of its earlier advantage is rerun serially
+up to twice. A retry replaces it if the retry clears that loss, or
+otherwise if it is smaller in one size metric and no larger in the
+other.
+
+Prior-result regression annotations are local to one state file: a
+row receives one only when it replaces an older result in the same
+state. A fresh state has no earlier rows, so the annotation count
+below does not replace the separate historical-state audit.
 
 - completed cases: 2431
 - misses: 0
@@ -41,10 +43,9 @@ The following sources have no timed reference and are not eligible:
 
 ## State-carried Prior-result Regression Annotations
 
-These annotations were attached while replacing prior rows in the
-same state. Each row lost more than 10% of a previous
-Columbo advantage over the same timed deft4j reference. They do
-not replace the independent historical-state audit.
+Each row below replaced an earlier row in the same state and lost
+more than 10% of Columbo's earlier advantage over the same
+timed deft4j reference.
 
 | format | file | metric | previous saved | current saved | advantage lost |
 | --- | --- | --- | ---: | ---: | ---: |

@@ -3,18 +3,16 @@
 
 //! Internal, lossless representation of a parsed Deflate stream.
 //!
-//! Columbo is a structural optimizer: it keeps the compressor's LZ77 parse
-//! and searches for cheaper ways to serialize it. The model therefore keeps
-//! both the decoded match values and the exact symbols/extras used on input.
+//! Columbo keeps the compressor's LZ77 parse, so the model stores both the
+//! decoded match values and the exact symbols and extra bits of the input.
 
 use std::sync::Arc;
 
 use super::huffman::huffman_tree_shape_is_complete;
 
-/// RFC 1951 advertises distance-code lengths for symbols 0 through 31.
-///
-/// Symbols 30 and 31 participate in Huffman-tree construction but are
-/// reserved and must never occur in a compressed payload.
+/// A dynamic header can give code lengths for distance symbols 0-31. Symbols
+/// 30 and 31 take part in the distance code but must never occur in compressed
+/// data.
 pub(crate) const RFC_DISTANCE_CODE_COUNT: usize = 32;
 pub(crate) const USABLE_DISTANCE_CODE_COUNT: usize = 30;
 pub(crate) const MAX_DYNAMIC_CODE_LENGTH_COUNT: usize = 286 + RFC_DISTANCE_CODE_COUNT;
@@ -28,8 +26,8 @@ pub(crate) const LENGTH_EXTRA_BITS: [u8; 29] = [
     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
 ];
 
-// Index the canonical length family directly. Construct this tiny table at
-// compile time so every fragment/repartition search avoids scanning 28 ranges.
+/// Length symbol index (symbol - 257) for each match length, indexed by
+/// length - 3.
 const LENGTH_FAMILY: [u8; 256] = {
     let mut families = [0; 256];
     let mut family = 0;
@@ -44,12 +42,12 @@ const LENGTH_FAMILY: [u8; 256] = {
     families
 };
 
-/// Return the canonical RFC 1951 symbol and extra fields for a match length.
+/// Return the RFC 1951 length symbol, extra-bits value and extra-bit count for
+/// a match length.
 ///
-/// The arithmetic range of symbol 284 also reaches 258, but RFC 1951 assigns
-/// that value to symbol 285. Columbo accepts the former spelling only as an
-/// explicit relaxed-mode compatibility extension, so structural rewrites must
-/// never create it implicitly.
+/// Length 258 maps to symbol 285. Structural rewrites must never create the
+/// alias symbol 284 with extra value 31, which Columbo emits only in relaxed
+/// mode (`--strict 0`).
 pub(crate) fn canonical_length_encoding(length: u16) -> Option<(u16, u16, u8)> {
     let offset = usize::from(length.checked_sub(3)?);
     let index = usize::from(*LENGTH_FAMILY.get(offset)?);
@@ -118,11 +116,6 @@ pub(crate) struct DynamicPlan {
 }
 
 impl DynamicPlan {
-    /// Whether the payload advertises at least two usable distance symbols.
-    ///
-    /// Dynamic headers may also carry lengths for reserved symbols 30 and 31;
-    /// those do not satisfy Columbo's strict decoder-compatibility policy and
-    /// are deliberately excluded from this count.
     pub(crate) fn has_two_usable_distance_codes(&self) -> bool {
         self.distance_lengths
             .iter()
@@ -132,13 +125,9 @@ impl DynamicPlan {
             >= 2
     }
 
-    /// Whether all three dynamic alphabets follow conservative decoder
-    /// practice rather than RFC 1951's empty/singleton exceptions.
-    ///
-    /// This mirrors the compatibility fix made for libdeflate issue #323:
-    /// literal/length, distance, and code-length trees must all occupy their
-    /// complete Kraft code space. Distance symbols 30 and 31 remain reserved,
-    /// so at least two usable distance symbols are required as well.
+    /// Whether all three codes suit conservative decoders (libdeflate issue
+    /// #323): each is complete, with no RFC 1951 empty or single-code exception,
+    /// and at least two of distance symbols 0-29 have codes.
     pub(crate) fn has_strictly_compatible_huffman_codes(&self) -> bool {
         huffman_tree_shape_is_complete(&self.literal_lengths)
             && huffman_tree_shape_is_complete(&self.distance_lengths)
@@ -146,9 +135,6 @@ impl DynamicPlan {
             && self.has_two_usable_distance_codes()
     }
 
-    /// Clone the small, owned Huffman-table vectors without relying on an
-    /// infallible allocator. Optional searches can abandon a candidate when
-    /// memory is tight while retaining the already-valid source plan.
     pub(crate) fn try_clone(&self) -> Option<Self> {
         Some(Self {
             literal_lengths: try_clone_slice(&self.literal_lengths)?,
@@ -180,9 +166,8 @@ pub(crate) struct OriginalBits {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedBlock {
-    /// Immutable payload buffers are shared by parsed blocks and plans. Most
-    /// planning choices only change representation metadata; sharing avoids
-    /// retaining several full copies of a near-limit decoded stream.
+    /// Token and decoded-byte buffers are immutable and shared with planned
+    /// blocks, which usually change only the representation.
     pub(crate) tokens: Arc<Vec<Token>>,
     pub(crate) plain: Arc<Vec<u8>>,
     pub(crate) literal_frequencies: [u32; 286],
@@ -203,8 +188,6 @@ impl ParsedBlock {
         self.distance_frequencies = distance;
     }
 
-    /// Adopt a planned token spelling, rebuilding its histograms only when
-    /// the immutable token buffer actually changed.
     pub(crate) fn replace_tokens(&mut self, tokens: Arc<Vec<Token>>) {
         if Arc::ptr_eq(&self.tokens, &tokens) {
             return;
@@ -213,8 +196,6 @@ impl ParsedBlock {
         self.recount_frequencies();
     }
 
-    /// Copy mutable block metadata while sharing the immutable token/plain
-    /// payloads. This is used only by optional preparation and grouping paths.
     pub(crate) fn try_clone_shared(&self) -> Option<Self> {
         Some(Self {
             tokens: Arc::clone(&self.tokens),
@@ -313,7 +294,6 @@ pub(crate) fn token_extra_bits(tokens: &[Token]) -> u64 {
         .sum()
 }
 
-/// Fallibly copy a slice for optional planning routes.
 pub(crate) fn try_clone_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
     let mut output = Vec::new();
     output.try_reserve_exact(source.len()).ok()?;

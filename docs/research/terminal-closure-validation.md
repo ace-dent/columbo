@@ -2,123 +2,74 @@
 
 # Terminal time and method closure in Max
 
-Catalogue update, 13 September: header-directed match response is R10 and
-length-symbol exchange is R11. The closure described here is now R12 and
-tracks eleven method inputs. The original
-R1–R9 validation measurements below retain their historical scope.
-
 11 September 2026. Baseline: `2e77f21`. **Accepted after matched validation.**
-The implementation is in `src/deflate/optimize.rs`; current production gates
-are catalogued in [routes and methods](../routes-and-methods.md).
-The sections below preserve the 11 September evidence. The accepted
-[13 September extension](#follow-up-on-13-september-2026-the-larger-max-work-class)
-widens the reservation to the existing larger Max work class.
+The implementation is in `src/deflate/optimize.rs`; the R12 and G0t rows in
+[routes and methods](../routes-and-methods.md) describe the current method. The
+accepted [13 September extension](#follow-up-on-13-september-2026-the-larger-max-work-class)
+widens the time reservation to the existing larger Max size class.
+
+On 13 September, header-directed match response became R10, length-symbol
+exchange R11, and this closure R12. The R1–R9 measurements below keep their
+original scope.
 
 ## Why a single sweep misses reachable savings
 
-The terminal methods do not commute. A later method can change the payload
-lengths, transmitted code-length tree, symbol support, tokens or block
-boundaries that an earlier method priced. In particular, a joint tree/RLE
-improvement can change the next iteration's header costs, and an alphabet
-split can create a new, profitable joint-tree problem. Finishing the ordered
-R1–R9 sweep therefore does not establish a local fixed point.
-
-Max now revisits terminal methods after a strict complete-stream improvement,
-while the existing optional deadline permits another route. The first sweep
-keeps the established order. Default still performs its single R1–R5 sweep,
-and the independent Default comparison endpoint and historical Max search
-seed retain their established construction.
-
-Nine score slots record the input last presented to each method. Accepted
-candidates strictly decrease `(physical bytes, meaningful bits)`, so an input
-score identifies its generation within this particular descent. A suffix
-already evaluated on the unchanged candidate is skipped. This is not a
-cross-route cache: equal-score alternative encodings in other lineages are
-not considered interchangeable.
-
-Each method retains its original size, block, support, operation and price
-bounds. Additional sweeps use optional time, even if the first Default sweep
-was mandatory. No new grace, worker, encoded-parent cache or stream-planner
-replay is introduced. Original-match restoration continues to consult the
-original source certificates, and every accepted result passes complete
-emission and identity validation.
-
-Strict improvement prevents cycles. A raw stream occupying at most L bytes
-has at most 8L positive meaningful-bit scores, giving a finite descent without
-an arbitrary round limit. A completed, unexpired sweep with no change establishes a
-fixed point only for these bounded operators. Exhausted operation budgets,
-heuristic menus, excluded work classes and compatibility policy still limit
-coverage; this is not a claim of globally optimal Deflate encoding.
+The terminal methods do not commute: a later method can change the lengths,
+code-length tree, support, tokens or boundaries that an earlier method priced.
+A joint tree/RLE improvement can change the next iteration's header costs, and
+an alphabet split can create a new, profitable joint-tree problem, so one
+ordered R1–R9 sweep is not a local fixed point. Max therefore repeats the
+terminal methods after a strict complete-stream improvement; Default keeps its
+single sweep. Strict improvement makes the descent finite: a raw stream of at
+most L bytes has at most 8L positive meaningful-bit scores.
 
 ## Giving terminal methods time
 
-Repeating a late sweep is ineffective if earlier token and source searches
-consume its entire allowance. Public-API trials of repetition alone confirmed
-this: all 20 frozen-parent Max results were identical at ten seconds, with
-18 timeouts in each build. The larger frozen-parent gains below are therefore
-not evidence that late repetition alone improved normal CLI output.
+Repeating a late sweep does nothing if earlier searches use the whole
+allowance: with repetition alone, all 20 frozen-parent Max results were
+identical at ten seconds, with 18 timeouts in each build. The frozen-parent
+gains below are therefore not evidence that repetition alone improves normal
+CLI output.
 
-For stream-owning `Complete` and `CompleteThenBounded` Max work, the
-11 September implementation reserved the final fifth of the original soft allowance for terminal methods
-when source compressed and decoded sizes are both at most 128 KiB and the
-wire stream has at most 128 blocks. These are the existing common work bounds
-of R1–R5. The fraction reuses the existing primary/follow-up scheduling share;
-it was not selected by testing several fractions against guard scores.
+The 11 September rule reserved the final fifth of the soft allowance for
+terminal methods under `Complete` and `CompleteThenBounded` when the source is
+at most 128 KiB compressed and decoded with at most 128 wire blocks. The
+fraction reuses the existing primary/follow-up share; it was not tuned against
+guard scores.
 
-The primary phase includes elapsed parsing and Default-floor time and has no
-separate grace. After the deferred compact source-split finalization, terminal
-tree floors and R1–R9 use the original full deadline and grace. At a primary
-phase yield, that split finalizer may use its existing cheap coarse rescue
-only while the full soft deadline remains open; it does not start an exhaustive
-split sweep in the reserved share. Phase expiry does not report a file timeout.
-The mandatory Default floor still completes, even if it uses the allowance.
-
-Each phase grows with configured time, preserving primary endpoints for longer
-runs while giving compact header methods a chance under normal allowances.
-This changes resource allocation and can lose a primary-search improvement;
-complete-candidate comparison prevents larger replacements within a run, not
-regression against a different schedule. The 22-file screening sample gained
-73 bytes / 580 bits overall, with one loss of 1 byte / 6 bits, and measured
-274.89 → 244.08 seconds. The hundred-file replay and independent generated
-inputs below test whether that tradeoff extends beyond the screen. Shared container
-children and larger work classes retain their earlier primary schedule.
+The reservation can lose a primary-search improvement against a different
+schedule. The 22-file screen gained 73 bytes / 580 bits overall, with one loss
+of 1 byte / 6 bits, and measured 274.89 → 244.08 seconds; the hundred-file
+replay and generated inputs below test whether that holds beyond the screen.
+Shared container children and larger size classes kept their earlier schedule.
 
 ## Portable regression witness
 
-The existing generated coupled-swap fixture supplies literal frequencies,
-source-certified matches and a stored history prefix. Its original stream
-uses 37,782 bits. One terminal sweep stops at 36,729 bits. The resulting
-alphabet splits expose another joint-tree improvement and another useful cut;
-closure reaches at most 36,637 bits, at least 92 bits beyond one sweep.
-
-The regression test validates the emitted stream, strict trees and actual
-maximum distance, then checks that another closure invocation leaves the
-bytes and meaningful bits unchanged. It also verifies that an expired Max
-allowance retains precisely the ordinary terminal endpoint when Default work
-is mandatory, and leaves the parent unchanged when all work is optional.
-No private fixture bytes are embedded in the test.
+The generated coupled-swap fixture's original stream uses 37,782 bits, and one
+terminal sweep stops at 36,729. The resulting alphabet splits expose another
+joint-tree improvement and another useful cut; closure reaches at most 36,637
+bits, at least 92 bits beyond one sweep. The test also checks that another
+closure changes nothing and that an expired Max allowance keeps the ordinary
+terminal endpoint. It embeds no private fixture bytes.
 
 ## Controlled exploration
 
-The private replay used 43 distinct completed Max parents from the previous
-coupled-swap validation. The R2–R9 sequence first received one full sweep;
-only subsequent gains are attributed to repetition. Repetition improved
-27/43 parents by **189 raw bytes / 1,485 meaningful bits**, with no larger
-result. These are frozen-parent gains, not additional whole-corpus benchmark
-savings. This exploration omitted original-match restoration; the production
-closure retains it against the original source.
+The private replay used 43 distinct completed Max parents from the coupled-swap
+validation. R2–R9 first received one full sweep, and only later gains are
+attributed to repetition: 27/43 parents improved by **189 raw bytes / 1,485
+meaningful bits**, with no larger result. These are frozen-parent gains, not
+whole-corpus savings. The exploration omitted original-match restoration,
+which production closure keeps.
 
-The exploratory harness allowed eight sweeps and 20 seconds per parent.
-Three parents were still improving on the eighth sweep, so its results are
-lower bounds on further reachable savings, not fixed-point claims. Production
-has no eight-sweep cutoff. Total measured time for all sweeps on these 43
-parents was 48.654 seconds, including the first sweep; it is not the added
-runtime of the CLI change.
+The harness allowed eight sweeps and 20 seconds per parent. Three parents were
+still improving on the eighth sweep, so the results are lower bounds;
+production has no eight-sweep cutoff. All sweeps on the 43 parents took
+48.654 seconds, including the first; this is not the CLI's added runtime.
 
 ## Matched hundred-file guard
 
-The canonical hundred-file guard is unchanged. All trials use its recorded
-mode and allowance, with the frozen baseline and candidate executables:
+All trials use the unchanged canonical hundred-file guard's recorded mode and
+allowance, with the frozen baseline and candidate executables:
 
 | Measure | Result |
 | --- | ---: |
@@ -133,87 +84,70 @@ mode and allowance, with the frozen baseline and candidate executables:
 | Validation errors | 0 |
 
 These are serial trials on a protective cohort, not a fresh complete DeflOpt or
-deft4j corpus. Historical floors have no comparable aggregate runtime. The
-measured time change is a single matched observation, not a platform-wide
-performance estimate. The screen overlaps this cohort and must not be added
-to its savings.
+deft4j corpus, and the time change is one matched observation. The screen
+overlaps this cohort and is not additive to it.
 
-The three losses against the fresh baseline are `motorcycle.png` (1 byte /
-6 bits), `sample_38-fs8.png` (11 bytes / 86 bits), and `sample_53.png` (8 bytes /
-64 bits), all under `css-ig-net`. They total 20 bytes / 156 bits, against gross
-wins of 335 bytes / 2,683 bits. Only `sample_53.png` also misses its older guard
+The three losses against the fresh baseline, all under `css-ig-net`, are
+`motorcycle.png` (1 byte / 6 bits), `sample_38-fs8.png` (11 bytes / 86 bits)
+and `sample_53.png` (8 bytes / 64 bits): 20 bytes / 156 bits against gross wins
+of 335 bytes / 2,683 bits. Only `sample_53.png` also misses its older guard
 floor, by 1 byte / 3 bits. The inherited `medium/LevelLoading.png` residual
-remains 6 bytes / 49 bits; it is outside the new reservation class.
+remains 6 bytes / 49 bits, outside the new reservation class.
 
 All four smaller losses against the newer full journals are recovered:
-`sample_04-fs8.png` improves that floor by 15 bytes / 121 bits, `sample_14.png`
+`sample_04-fs8.png` beats that floor by 15 bytes / 121 bits, `sample_14.png`
 by 20 bytes / 160 bits, `test-convertir-truecoloralpha-trns.png` by 7 bytes /
 53 bits, and `small/psydk-Pink.png` by 4 bytes / 30 bits. These are the same
-trials joined to different reference floors, not additional corpus savings.
+trials joined to different floors, not extra savings.
 
-Two additional serial baseline trials reproduce all three old endpoints
-exactly. Two candidate confirmations reproduce `sample_38-fs8.png` at
-+11 bytes / +86 bits and `sample_53.png` at +8 bytes / +64 bits. `motorcycle.png`
-varies: one confirmation improves the baseline by 16 bytes / 127 bits, while
-the other repeats +1 byte / +6 bits. Its 60-second trial also remains +1 / +6.
-Thus the first cohort is kept intact, rather than replacing its loss with the
-best repeat. Timed search order matters; monotone incumbent selection within a
-run does not imply monotone output across different configured allowances.
+Two more serial baseline trials reproduce all three old endpoints. Two
+candidate confirmations reproduce `sample_38-fs8.png` at +11 bytes / +86 bits
+and `sample_53.png` at +8 bytes / +64 bits. `motorcycle.png` varies: one
+confirmation beats the baseline by 16 bytes / 127 bits, the other repeats
++1 byte / +6 bits, and its 60-second trial also stays +1 / +6. The first
+cohort is kept as measured rather than replaced by the best repeat.
 
-At 60 seconds, `sample_38-fs8.png` improves on the fresh ten-second baseline
-by 11 bytes / 92 bits (65.61 seconds measured), and `sample_53.png` by 18 bytes /
-143 bits (65.66 seconds). Both formerly smaller endpoints remain recoverable;
-the additional time is a quality/cost choice rather than a per-file default.
-Relative to the candidate's ten-second results, each run spends another
-53.90 seconds to recover 22 bytes / 178 bits and 26 bytes / 207 bits,
-respectively. No filename-specific time allowance is built into the optimizer.
-The 180-second `motorcycle.png` trial still reports +1 byte / +6 bits
-(143.02 seconds measured). A better current-code result is nevertheless
-witnessed by the ten-second repeat above, so it is not a structurally forbidden
-endpoint. More allowance alone does not reproduce that search order. This tiny
-residual is retained as a measured schedule tradeoff; no timer threshold or
-filename exception is added to recover it.
-The final build also recovers `medium/LevelLoading.png` at 180 seconds:
-zero byte loss and five bits below its historical floor, in 195.92 seconds.
-The fresh baseline needed the same allowance and took 195.87 seconds; its
-60-second trial still lost 6 bytes / 49 bits. All hundred historical guard
-floors are therefore witnessed in the current code: 98 at recorded allowances,
-plus `sample_53.png` at 60 seconds and LevelLoading at 180 seconds. This does
-not replace the matched-budget 98/100 result or its aggregate timing with
-best-of-multiple-budget scores. The older APNG results are recorded below.
+At 60 seconds, `sample_38-fs8.png` beats the fresh ten-second baseline by
+11 bytes / 92 bits (65.61 seconds measured) and `sample_53.png` by 18 bytes /
+143 bits (65.66 seconds). Relative to the candidate's ten-second results, each
+spends another 53.90 seconds to recover 22 bytes / 178 bits and 26 bytes /
+207 bits respectively. The 180-second `motorcycle.png` trial still reports
++1 byte / +6 bits (143.02 seconds measured), although the ten-second repeat
+above shows a better result is reachable. No per-file exception is added for
+these residuals.
+
+At 180 seconds the final build also recovers `medium/LevelLoading.png`: no
+byte loss and five bits below its historical floor, in 195.92 seconds. The
+fresh baseline needed the same allowance (195.87 seconds); its 60-second trial
+still lost 6 bytes / 49 bits. All hundred historical guard floors are
+therefore witnessed in the current code: 98 at recorded allowances, plus
+`sample_53.png` at 60 seconds and LevelLoading at 180 seconds. This does not
+replace the matched-budget 98/100 result or its timing.
 
 ## Public raw Max control
 
-The final serial, interleaved API sample contains thirteen frozen raw parents
-representing PNG/APNG, GZIP and ZIP families, three generated method witnesses,
-and four guard endpoints. At ten seconds, **13/20 improve and seven tie**, with
-no larger result: net **83 raw bytes / 664 meaningful bits**, and measured optimizer time
+The final serial, interleaved API sample has thirteen frozen raw parents from
+PNG/APNG, GZIP and ZIP families, three generated method witnesses and four
+guard endpoints. At ten seconds **13/20 improve and seven tie**, with no larger
+result: net **83 raw bytes / 664 meaningful bits**, with optimizer time
 218.640 → 159.662 seconds. Eighteen baseline calls and two candidate calls
-report the full deadline reached. A primary phase yield alone is not a file
-timeout; a non-timeout result still does not prove global optimality.
+reach the full deadline. Repetition without reserved time produced identical
+output on all twenty inputs. Some sources overlap other controls, so these are
+not added to the hundred-file savings.
 
-These are already-optimized parents passed through the raw public API, not a
-complete wrapper corpus, and some source identities overlap other controls.
-They must not be added to the hundred-file savings. In contrast, repetition
-without reserved time produced identical output on all twenty inputs.
-
-Meaningful bits are parsed independently from the emitted streams. The public
-API's `bits_saved` field uses eight bits per removed physical byte when a file
-shrinks, and meaningful-bit savings only when its byte length ties. Subtracting
-that display metric between different byte sizes is not a meaningful-bit
-measurement; the independent check caught and corrected that harness assumption.
+Meaningful bits are parsed from the emitted streams; the public API's
+`bits_saved` field counts eight bits per removed byte when a file shrinks.
 
 ## Default control
 
-A serial, interleaved public-API comparison covers 365 raw streams and 39
-wrapper files. All **404 outputs are byte-for-byte identical**. Neither build
-reports a timeout. Aggregate optimizer time is 148.677 seconds for baseline
-and 149.513 seconds for the final candidate (+0.56%); this single observation does
-not establish a speed difference.
+A serial, interleaved public-API comparison of 365 raw streams and 39 wrapper
+files gives **404 byte-identical outputs**, with no timeout. Optimizer time is
+148.677 seconds for the baseline and 149.513 for the candidate (+0.56%), a
+single observation that does not establish a speed difference.
 
 ## Generated input controls
 
-The final build also runs on deterministic generated raw streams independent
+The final build also runs on deterministic generated raw streams, independent
 of benchmark file identities:
 
 | Control | Byte/meaningful-bit result | Measured optimizer time, baseline → candidate |
@@ -222,106 +156,84 @@ of benchmark file identities:
 | 26 fixed streams with literal history and source-certified matches | Seven wins, 19 ties, no losses; −5 bytes / −44 bits | 260.534 → 188.938 seconds |
 
 Literal controls are serial and interleaved. The match control uses the first
-26 consecutive cases recorded before the final build; candidate trials are a
-separate serial batch at the same ten-second allowance. Its timing is not an
-interleaved performance estimate. Eighteen baseline match calls reach the full
-deadline; no candidate call does. All generated sources and outputs are
-independently decoded and all reported meaningful bits are independently parsed.
-These raw controls are not added to wrapper-corpus totals.
+26 consecutive cases recorded before the final build, with candidate trials
+run as a separate serial batch at the same ten-second allowance, so its timing
+is not an interleaved estimate. Eighteen baseline match calls reach the full
+deadline; no candidate call does.
 
 ## Older APNG residuals
 
 At the original 20-second allowance, both candidate outputs are byte-identical
-to the fresh baseline. `steam-stickers_apng/2313020_361766…` remains 4 bytes /
-39 bits above its old floor; `657730_102978…` remains 2 bytes / 14 bits above.
-At 60 seconds, the same differences remain, with measured times of 64.44 and
-64.52 seconds. All four candidate outputs validate.
-
-These shared-frame jobs do not receive the compact stream-owner reservation.
-The earlier audit records the general tree-route tradeoff that left these six
-bytes after much larger aggregate APNG gains. This change does not recover
-them, and a 60-second non-recovery is not proof of structural unreachability.
-No full current APNG corpus is claimed from this pair of residual checks.
+to the fresh baseline: `steam-stickers_apng/2313020_361766…` stays 4 bytes /
+39 bits above its old floor and `657730_102978…` 2 bytes / 14 bits. At
+60 seconds the same differences remain, in 64.44 and 64.52 seconds measured.
+These shared-frame jobs do not get the reservation, which applies only to
+`Complete` and `CompleteThenBounded` streams. The earlier audit records the
+tree-route tradeoff that left these six bytes after much larger aggregate APNG
+gains.
 
 ## Acceptance and verification
 
-Accept the general scheduling and closure changes for their net matched-guard
-saving, reduced measured Max time, unchanged Default outputs, and supporting
-raw/generated controls. The fixed fraction and work bounds were not adjusted
-to recover individual losses. The canonical hundred-file guard is unchanged;
-its two short-budget residuals and the three fresh-baseline losses remain in
-the report even where longer or repeated runs recover better results.
+The scheduling and closure changes are accepted for their net matched-guard
+saving, lower measured Max time, unchanged Default outputs and supporting raw
+and generated controls. The fixed fraction and work bounds were not tuned to
+recover individual losses.
 
-- `cargo test --release --locked`: 561 regular Rust tests pass.
-- Both opt-in private-corpus groups pass: six integration and four library
-  tests, giving 571 Rust tests in total.
-- Thirteen published-tool and 189 private benchmark-harness Python tests pass.
-- Clippy with all targets/features and warnings denied passes; formatting and
-  diff whitespace checks pass.
+- 571 Rust tests pass, including both opt-in private-corpus groups; 13
+  published-tool and 189 private benchmark-harness Python tests pass.
 - Independent zlib/PNG/GZIP/ZIP validation passes for 77 frozen probe outputs
-  and both arms of the 404 Default, 20 raw Max, 64 literal and 26 match controls.
-  Raw meaningful-bit counts are checked independently of the public API's
-  byte-first display metric. The benchmark runners also independently validate
-  every retained guard, miss, Defluff, confirmation and longer-time output.
+  and both arms of the 404 Default, 20 raw Max, 64 literal and 26 match
+  controls, and for every retained guard, miss, Defluff, confirmation and
+  longer-time output.
 - All 66 Defluff pairs pass; all 17 published strict miss rows reproduce,
   sixteen recover under the relaxed policy and the signed PNG is preserved.
 - Final source, executable and canonical-guard hashes match the frozen manifest.
 
-Strict descent and positive time shares remove two barriers, not every search
-limit. Method-specific budgets, heuristic menus, retained parent choices and
-compatibility policy still constrain the reachable set. This work establishes
-bounded method closure and measured corpus improvement, not global Deflate
-optimality or monotonic quality across separate timeout settings.
+Method budgets, heuristic menus, retained parent choices and compatibility
+policy still constrain the reachable set. This establishes bounded method
+closure and measured corpus improvement, not global Deflate optimality or
+monotone quality across timeout settings.
 
 Private inputs, outputs, executable hashes, exact source patch, timings,
-independent bit counts, confirmations and checkpoints are retained under
-`work/miss-regression-20260911/`. The complete DeflOpt, deft4j and APNG journals
-retain their own earlier binary identities; they were not relabelled as full
-runs of this candidate.
+independent bit counts, confirmations and checkpoints are under
+`work/miss-regression-20260911/`. The complete DeflOpt, deft4j and APNG
+journals keep their earlier binary identities.
 
 ## Follow-up on 13 September 2026: the larger Max work class
 
-**Accepted after matched screening, complete work-class validation and the
+**Accepted after matched screening, complete size-class validation and the
 unchanged hundred-file guard.** The reservation now covers the existing 1 MiB
-source work class. The measured guard tradeoff is retained below.
+source size class.
 
-R6–R9 already admit parents up to 1 MiB compressed and decoded, whereas the
-11 September reservation used only the common 128 KiB R1–R5 class. An eligible
-larger parent could therefore receive no optional terminal time. The extension
-uses the existing Max bound for source admission, with both sizes at most
-1 MiB and at most 128 source wire blocks. Max, nonzero allowance, and stream
-ownership through `Complete` or `CompleteThenBounded` remain required.
-This describes the 13 September admission rule. The later `ApngMax` child
-share is documented in the [benchmark miss audit](../benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026).
-
-The 4/5 primary share, original terminal deadline/grace, deferred coarse split
-rescue and all method budgets remain unchanged. R1–R5 still have their 128 KiB
-method gates. No fraction, image dimension or filename condition was selected
-from the results. Both phases grow with configured time. This is a scheduling
-choice; it does not enlarge candidate menus or prove global optimality.
+R6–R9 already accepted parents up to 1 MiB compressed and decoded, but the
+11 September reservation used only the 128 KiB R1–R5 limit, so an eligible
+larger parent could get no optional terminal time. The extension uses the
+existing Max bound: both sizes at most 1 MiB and at most 128 source wire
+blocks. The later `ApngMax` child share is documented in the
+[benchmark miss audit](../benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026).
+The primary share, deadlines, method budgets and R1–R5 gates are unchanged, and
+no condition was chosen from the results.
 
 The pre-extension executable is
 `4d4e1586a0bf877b84d1bc8ff015356b07d616197fa1cdb42e53b5ad7027dfea`
 (source `c2fce04`). The production candidate is
 `cd2e432fad4d2672d27e1adb4fdad36658c9a98a7dfedae53c67b7242e1e81d3`.
-The initial private screen used the equivalent admission expression through
+The initial private screen used an equivalent eligibility expression through
 `HeaderTree.max_bytes()`, executable
-`ea328f98ae6ffafe73d5fea709d449372ccc57a96964c5433596743a79f30583`;
-production shares a named constant with the existing R6–R9 limits.
+`ea328f98ae6ffafe73d5fea709d449372ccc57a96964c5433596743a79f30583`.
 
 ### Selection and normal-allowance results
 
-Before candidate results, the screen selected the first, middle and last
+Before any candidate results, the screen selected the first, middle and last
 compressed size in each eligible PNG family, plus the four new journal-loss
-sources inside the expanded class. That gives fifteen sources across five
-families. Baseline/candidate order alternates across files; all optimization
-calls are serial. The screen has seven wins, four ties and four losses:
+sources inside the expanded class: fifteen sources across five families, run
+serially in alternating order. It gives seven wins, four ties and four losses:
 −526 bytes / −4,189 meaningful bits, with 167.54 → 160.66 seconds measured.
 
 The production confirmation covers all 138 static PNG sources in that size
-class in the complete DeflOpt journal, including the 123 outside the screen.
-Each uses the pre-extension journal's recorded allowance. The comparison is
-against that complete recorded baseline, not interleaved fresh pairs.
+class in the complete DeflOpt journal, 123 of them outside the screen. Each
+uses the pre-extension journal's recorded allowance and is compared with that
+recorded baseline, not with fresh interleaved pairs.
 
 | Cohort | Wins / ties / losses | Net bytes / meaningful bits | Pre-extension → candidate time |
 | --- | ---: | ---: | ---: |
@@ -329,12 +241,10 @@ against that complete recorded baseline, not interleaved fresh pairs.
 | 123 outside the screen | 78 / 26 / 19 | −341 / −2,772 | 1,531.70 → 1,437.25 s |
 | Nine generated raw/zlib/GZIP controls | 2 / 7 / 0 | −1 / −4 | 107.783 → 84.245 s |
 
-The full size-class result trades gross wins of 1,502 bytes / 12,028 bits
-against gross losses of 493 bytes / 3,914 bits. Runtime falls by 6.0% in this
-observation; this is not a uniform whole-file speedup claim. All 138 candidate
-outputs match or beat DeflOpt, all live Max-over-Default checks pass, and their
-Default byte/bit counts match the pre-extension journal throughout. Independent
-PNG validation checks decoded streams, wrappers, CRCs and meaningful bits.
+The full class trades gross wins of 1,502 bytes / 12,028 bits against gross
+losses of 493 bytes / 3,914 bits, and runtime falls 6.0% in this observation.
+All 138 candidate outputs match or beat DeflOpt, all live Max-over-Default
+checks pass, and Default byte/bit counts match the pre-extension journal.
 
 | Family | Sources | Net bytes / meaningful bits |
 | --- | ---: | ---: |
@@ -344,70 +254,62 @@ PNG validation checks decoded streams, wrappers, CRCs and meaningful bits.
 | oxipng | 47 | +82 / +629 |
 | samplelib-png | 3 | −36 / −292 |
 
-The oxipng family is a measured loss. The positive full and held-out totals
-do not establish that every workload benefits. The generated controls use
-literal-skew, periodic-match and frequency-regime payloads at 192, 384 and
-768 KiB, with raw, zlib and GZIP wrappers. They contain no corpus bytes.
-Baseline/candidate order alternates, and independent decoding verifies every
-output. Meaningful bits are parsed from emitted streams rather than inferred
-from the public byte-oriented `bits_saved` result.
+The oxipng family is a measured loss, so the positive totals do not show that
+every workload benefits. The generated controls use literal-skew,
+periodic-match and frequency-regime payloads at 192, 384 and 768 KiB with raw,
+zlib and GZIP wrappers and no corpus bytes.
 
-A separately generated APNG has two identical full-canvas RGB frames. IDAT is
-its own job, so these are two optimization jobs under the unchanged `ApngMax`
-shared policy, despite their identical compressed image payloads. Both builds
-emit byte-identical files: 247,025 bytes / 1,974,740 aggregate meaningful bits,
-in 11.646 → 11.637 seconds. Both decoded image streams and all CRCs validate.
-This is a shared-policy control, not evidence for the stream-owner extension.
+A generated APNG with two identical full-canvas RGB frames gives two
+optimization jobs under the unchanged `ApngMax` shared policy. Both builds emit
+byte-identical files, 247,025 bytes / 1,974,740 aggregate meaningful bits, in
+11.646 → 11.637 seconds. This is a shared-policy control, not evidence for the
+extension.
 
 ### Unchanged hundred-file guard
 
-Against the historical floors, the production candidate records 90 wins,
-seven ties and three losses: net −3,821 bytes / −30,617 bits in 1,195.35 seconds.
-All 53 live Max-over-Default checks pass, with no validation error. The normal
-allowance residuals are LevelLoading (+7 bytes / +52 bits at ten seconds),
-`sample_53.png` (+1 byte / +3 bits at ten seconds), and `sample_71.png`
-(+52 bytes / +422 bits at twelve seconds). The first two were already residuals
-before the extension; LevelLoading adds one byte / three bits.
+Against the historical floors, the production candidate records 90 wins, seven
+ties and three losses: net −3,821 bytes / −30,617 bits in 1,195.35 seconds,
+with all 53 live Max-over-Default checks passing and no validation error. The
+normal-allowance residuals are LevelLoading (+7 bytes / +52 bits at ten
+seconds), `sample_53.png` (+1 byte / +3 bits at ten seconds) and
+`sample_71.png` (+52 bytes / +422 bits at twelve seconds). The first two were
+already residuals before the extension; LevelLoading adds one byte / three
+bits.
 
 Against the pre-extension build's complete guard coverage, the same trials
-have sixteen wins, 77 ties and seven losses, for **+126 bytes / +989 bits**.
-Pre-extension time was 1,199.04 seconds; the small time difference is not a
-speed claim. This adverse protective-cohort result is retained alongside the
-broader size-class gain. The cohorts overlap and their totals must not be added.
-No historical floor is weakened or replaced by a best-of-repeat result.
+have sixteen wins, 77 ties and seven losses, **+126 bytes / +989 bits**;
+pre-extension time was 1,199.04 seconds. This adverse protective-cohort result
+stands beside the broader size-class gain; the cohorts overlap and are not
+additive.
 
-The seven losses against the pre-extension guard results are LevelLoading,
-`sample_71-fs8.png`, `sample_71.png`, Death, `filter_0_for_grayscale_16.png`,
-`interlaced_grayscale_16_should_be_grayscale_16.png`, and
-`profile_gray_disallow_color.png`. The palette `sample_71-fs8.png` stream stays
-inside the unchanged 128 KiB reservation class. Two fresh trials per executable
-all reproduce its +50-byte / +394-bit loss against the earlier journal. This
-diagnostic does not isolate that loss to the reservation extension.
+The seven losses are LevelLoading, `sample_71-fs8.png`, `sample_71.png`, Death,
+`filter_0_for_grayscale_16.png`,
+`interlaced_grayscale_16_should_be_grayscale_16.png` and
+`profile_gray_disallow_color.png`. The palette `sample_71-fs8.png` stream is
+inside the unchanged 128 KiB reservation class; two fresh trials per
+executable all reproduce its +50-byte / +394-bit loss against the earlier
+journal, so this diagnostic does not attribute that loss to the extension.
 
 ### Longer-time recovery and remaining coverage
 
-Thirty-two sources received 60-second trials against the strongest comparable
+Thirty-two sources got 60-second trials against the strongest comparable
 observed floors from the census, screen, journal losses and guard, including
-the unchanged-class `sample_71-fs8.png` control. Each target is an actually
-observed byte/bit pair under the same format and preservation policy; the
-comparison never constructs an artificial floor from different trials.
-Twenty-six recover their target, with 2,011.83 seconds measured in total.
-All 31 applicable live Max-over-Default comparisons pass. The original
-normal-allowance rows and aggregate timings remain unchanged.
+the unchanged-class `sample_71-fs8.png` control. Each target is an observed
+byte/bit pair from a single trial. Twenty-six recover their target, in
+2,011.83 seconds measured in total, and all 31 applicable live
+Max-over-Default comparisons pass.
 
 Recoveries include Ball, `sample_59.png`, `sample_71.png`, `file09.png`,
 `numbers.512.png` and `TruePNG calling-cleric.png`. The unchanged-class
-`sample_71-fs8.png` beats its stronger pre-extension journal floor by 13 bytes /
-106 bits in 65.72 seconds. This establishes reachable savings, while its
-same-time repeats above do not isolate the original loss to the extension.
+`sample_71-fs8.png` beats its stronger pre-extension journal floor by
+13 bytes / 106 bits in 65.72 seconds.
 
 LevelLoading still loses six bytes / 48 bits at 60 seconds. The earlier
 unreserved 180-second run had roughly 199 seconds of primary time including
-grace. A 250-second allowance gives the new zero-grace primary phase 200
-seconds, permitting a comparable primary search before terminal work. This
-trial beats the historical guard floor by **one byte / eight bits**, with
-270.79 seconds measured. The configured allowance and measured wall time are
-reported separately because active work can finish within the existing grace.
+grace; a 250-second allowance gives the new zero-grace primary phase
+200 seconds, a comparable primary search before terminal work. That trial
+beats the historical guard floor by **one byte / eight bits**, in
+270.79 seconds measured.
 
 All hundred historical guard floors now have recovery witnesses on this exact
 production candidate: 97 at their recorded mode and allowance, plus:
@@ -418,12 +320,11 @@ production candidate: 97 at their recorded mode and allowance, plus:
 | `css-ig-net/sample_71.png` | 60 s | 65.10 s | −14 bytes / −106 bits |
 | `medium/LevelLoading.png` | 250 s | 270.79 s | −1 byte / −8 bits |
 
-These witnesses do not replace the ordinary 97/100 floor result or imply
-monotone quality across allowances. The extra time recovers small amounts;
-it is not a suitable default cost for every input.
+These witnesses do not replace the ordinary 97/100 result; the small extra
+recoveries do not justify the time as a default.
 
-Five residuals remain against the stronger observed follow-up floors after
-the tested larger allowances, totalling six bytes / 45 meaningful bits:
+Five residuals remain against the stronger follow-up floors after the tested
+larger allowances, totaling six bytes / 45 meaningful bits:
 
 | Source | Largest tested allowance | Residual bytes / meaningful bits |
 | --- | ---: | ---: |
@@ -433,62 +334,40 @@ the tested larger allowances, totalling six bytes / 45 meaningful bits:
 | `medium/road.png` | 60 s | 0 / 2 |
 | `oxipng/interlaced_palette_8_should_be_palette_8.png` | 180 s | 3 / 20 |
 
-The palette trial takes 141.80 seconds and retains the same three-byte /
-20-bit residual as at 60 seconds. It provides no evidence that simply
-increasing its deadline recovers the floor. A finite failed run does not
-prove structural unreachability: primary lineage choices, heuristic menus and
-per-invocation budgets still restrict search. More time also does not expand
-hard method gates. No per-file condition or budget enlargement is introduced
-to chase these remaining bits. The two older APNG residuals above belong to
-the 11 September executable; this follow-up does not present them as fresh
-candidate trials or include them in this five-source total.
+The palette trial takes 141.80 seconds and keeps the same three-byte / 20-bit
+residual as at 60 seconds: more time does not widen hard method gates. The two
+older APNG residuals above belong to the 11 September executable and are not in
+this total.
 
 ### Reference misses and verification
 
-The production candidate reproduces all seventeen strict reference misses;
-sixteen reach parity or better in same-allowance relaxed audits. The signed
-PNG retains its preservation-policy difference. Its complete Defluff replay
-again has 61 wins and five ties, saving 109 bytes / 932 bits in 7.535 seconds,
-with no errors.
-The existing complete public journals retain their original executable
-identities; partial new-binary results are kept separate.
+The candidate reproduces all seventeen strict reference misses; sixteen reach
+parity or better in same-allowance relaxed audits, and the signed PNG keeps
+its preservation-policy difference. The complete Defluff replay again has
+61 wins and five ties, saving 109 bytes / 932 bits in 7.535 seconds, with no
+errors.
 
-All 571 Rust tests, including the private-corpus regressions, pass. The updated
-reservation test covers both exact size limits, either size over its limit,
-source block limits, stream ownership, Default mode and zero allowance.
-The original phase-clock/grace and terminal-closure regression tests pass.
-Locked build, formatting, all-feature Clippy with warnings denied, documentation
-tests, thirteen Python utility tests and 189 private benchmark tests pass.
-The package list excludes private fixtures and scratch artifacts.
+All 571 Rust tests, including the private-corpus regressions, pass; the
+updated reservation test covers both exact size limits, source block limits,
+floor policy, Default mode and zero allowance. Thirteen Python utility tests
+and 189 private benchmark tests pass.
 
 ### Acceptance
 
-Accept the extension because it closes a scheduling gap across an existing
-method work class, improves both the complete class and the files outside the
-screen, and reduces measured aggregate runtime there. The independent generated
-controls show no loss, Default comparisons pass, and all historical guard
-floors have current-code witnesses. The adverse guard and oxipng totals remain
-part of this decision; success on these cohorts does not establish universal
-benefit. No new heuristic threshold was fitted to individual results.
+The extension is accepted because it closes a scheduling gap across an
+existing method size class, improves both the complete class and the files
+outside the screen, and lowers measured aggregate runtime there. The adverse
+guard and oxipng totals remain part of the decision, and no threshold was
+fitted to individual results.
 
 Executable and source hashes match the frozen production manifest; the
 canonical hundred-file guard hash is unchanged. Private selection manifests,
 retained outputs, independent bit counts, trial journals, recovery witnesses
-and final audit summary are under `work/miss-regression-20260913/`.
+and the final audit summary are under `work/miss-regression-20260913/`.
 
-## Follow-up on 15 September 2026: header admission within the Max class
+## Follow-up on 15 September 2026: header eligibility within the Max size class
 
-The [accepted header-admission correction](terminal-header-work-class-validation.md)
-extends R2–R5 to the existing 1 MiB Max enclosing-stream class. Default and
-its mandatory comparison work retain 128 KiB admission, R1 is unchanged,
-and R5 keeps its 128 KiB block limit. Reservation fractions, per-method
-budgets and deadlines are unchanged. Generated witnesses and no-deadline
-frozen-parent probes establish the admission barrier independently of timing.
-
-The complete 138-file PNG class saves 1,641 bytes / 13,142 bits with 2.1%
-more measured runtime. The additional cohort and unchanged guard also improve
-in aggregate; all hundred historical guard floors have candidate witnesses,
-including five at larger allowances. The linked record retains normal-run
-losses, five remaining target gaps, and the limits established by the
-response-method budget probes. The dated 11 and 13 September evidence above
-keeps its original executable identities and measurements.
+The [accepted header-eligibility correction](terminal-header-work-class-validation.md)
+extends R2–R5 to the existing 1 MiB Max enclosing-stream class. The complete
+138-file PNG class saves 1,641 bytes / 13,142 bits with 2.1% more measured
+runtime; the linked record has the full evidence, losses and remaining gaps.

@@ -28,7 +28,6 @@ fn escapes_need_a_terminal_that_is_not_dumb() {
 
 #[test]
 fn without_term_escapes_follow_the_host() {
-    // Unix hosts always announce support; a Windows console must say so.
     assert!(escapes_enabled_for(true, None, true));
     assert!(!escapes_enabled_for(true, None, false));
 }

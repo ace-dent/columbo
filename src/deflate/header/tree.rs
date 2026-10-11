@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Jointly choose the code-length tree and its shortest RLE spelling while
-//! holding the data trees and advertised spans fixed. Nonzero runs depend
-//! only on their literal code price and repeat-16 price. Enumerating the four
-//! optional zero/repeat prices leaves a small exact Kraft-capacity problem.
+//! Choose the code-length code and its cheapest RLE spelling together, with
+//! the data code lengths, HLIT and HDIST fixed (R7). The cost of a run of a
+//! nonzero length depends only on the code lengths of that value and of symbol
+//! 16. Enumerating the code lengths of symbols 0, 16, 17 and 18 leaves a small
+//! exact Kraft-capacity problem for the nonzero values.
 
 use super::{dynamic_bits, shortest_rle, trim_code_lengths};
 use crate::deflate::model::{try_clone_slice, DynamicPlan, ParsedBlock, CODE_LENGTH_ORDER};
@@ -69,15 +70,14 @@ impl Runs {
                 runs.symbol_count += 1;
             }
         }
-        // A valid Deflate data-length list always needs two emitted CL
-        // symbols: either two positive lengths or a positive length and a
-        // zero encoding. A singleton arbitrary sequence needs a filler rule
-        // and is outside this solver's domain.
+        // A valid sequence emits at least two code-length symbols (two nonzero
+        // values, or one plus zeros); a single-value sequence would need a
+        // filler rule, which this solver does not handle.
         if runs.symbol_count == 0 || (runs.symbol_count == 1 && runs.longest[0] == 0) {
             return None;
         }
-        // All optional symbols (16, 17, 18, 0) precede every mandatory
-        // positive literal in the transmission order, so HCLEN is constant.
+        // The optional symbols 16, 17, 18 and 0 come first in the RFC 1951
+        // code-length order, so HCLEN depends only on the nonzero values.
         runs.hclen = CODE_LENGTH_ORDER
             .iter()
             .rposition(|&s| (1..16).contains(&s) && runs.longest[s] != 0)?
@@ -94,10 +94,11 @@ fn weight(length: u8) -> usize {
     }
 }
 
-/// A positive run starts with a literal. If repeats save bits, use either
-/// as many six-value repeats as fit, or one more repeat with values spread
-/// across groups of three to six. Fewer repeats leave more literal work;
-/// further repeats cannot reduce the one mandatory literal's cost.
+/// Cost of a run of `count` equal nonzero lengths. After one explicit length,
+/// the rest is all explicit, or as many six-repeat codes 16 as fit plus an
+/// explicit remainder, or one more code 16 with repeats in groups of three to
+/// six. Fewer codes 16 leave more explicit lengths, and more cannot remove the
+/// first one.
 fn positive_run_cost(count: usize, literal: u8, repeat: u8) -> u32 {
     let count = count as u32;
     let literal = u32::from(literal);
@@ -123,9 +124,8 @@ fn positive_costs(
         // One literal edge and at most four repeat edges per run position.
         budget.spend(7 * runs.longest[symbol] * 5)?;
     }
-    // The spelling of a positive run depends on its size and code prices,
-    // not its symbol. Compute each run price once, then weight it by every
-    // symbol's histogram. Keep the original conservative work charges above.
+    // A nonzero run's cost does not depend on its value, so price each run
+    // length once. Keep the conservative work charges above.
     let longest = runs.longest[1..].iter().copied().max().unwrap_or(0);
     let mut prices = [0; LENGTHS];
     for length in 1..=7_u8 {
@@ -225,7 +225,7 @@ impl ZeroScratch {
                     continue;
                 }
                 // Sliding minima price each repeat range in amortized
-                // constant time. Every suffix enters and leaves once.
+                // constant time.
                 while tails[q] > heads[q]
                     && self.costs[self.queues[q][tails[q] - 1]] >= self.costs[at]
                 {
@@ -253,12 +253,11 @@ impl ZeroScratch {
     }
 }
 
-/// Completed enumeration is exact for fixed data-length lists and spans.
-/// Unused CL leaves cannot help: removing them and suppressing unary nodes
-/// never lengthens an emitted code or HCLEN, and at least two emitted symbols
-/// remain. Enumerate all usable repeat/zero support choices, including absence.
-/// Budget and deadline stops return the best completed tree, without claiming
-/// the unfinished search proved optimality.
+/// Find the cheapest code-length code below `incumbent_bits`. A completed
+/// enumeration is exact: unused code-length leaves cannot help, since removing
+/// them and collapsing single-child nodes never lengthens a used code or HCLEN,
+/// and at least two used symbols remain. A budget or deadline stop returns the
+/// best tree so far.
 fn search(
     runs: &Runs,
     incumbent_bits: u64,
@@ -300,8 +299,7 @@ fn search(
                         continue;
                     }
                     // One literal transition and three monotone repeat
-                    // windows per position. A window's total queue work is
-                    // linear, including all entries removed in its loops.
+                    // windows per position, each with linear queue work.
                     if budget.spend(4 * runs.longest[0]).is_none() {
                         return best;
                     }
@@ -363,8 +361,6 @@ pub(crate) fn plan_header_tree(
     let sequence = &sequence[..count];
     let runs = Runs::new(sequence)?;
     let (tree, bits) = search(&runs, header, budget, stop)?;
-    // Reconstruct one shortest spelling only after selecting a completed
-    // tree. The data codewords, token sequence and advertised spans stay fixed.
     let rle = shortest_rle(sequence, &tree)?;
     Some(DynamicPlan {
         literal_lengths: try_clone_slice(&parent.literal_lengths)?,

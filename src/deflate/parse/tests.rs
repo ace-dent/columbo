@@ -133,8 +133,8 @@ fn explicit_dynamic_stream(
         writer.write(u32::from(code.code), code.length).unwrap();
     }
 
-    // Invalid tree-shape tests are rejected before reaching this payload.
-    // Valid empty-block fixtures consume the ordinary end code.
+    // Fixtures with an invalid tree fail before this point; valid ones end with
+    // symbol 256.
     if let Some(end) = Huffman::build(literal_lengths).and_then(|tree| tree.code(256)) {
         writer.write(u32::from(end.code), end.length).unwrap();
     }
@@ -229,9 +229,8 @@ fn accepts_minimal_payload_tree_exceptions() {
 
 #[test]
 fn accepts_unused_reserved_distance_codes_in_dynamic_headers() {
-    // RFC 1951 permits HDIST to advertise all 32 distance-code lengths.
-    // Symbols 30 and 31 may participate in the tree, but cannot be used
-    // by the compressed payload.
+    // HDIST may give all 32 distance code lengths; symbols 30 and 31 may have
+    // codes but never occur in compressed data.
     let mut code_length_lengths = [0_u8; 19];
     code_length_lengths[0] = 1;
     code_length_lengths[1] = 1;
@@ -251,7 +250,7 @@ fn accepts_unused_reserved_distance_codes_in_dynamic_headers() {
         assert_eq!(parsed.decoded_size, 0);
     }
 
-    // Also retain the audit's compact HDIST=32/all-zero-distance vector.
+    // Compact vector with HDIST=32 and all distance code lengths zero.
     let all_zero = [
         0x05, 0xdf, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x90, 0xff, 0x6b, 0x2b, 0x00,
     ];
@@ -302,9 +301,8 @@ fn rejects_a_reserved_distance_code_when_the_payload_uses_it() {
 
 #[test]
 fn accepts_the_defluff_258_alias_as_an_input_compatibility_extension() {
-    // Defluff emits symbol 284 with extra value 31 for length 258. That
-    // spelling is outside RFC 1951, but accepting existing streams lets
-    // default mode normalize them when doing so is no larger.
+    // Defluff emits symbol 284 with extra value 31 for length 258. Accepting
+    // such streams lets default mode normalize them when that is no larger.
     let input = [
         0xe5, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x80, 0x20, 0xb6, 0xfd, 0xa5, 0x06, 0xa9, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01,

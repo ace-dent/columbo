@@ -7,12 +7,8 @@ use crate::deflate::model::{
     token_extra_bits, OriginalBits, SourceBlockType, LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 
-/// Price Columbo's bounded cumulative length-symbol-family states.
-///
-/// Some merged photographic blocks get a smaller table only after all
-/// existing matches in symbol 260, then symbols 260..=261, and so on through
-/// symbol 264 are written as literals. The family is inspired by repeated
-/// deft4j least-family pruning, but the fixed cumulative bands are Columbo's.
+/// Price the cumulative short-length bands (symbols 260, then 260..=261, up to
+/// 260..=264) after the same-distance floor.
 fn plan_block_with_short_family_floor(
     block: &ParsedBlock,
     alignment: u8,
@@ -1651,8 +1647,7 @@ fn expansion_budget_counts_tokens_and_decoded_bytes() {
     let plain = b"aaaa";
     let exact_limit = parsed_model_bytes(plain.len(), plain.len(), 1).unwrap();
 
-    // One byte below the complete one-block model budget must reject the
-    // optional expansion before allocating its four literal tokens.
+    // One byte below the budget must reject the expansion before allocation.
     assert!(
         expand_selected_matches_with_limit(&source, plain, exact_limit - 1, |_, _, _| true,)
             .is_none()

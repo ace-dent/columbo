@@ -1,23 +1,20 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Cooperative stopping shared by Deflate search planners.
-//!
-//! Search functions used to be generic over each caller's deadline closure.
-//! That made a distinct copy of the complete planner for every closure type.
-//! `SearchStop` keeps the policy explicit and concrete, so production deadline
-//! probes remain direct calls while the optimizer emits one planner body.
+//! Cooperative stopping shared by Deflate search planners: deadlines, grace
+//! periods and route cancellation.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 const DEADLINE_TIMED_OUT: u8 = 1;
-const DEADLINE_ROUTES_CANCELLED: u8 = 2;
+const DEADLINE_ROUTES_CANCELED: u8 = 2;
 pub(crate) const TIMEOUT_GRACE_DIVISOR: u32 = 10;
 pub(crate) const TIMEOUT_GRACE_BASE: Duration = Duration::from_secs(1);
 const INITIAL_BOUNDED_PHASE_NUMERATOR: u32 = 4;
 const INITIAL_BOUNDED_PHASE_DENOMINATOR: u32 = 5;
 
+/// Grace period after the soft deadline.
 pub(crate) fn timeout_grace(duration: Duration) -> Duration {
     if duration.is_zero() {
         return Duration::ZERO;
@@ -33,9 +30,8 @@ pub(crate) struct Deadline {
     pub(crate) started: Instant,
     pub(crate) duration: Duration,
     pub(crate) grace: Duration,
-    /// Timeout and route-cancellation flags share one atomic so a hot search
-    /// probe performs only one synchronization load. The flags carry no data,
-    /// so relaxed ordering is sufficient.
+    /// Timeout and route-cancellation flags share one atomic, so a stop check
+    /// is one load. They guard no other data, so relaxed ordering is enough.
     state: AtomicU8,
 }
 
@@ -53,12 +49,11 @@ impl Deadline {
         self.duration.saturating_sub(self.started.elapsed())
     }
 
-    /// Whether another independent route may begin.
     pub(crate) fn can_start_route(&self) -> bool {
         if self.soft_expired() {
             return false;
         }
-        self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED == 0
+        self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELED == 0
     }
 
     #[inline(always)]
@@ -70,10 +65,10 @@ impl Deadline {
         true
     }
 
-    /// Hard stop polled by an active route while it finalizes a candidate.
+    /// Hard stop for an active route finishing a candidate.
     #[inline(always)]
     pub(crate) fn expired(&self) -> bool {
-        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED != 0 {
+        if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELED != 0 {
             return true;
         }
         let hard_duration = self.duration.saturating_add(self.grace);
@@ -90,9 +85,9 @@ impl Deadline {
     }
 
     pub(crate) fn cancel_routes(&self) {
-        // `fetch_or` cannot erase a timeout racing with this route failure.
+        // `fetch_or` keeps a timeout flag set concurrently by another thread.
         self.state
-            .fetch_or(DEADLINE_ROUTES_CANCELLED, Ordering::Relaxed);
+            .fetch_or(DEADLINE_ROUTES_CANCELED, Ordering::Relaxed);
     }
 
     pub(crate) fn was_triggered(&self) -> bool {
@@ -115,11 +110,9 @@ impl Deadline {
     }
 }
 
-/// Cooperative stop boundary for one route phase.
-///
-/// A phase yield does not mark the file as timed out: it merely forwards each
-/// route's complete incumbent to the next stage while the global soft budget
-/// still permits that stage to start.
+/// Cooperative stop boundary for one route phase. Reaching it does not mark
+/// the file as timed out: the route passes its complete incumbent to the next
+/// phase, which still starts if the soft deadline allows.
 pub(crate) struct RouteWindow<'a> {
     deadline: &'a Deadline,
     stop_after: Option<Duration>,
@@ -133,6 +126,8 @@ impl<'a> RouteWindow<'a> {
         }
     }
 
+    /// Window that closes after 4/5 of the remaining time, leaving the rest
+    /// for follow-up phases.
     pub(crate) fn reserving_follow_up(deadline: &'a Deadline) -> Self {
         let elapsed = deadline.started.elapsed();
         let initial_share = initial_bounded_phase_share(deadline.remaining());
@@ -156,18 +151,16 @@ impl<'a> RouteWindow<'a> {
         }
     }
 
-    /// Let an admitted dependent refinement finish within the file grace.
+    /// Hard stop that lets a dependent refinement, once started, run into the
+    /// file's grace period.
     pub(crate) fn hard_stop(&self) -> SearchStop<'_> {
         self.deadline.hard_stop()
     }
 }
 
-/// One concrete stop policy for the complete planner hierarchy.
-///
-/// Normal execution uses the deadline and window variants, which make direct
-/// calls and avoid virtual dispatch. The callback variant remains available
-/// for progress instrumentation and focused tests without multiplying the hot
-/// planner for every closure type.
+/// Stop policy passed through all planners: an enum rather than a generic
+/// closure, so each planner is compiled once and deadline checks stay direct
+/// calls.
 pub(crate) enum SearchStop<'a> {
     Deadline {
         deadline: &'a Deadline,
@@ -195,13 +188,12 @@ impl<'a> SearchStop<'a> {
         Self::Callback(callback)
     }
 
-    /// Whether an already-admitted route owns file-level grace for one small
-    /// deterministic finalization.
+    /// Whether a started route may use the file's grace period for one small,
+    /// deterministic finalization step.
     ///
-    /// Container schedulers give grace only to the child that owns the actual
-    /// file remainder. A route-window boundary and an earlier zero-grace child
-    /// must forward their incumbent immediately, otherwise many streams could
-    /// multiply what is intended to be one file-wide allowance.
+    /// Only the embedded stream that runs until the file's own deadline gets
+    /// grace (earlier streams have zero grace), so many streams cannot each take
+    /// the one file-wide allowance.
     pub(crate) fn permits_bounded_finalization(&self) -> bool {
         match self {
             Self::Deadline {
@@ -209,7 +201,7 @@ impl<'a> SearchStop<'a> {
                 stop_at_soft_deadline: false,
             } => {
                 !deadline.grace.is_zero()
-                    && deadline.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELLED == 0
+                    && deadline.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELED == 0
             }
             Self::Always => true,
             Self::Deadline { .. } | Self::Window { .. } | Self::Never | Self::Callback(_) => false,

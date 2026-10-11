@@ -34,7 +34,8 @@ fn oracle(plain: &[u8], literal: &[u8], distance: &[u8]) -> u64 {
     best
 }
 
-/// Quadratic edge enumeration retained as an independent tie-order oracle.
+/// Quadratic edge scan, kept as an independent oracle for `spell`'s tie order
+/// and budget charges.
 fn scanning_spell(
     seed: Token,
     plain: &[u8],
@@ -48,8 +49,6 @@ fn scanning_spell(
     if !(3..=258).contains(&n) || n != seed.decoded_len() || stop.reached() {
         return None;
     }
-    // Charge array preparation and every DP edge, including absent symbols,
-    // before starting an interval. A cutoff never exposes a partial spelling.
     budget.spend(3 * 259 + n * (n + 1) / 2)?;
     let mut matches = [None; 259];
     for (length, slot) in matches.iter_mut().enumerate().take(n + 1).skip(3) {
@@ -57,7 +56,6 @@ fn scanning_spell(
         *slot = match_price(token, literal, distance).map(|bits| (token, bits));
     }
     let mut costs = [INF; 259];
-    // 1 emits a literal, 3..=258 a canonical submatch, 259 the exact source.
     let mut choices = [0_u16; 259];
     costs[n] = 0;
     for start in (0..n).rev() {

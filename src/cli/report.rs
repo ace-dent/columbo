@@ -367,8 +367,7 @@ fn describe_byte_change(input_bytes: usize, output_bytes: usize) -> String {
     match input_bytes.cmp(&output_bytes) {
         std::cmp::Ordering::Greater => {
             let saved = input_bytes - output_bytes;
-            // CLI inputs are capped at 1 GiB. Widen before multiplying so
-            // scaling to basis points is also safe on 32-bit targets.
+            // Scale in u64: a 1 GiB input times 10,000 overflows 32-bit `usize`.
             let input = input_bytes as u64;
             let percentage_hundredths = (saved as u64 * 10_000 + input / 2) / input;
             format!(

@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Joint payload-code and code-length-repeat search under a fixed header tree.
+//! Joint search over payload code lengths and their run-length encoding, with
+//! the code-length code held fixed.
 //!
-//! A state records the next alphabet position, remaining Kraft capacity, and
-//! previous length. An edge emits one complete code-length instruction and
-//! charges both its header bits and the payload bits of the lengths it assigns.
-//! Literal/length and distance alphabets have separate capacities; an
-//! instruction may cross their boundary without resetting the previous length.
+//! A dynamic-programming state is (next symbol position, remaining Kraft
+//! capacity, previous length). Each edge emits one code-length symbol (a
+//! length 0-15 or a 16/17/18 run) and costs its header bits plus the payload
+//! bits of the lengths it assigns. The literal/length and distance codes have
+//! separate capacities; a run may cross between them without resetting the
+//! previous length.
 
 use super::header::{plan_for_advertised_lengths, token_bits};
 use super::model::{
@@ -18,9 +20,9 @@ use super::stop::SearchStop;
 const INF: u64 = u64::MAX / 4;
 const MAX_DEPTH: usize = 9;
 
-/// One budget shared by every block in a terminal pass. Charge preparation,
-/// dense-state scans, and candidate edges, including impossible edges. The
-/// fixed-alphabet header repricer runs at most once per successful block.
+/// Work budget shared by every block in a terminal pass. It charges
+/// preparation, dense-state scans and every candidate edge, including illegal
+/// ones; header repricing (once per successful block) is not charged.
 pub(crate) struct JointBudget {
     work_left: u64,
 }
@@ -51,7 +53,8 @@ fn filled<T: Clone>(size: usize, value: T) -> Option<Vec<T>> {
 struct Problem<'a> {
     frequencies: &'a [u32],
     split: usize,
-    /// Reserved distance positions are advertised as zero, never payload codes.
+    /// First reserved position (distance symbol 30, or the end). Reserved
+    /// positions always get length 0.
     reserved_from: usize,
     costs: &'a [u8; 19],
     max_depth: usize,
@@ -87,8 +90,8 @@ fn payload_suffix(
         if i < reserved_from {
             for &(length, units) in allowed {
                 let price = u64::from(frequencies[i]) * length as u64;
-                // Assign this length to every capacity where it fits. The
-                // shifted suffix rows avoid a per-capacity feasibility test.
+                // Offsetting the rows by `units` tries this length at every
+                // capacity where it fits.
                 for (best, &rest) in current[units..].iter_mut().zip(next) {
                     *best = (*best).min(rest + price);
                 }
@@ -98,9 +101,9 @@ fn payload_suffix(
     Some(costs)
 }
 
-/// Exact within the fixed-CL, complete-tree, depth-limited domain when the
-/// budget and stop permit completion. A cutoff returns only an already complete
-/// strict improvement, never an unfinished path or a claim of optimality.
+/// Find the cheapest complete, depth-limited code lengths and run-length
+/// encoding below `target` bits, with the code-length code fixed. The result
+/// is optimal in that domain unless the budget or stop cuts the search off.
 fn solve(
     problem: &Problem<'_>,
     mut target: u64,
@@ -126,8 +129,8 @@ fn solve(
     {
         return None;
     }
-    // A positive length must first appear as a direct CL symbol. Repeats
-    // cannot introduce a length absent from this fixed tree.
+    // Each nonzero length needs its own code-length symbol (16 only repeats
+    // one), so no length can exceed the deepest coded one.
     let depth = (1..=max_depth).rev().find(|&length| cl[length] > 0)?;
     let capacity = 1usize << depth;
     let previous_count = depth + 2;
@@ -138,8 +141,8 @@ fn solve(
         .filter(|&length| cl[length] > 0)
         .map(|length| (length, 1 << (depth - length)))
         .collect();
-    // Reserve an upper bound on preparation, allocations, and dense scans
-    // before allocating. In particular, impossible blocks also consume work.
+    // Charge an upper bound for preparation, allocation and dense scans
+    // before allocating, so blocks with no solution also use budget.
     let preparation = 3 * cells
         + (n + 2) * (capacity + 1) * (allowed.len() + 3)
         + n * (depth + 1 + 138 + previous_count * 4);
@@ -185,8 +188,8 @@ fn solve(
                 i + count <= reserved_from
             }
     };
-    // Independent exact suffix minima ignore each other's assignments. Their
-    // sum is an admissible lower bound, even when those assignments disagree.
+    // The payload and header suffix minima are computed independently and may
+    // assume different lengths; their sum is still a safe lower bound.
     let mut header = filled((n + 1) * previous_count, INF)?;
     header[n * previous_count..].fill(0);
     for i in (0..n).rev() {
@@ -225,8 +228,8 @@ fn solve(
     if payload_bound(0, capacity) + header[none] >= target {
         return None;
     }
-    // At depth nine the two tables plus suffix bounds occupy less than 24 MiB.
-    // Blocks reuse this allowance sequentially without per-block arenas.
+    // At depth 9 the two tables plus suffix bounds take less than 24 MiB,
+    // held for one block at a time.
     let mut cost = filled(cells, INF)?;
     let mut trace = filled(cells, u32::MAX)?;
     let start = capacity * previous_count + none;
@@ -283,8 +286,9 @@ fn solve(
                     let to = j * stride + next * previous_count + length;
                     if score < cost[to] {
                         cost[to] = score;
-                        // Position always advances, so predecessor traces are
-                        // final before they are used. Fewer than 2^21 cells.
+                        // Position always advances, so a predecessor's trace
+                        // is final before it is read. There are fewer than
+                        // 2^21 cells, so `from << 2` fits in a u32.
                         trace[to] = ((from as u32) << 2) | kind;
                         if j == n {
                             debug_assert_eq!(next, 0);
@@ -374,8 +378,8 @@ pub(crate) fn plan_joint_tree_rle(
     stop: &mut SearchStop<'_>,
 ) -> Option<DynamicPlan> {
     let parent = block.original_dynamic.as_ref()?;
-    // Always produce complete payload and CL trees, including two usable
-    // distance codes. Relaxed sources outside that domain keep their parent.
+    // The search produces only strictly compatible codes. Sources outside
+    // that domain (possible in relaxed mode) keep their original header.
     if !parent.has_strictly_compatible_huffman_codes() || stop.reached() {
         return None;
     }
@@ -414,8 +418,8 @@ pub(crate) fn plan_joint_tree_rle(
     if !plan.has_strictly_compatible_huffman_codes() {
         return None;
     }
-    // Reprice this complete joint winner with the existing header feedback.
-    // Preserve the advertised spans, and retain the fixed-CL winner separately.
+    // Reprice the winning lengths with the general header optimizer, which
+    // keeps HLIT and HDIST but may change the code-length code.
     if !stop.reached() {
         let payload = token_bits(&block.tokens, &plan.literal_lengths, &plan.distance_lengths)?;
         if let Some(repriced) =

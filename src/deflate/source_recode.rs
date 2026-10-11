@@ -1,20 +1,17 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Source-ordered block recoding and candidate optimization.
+//! Source-order block recoding and merging, derived from deft4j (M1).
 //!
-//! deft4j does not rank a generic beam of promising token streams. It walks a
-//! named, insertion-ordered graph of block objects carrying both tokens and
-//! data-code tables, then feeds optimized objects into a greedy left-to-right
-//! merge pass. Keeping that route isolated makes its ordering and tie rules
-//! visible instead of hiding them inside the broader Columbo search.
+//! deft4j walks an insertion-ordered graph of block states (tokens and Huffman
+//! code lengths) rather than ranking a beam, then merges the optimized blocks
+//! greedily from left to right. The route stays separate from the main search
+//! so its order and tie rules stay visible.
 //!
-//! This is deliberately labelled deft4j-derived rather than exact parity.
-//! Columbo adds structural state de-duplication, safety budgets, deadlines, an
-//! alternate table seed, a legacy two-leaf distance rebuild, corrected
-//! empty-block traversal, and corrected alignment accounting. The recovered
-//! deft4j operations and their order stay visible inside those Columbo
-//! safeguards.
+//! Columbo adds state deduplication, memory and work budgets, deadlines, a
+//! second seed from the best plan's code lengths, the two-leaf distance-code
+//! rebuild of deft4j's C implementation, and fixes to empty-block traversal
+//! and alignment accounting; deft4j's operations keep their order.
 
 use std::array;
 use std::collections::HashMap;
@@ -37,10 +34,8 @@ use super::stop::SearchStop;
 
 type StateId = usize;
 
-/// The parsed stream already owns up to `MAX_PARSED_MODEL_BYTES`. This
-/// deft4j-derived route shares that source model but can materialize expanded
-/// token states and merged payloads. Columbo keeps every additional live
-/// payload under one ceiling so many blocks cannot multiply memory use.
+/// One memory limit for all of this route's own allocations (states and merged
+/// blocks), so many blocks cannot multiply memory use.
 const MAX_SOURCE_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
 const MAX_SOURCE_ARENA_BYTES: usize = MAX_SOURCE_ROUTE_BYTES;
 const SOURCE_STATE_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -49,12 +44,9 @@ fn token_payload_bytes(token_count: usize) -> Option<usize> {
     token_count.checked_mul(size_of::<Token>())
 }
 
-/// Additional memory retained by one bounded deft4j source-list candidate.
-///
-/// The parser's source buffers are deliberately not charged again: source
-/// blocks share those `Arc`s. Expanded token vectors and merged token/plain
-/// buffers are charged before allocation and remain charged until the owning
-/// working block is replaced or discarded.
+/// Tracks memory held beyond the parser's shared buffers. Buffers are charged
+/// before allocation and released when their working block is replaced or
+/// dropped.
 struct SourceRouteBudget {
     limit_bytes: usize,
     live_bytes: usize,
@@ -156,9 +148,6 @@ enum LeastFamilyMemo {
 
 struct RecodeState {
     tokens: Arc<Vec<Token>>,
-    /// Content hash shared by every table-only state for this token vector.
-    /// Keeping it beside the `Arc` avoids hashing a 16K-token image block for
-    /// every recode edge in the deft4j queue.
     token_hash: u64,
     literal_lengths: [u8; 286],
     distance_lengths: [u8; 30],
@@ -168,25 +157,17 @@ struct RecodeState {
     depth: usize,
     scores: [ScoreMemo; 2],
     transforms: [Option<TransformMemo>; 5],
-    /// Both least-family selectors use the same per-match costs and counts.
-    /// Cache their choices together so asking for the second route does not
-    /// rescan the complete decoded block under the same Huffman tables.
+    /// Both least-family selectors share one scan of the block.
     least_families: LeastFamilyMemo,
 }
 
 #[derive(Clone, Copy)]
 enum TokenPayloadCharge {
-    /// The token allocation is already owned by the parser or another state.
     Shared,
-    /// This state retains a newly expanded token allocation in the arena.
     NewlyAllocated,
 }
 
-/// Fully computed state waiting to enter the memoized deft4j queue.
-///
-/// Named fields make the two `u64` values and four Huffman arrays unambiguous
-/// at call sites. Callers still supply already-computed statistics so insertion
-/// never rescans a potentially large token vector.
+/// A precomputed state, so [`SourceStateQueue::push`] never rescans tokens.
 struct PendingState {
     tokens: Arc<Vec<Token>>,
     token_hash: u64,
@@ -199,17 +180,15 @@ struct PendingState {
     token_payload_charge: TokenPayloadCharge,
 }
 
-/// Columbo's memoized execution queue for deft4j's ordered candidate graph.
+/// Memoized, insertion-ordered queue of states for deft4j's candidate graph.
 ///
-/// deft4j beta-17's key objects retain `Object`'s identity-based equality and
-/// hashing, while `LinkedHashMap` preserves their insertion order. Columbo
-/// hashes equivalent token/table content to avoid duplicate work while
-/// preserving first-insertion order.
+/// deft4j beta-17 keys its `LinkedHashMap` by object identity. Columbo merges
+/// states with equal tokens and code lengths, keeping the position of the
+/// first insertion.
 struct SourceStateQueue {
     states: Vec<RecodeState>,
-    /// A hash maps to the first state with that fingerprint. A vanishingly
-    /// unlikely collision falls back to a full scan, retaining correctness
-    /// without allocating a second `Vec` for every hash bucket.
+    /// Maps a hash to the first state with that hash; `push` scans all states
+    /// on a collision.
     first_by_hash: HashMap<u64, StateId>,
     accounted_bytes: usize,
     limit_bytes: usize,
@@ -253,8 +232,6 @@ impl SourceStateQueue {
             ) {
                 return Some(candidate);
             }
-            // Preserve correctness under a real hash collision. The normal
-            // path examines one state; only colliding fingerprints scan all.
             if let Some(index) = self.states.iter().position(|state| {
                 state_matches(state, &tokens, &literal_lengths, &distance_lengths)
             }) {
@@ -266,10 +243,8 @@ impl SourceStateQueue {
             TokenPayloadCharge::Shared => 0,
             TokenPayloadCharge::NewlyAllocated => tokens.len().checked_mul(size_of::<Token>())?,
         };
-        // Bound the queue by its actual arena bytes rather than an arbitrary
-        // state count. This permits long pruned fixed points when Max has time,
-        // while retaining an explicit peak-memory ceiling. Charge hash-table
-        // overhead conservatively along with each inline state and payload.
+        // Limit the queue by bytes rather than state count, so Max can run
+        // long pruning chains with bounded peak memory.
         let index_bytes = size_of::<(u64, StateId)>().checked_mul(4)?;
         let added = size_of::<RecodeState>()
             .checked_add(index_bytes)?
@@ -381,9 +356,8 @@ impl SourceStateQueue {
             return Some(result);
         }
 
-        // The least-family route will need a byte-per-token mark vector and a
-        // new queued state. Bail out before its full decoded-data scan when the
-        // remaining arena cannot hold even those fixed costs.
+        // Give up before scanning if the queue cannot hold a new state and a
+        // one-byte-per-token mark vector.
         let expansion_budget = self
             .remaining_bytes()
             .checked_sub(size_of::<RecodeState>())?;
@@ -399,9 +373,8 @@ impl SourceStateQueue {
                     &state.literal_lengths,
                     &state.distance_lengths,
                 )
-                // The old single-selector helper treated an inconsistent
-                // internal token/plain pair as "no family". Retain that safe
-                // no-op behavior while caching the result for both selectors.
+                // Inconsistent tokens and decoded bytes mean "no family", so
+                // both transforms become no-ops.
                 .unwrap_or(LeastFamilyChoices {
                     least_expensive: None,
                     least_seen: None,
@@ -432,10 +405,6 @@ impl SourceStateQueue {
             }
             return Some(memo);
         };
-        // `expand_where` temporarily owns both its byte-per-token mark vector
-        // and the expanded token payload. Leave room for the queued state's
-        // inline metadata as well, so rejection happens before either large
-        // allocation rather than after `push` observes the arena limit.
         let state = &self.states[source];
         let expanded = expand_where(
             &state.tokens,
@@ -463,9 +432,8 @@ impl SourceStateQueue {
         };
         self.states[source].transforms[kind.index()] = Some(memo);
         if choices.least_expensive == choices.least_seen {
-            // Identical family choices have identical token output and retain
-            // the same data-code tables. Share the queued state as well as the
-            // analysis without changing which named route is visited first.
+            // Both selectors chose the same length symbol; visit order is
+            // unchanged.
             self.states[source].transforms[other_kind.index()] = Some(memo);
         }
         Some(memo)
@@ -533,9 +501,7 @@ impl SourceStateQueue {
                 TokenPayloadCharge::Shared,
             )
         };
-        // The transform decision is fully represented by `tokens` now. Drop
-        // the byte-per-token marks before building deft4j tables or inserting
-        // the state so they do not overlap those later allocations.
+        // Free the marks so they do not overlap the next allocations.
         drop(marks);
         let (literal_lengths, distance_lengths) = if rebuild_source_lengths {
             source_recode_lengths(&literal_frequencies, &distance_frequencies)?
@@ -563,10 +529,9 @@ impl SourceStateQueue {
     }
 }
 
+/// Hash of a state's tokens and code lengths, used only to find a candidate
+/// state; `state_matches` compares everything before reuse.
 fn state_hash(token_hash: u64, literal_lengths: &[u8; 286], distance_lengths: &[u8; 30]) -> u64 {
-    // This fingerprint only selects a candidate state. `state_matches` verifies
-    // both complete alphabets and every token before the queue reuses it, so a
-    // keyed, cryptographic-strength hasher adds cost without adding safety.
     let mut fingerprint = SOURCE_STATE_FINGERPRINT_OFFSET;
     mix_state_fingerprint(&mut fingerprint, token_hash);
     mix_length_fingerprint(&mut fingerprint, literal_lengths);
@@ -653,12 +618,11 @@ fn state_matches(
         && (Arc::ptr_eq(&state.tokens, tokens) || state.tokens.as_slice() == tokens.as_slice())
 }
 
-/// Build Columbo's deft4j-derived payload trees.
+/// Build code lengths with deft4j's `HuffmanTree`/`PriorityQueue` builder.
 ///
-/// Both alphabets use the recovered `HuffmanTree`/`PriorityQueue` path. The
-/// beta-17 payload caller bypasses that path for zero or one used distance
-/// symbol; retaining the original Columbo C implementation's two-leaf spelling
-/// is a deliberate size-preserving extension rather than deft4j parity.
+/// deft4j beta-17 bypasses the builder when zero or one distance symbol is
+/// used; Columbo keeps the builder's two-leaf result, as deft4j's C
+/// implementation did (a size-preserving extension).
 fn source_recode_lengths(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
@@ -672,8 +636,8 @@ fn source_recode_lengths(
     let mut distance_lengths = [0_u8; 30];
     literal_lengths.copy_from_slice(&literal);
     distance_lengths.copy_from_slice(&distance);
-    // Frequencies produced by the parser already include EOB. Keep the guard
-    // explicit because queue states are also constructed from transformations.
+    // Parser frequencies always include end-of-block, but queue states are
+    // also built by transforms, so keep the guard.
     if literal_lengths[256] == 0 {
         literal_lengths[256] = 1;
     }
@@ -818,8 +782,8 @@ fn expand_where(
     should_expand: impl Fn(Token) -> bool,
     max_additional_bytes: usize,
 ) -> Option<ExpandedState> {
-    // The mark vector stays live while `expand_marked` allocates its output.
-    // Debit it first so their combined peak remains within the caller's arena.
+    // The marks stay allocated while `expand_marked` runs, so charge them
+    // first.
     if tokens.len() > max_additional_bytes {
         return None;
     }
@@ -1186,8 +1150,8 @@ fn plan_source_block_once(
         }
     }
 
-    // Both deft4j and Defluff price a fixed block after expanding every match
-    // that is strictly dearer than its decoded literals in the fixed table.
+    // Like deft4j and Defluff, also price a fixed block after replacing every
+    // match that costs more than its literals under the fixed code.
     if block.source_type != SourceBlockType::Stored {
         let (fixed_literal, fixed_distance) = fixed_lengths();
         if let Some(marks) = mark_cost_expansions(
@@ -1225,9 +1189,8 @@ fn plan_source_block_once(
         SourceBlockType::Fixed | SourceBlockType::Dynamic
     ) && !stop.reached()
     {
-        // A fixed-strict winner above remains alive while the deft4j state
-        // queue runs. Reserve its payload from the queue's arena so both cannot
-        // each consume the full remaining route budget at the same time.
+        // An expanded fixed-block winner stays allocated while the queue runs,
+        // so subtract its tokens from the queue's limit.
         let retained_best_bytes = if Arc::ptr_eq(&best.plan.tokens, &block.tokens) {
             0
         } else {
@@ -1246,9 +1209,6 @@ fn plan_source_block_once(
             source_recode_lengths(&block.literal_frequencies, &block.distance_frequencies)
         };
         if let Some((literal_lengths, distance_lengths)) = seed {
-            // Both ordered seeds keep the source token stream. Hash it once;
-            // the queue still compares token contents on a hash collision.
-            // Their token extra-bit total is likewise identical.
             let source_token_hash = token_hash(&block.tokens);
             let source_extra_bits = token_extra_bits(&block.tokens);
             let mut pipeline = SourceRecodePipeline {
@@ -1269,14 +1229,10 @@ fn plan_source_block_once(
             }) {
                 pipeline.run_ordered(base, &mut best, stop);
 
-                // The source table and deft4j recodes form the source-derived
-                // path. Columbo's no-split sibling also keeps the original
-                // token stream and starts the same ordered graph from the
-                // independently best completed table. This is a genuinely
-                // different state: using the winning tokens here would merely
-                // repeat the fixed-point adoption performed by `WorkingBlock`.
-                // Reuse this queue so shared states are deduplicated rather
-                // than rescanning them in a second complete route.
+                // Columbo addition: rerun the ordered graph on the source
+                // tokens, seeded with the best plan's code lengths. (Winning
+                // tokens would only repeat `WorkingBlock`'s fixed-point
+                // adoption.)
                 if !stop.reached() && !pipeline.queue.saturated {
                     if let Some((alternate_literal, alternate_distance)) =
                         alternate_seed_lengths(&best.plan, &literal_lengths, &distance_lengths)
@@ -1361,14 +1317,8 @@ fn initial_plan(block: &ParsedBlock, alignment: u8, options: &Options) -> Planne
     }
 }
 
-/// Return a valid spelling of the block's current object without running any
-/// match-expansion or header-search work.
-///
-/// This is used only to finish a source-route candidate after its deadline.
-/// Original bits are preferred whenever they remain safe for alignment and
-/// compatibility. An adopted dynamic object already owns its completed header;
-/// otherwise a fixed spelling is the cheap universal fallback for Huffman
-/// tokens.
+/// Plan the block as it stands, without match expansion or header search, to
+/// finish a source-route candidate after its deadline.
 fn cheap_current_plan(
     block: &ParsedBlock,
     alignment: u8,
@@ -1442,9 +1392,7 @@ fn fixed_lengths() -> ([u8; 286], [u8; 30]) {
 struct WorkingBlock {
     block: ParsedBlock,
     plans: [Option<PlannedBlock>; 8],
-    /// deft4j-route allocations owned by this block. Source `Arc`s are shared
-    /// with the parser and therefore start at zero; transformed tokens and
-    /// merged payloads are charged here until this block is dropped/replaced.
+    /// Zero while the tokens are shared with the parser.
     token_payload_bytes: usize,
     other_model_bytes: usize,
 }
@@ -1500,9 +1448,8 @@ impl WorkingBlock {
                 0
             };
             if replaces_tokens {
-                // The old and new token buffers coexist until adoption. Charge
-                // the new allocation first, then release the old one only after
-                // every cache/reference owned by this block has been dropped.
+                // Old and new tokens coexist until adoption; release the old
+                // buffer only after this block drops every reference to it.
                 budget.reserve(new_token_bytes)?;
             }
             if adopt_plan(&mut self.block, &outcome.plan, replaces_tokens).is_none() {
@@ -1517,8 +1464,8 @@ impl WorkingBlock {
                 self.token_payload_bytes = new_token_bytes;
             }
             if stop.reached() {
-                // The adopted plan is complete and remains a valid emission
-                // candidate even though another fixed-point pass cannot start.
+                // The adopted plan is complete and can be emitted; only the
+                // next fixed-point pass is skipped.
                 self.plans[slot] = Some(outcome.plan);
                 return Some(bits);
             }
@@ -1534,10 +1481,6 @@ impl WorkingBlock {
     ) -> Option<PlannedBlock> {
         let slot = usize::from(alignment & 7);
         if self.plans[slot].is_none() && stop.reached() {
-            // An untouched tail must not run fixed-strict expansion after the
-            // deadline. Emit the current block object faithfully instead; this
-            // keeps all earlier source-route wins without another
-            // full model scan.
             return cheap_current_plan(&self.block, alignment, options);
         }
         self.plan(alignment, options, budget, stop)?;
@@ -1551,9 +1494,6 @@ fn adopt_plan(block: &mut ParsedBlock, plan: &PlannedBlock, replaces_tokens: boo
         block.tokens = Arc::clone(&plan.tokens);
         block.recount_frequencies();
     }
-    // Representation-only fixed-point wins retain the exact payload buffers,
-    // so their already-counted frequencies remain valid. Avoid rescanning the
-    // block or cycling either Arc's reference count on every such adoption.
     if !Arc::ptr_eq(&block.plain, &plan.plain) {
         block.plain = Arc::clone(&plan.plain);
     }
@@ -1583,11 +1523,8 @@ fn adopt_plan(block: &mut ParsedBlock, plan: &PlannedBlock, replaces_tokens: boo
     Some(())
 }
 
-/// Produce Columbo's bounded source-ordered deft4j candidate list.
-///
-/// The returned blocks are ready for emission in order. A deadline may leave a
-/// valid partially explored list, while allocation failure abandons this
-/// optional route and leaves the caller's complete fallback untouched.
+/// Run the deft4j-derived source-order route (M1). After a deadline the result
+/// is valid but only partly optimized; on allocation failure it returns `None`.
 pub(crate) fn plan_source_blocks(
     source: &[ParsedBlock],
     start_alignment: u8,
@@ -1603,14 +1540,8 @@ pub(crate) fn plan_source_blocks(
     )
 }
 
-/// Optimize one source block with the bounded deft4j-derived candidate graph,
-/// without attempting stream-level adjacent merges.
-///
-/// The direct no-split route uses this completed object as an additive seed
-/// for its table-feedback ladder. Keeping the helper here reuses the deft4j
-/// queue's state cache without invoking the source-list route's separate
-/// fixed-point adoption or reimplementing the deft4j graph in the stream
-/// planner.
+/// Optimize one block with the deft4j-derived candidate graph, without merging
+/// or fixed-point adoption; M2 uses it as an extra seed.
 pub(crate) fn plan_source_block(
     source: &ParsedBlock,
     alignment: u8,
@@ -1628,19 +1559,16 @@ fn plan_source_blocks_with_budget(
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let mut budget = SourceRouteBudget::new(budget_bytes.min(MAX_SOURCE_ROUTE_BYTES));
-    // Once source-list admission is no longer capped at an arbitrary block
-    // count, charge the shallow working copies themselves. Their shared token
-    // and plain payloads remain owned by the parser; inline block metadata and
-    // the small cloned dynamic/split vectors are route-local.
+    // There is no block-count limit, so charge the shallow working copies.
     budget.reserve(prepared_source_blocks_bytes(source)?)?;
     let mut blocks = prepare_source_blocks(source)?;
     if blocks.is_empty() {
         return None;
     }
 
-    // deft4j first optimizes every list member in source order. Columbo
-    // deliberately recomputes the true alignment after every chosen block,
-    // correcting beta-17's repeated-pass position-accounting quirk.
+    // Like deft4j, first optimize every block in source order. Recompute the
+    // true alignment after each block, fixing beta-17's bit-position
+    // accounting across repeated passes.
     let mut alignment = start_alignment & 7;
     for block in blocks.iter_mut().flatten() {
         if stop.reached() {
@@ -1650,10 +1578,8 @@ fn plan_source_blocks_with_budget(
         alignment = ((u64::from(alignment) + bits) & 7) as u8;
     }
 
-    // deft4j's `mergeBlocks()` is deliberately greedy. Keep the accepted left
-    // block in place and retire its right neighbour without shifting the tail.
-    // The right cursor visits each source slot once; the final walk skips the
-    // retired slots. This preserves merge order with linear list maintenance.
+    // Greedy left-to-right merge, as in deft4j's `mergeBlocks()`. The right
+    // slot of a merge becomes `None`, so the tail never shifts.
     alignment = start_alignment & 7;
     let mut index = 0;
     let mut next = 1;
@@ -1661,26 +1587,26 @@ fn plan_source_blocks_with_budget(
     while next < blocks.len() && !stop.reached() {
         let (prefix, tail) = blocks.split_at_mut(next);
         let current = prefix[index].as_mut()?;
-        let neighbour = tail[0].as_mut()?;
+        let neighbor = tail[0].as_mut()?;
         let current_bits = current.plan(alignment, options, &mut budget, stop)?;
         let next_alignment = ((u64::from(alignment) + current_bits) & 7) as u8;
-        let next_bits = neighbour.plan(next_alignment, options, &mut budget, stop)?;
+        let next_bits = neighbor.plan(next_alignment, options, &mut budget, stop)?;
 
         let left_type = current.block.source_type;
-        let right_type = neighbour.block.source_type;
+        let right_type = neighbor.block.source_type;
         let huffman_merge = is_huffman(left_type) && is_huffman(right_type);
         let stored_merge = left_type == SourceBlockType::Stored
             && current
                 .block
                 .plain
                 .len()
-                .checked_add(neighbour.block.plain.len())
+                .checked_add(neighbor.block.plain.len())
                 .is_some_and(|length| length <= 65_535);
 
         if huffman_merge || stored_merge {
             if let Some(merged) = merge_blocks(
                 &current.block,
-                &neighbour.block,
+                &neighbor.block,
                 if stored_merge {
                     SourceBlockType::Stored
                 } else {
@@ -1698,7 +1624,7 @@ fn plan_source_blocks_with_budget(
                 if merged_bits < current_bits.checked_add(next_bits)? {
                     let replaced_bytes = current
                         .accounted_bytes()?
-                        .checked_add(neighbour.accounted_bytes()?)?;
+                        .checked_add(neighbor.accounted_bytes()?)?;
                     *current = merged;
                     tail[0] = None;
                     budget.release(replaced_bytes)?;
@@ -1729,9 +1655,9 @@ fn plan_source_blocks_with_budget(
 }
 
 fn prepare_source_blocks(source: &[ParsedBlock]) -> Option<Vec<Option<WorkingBlock>>> {
-    // Columbo removes every redundant empty block while retaining one legal
-    // block for an all-empty stream. beta-17 intends this behavior but its
-    // cleared linked-list successor stops each source walk after one removal.
+    // Drop every empty block, but keep one if the stream is entirely empty.
+    // deft4j beta-17 intends the same, but clearing the linked-list successor
+    // stops each of its walks after one removal.
     let nonempty = source
         .iter()
         .filter(|block| !block.plain.is_empty())
@@ -1831,9 +1757,8 @@ fn merge_blocks(
     }
     let other_model_bytes = accounted_bytes.checked_sub(token_payload_bytes)?;
 
-    // Every size and route-budget check is complete before the payload
-    // allocations. A rejected merge therefore cannot briefly exceed the live
-    // deft4j-route ceiling while its two input blocks are still resident.
+    // All size and budget checks come first, so a rejected merge never
+    // exceeds the route limit while both inputs are still allocated.
     let mut tokens = Vec::new();
     tokens.try_reserve_exact(token_count).ok()?;
     tokens.extend_from_slice(&left.tokens);

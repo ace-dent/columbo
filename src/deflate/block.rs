@@ -19,21 +19,15 @@ use super::model::{
 };
 use super::stop::SearchStop;
 
-/// Route-local ceiling for completed canonical Huffman kernels.
-///
-/// Token vectors are reference-counted rather than copied, but retaining a
-/// transformed route solely as a cache key can otherwise extend its lifetime
-/// indefinitely. Both limits are conservative charges: repeated `Arc`s count
-/// their full token bytes again, keeping peak memory bounded without a second
-/// allocation-identity table.
+/// Per-route limits for [`CanonicalPlanCache`]. Keys hold `Arc` token buffers,
+/// so the byte limit bounds memory kept alive for discarded candidates; entries
+/// sharing one `Arc` are each charged in full.
 const MAX_CANONICAL_PLAN_CACHE_ENTRIES: usize = 512;
 const MAX_CANONICAL_PLAN_CACHE_TOKEN_BYTES: usize = 16 * 1024 * 1024;
 
-/// Return original block bits that remain safe at the requested alignment.
-///
-/// This answers only wire-format and compatibility questions, not whether the
-/// original is the cheapest representation. Stored blocks contain alignment
-/// padding, while strict dynamic originals must use complete Huffman codes.
+/// Return the original block's bit range if it can be copied verbatim at
+/// `alignment` (validity only, not cost). A stored block's padding depends on
+/// its alignment.
 pub(crate) fn reusable_original_bits(
     block: &ParsedBlock,
     alignment: u8,
@@ -68,12 +62,8 @@ pub(crate) fn plan_block(
     }
 }
 
-/// Price an owned candidate without cloning its potentially large token and
-/// decoded-byte vectors into the returned plan.
-///
-/// Structural search builds those vectors with fallible allocation. Moving
-/// them here preserves that safety boundary; the ordinary borrowed planner
-/// above remains convenient for persistent parsed blocks.
+/// Like [`plan_block`], but moves the block's token and decoded-byte buffers
+/// into the plan instead of cloning their `Arc`s.
 pub(crate) fn plan_owned_block(
     block: ParsedBlock,
     alignment: u8,
@@ -90,13 +80,11 @@ pub(crate) fn plan_owned_block(
     }
 }
 
-/// Best generated fixed or dynamic representation for one token set.
+/// Cheapest fixed or dynamic representation of one token sequence.
 ///
-/// Huffman payload and header costs do not depend on the block's starting bit
-/// alignment. Stream boundary search can therefore build this comparatively
-/// expensive part once, then compare it with the eight cheap stored-padding
-/// and exact-source possibilities. Exact source ranges deliberately remain
-/// outside this kernel because they refer to one particular compressed input.
+/// Its cost does not depend on the block's bit alignment, so boundary search
+/// computes it once and compares it with the stored and original-copy costs at
+/// each alignment.
 pub(crate) struct ReusableBlockPlan {
     representation: Representation,
     bits: u64,
@@ -110,7 +98,7 @@ impl ReusableBlockPlan {
         })
     }
 
-    /// Return the cheapest aligned bit count without cloning the block.
+    /// Return the cheapest bit count at `alignment` without cloning the plan.
     pub(crate) fn bits_at_alignment(
         &self,
         plain_len: usize,
@@ -124,11 +112,11 @@ impl ReusableBlockPlan {
         bits
     }
 
-    /// Select one aligned representation while retaining this reusable kernel.
+    /// Select the cheapest representation at `alignment`, keeping `self` for
+    /// reuse.
     ///
-    /// A dynamic-table clone is optional work. If allocation fails, retain the
-    /// cheapest allocation-free stored or exact-original representation rather
-    /// than discarding the complete boundary-DP edge.
+    /// If cloning the dynamic plan fails, fall back to the cheaper of stored
+    /// and original copy so the boundary-search edge survives.
     pub(crate) fn at_alignment(
         &self,
         plain_len: usize,
@@ -147,8 +135,7 @@ impl ReusableBlockPlan {
             return (representation, self.bits);
         }
 
-        // The reusable dynamic table could not be copied. Exact source bits
-        // remain preferable to stored bytes on an equal-bit fallback.
+        // The original copy wins a tie with stored.
         if let Some(original) = original.filter(|original| original.len <= stored_bits) {
             (Representation::Original(original), original.len)
         } else {
@@ -172,7 +159,6 @@ impl ReusableBlockPlan {
     }
 }
 
-/// Price the alignment-independent representation kernel for one block.
 pub(crate) fn plan_reusable_block(
     block: &ParsedBlock,
     options: &Options,
@@ -216,11 +202,7 @@ pub(crate) fn plan_reusable_block_with_header_cache(
     }
 }
 
-/// Observability for the route-local canonical plan cache.
-///
-/// These counters are intentionally internal. They let route tests and future
-/// verbose reporting distinguish genuine sharing from a cache that merely
-/// preserves output while never finding an identical state.
+/// Counters for [`CanonicalPlanCache`], read by tests to confirm real hits.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CanonicalPlanCacheStats {
     pub(crate) lookups: usize,
@@ -244,12 +226,9 @@ struct CachedReusablePlan {
     plan: ReusableBlockPlan,
 }
 
-/// Completed canonical fixed/dynamic/header work shared by one planning run.
-///
-/// Hashes only select a short collision chain. Every hit verifies the complete
-/// token spelling, frequencies, source-tree seed and planning policy before a
-/// cached kernel is reused. Deadline-sensitive callers may look up an earlier
-/// completed entry, but only the explicit complete-planning API inserts.
+/// Completed [`ReusableBlockPlan`]s shared within one planning run. Callers
+/// under a deadline may look up entries, but only
+/// [`Self::plan_reusable_complete`], which plans without a stop, inserts them.
 pub(crate) struct CanonicalPlanCache {
     first_by_hash: HashMap<u64, usize>,
     entries: Vec<CachedReusablePlan>,
@@ -277,7 +256,6 @@ impl CanonicalPlanCache {
         }
     }
 
-    /// Return an exactly matching completed kernel without starting new work.
     pub(crate) fn lookup_reusable(
         &mut self,
         block: &ParsedBlock,
@@ -320,7 +298,7 @@ impl CanonicalPlanCache {
         None
     }
 
-    /// Complete deterministic planning and retain its reusable kernel.
+    /// Return the cached plan, or plan without a stop and cache the result.
     pub(crate) fn plan_reusable_complete(
         &mut self,
         block: &ParsedBlock,
@@ -398,13 +376,9 @@ impl CanonicalPlanCache {
     }
 }
 
+/// FNV-1a-style hash of the tokens and options that only selects a collision
+/// chain; lookups compare every field, so a collision cannot cause a false hit.
 fn canonical_plan_fingerprint(block: &ParsedBlock, options: &Options) -> u64 {
-    // This is a bounded cache-bucket accelerator, never an identity proof.
-    // Exact token, frequency, source-tree, and policy comparisons follow every
-    // bucket hit. Hash the canonical token state directly instead of running a
-    // cryptographic-strength SipHash over the tokens and then over both derived
-    // frequency arrays. Omitting the source-tree seed may lengthen a rare
-    // collision chain, but cannot produce a false cache hit.
     let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
     mix_plan_fingerprint(&mut fingerprint, block.tokens.len() as u64);
     for &token in block.tokens.iter() {
@@ -454,7 +428,6 @@ fn mix_plan_fingerprint(fingerprint: &mut u64, value: u64) {
     *fingerprint ^= *fingerprint >> 32;
 }
 
-/// Plan one block through a completed route-local canonical kernel.
 pub(crate) fn plan_block_cached(
     block: &ParsedBlock,
     alignment: u8,
@@ -475,7 +448,6 @@ pub(crate) fn plan_block_cached(
     }
 }
 
-/// Instantiate a cached kernel if a prior deterministic route completed it.
 pub(crate) fn lookup_block_cached(
     block: &ParsedBlock,
     alignment: u8,
@@ -512,9 +484,8 @@ fn select_aligned_representation(
     huffman_bits: u64,
 ) -> (Representation, u64) {
     let stored_bits = stored_block_bits(alignment, plain_len);
-    // Rewritten candidates intentionally use the original Columbo C tie order:
-    // stored before fixed before dynamic. A usable exact-original candidate is
-    // considered afterward and wins an equal-bit tie, avoiding pointless churn.
+    // Tie order: stored, fixed, then dynamic (as in Columbo's C
+    // implementation). A reusable original block wins any tie.
     let (mut representation, mut bits) = if stored_bits <= huffman_bits {
         (Representation::Stored, stored_bits)
     } else {
@@ -570,8 +541,8 @@ pub(crate) fn emit_block(
     match &block.representation {
         Representation::Original(original) => {
             writer.write(u32::from(final_block), 1)?;
-            // BFINAL is the only bit whose meaning depends on the new stream
-            // layout. Everything after it can be copied verbatim.
+            // Only BFINAL depends on the new stream layout; copy the rest
+            // verbatim.
             let copied_start = original
                 .start
                 .checked_add(1)

@@ -23,9 +23,9 @@ fn literal_block(bytes: &[u8], source_type: SourceBlockType) -> ParsedBlock {
 }
 
 fn costly_match_block() -> ParsedBlock {
-    // Under fixed tables this length-three, longest-family distance match
-    // costs one bit more than spelling its three decoded `a` bytes. It is a
-    // compact fixture for proving whether fixed-strict expansion ran.
+    // Under the fixed code, this length-3 match with distance symbol 29 costs
+    // one bit more than its three literal `a` bytes, so it shows whether
+    // fixed-code match expansion ran.
     let tokens = vec![Token::Match {
         length: 3,
         distance: 24_577,
@@ -109,7 +109,7 @@ fn accepted_merge_retries_the_same_index() {
     assert_eq!(
         plans.len(),
         1,
-        "the accepted pair must absorb its third neighbour"
+        "the accepted pair must absorb its third neighbor"
     );
     assert_eq!(plans[0].plain.len(), 24);
 }
@@ -167,8 +167,8 @@ fn retired_merge_slots_preserve_order_alignment_and_the_unvisited_tail() {
                 at = ((u64::from(at) + plan.bits) & 7) as u8;
             }
             if cutoff == usize::MAX {
-                // Accept the first pair, reject its oversized neighbour,
-                // accept a later pair, then retain the final untouched block.
+                // Accept the first pair, reject its oversized neighbor, accept
+                // a later pair, then keep the final untouched block.
                 assert_eq!(
                     plans
                         .iter()
@@ -231,9 +231,9 @@ fn cumulative_budget_limits_retained_expansions_across_blocks() {
     let blocks = [costly_match_block(), costly_match_block()];
     let working_bytes = prepared_source_blocks_bytes(&blocks).unwrap();
     // One three-token expansion plus its temporary one-byte mark fits. Once
-    // retained, only that mark byte remains and the second block cannot
-    // allocate another expanded token vector. The route-local working-block
-    // metadata is now charged independently of transformed payloads.
+    // it is kept, only the mark byte remains and the second block cannot
+    // allocate another expanded token vector. Working-block metadata is
+    // charged separately from transformed tokens.
     let budget_bytes = working_bytes + token_payload_bytes(3).unwrap() + 1;
     let mut never = SearchStop::never();
     let plans =
@@ -380,11 +380,10 @@ fn queue_identity_keeps_shared_pointer_and_content_fallbacks() {
     let mut queue = SourceStateQueue::new(MAX_SOURCE_ARENA_BYTES);
     let first = push_fixed_state(&mut queue, Arc::clone(&block.tokens));
 
-    // The common table-only path shares the allocation. A separately
-    // allocated but equal token vector still exercises the collision-safe
-    // content fallback and must resolve to the same state. Duplicate
-    // detection happens before arena charging, even when the caller just
-    // allocated that equivalent payload.
+    // Table-only transforms share the token buffer. An equal token vector in
+    // a separate allocation must resolve to the same state by comparing
+    // contents. Duplicates are found before any bytes are charged, even when
+    // the caller has just allocated the copy.
     let shared = push_fixed_state(&mut queue, Arc::clone(&block.tokens));
     let accounted_before_duplicate = queue.accounted_bytes;
     let copied_tokens = Arc::new(block.tokens.as_ref().clone());
@@ -438,9 +437,9 @@ fn identical_least_family_routes_share_the_transformed_state() {
 
 #[test]
 fn distinct_least_family_choices_reuse_analysis_but_keep_route_order() {
-    // Family 257 appears twice and saves one fixed-table bit per match;
-    // family 258 appears once but is much dearer to expand. The two named
-    // selectors must therefore retain their distinct source-order choices.
+    // Length symbol 257 appears twice and saves one bit per match under the
+    // fixed code; symbol 258 appears once but costs much more to expand. The
+    // two selectors must therefore keep their different choices.
     let tokens = Arc::new(vec![
         match_token(3, 257, 29),
         match_token(3, 257, 29),

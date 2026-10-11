@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Ordered Deflate stream map.
+//! Deflate block maps printed in physical stream order.
 //!
-//! Optimizer workers update cached stream views and never write terminal
-//! control sequences. The reporting coordinator emits immutable cards as
-//! complete physical streams become available in order. This preserves
-//! readable scrollback without weakening multi-stream parallelism.
+//! Workers only update cached stream views. The report coordinator prints each
+//! stream's card once, after it and all earlier streams are complete.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -384,9 +382,8 @@ impl Renderer {
             self.reset();
             return;
         }
-        // Keep the width captured with the header. Earlier immutable cards may
-        // already be in scrollback, so resampling after a resize would make
-        // later cards visually inconsistent with the same file.
+        // Keep the width captured with the header: earlier cards may already be
+        // in scrollback, and resampling would make later cards inconsistent.
         let glyphs = Glyphs::for_unicode(self.unicode);
         let cards: Vec<_> = self
             .ordered_views()
@@ -702,7 +699,7 @@ fn aligned_output_layout(
 }
 
 /// Keep savings beside representative output blocks when the terminal is too
-/// narrow to preserve every source and output boundary simultaneously.
+/// narrow to show every source and output boundary.
 fn localized_output_layout(
     source: &BlockReport,
     output: &BlockReport,
@@ -752,12 +749,8 @@ fn localized_output_layout(
     })
 }
 
-/// Apportion source bits to output blocks by decoded overlap.
-///
-/// A changed plan can split, merge, or move Deflate boundaries. Mapping both
-/// reports through their shared decoded stream gives each output block a
-/// source-sized visual region, allowing savings to remain beside the data
-/// that produced them instead of collecting at the right edge.
+/// Apportion source bits to output blocks by decoded overlap, so savings stay
+/// beside the data that produced them even when block boundaries moved.
 fn source_bits_by_output_block(source: &BlockReport, output: &BlockReport) -> Option<Vec<u64>> {
     let source_ranges = decoded_ranges(source)?;
     let output_ranges = decoded_ranges(output)?;
@@ -956,12 +949,12 @@ enum VisualCell {
     Unknown,
 }
 
-/// Lay out complete, reasonably small block lists as explicit segments.
+/// Lay out a complete, small block list as explicit segments.
 ///
-/// Boundary markers consume their own columns, and every block receives at
-/// least one type cell. A one-cell block therefore remains visible instead of
-/// being replaced by its leading boundary. Very fragmented or truncated
-/// reports fall back to a dense representative layout below.
+/// Boundary markers take their own columns, and every block gets at least one
+/// cell, so a one-cell block is not hidden by its leading boundary. Returns
+/// `None` for a truncated report or blocks that do not fit; callers then use
+/// [`dense_cells`].
 fn segmented_cells(report: &BlockReport, width: usize, source: bool) -> Option<Vec<VisualCell>> {
     let widths = complete_segment_widths(report, width)?;
 
@@ -1012,11 +1005,10 @@ fn complete_segment_widths(report: &BlockReport, width: usize) -> Option<Vec<usi
     Some(widths)
 }
 
-/// Select a bounded schematic of a fragmented stream.
+/// Lay out a representative subset of a fragmented stream's blocks.
 ///
-/// Changed encodings and unusually small blocks are selected first, then the
-/// remaining cells are spread across the largest gaps. This makes the blocks
-/// most likely to disappear under midpoint sampling explicitly visible.
+/// The first and last blocks, blocks whose encoding changed, and the smallest
+/// blocks are selected first; the rest fill the midpoints of the largest gaps.
 fn dense_cells(report: &BlockReport, width: usize, source: bool) -> CellLayout {
     if width == 0 || report.blocks.is_empty() {
         return CellLayout {
@@ -1244,9 +1236,8 @@ fn scaled_columns(output_bits: u64, source_bits: u64, width: usize) -> usize {
     if source_bits == 0 || output_bits >= source_bits {
         return width;
     }
-    // A strict floor makes even a sub-cell saving visible. The percentage and
-    // exact byte count below the bar keep that intentionally eager visual
-    // contraction quantitatively honest.
+    // Rounding down shortens the bar by at least one cell for any saving. The
+    // sizes and percentage on the summary line show the actual change.
     let scaled = width as u128 * u128::from(output_bits) / u128::from(source_bits);
     usize::try_from(scaled).unwrap_or(width).clamp(1, width)
 }
@@ -1436,8 +1427,9 @@ fn display_text(text: &str, glyphs: Glyphs) -> String {
 }
 
 fn visible_width(text: &str) -> usize {
-    // Every visual glyph is deliberately one cell wide. Locales that commonly
-    // render box/block characters as double-width automatically use ASCII.
+    // Every glyph used here is one cell wide. Japanese, Korean, and Chinese
+    // locales, where box and block characters are often double-width, use
+    // ASCII glyphs instead.
     text.chars().count()
 }
 

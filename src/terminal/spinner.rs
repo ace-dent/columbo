@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Shared terminal pulse for CLI and detailed progress modes.
+//! Stderr spinner with a timeout countdown, shared by the CLI and the verbose
+//! and visual reporters.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,8 +17,8 @@ use crate::terminal::formatting::{
 
 const TICK: Duration = Duration::from_secs(1);
 const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// A console that prints escapes literally is a legacy console host, whose
-/// usual fonts have no Braille patterns.
+/// ASCII frames for legacy consoles that print escapes literally; their fonts
+/// usually lack Braille patterns.
 const PLAIN_FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
 
 pub(crate) struct Spinner {

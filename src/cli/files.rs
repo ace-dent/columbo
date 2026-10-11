@@ -22,8 +22,8 @@ pub(super) enum ReadError {
 }
 
 pub(super) fn read_file(path: &Path, maximum_size: u64) -> Result<Vec<u8>, ReadError> {
-    // Reject devices, sockets, and ordinary FIFO paths before opening them.
-    // Check the opened handle too, since the path can change after metadata.
+    // Reject devices, sockets, and FIFOs before opening, and recheck the
+    // handle in case the path changed.
     if !fs::metadata(path).map_err(ReadError::Io)?.is_file() {
         return Err(ReadError::NotRegular);
     }
@@ -43,11 +43,8 @@ pub(super) fn read_file(path: &Path, maximum_size: u64) -> Result<Vec<u8>, ReadE
     Ok(bytes)
 }
 
-/// Read through a fixed stack buffer so allocation failure is recoverable.
-///
-/// `Read::read_to_end` grows its destination internally. Explicit fallible
-/// reservations keep a hostile size-changing or seekless input from turning
-/// memory pressure into an allocation panic or abort.
+/// Unlike `Read::read_to_end`, growth uses fallible reservations, so memory
+/// exhaustion is an error rather than an abort.
 fn read_bounded(reader: impl Read, maximum_size: u64) -> Result<Vec<u8>, ReadError> {
     let mut bytes = Vec::new();
     let mut reader = reader.take(maximum_size.saturating_add(1));
@@ -72,8 +69,6 @@ fn read_bounded(reader: impl Read, maximum_size: u64) -> Result<Vec<u8>, ReadErr
     Ok(bytes)
 }
 
-/// Interrupted reads consumed no bytes and can be retried without changing
-/// the input limit or the snapshot comparison position.
 fn read_retrying_interrupts(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<usize> {
     loop {
         match reader.read(buffer) {
@@ -83,16 +78,16 @@ fn read_retrying_interrupts(reader: &mut impl Read, buffer: &mut [u8]) -> io::Re
     }
 }
 
-/// Publish complete output with a single same-filesystem rename.
-/// Errors before publication leave any existing destination untouched.
+/// Publish complete output with one same-filesystem rename; earlier errors
+/// leave any existing destination untouched.
 pub(super) fn write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temporary = stage_private_output(path, bytes)?;
     publish_output(path, temporary, None, CommitMode::Replace).map(|_| ())
 }
 
-/// Recheck the original bytes after staging and syncing, immediately before
-/// replacement. This catches edits made during optimization; it is not an
-/// atomic compare-and-swap against uncooperative concurrent writers.
+/// Like [`write_file`], but return `Ok(false)` without replacing `path` if it
+/// no longer holds `expected`. The check runs just before the rename and is not
+/// an atomic compare-and-swap.
 pub(super) fn write_file_if_unchanged(
     path: &Path,
     expected: &[u8],
@@ -102,9 +97,9 @@ pub(super) fn write_file_if_unchanged(
     publish_output(path, temporary, Some(expected), CommitMode::Replace)
 }
 
-/// Publish a complete file only if the destination entry is still absent.
-/// A same-filesystem hard link provides an atomic no-clobber commit. A
-/// filesystem without hard-link support fails without exposing partial data.
+/// Publish a complete file only if the destination entry is still absent;
+/// return `Ok(false)` if it exists. A hard link gives an atomic no-clobber
+/// commit; without hard links this fails without exposing partial data.
 pub(super) fn write_new_file(path: &Path, bytes: &[u8]) -> io::Result<bool> {
     let temporary = stage_private_output(path, bytes)?;
     publish_output(path, temporary, None, CommitMode::CreateNew)
@@ -141,9 +136,8 @@ fn file_contents_equal(path: &Path, expected: &[u8]) -> io::Result<bool> {
     }
     #[cfg(test)]
     tests::after_snapshot_comparison(path);
-    // Comparing a large input can take time. Catch edits to the open file and
-    // replacement of its directory entry during that read, not just changes
-    // made before the comparison started.
+    // Also catch edits to the file, or replacement of its directory entry,
+    // during the comparison.
     let current = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -152,8 +146,8 @@ fn file_contents_equal(path: &Path, expected: &[u8]) -> io::Result<bool> {
     Ok(same_file_version(&metadata, &file.metadata()?) && same_file_version(&metadata, &current))
 }
 
-/// Compare the strongest version metadata exposed by the supported standard
-/// library APIs. This supplements byte comparison; it does not lock a file.
+/// Compare the strongest file-version metadata the standard library exposes on
+/// each platform. This supplements byte comparison; it does not lock a file.
 fn same_file_version(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     if !left.is_file() || !right.is_file() || left.len() != right.len() {
         return false;
@@ -192,9 +186,8 @@ pub(super) fn output_entry_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Reject unusable explicit destinations before reading or optimizing input.
-/// Probe creation permissions without writing payload data or syncing to disk.
-/// Publication still checks for errors because filesystem state can change.
+/// Reject an unusable explicit destination before any input is read. The probe
+/// writes no data; publication still reports its own errors.
 pub(super) fn validate_output_destination(path: &Path) -> io::Result<()> {
     let name = path.as_os_str().to_string_lossy();
     if path.file_name().is_none()
@@ -218,8 +211,8 @@ pub(super) fn validate_output_destination(path: &Path) -> io::Result<()> {
                     "output is read-only",
                 ));
             }
-            // Ask the OS to check effective access, including ACLs. Opening
-            // without create or truncate leaves the existing bytes intact.
+            // Let the OS check effective access, including ACLs; opening
+            // without create or truncate leaves the bytes intact.
             let file = OpenOptions::new().write(true).open(path)?;
             if !file.metadata()?.is_file() {
                 return Err(io::Error::new(
@@ -241,16 +234,15 @@ pub(super) fn validate_output_destination(path: &Path) -> io::Result<()> {
     let _directory = ParentDirectory::open(output_parent(path))?;
     let location = TemporaryLocation::create(path)?;
     drop(create_temporary_output(&location.path)?);
-    // Close before removal on Windows. Report cleanup failures here while
-    // the guard also handles partial creation and retries failed cleanup.
+    // Close the probe first (required on Windows); remove it explicitly to
+    // report cleanup errors.
     fs::remove_file(&location.path)?;
     fs::remove_dir(&location.directory)?;
     Ok(())
 }
 
-/// Stage output in a new sibling directory. Its Unix mode stays `0700` even
-/// when the completed file receives the destination's ordinary access bits.
-/// This lets all permission changes and data syncs finish before publication.
+/// Stage output in a new sibling directory whose Unix mode stays `0700`, so
+/// the staged file stays private while its permissions and data are finalized.
 fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<TemporaryOutput> {
     stage_output_with(path, |file| file.write_all(bytes))
 }
@@ -324,7 +316,7 @@ fn publish_output(
     directory.sync()?;
 
     let TemporaryOutput { file, location } = temporary;
-    // In particular, Windows must close this handle before rename or cleanup.
+    // Windows requires the handle to be closed before rename or cleanup.
     drop(file);
     if let Some(expected) = expected {
         if !file_contents_equal(path, expected)? {
@@ -341,8 +333,8 @@ fn publish_output(
         },
     }
 
-    // File sync alone does not persist the changed directory entry on Unix.
-    // A failure here is post-commit: report uncertainty without undoing output.
+    // File sync alone does not persist the directory entry on Unix; a failure
+    // here is post-commit, so report it without undoing the output.
     directory.sync_after_install().map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -351,13 +343,13 @@ fn publish_output(
             ),
         )
     })?;
-    // Cleanup is best effort. Failure to remove an extra staging link must not
-    // turn an otherwise successful, durable publication into a failed write.
+    // Dropping `location` removes the staging entry on a best-effort basis; a
+    // cleanup failure must not fail a durable publication.
     Ok(true)
 }
 
-/// Validate the destination type and prepare supported permission metadata.
-/// Symlinks retain the existing policy: replace the link, not its target.
+/// Reject a non-regular destination and, on Unix, copy its access bits to the
+/// staged file.
 fn prepare_output_permissions(path: &Path, file: &File) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -377,7 +369,7 @@ fn prepare_output_permissions(path: &Path, file: &File) -> io::Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        // Preserve ordinary access bits, not executable privilege bits.
+        // Copy the rwx bits only; drop setuid, setgid, and sticky bits.
         file.set_permissions(fs::Permissions::from_mode(
             metadata.permissions().mode() & 0o777,
         ))?;
@@ -432,9 +424,8 @@ impl ParentDirectory {
         }
         #[cfg(not(unix))]
         {
-            // Rust's standard API does not expose a portable directory flush
-            // on Windows. Data is synced, but power-loss durability of the
-            // rename is a filesystem/platform guarantee, not a CLI promise.
+            // The standard library has no directory flush on Windows, so the
+            // rename's durability after power loss depends on the filesystem.
             Ok(())
         }
     }
@@ -446,8 +437,8 @@ impl ParentDirectory {
     }
 }
 
-/// Field order closes the file before its location guard tries to unlink it.
-/// This also covers write errors and panic unwinding on Windows.
+/// Fields drop in order, so the file closes before its location guard
+/// unlinks it, including after write errors and panics (needed on Windows).
 struct TemporaryOutput {
     file: File,
     location: TemporaryLocation,
@@ -499,8 +490,8 @@ impl TemporaryLocation {
 
 impl Drop for TemporaryLocation {
     fn drop(&mut self) {
-        // Remove only our known file and empty directory. Never recursively
-        // delete an unexpected entry or sweep another process's staging data.
+        // Remove only our own file and empty directory; never delete
+        // recursively or sweep another process's staging data.
         let _ = fs::remove_file(&self.path);
         let _ = fs::remove_dir(&self.directory);
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Cache controls and observations shared by planner tests.
+//! Cache limits and counters shared by planner tests.
 
 use super::{CanonicalPlanCache, CanonicalPlanCacheStats};
 

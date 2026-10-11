@@ -23,9 +23,8 @@ fn compact_png_uses_the_rle_smoothed_reduced_depth_tree_floor() {
     )
     .unwrap();
 
-    // The pre-floor endpoint is 2,039 bytes; smoothing at depth 15 reaches
-    // 2,037, and the reduced-depth frontier reaches 2,032. Keep this monotone
-    // so a future improvement can make the fixture smaller.
+    // Without this floor the output is 2,039 bytes; smoothing at depth 15
+    // reaches 2,037, and the reduced-depth frontier reaches 2,032.
     assert!(optimized.data.len() <= 2_032);
     assert!(optimized.bits_saved >= 9 * 8);
 }
@@ -66,8 +65,8 @@ fn rle_smoothed_tree_frontier_retains_the_classic_zopfli_win() {
 fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
     let source = &corpus_file("png/PngSuite/f00n0g08.png");
     let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
-    // The completed pre-restoration endpoint occupied 297 bytes. Restoring
-    // the original 18-byte match at distance 34 saves its next physical byte.
+    // Without restoration the output is 297 bytes. Restoring the original
+    // 18-byte match at distance 34 saves one more byte.
     assert!(ordinary.data.len() <= 296);
     for (verbose, visual) in [(true, false), (false, true)] {
         let reported = optimize(
@@ -101,8 +100,8 @@ fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
 fn payload_header_tradeoff_reaches_png_and_the_mandatory_max_floor() {
     let source = &corpus_file("png/PngSuite/basi4a16.png");
     let ordinary = optimize(source, Format::Png, &Options::default()).unwrap();
-    // The completed parent was 2,827 bytes. A seven-bit payload tax removes
-    // eighteen header bits, saving eleven meaningful bits and one file byte.
+    // The parent candidate is 2,827 bytes. Spending seven payload bits to
+    // remove eighteen header bits saves eleven meaningful bits and one byte.
     assert!(ordinary.data.len() <= 2_826);
     let max = optimize(
         source,
@@ -133,7 +132,7 @@ fn literal_span_reaches_png_output_and_the_mandatory_max_floor() {
         },
     )
     .unwrap();
-    // With no optional time, the complete PNG Default floor must include its
-    // final advertised-span spelling, even when the physical byte count ties.
+    // With no optional time, the PNG Default floor must still include its
+    // final HLIT choice, even when the byte count ties.
     assert_eq!(max.data, ordinary.data);
 }

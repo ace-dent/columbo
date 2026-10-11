@@ -81,7 +81,7 @@ fn terminal_reservation_requires_max_owned_time_and_the_full_terminal_work_class
         share(&options, bytes, decoded, blocks),
         TerminalShare::Search
     );
-    // Outside the header work class, only linear finalization keeps a share.
+    // Outside the header size class, only linear finalization keeps a share.
     for (compressed, decoded, blocks) in [
         (bytes + 1, decoded, blocks),
         (bytes, decoded + 1, blocks),
@@ -92,8 +92,8 @@ fn terminal_reservation_requires_max_owned_time_and_the_full_terminal_work_class
             TerminalShare::Finalization
         );
     }
-    // An established continuation owns its own window, but reserves only
-    // the finalization share and only outside the header work class.
+    // An established continuation runs in its own window, but reserves only
+    // the finalization share, and only outside the header size class.
     let established = |compressed, decoded| {
         DefaultFloor::Established.terminal_share(&options, compressed, decoded, 2)
     };
@@ -421,7 +421,7 @@ fn max_terminal_headers_reach_small_blocks_inside_larger_streams() {
         (TerminalHeaderSearch::SymbolSets, symbol_set_test_block(), 4),
     ] {
         for prefix_len in [TERMINAL_HEADER_MAX_BYTES, MAX_TERMINAL_HEADER_MAX_BYTES] {
-            // A large stored prefix changes the enclosing stream's work
+            // A large stored prefix changes the enclosing stream's size
             // class without changing the generated header problem. Stored
             // emission splits the prefix into legal wire blocks.
             let mut writer = BitWriter::default();
@@ -521,8 +521,9 @@ fn joint_tree_rle_reaches_the_final_stream_and_png_header() {
 
 #[test]
 fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
-    // f04n0g08's completed Max endpoint. Freezing the parent isolates the
-    // new header move without a long search or deadline-dependent result.
+    // A completed Max endpoint recorded for a PngSuite image. Fixing the
+    // parent tests the header move without a long search or a
+    // deadline-dependent result.
     let raw = [
         0x85, 0xd1, 0x0d, 0x06, 0x02, 0x30, 0x18, 0xc6, 0xf1, 0xff, 0xb6, 0x77, 0x5b, 0x67, 0xea,
         0x0c, 0xe9, 0x0c, 0xd1, 0x01, 0x02, 0x22, 0xd0, 0x0d, 0x22, 0xe8, 0x04, 0xd1, 0x2d, 0xba,
@@ -633,9 +634,9 @@ fn payload_tradeoff_leaves_discarded_empty_blocks_to_other_routes() {
 #[test]
 #[ignore = "requires the private tests/fixtures corpus"]
 fn original_match_restoration_improves_a_completed_max_fixed_point() {
-    // Recorded Max endpoint of f00n0g08: another complete Max invocation
-    // retained these exact 1,740 bits. Keep the parent fixed to isolate
-    // original-proof restoration without running a long timed search.
+    // A Max fixed point recorded from a complete Max run on the corpus image
+    // loaded below. Fixing the parent tests original-match restoration
+    // without a long timed search.
     const MAX_PARENT: &[u8] = &[
         0x62, 0xa8, 0x6f, 0xef, 0x9b, 0x36, 0x77, 0xc9, 0xea, 0x4d, 0x3b, 0xf6, 0x1d, 0x39, 0x79,
         0xee, 0xf2, 0x8d, 0x3b, 0x0f, 0x9f, 0xbc, 0x78, 0xfd, 0xee, 0xe3, 0x97, 0x6f, 0x3f, 0x7e,
@@ -981,7 +982,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
     .unwrap();
     assert!(smoothed.bits < ordinary.bits.min(frontier.bits));
 
-    // Nine blocks exceed the compact payload-tree floor's eight-block class,
+    // Nine blocks exceed the compact payload-tree floor's eight-block limit,
     // so only R14 prices the smoothed trees for this stream.
     let saving = 9 * (ordinary.bits - smoothed.bits);
     let (data, bits) = emit_plans(&[], &vec![ordinary; 9], true).unwrap();
@@ -1216,17 +1217,12 @@ fn no_split_replay_requires_a_new_parent_state() {
 
 #[test]
 fn one_pass_closes_repeated_deflopt_defluff_feedback() {
-    // This small synthetic dynamic block witnesses the interaction between
-    // the recovered DeflOpt and Defluff methods. DeflOpt expands one
-    // length-three match into literals and rebuilds a stream that is five
-    // bits smaller overall. On that new frequency state, Defluff swaps the
-    // five- and six-bit assignments of equal-frequency length symbols 259
-    // and 260. The payload remains 196 bits while the dynamic header
-    // shrinks from 130 to 129 bits. The original tools therefore need two
-    // programs/passes: 331 -> 326 -> 325 meaningful bits.
-    //
-    // Columbo's broader feedback route must close the same state graph in
-    // one invocation. A second invocation must not find another saving.
+    // A synthetic dynamic block that DeflOpt and Defluff need two passes for
+    // (331 -> 326 -> 325 meaningful bits): DeflOpt expands one length-3 match
+    // into literals, then Defluff swaps the five- and six-bit codes of the
+    // equal-frequency length symbols 259 and 260, shrinking the dynamic header
+    // from 130 to 129 bits while the payload stays 196 bits. Columbo must
+    // close this in one invocation; a second must find nothing.
     let input = FEEDBACK_RAW;
     let source = parse_stream(input, 86).unwrap();
     assert_eq!(source.meaningful_bits, 331);
@@ -1246,9 +1242,8 @@ fn one_pass_closes_repeated_deflopt_defluff_feedback() {
     assert_eq!(second.info.deflate_bits, first.info.deflate_bits);
     assert_eq!(second.data, first.data);
 
-    // Even a zero-budget max run must finish and retain Default. The zero
-    // allowance disables Max-exclusive routes; it cannot weaken the
-    // mandatory comparison floor.
+    // A zero-budget Max run must still finish and keep the mandatory Default
+    // floor.
     let zero_budget_max = Options {
         exhaustive: true,
         strict: false,
@@ -1260,8 +1255,8 @@ fn one_pass_closes_repeated_deflopt_defluff_feedback() {
     assert!(stopped.data.len() <= first.data.len());
     assert!(stopped.info.deflate_bits <= first.info.deflate_bits);
 
-    // With sufficient time, max mode closes the same feedback graph in one
-    // invocation and is itself at a fixed point.
+    // With enough time, Max also closes the graph in one invocation and is
+    // itself at a fixed point.
     let max_options = Options {
         timeout: Duration::from_secs(1),
         ..zero_budget_max
@@ -1674,10 +1669,8 @@ fn strict_mode_repairs_alias_and_single_distance_code_inputs() {
     let relaxed_stream = parse_stream(&relaxed.data, 2_302).unwrap();
     assert_eq!(relaxed_stream.decoded_size, source.decoded_size);
     assert!(relaxed.data.len() <= input.len());
-    // Relaxed mode permits the source exceptions but may still select an
-    // independently cheaper canonical fixed or dynamic representation.
-    // Parsing and explicit alias-rewrite tests cover retention of those
-    // extensions when they remain the winning spelling.
+    // Relaxed mode permits the source exceptions but may still select a
+    // cheaper canonical fixed or dynamic representation.
 }
 
 fn stream_uses_258_alias(stream: &ParsedStream) -> bool {
@@ -1700,9 +1693,8 @@ fn stream_uses_258_alias(stream: &ParsedStream) -> bool {
 #[test]
 fn optimization_never_discovers_new_lz77_matches() {
     // A stored block has only literal source tokens. Even though this
-    // deliberately repetitive payload would be easy to recompress with
-    // new matches, Columbo may only choose a cheaper serialization of the
-    // existing parse.
+    // repetitive payload would be easy to recompress with new matches,
+    // Columbo may only choose a cheaper serialization of the existing parse.
     let plain = vec![b'A'; 1_024];
     let length = plain.len() as u16;
     let mut input = vec![0x01]; // Final stored block, then byte alignment.
@@ -1830,9 +1822,6 @@ fn no_split_route_uses_bounded_source_size_and_topology() {
 
 #[test]
 fn max_replay_ceiling_covers_every_strict_stream_score() {
-    // Meaningful bits can occupy only the eight residues belonging to each
-    // emitted byte length. Max therefore gets a complete metric bound,
-    // while Default retains its small consistent replay budget.
     assert_eq!(resolved_replay_limit(MAX_RAW_REPLAY_LIMIT, 10), 80);
     assert_eq!(resolved_replay_limit(DEFAULT_RAW_REPLAY_LIMIT, 10), 3);
     assert_eq!(resolved_replay_limit(MAX_RAW_REPLAY_LIMIT, 0), 1);
@@ -1933,9 +1922,8 @@ fn established_floor_is_a_complete_strict_max_candidate() {
 
 #[test]
 fn bounded_parallel_floors_preserve_a_complete_stream() {
-    // Two nonempty Huffman blocks activate both independent phase-one
-    // routes. They share the parsed token/plain buffers and wall clock,
-    // then rejoin before any deft4j refinement is considered.
+    // Two nonempty Huffman blocks activate both phase-one routes, which
+    // rejoin before any deft4j refinement.
     let (literal, _) = fixed_trees();
     let end = literal.code(256).unwrap();
     let mut writer = BitWriter::default();
@@ -2207,10 +2195,8 @@ fn completed_compact_split_parent_requires_exact_encoded_identity() {
 
 #[test]
 fn bounded_generic_routes_preserve_complete_candidates() {
-    // Empty stored blocks have no useful deft4j or narrow source route.
-    // They make a small generic-only stream whose floor and original-source
-    // max routes can be checked independently after their parallel phase
-    // rejoins.
+    // Empty stored blocks have no useful deft4j or no-split route, so this
+    // small stream runs only the floor and original-source max routes.
     let input = [
         0x00, 0x00, 0x00, 0xff, 0xff, // Non-final empty stored block.
         0x01, 0x00, 0x00, 0xff, 0xff, // Final empty stored block.
@@ -2464,8 +2450,8 @@ fn complete_png_floor_reuses_the_full_default_route_sequence() {
 
 #[test]
 fn strict_completion_competes_only_after_max_searches_its_parent() {
-    // A literal-only block whose planned `[1, 1]` distance completion forces
-    // HCLEN 18, so R1b wins on Default's endpoint.
+    // A literal-only block whose planned `[1, 1]` distance completion needs
+    // 18 code-length codes, so R1b wins on Default's endpoint.
     let block = payload_tradeoff_test_block();
     let dynamic = block.original_dynamic.as_ref().unwrap();
     let mut writer = BitWriter::default();
@@ -2557,9 +2543,8 @@ fn strict_completion_competes_only_after_max_searches_its_parent() {
 #[test]
 #[ignore = "requires the private tests/fixtures corpus"]
 fn complete_png_floor_includes_terminal_tree_methods() {
-    // This stream receives a material terminal payload-tree improvement.
-    // It guards the architectural boundary that previously let Default
-    // apply the method only after Max had captured its comparison floor.
+    // This stream gains from a terminal payload-tree method. Max's complete
+    // Default floor must include that gain, exactly as Default does.
     let input = png_raw_deflate(&corpus_file("png/PngSuite/tbbn2c16.png"));
     let parsed = parse_stream(&input, 1 << 20).unwrap();
     let source = CandidateInput {
@@ -3637,7 +3622,7 @@ fn coupled_swaps_do_not_change_zero_budget_default_floor() {
 #[test]
 fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
     // Generated frequencies and source-certified matches, with a stored
-    // history prefix. One R1..R9 sweep stops at 36,729 bits: its alphabet
+    // history prefix. One R1–R9 sweep stops at 36,729 bits: its alphabet
     // splits expose another joint-tree improvement and another useful cut.
     let input = super::super::header::test_support::coupled_swap_test_stream();
     let parsed = parse_stream(&input, 16384).unwrap();

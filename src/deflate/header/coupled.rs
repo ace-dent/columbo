@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Swap lengths in both payload alphabets together. Their shared code-length
-//! tree and RLE description can make the combined saving non-additive.
+//! Swap two code lengths in the literal/length alphabet and two in the distance
+//! alphabet together. Both alphabets share one code-length code and one RLE
+//! sequence, so the combined saving need not be the sum of the separate
+//! savings.
 
 use super::{dynamic_bits, plan_for_advertised_lengths};
 use crate::deflate::model::{DynamicPlan, ParsedBlock, MAX_DYNAMIC_CODE_LENGTH_COUNT};
@@ -40,7 +42,9 @@ struct Swap {
     positions: [usize; 2],
 }
 
-/// Swap consecutive pairs of sorted positions, including the LL/DD seam.
+/// Run transitions removed by swapping the values at `positions[2k]` and
+/// `positions[2k + 1]`. Positions must be strictly increasing; edges across
+/// the boundary between the two alphabets count too.
 fn transitions_removed<const N: usize>(lengths: &[u8], positions: [usize; N]) -> i64 {
     let values = std::array::from_fn(|i| lengths[positions[i ^ 1]]);
     super::transitions_removed(lengths, positions, values)
@@ -88,8 +92,9 @@ fn alphabet_menu(
             }
             let positions = [offset + a, offset + b];
             let removed = transitions_removed(lengths, positions);
-            // A neutral run count may still help the shared CL tree. This
-            // admission rule and ranking are heuristics, not lower bounds.
+            // Keep swaps that leave the transition count unchanged: they can
+            // still help the shared code-length code. This filter and the
+            // ranking are heuristics, not bounds.
             if removed < 0 {
                 continue;
             }
@@ -136,8 +141,9 @@ fn pair_menu(
             if !(-MAX_PAYLOAD_TAX..=MAX_PAYLOAD_TAX).contains(&tax) {
                 continue;
             }
-            // Price the seam interaction once, rather than adding its two
-            // independently measured alphabet deltas.
+            // Count all four positions together: when the two swaps touch
+            // neighboring positions at the alphabet boundary, adding their
+            // separate counts would be wrong.
             let removed = transitions_removed(
                 lengths,
                 [
@@ -162,9 +168,11 @@ fn pair_menu(
     Some(menu)
 }
 
-/// Every paired move starts from the same parent. Preserve tokens, support,
-/// length histograms and advertised spans, and retain fully priced winners
-/// at a stop. No single-swap intermediate needs to improve the parent.
+/// Try one literal/length swap and one distance swap together. Every pair
+/// starts from the same parent and keeps the tokens, the set of used symbols,
+/// each alphabet's length histogram, and HLIT and HDIST. Neither swap needs to
+/// improve the parent on its own. A stop returns the best fully priced plan
+/// found so far.
 pub(crate) fn plan_coupled_length_swaps(
     block: &ParsedBlock,
     strict: bool,
@@ -185,8 +193,8 @@ pub(crate) fn plan_coupled_length_swaps(
     let lengths = lengths.get_mut(..count)?;
     lengths[..middle].copy_from_slice(&parent.literal_lengths);
     lengths[middle..].copy_from_slice(&parent.distance_lengths);
-    // Empty, singleton and uniform distance alphabets cannot supply a swap.
-    // Search this small side first, before scanning the literal alphabet.
+    // Search the small distance side first: empty, singleton and uniform
+    // distance alphabets cannot supply a swap.
     let distance = alphabet_menu(lengths, middle, &block.distance_frequencies, budget, stop)?;
     if distance.is_empty() || stop.reached() {
         return None;

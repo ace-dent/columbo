@@ -1,10 +1,10 @@
 # Defluff Relaxed Benchmark
 
-This report compares normal Columbo with `--strict 0` against paired
-Defluff PNG outputs. Defluff uses compatibility-sensitive Huffman
-alphabet forms enabled by Columbo's relaxed mode, making this a
-like-for-like comparison. A case passes only when Columbo is equal or
-smaller in both complete-file bytes and meaningful Deflate-stream bits.
+This report compares Columbo's Default mode with `--strict 0` against
+paired Defluff PNG outputs. Defluff emits empty or singleton Huffman
+alphabets, which Columbo allows only with `--strict 0`, so the
+comparison is like-for-like. A case passes only when Columbo is equal
+or smaller in both complete-file bytes and meaningful Deflate bits.
 
 - discovered source/reference pairs: 66
 - completed rows for this binary: 66

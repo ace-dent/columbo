@@ -3,10 +3,10 @@
 
 //! Validating Deflate parser used by every optimization route.
 //!
-//! Parsing is deliberately completed before any optional search observes the
-//! deadline. A successful prefix result therefore always consumes one whole
-//! stream; `timed_out` can never describe a partially decoded member. The one
-//! deliberate compatibility extension is Defluff's non-RFC length-258 alias.
+//! Parsing finishes before any optional search checks the deadline, so a
+//! successful prefix result covers one whole stream and `timed_out` never
+//! describes a partly decoded member. The only accepted extension to RFC 1951
+//! is Defluff's length-258 alias (symbol 284 with extra value 31).
 
 use std::sync::OnceLock;
 
@@ -24,10 +24,6 @@ use super::model::{
     RFC_DISTANCE_CODE_COUNT, USABLE_DISTANCE_CODE_COUNT,
 };
 
-/// Data shared by every block representation after its payload is decoded.
-///
-/// Naming these fields keeps the stored, fixed, and dynamic parser routes
-/// visibly aligned without relying on the position of values in a long tuple.
 struct BlockPayload {
     tokens: Vec<Token>,
     plain: Vec<u8>,
@@ -36,29 +32,20 @@ struct BlockPayload {
     dynamic: Option<DynamicPlan>,
 }
 
-/// Parsed blocks deliberately retain decoded bytes, tokens, frequency tables,
-/// and source metadata for later structural searches. A byte-only input limit
-/// cannot bound that richer representation: a tiny stream may contain hundreds
-/// of thousands of one-literal blocks. Keep the persistent model bounded so a
-/// hostile but valid stream returns an error instead of exhausting the process.
-/// Shared ceiling for persistent parsing and optional transformed-token
-/// candidates. Search imports this value so a match cannot expand into a
-/// token vector larger than the model the parser itself is willing to keep.
+/// Memory limit for the parsed model, shared with transformed-token candidates.
+/// Input size cannot bound the model: a tiny stream can hold hundreds of
+/// thousands of one-literal blocks.
 pub(crate) const MAX_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
-/// Empty fixed blocks occupy only ten bits and are discarded from the retained
-/// model. Without a separate count limit, a relatively small hostile stream
-/// could therefore force millions of parser iterations while using almost no
-/// decoded-byte or model budget.
+/// Empty blocks (10 bits when fixed) are dropped from the model, so this bounds
+/// parser work on a small hostile stream.
 const MAX_SOURCE_BLOCKS: usize = 262_144;
 const PARSED_BLOCK_MODEL_BYTES: usize = std::mem::size_of::<ParsedBlock>() + 4 * 1024;
 const WINDOW_SIZE: usize = 32_768;
 const WINDOW_MASK: u64 = (WINDOW_SIZE - 1) as u64;
 const MAX_MATCH_LENGTH: usize = 258;
 
-/// Materialize one already-validated match without repeatedly updating the
-/// parser's ring buffer. The first period comes from prior history; doubling
-/// that period in the scratch buffer exactly reproduces Deflate's overlapping
-/// copy semantics for every distance, including distance one.
+/// Expand one validated match into `scratch`. Doubling the first
+/// min(distance, length) bytes reproduces Deflate's overlapping copy.
 fn expand_match<'a>(
     window: &[u8; WINDOW_SIZE],
     decoded_position: u64,
@@ -114,9 +101,8 @@ fn fixed_payload_trees() -> (&'static Huffman, &'static Huffman) {
     (literal, distance)
 }
 
-/// Estimate the owned model bytes accounted by the parser. Optional search
-/// candidates use the same formula so their expanded tokens plus decoded
-/// bytes cannot exceed the parser's established ceiling.
+/// Model size charged against [`MAX_PARSED_MODEL_BYTES`]; search candidates
+/// use the same formula.
 pub(crate) fn parsed_model_bytes(
     decoded_bytes: usize,
     token_count: usize,
@@ -144,8 +130,8 @@ fn parse_stream_with_model_limit(
     parse_stream_with_padding(input, decoded_limit, model_limit, |_, _| Ok(()))
 }
 
-/// Observe ignored bits while validating every block, including empty blocks
-/// that are omitted from the optimization model.
+/// Parse and validate every block, calling `padding(start, end)` for each bit
+/// range a decoder ignores: stored-block alignment and final-byte padding.
 fn parse_stream_with_padding(
     input: &[u8],
     decoded_limit: u64,
@@ -194,13 +180,8 @@ fn parse_stream_with_padding(
                 trailing_empty_blocks += 1;
             }
 
-            // Empty blocks have no effect on decoded bytes or history. Keep
-            // one only while the stream might prove entirely empty; once a
-            // content block exists, every empty block can be discarded as it
-            // is parsed. This mirrors the original Columbo C implementation's
-            // pending-block loop and prevents a compact run of empty blocks
-            // from amplifying into large memory use through per-block frequency
-            // tables.
+            // Keep one empty block only until content appears, so an empty
+            // stream still has a block (as in Columbo's C parser).
             if !saw_content && blocks.is_empty() {
                 blocks.try_reserve(1).map_err(|_| model_limit_error())?;
                 blocks.push(block);
@@ -243,8 +224,8 @@ fn parse_stream_with_padding(
     })
 }
 
-/// Zero only parser-certified alignment and terminal padding. Collect masks
-/// before mutating so validation always sees the original complete stream.
+/// Zero the stored-block alignment bits and final-byte padding found by the
+/// parser. Masks are collected first so parsing sees the unmodified stream.
 pub(crate) fn normalize_padding(input: &mut [u8], decoded_limit: u64) -> Result<()> {
     let mut masks = Vec::new();
     let parsed = parse_stream_with_padding(
@@ -409,8 +390,8 @@ impl Parser<'_> {
         for &symbol in &CODE_LENGTH_ORDER[..hclen] {
             code_length_lengths[symbol] = self.reader.read(3)? as u8;
         }
-        // The code-length alphabet has none of the one-symbol exceptions used
-        // by payload trees. zlib-compatible decoders require it to be complete.
+        // Unlike the payload codes, the code-length code has no single-code
+        // exception; zlib requires it to be complete.
         let code_length_tree = CodeLengthDecoder::build(&code_length_lengths)
             .ok_or_else(|| Error::new("invalid code-length Huffman tree"))?;
 
@@ -430,8 +411,6 @@ impl Parser<'_> {
                     });
                 }
                 16 => {
-                    // Symbol 16 copies an already decoded length; unlike 17 and
-                    // 18, it does not provide an implicit initial zero.
                     if lengths.is_empty() {
                         return Err(Error::new("dynamic length repeat has no previous length"));
                     }
@@ -634,9 +613,8 @@ impl Parser<'_> {
         }
 
         let next_position = self.decoded_position + bytes.len() as u64;
-        // When the input is larger than the ring, only its final window can
-        // affect a later match. Locate that suffix at its absolute position so
-        // the circular layout remains identical to byte-at-a-time insertion.
+        // Only the last 32 KiB matter. Place them at their absolute position
+        // so the ring matches byte-by-byte insertion.
         let retained = if bytes.len() > WINDOW_SIZE {
             &bytes[bytes.len() - WINDOW_SIZE..]
         } else {
@@ -658,12 +636,8 @@ impl Parser<'_> {
     }
 }
 
-/// Decode one already-validated raw stream into a bounded comparison buffer.
-///
-/// This is deliberately not a public decompression API. PNG uses it only to
-/// prove that two APNG frame streams contain exactly the same decoded bytes
-/// before reusing the smaller compressed representation. Returning `None`
-/// merely disables that optional optimization.
+/// Decode one already-validated raw stream if it decodes to at most
+/// `comparison_limit` bytes; `None` disables APNG exact frame reuse.
 pub(crate) fn decoded_bytes_for_comparison(
     input: &[u8],
     decoded_limit: u64,
@@ -686,14 +660,8 @@ pub(crate) fn decoded_bytes_for_comparison(
     (decoded.len() == decoded_size).then_some(decoded)
 }
 
-/// Materialize one complete raw stream for a container-level stored
-/// representation.
-///
-/// ZIP uses this both to validate streams whose zero-to-four-byte decoded
-/// payload bypasses Deflate optimization and to build a final method-0
-/// alternative. The parser performs the identity check and supplies both the
-/// exact meaningful-bit cost being challenged and the decoded payload needed
-/// by method 0.
+/// Decode one complete raw stream for a ZIP Store (method 0) alternative,
+/// returning the decoded bytes, meaningful bits and CRC-32.
 pub(crate) fn decoded_bytes_for_storage(
     input: &[u8],
     decoded_limit: u64,

@@ -4,9 +4,10 @@
 
 """Remove build-source paths from a linked distribution executable.
 
-Only a fixed-length compiler path prefix is rewritten. Paths that could reveal
-the build user's directories cause a hard failure so they cannot accidentally
-reach a published artifact.
+Only the rustc and Homebrew sysroot path prefixes are rewritten, with
+equal-length replacements, so the file size is unchanged. Any path that could
+reveal the build user's directories is a hard failure. With --check, only
+audit the executable.
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from pathlib import Path
 UNIX_SEPARATOR = b"/"
 WINDOWS_SEPARATOR = b"\\"
 
-# Construct path markers from components so this source file does not itself
-# contain absolute paths that would trigger the repository privacy audit.
+# Build path markers from components so this file contains no literal absolute
+# paths that a repository path search would flag.
 COMPILER_PREFIX = UNIX_SEPARATOR.join((b"", b"rustc", b""))
 REDACTED_COMPILER_PREFIX = b"rustc_/"
 HOMEBREW_PREFIX = UNIX_SEPARATOR.join((b"", b"opt", b"homebrew", b""))
@@ -93,9 +94,9 @@ def compiler_path_offsets(data: bytes) -> list[int]:
         if offset < 0:
             return offsets
 
-        # A genuine compiler source path contains its commit identifier and a
-        # library directory shortly after the prefix. Refuse to edit a matching
-        # byte sequence elsewhere, such as an extremely unlikely code match.
+        # A real rustc source path has a commit hash and a library directory
+        # shortly after the prefix. Refuse to edit the same bytes in any other
+        # context, such as an unlikely match inside code.
         context = data[offset : offset + 96]
         if UNIX_LIBRARY_MARKER not in context and WINDOWS_LIBRARY_MARKER not in context:
             raise ValueError("compiler prefix appeared outside a source path")
@@ -153,7 +154,11 @@ def redact_compiler_paths(data: bytes) -> bytes:
 
 
 def replace_atomically(path: Path, data: bytes) -> None:
-    """Sync a complete executable before replacement and persist its Unix name."""
+    """Atomically replace an executable, keeping its permissions.
+
+    The new file is synced before the rename; on POSIX, the directory entry is
+    synced afterward.
+    """
 
     permissions = stat.S_IMODE(path.stat().st_mode)
     temporary_path: Path | None = None

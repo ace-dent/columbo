@@ -392,7 +392,7 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     )?;
     writeln!(
         output,
-        "NO_COLOR disables colour; TERM=dumb also disables the spinner."
+        "NO_COLOR disables color; TERM=dumb also disables the spinner."
     )?;
     writeln!(
         output,

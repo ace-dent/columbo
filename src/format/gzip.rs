@@ -17,9 +17,8 @@ const FNAME: u8 = 0x08;
 const FCOMMENT: u8 = 0x10;
 const RESERVED_FLAGS: u8 = 0xe0;
 const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate GZIP output";
-/// Concatenation is legitimate, but an empty member is only twenty bytes. A
-/// dedicated cap prevents a small file from multiplying parser setup and
-/// checksum work without consuming the decoded-byte budget.
+/// Bounds per-member parser and checksum work: RFC 1952 allows any number of
+/// members, and an empty member is only 20 bytes.
 const MAX_GZIP_MEMBERS: usize = 16_384;
 
 #[derive(Clone, Copy)]
@@ -117,8 +116,7 @@ pub(super) fn optimize_preflight(
         let has_optional_metadata = member.flags & (FEXTRA | FNAME | FCOMMENT | FHCRC) != 0;
         if options.strip_metadata && has_optional_metadata {
             let mut header = input[member.start..member.start + 10].to_vec();
-            // FTEXT is a content hint rather than an optional variable-length
-            // field. Keep it, and remove only fields whose bytes were dropped.
+            // Keep FTEXT, a content hint; clear only the flags of dropped fields.
             header[3] = member.flags & !(FEXTRA | FNAME | FCOMMENT | FHCRC);
             try_append_bytes(&mut output, &header, OUTPUT_ALLOCATION_ERROR)?;
         } else {
@@ -185,9 +183,9 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     while member_start < input.len() {
         let remaining = &input[member_start..];
         if !members.is_empty() && !has_signature(remaining) {
-            // A later member signature makes this an ambiguous gap, not a
-            // proven terminal suffix. Never resynchronize or hide a partial
-            // subsequent member behind the stripping policy.
+            // Trailing data containing a member signature (or ending with its
+            // first byte) may hide a damaged or partial member. Reject it
+            // rather than resynchronizing or removing it with --strip.
             if remaining.windows(2).any(|bytes| bytes == [0x1f, 0x8b])
                 || remaining.last() == Some(&0x1f)
             {

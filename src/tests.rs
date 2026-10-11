@@ -48,8 +48,7 @@ fn deterministic_malformed_corpus_never_panics_or_grows_output() {
     let mut state = 0x6a09_e667_f3bc_c909_u64;
 
     for case in 0..512_usize {
-        // Xorshift64 gives a reproducible spread of lengths and bytes
-        // without adding a random-number dependency to the crate.
+        // Xorshift64 gives reproducible inputs without a random-number dependency.
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;

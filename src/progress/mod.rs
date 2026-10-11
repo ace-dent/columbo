@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Dependency-free human optimization reporting.
+//! Verbose and visual optimization reports.
 //!
-//! Worker threads cache stream-labelled events instead of writing concurrently.
-//! A file-level coordinator appends each completed physical stream as soon as
-//! every one of its producers has finished and all earlier streams are ready.
+//! Worker threads buffer events per stream instead of writing concurrently. A
+//! file-level coordinator prints each physical stream, in file order, as soon
+//! as all its producers have finished and every earlier stream is printed.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,24 +26,20 @@ mod visual;
 pub(crate) const MAX_REPORTED_BLOCKS: usize = 64;
 
 static NEXT_STREAM_ID: AtomicUsize = AtomicUsize::new(1);
-/// A physical stream can have more than one optimizer lineage in flight (for
-/// example ZIP's Default and direct-Max archive branches). Keep presentation
-/// identity separate from the human-facing stream number so their concurrent
-/// updates never overwrite each other.
+/// Report IDs are separate from displayed stream numbers, so concurrent
+/// lineages of one stream never overwrite each other.
 static NEXT_REPORT_ID: AtomicUsize = AtomicUsize::new(1);
 static REPORT_SPINNER: OnceLock<Mutex<Option<Spinner>>> = OnceLock::new();
 static REPORT_COORDINATOR: OnceLock<Mutex<ReportCoordinator>> = OnceLock::new();
 static REPORT_EMITTER: OnceLock<Mutex<()>> = OnceLock::new();
-/// Held for the whole of one reporting-enabled optimization call.
 static REPORT_SESSION: Mutex<()> = Mutex::new(());
 pub(crate) const PRIMARY_STREAM_PRODUCER: u8 = 0;
 const FIRST_ROUTE_HEARTBEAT: Duration = Duration::from_secs(2);
 const MIN_ROUTE_HEARTBEAT: Duration = Duration::from_secs(3);
 const MAX_ROUTE_HEARTBEAT: Duration = Duration::from_secs(60);
 
-/// Sort reporting-only collections whose length is deliberately tiny.
-///
-/// This keeps the general-purpose slice sorter out of cold presentation paths.
+/// Insertion sort for tiny report collections; keeps the general slice sort out
+/// of cold code.
 #[cold]
 #[inline(never)]
 fn sort_tiny_by<T>(values: &mut [T], mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering) {
@@ -193,7 +189,7 @@ impl ReportCoordinator {
     }
 }
 
-/// One final ZIP wrapper conversion selected after all Deflate work.
+/// A ZIP entry rewritten from Deflate to Store after all Deflate work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ZipStoreProgress {
     pub(crate) stream_id: usize,
@@ -209,11 +205,8 @@ fn with_report_coordinator<T>(operation: impl FnOnce(&mut ReportCoordinator) -> 
     operation(&mut coordinator)
 }
 
-/// Declare the complete set of independent producers for every physical stream.
-///
-/// ZIP Max registers its archive lineages before starting them. A stream is
-/// released only after all registered lineages, including their reclaim
-/// passes, have reported completion.
+/// Declare the producers (such as ZIP Max's archive lineages) of every
+/// physical stream; a stream prints only after all of them report completion.
 pub(crate) fn set_stream_producers(producers: &[u8]) {
     with_report_coordinator(|coordinator| coordinator.set_expected_producers(producers));
     emit_ready_streams();
@@ -233,11 +226,8 @@ pub(crate) fn complete_all_stream_producers(producer: u8) {
     emit_ready_streams();
 }
 
-/// Retain only the Store conversions belonging to the selected ZIP lineage.
-///
-/// Max may build several complete archive candidates. The wrapper calls this
-/// once, after selecting the winner, so reporting never attributes a method
-/// change from a discarded lineage to the final file.
+/// Record the Store conversions of the selected ZIP lineage, after selection,
+/// so reports never show a discarded lineage's changes.
 pub(crate) fn zip_store_changes(options: &Options, changes: &[ZipStoreProgress]) {
     if changes.is_empty() || !ProgressMode::for_options(options).enabled() {
         return;
@@ -348,11 +338,8 @@ impl Drop for RouteLineageGuard {
     }
 }
 
-/// Add context to every stream optimized by one concurrent container branch.
-///
-/// ZIP Max can evaluate a Default floor and a direct-Max archive at the same
-/// time. Both operate on the same physical stream numbers, so this label lets
-/// human reports distinguish the two trials without changing optimizer data.
+/// Label every stream optimized by one concurrent container branch, so reports
+/// can tell ZIP Max's Default and direct-Max archives apart.
 pub(crate) fn with_route_lineage<T>(note: &'static str, operation: impl FnOnce() -> T) -> T {
     let previous = ROUTE_LINEAGE.with(|lineage| lineage.replace(Some(note)));
     let _guard = RouteLineageGuard(previous);
@@ -374,10 +361,7 @@ pub(crate) fn with_optional_route_lineage<T>(
 }
 
 /// Associate one optimizer invocation with its physical container stream.
-///
-/// Exact APNG duplicates retain their own file-order identifiers while sharing
-/// one optimizer invocation. The visual title names those duplicate streams
-/// instead of presenting shared work as missing cards.
+/// Exact APNG `duplicates` share the work but keep their own identifiers.
 pub(crate) fn with_stream_group<T>(
     id: usize,
     duplicates: &[usize],
@@ -386,7 +370,8 @@ pub(crate) fn with_stream_group<T>(
     with_stream_context(id, duplicates, None, false, operation)
 }
 
-/// Associate an optimizer invocation with a proportional stream search slice.
+/// Like [`with_stream_group`], for a stream searched within its proportional
+/// slice of the file's time budget.
 pub(crate) fn with_stream_slice<T>(
     id: usize,
     duplicates: &[usize],
@@ -479,9 +464,6 @@ pub(crate) struct CandidateProgress {
     pub(crate) report: Option<BlockReport>,
     pub(crate) reference_bits: u64,
     /// Whether this complete candidate is strictly smaller than its source.
-    ///
-    /// Several routes can be profitable at once. The final stream line, rather
-    /// than this marker, identifies the candidate Columbo ultimately selected.
     pub(crate) profitable: bool,
 }
 
@@ -763,11 +745,7 @@ impl Progress {
         }
     }
 
-    /// Start a route whose nested work can take long enough to need context.
-    ///
-    /// The returned reporter is deliberately single-threaded. Long searches
-    /// already check their deadline frequently, so those checks also provide a
-    /// natural, low-overhead opportunity to print a heartbeat.
+    /// Start a long route that reports its phases and periodic heartbeats.
     pub(crate) fn start_detailed(
         self,
         name: &'static str,
@@ -935,17 +913,15 @@ impl Progress {
             ));
             verbose::finish(self.report_id);
         }
-        // A scheduler may already have sealed this stream while the final
-        // report update was racing to the cache. Recheck the ordered head.
+        // The scheduler may have sealed this stream before this final update
+        // reached the cache, so recheck the next stream to print.
         emit_ready_streams();
     }
 }
 
-/// Cached context for one long-running route.
-///
-/// Every method is a no-op when progress reporting is disabled. Interior
-/// mutability lets the deadline callback and planner share this reporter
-/// without changing the optimizer's ownership or cancellation model.
+/// Buffered progress state for one long-running route; a no-op when reporting
+/// is disabled. Interior mutability lets the deadline callback and planner
+/// share it.
 pub(crate) struct RouteProgress {
     best_bits: Cell<Option<u64>>,
     best_blocks: Cell<usize>,
@@ -1085,7 +1061,7 @@ impl RouteProgress {
         }
     }
 
-    /// Identify the block currently being searched for heartbeat context.
+    /// Record the block being searched and its token count for the heartbeat.
     pub(crate) fn item(&self, current: usize, tokens: usize) {
         if self.mode.enabled() {
             self.completed.set(current.min(self.total.get()));
@@ -1101,10 +1077,8 @@ impl RouteProgress {
         }
     }
 
-    /// Refine the current activity shown by the next heartbeat.
-    ///
-    /// Unlike `phase`, this emits no immediate line and does not reset the
-    /// silence timer. It is safe to call at existing block/merge boundaries.
+    /// Refine the current activity shown by the next heartbeat. Unlike `phase`,
+    /// this prints nothing and does not reset the heartbeat timer.
     pub(crate) fn activity(&self, name: &'static str) {
         if self.mode.enabled() {
             self.phase.set(name);
@@ -1114,7 +1088,7 @@ impl RouteProgress {
         }
     }
 
-    /// Cache a periodic status line from an existing deadline probe.
+    /// Buffer a periodic status line; called from existing deadline checks.
     pub(crate) fn heartbeat(&self) {
         if !self.mode.enabled() {
             return;
@@ -1485,11 +1459,9 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
     }
 }
 
-/// Emit any remaining stream reports after container work has joined.
-///
-/// Ordinarily each sealed physical stream has already been appended in order.
-/// Force-sealing here retains error-path reports when a container returned
-/// before it could publish all of its normal scheduler completion events.
+/// Print any remaining stream reports once container work has finished.
+/// Force-sealing keeps the reports of a container that returned early on an
+/// error.
 pub(crate) fn finish_file(options: &Options) {
     let mode = ProgressMode::for_options(options);
     if !mode.enabled() {
@@ -1557,22 +1529,15 @@ fn write_format_summary(
     Ok(())
 }
 
-/// Whether block-plan snapshots will be consumed by a progress renderer.
-/// Exclusive use of the process-wide report state for one optimization call.
-///
-/// Stream identifiers, the coordinator, report caches and terminal renderers
-/// are shared statics, and every reporting call writes to the same standard
-/// output. A call resets that state when its format is detected and drains it
-/// when the file finishes, so overlapping reporting calls would discard or
-/// interleave each other's reports. Reporting calls therefore run one at a
-/// time. Quiet calls never touch this state and are never serialized.
+/// Exclusive use of the static, per-file report state (stream IDs,
+/// coordinator, caches, renderers), so reporting calls run one at a time.
+/// Quiet calls never touch it.
 pub(crate) struct ReportSession {
     _guard: MutexGuard<'static, ()>,
 }
 
-/// Begin a report session, waiting for any other reporting call to finish.
-///
-/// Returns `None` without waiting when the options disable reporting.
+/// Begin a report session, waiting for any other reporting call to finish;
+/// `None` without waiting when reporting is disabled.
 pub(crate) fn begin_report_session(options: &Options) -> Option<ReportSession> {
     reports_enabled(options).then(|| ReportSession {
         // A panic in another reporting call leaves only presentation state,
@@ -1583,6 +1548,7 @@ pub(crate) fn begin_report_session(options: &Options) -> Option<ReportSession> {
     })
 }
 
+/// Whether a progress renderer will consume block-plan snapshots.
 pub(crate) fn reports_enabled(options: &Options) -> bool {
     ProgressMode::for_options(options).enabled()
 }

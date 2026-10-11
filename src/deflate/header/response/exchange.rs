@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Move a length code to an absent symbol, then repair its certified payload.
-//! Price the header first and bound each interval by its cheapest bits/byte.
+//! Move a used length symbol's code to an unused length symbol, then re-spell
+//! the matches under the new code lengths.
 
 use super::{
     match_families, match_price, plan_for_advertised_lengths, price, response, token_bits,
@@ -11,7 +11,8 @@ use super::{
 use crate::deflate::model::{DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token};
 use crate::deflate::stop::SearchStop;
 
-// k used length symbols and 29-k absent symbols yield at most 14*15 pairs.
+/// With k used and 29 - k unused length symbols there are at most 14 * 15
+/// (from, to) pairs.
 const MAX_PROPOSALS: usize = 14 * 15;
 
 struct Interval {
@@ -32,8 +33,10 @@ impl Proposal {
     }
 }
 
-/// Every legal edge costs at least its width times the smallest edge ratio.
-/// Ignoring exact coverage and literal positions can only lower the price.
+/// Lower bound on the cost of re-spelling one match: every usable token costs
+/// at least its byte count times the smallest bits-per-byte ratio among them.
+/// Ignoring how tokens must tile the match, and where each literal falls, can
+/// only lower the bound.
 fn interval_bound(interval: &Interval, literal: &[u8], distance: &[u8]) -> Option<u64> {
     let n = interval.seed.decoded_len();
     let mut ratio = interval.literal_min.map(|bits| (bits, 1_u64));
@@ -43,12 +46,13 @@ fn interval_bound(interval: &Interval, literal: &[u8], distance: &[u8]) -> Optio
             ratio = Some((bits, width));
         }
     };
-    // The exact source edge may include relaxed length-258 spelling, which
-    // is deliberately absent from the generated canonical edges below.
+    // The source token may use the non-standard length-258 alias, which the
+    // canonical families below never generate.
     if let Some(bits) = match_price(interval.seed, literal, distance) {
         consider(bits, n);
     }
-    // Equal-cost edges have their lowest bits/byte at the family's last width.
+    // All lengths in a family cost the same, so the longest has the lowest
+    // bits per byte.
     for family in match_families(interval.seed, literal, distance) {
         consider(family.bits, family.last);
     }
@@ -80,11 +84,12 @@ fn intervals(block: &ParsedBlock, literal: &[u8]) -> Option<(Vec<Interval>, u64)
     (offset == block.plain.len()).then_some((intervals, fixed))
 }
 
-/// The donor and recipient are length symbols only: literal prices, distance
-/// prices, and all match certificates remain fixed. Both advertised spans are
-/// fully priced before the exact token solve, and only their cheaper header
-/// needs to survive because they define the same payload tree.
-/// The recipient can remain unused when its position makes the header cheaper.
+/// Move the code of a used length symbol (`from`) to an unused one (`to`).
+/// Literal and distance code lengths and the source matches stay fixed. Each
+/// move is priced with the trimmed HLIT and, if larger, the parent's HLIT;
+/// both describe the same code, so only the cheaper header is kept. Proposals
+/// are then re-spelled in order of their lower bound. The recipient may stay
+/// unused when its position alone makes the header cheaper.
 pub(crate) fn plan_length_exchange(
     block: &ParsedBlock,
     strict: bool,
@@ -130,7 +135,7 @@ pub(crate) fn plan_length_exchange(
             if literal[to] != 0 {
                 continue;
             }
-            // Charge the lower-bound edge walks before generating this tree.
+            // Charge the lower-bound computation before building this tree.
             if budget
                 .spend(block.plain.len() + intervals.len() + literal.len())
                 .is_none()

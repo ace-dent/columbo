@@ -21,9 +21,10 @@ impl HeaderPlanCache {
     }
 }
 
+/// A completed Default parent block. Its payload codes need only 269
+/// literal/length code lengths, but sending eight more (unused) lengths saves
+/// one header bit.
 pub(crate) fn literal_span_test_block() -> ParsedBlock {
-    // Completed Default basi0g04 parent. Its unchanged payload codes need
-    // HLIT=269, but advertising eight unused lengths saves one header bit.
     let raw = [
         0x65, 0x8e, 0x61, 0x11, 0x40, 0x00, 0x0c, 0x85, 0x1f, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00,
         0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x00, 0x0d, 0xd0, 0x80, 0x08, 0x44, 0x90,
@@ -40,9 +41,9 @@ pub(crate) fn literal_span_test_block() -> ParsedBlock {
     parse_stream(&raw, 1024).unwrap().blocks.remove(0)
 }
 
+/// A small literal-only block where spending three payload bits saves four
+/// header bits, even after a full header search on the unchanged tree.
 pub(crate) fn payload_tradeoff_test_block() -> ParsedBlock {
-    // A small literal-only witness: spending three payload bits saves four
-    // header bits even after full repricing of the unchanged tree.
     let counts = [14, 6, 9, 7, 13, 8, 3, 13, 15, 5, 2, 4, 1, 3, 10, 3];
     let plain: Vec<u8> = counts
         .iter()
@@ -67,9 +68,9 @@ pub(crate) fn payload_tradeoff_test_block() -> ParsedBlock {
     }
 }
 
+/// A completed Default parent block. The exact code-length code and RLE
+/// search saves three bits more than a full header search on these data trees.
 pub(crate) fn header_tree_test_block() -> ParsedBlock {
-    // Completed Default g10n3p04 parent. Exact CL-tree/RLE optimization saves
-    // three bits beyond full existing header repricing of these data trees.
     let raw = [
         0xbd, 0xca, 0x1d, 0x17, 0x80, 0x60, 0x10, 0x44, 0xe1, 0xa1, 0x8d, 0x33, 0x0f, 0xbc, 0xca,
         0x3c, 0xf3, 0xfc, 0xa5, 0xe1, 0x6c, 0xcd, 0x33, 0xef, 0xdf, 0x36, 0x7d, 0xef, 0x09, 0xab,
@@ -119,9 +120,9 @@ pub(crate) fn rotation_test_block(distance: &[u8]) -> ParsedBlock {
         .remove(0)
 }
 
-/// A deterministic synthetic frequency search found this pair-swap local
-/// optimum. Two simultaneous alphabet swaps spend eight payload bits to
-/// remove ten header bits. A stored prefix supplies the long match history.
+/// A pair-swap local optimum found by a deterministic synthetic frequency
+/// search. One swap in each alphabet, made together, spends eight payload bits
+/// to save ten header bits. A stored prefix supplies the match history.
 pub(crate) fn coupled_swap_test_stream() -> Vec<u8> {
     use super::{plan_header_tree, HeaderTreeBudget};
     use crate::deflate::bitstream::BitWriter;
@@ -209,7 +210,8 @@ pub(crate) fn coupled_swap_test_stream() -> Vec<u8> {
     emit(&plan)
 }
 
-/// A generated 276-byte stream whose tree and token changes win only together.
+/// A generated stream (276 bytes decoded) whose tree and token changes win
+/// only together.
 pub(crate) fn header_response_test_stream() -> Vec<u8> {
     vec![
         0x65, 0x85, 0x01, 0x12, 0xc0, 0x30, 0x04, 0x04, 0x25, 0xe0, 0xff, 0x3f, 0x6e, 0x2b, 0x1d,
@@ -219,9 +221,10 @@ pub(crate) fn header_response_test_stream() -> Vec<u8> {
     ]
 }
 
+/// A stream generated from a deterministic token and byte construction
+/// (seed 138), then settled under the fixed-support header response. It
+/// contains no corpus bytes.
 pub(crate) fn length_exchange_test_stream() -> Vec<u8> {
-    // Generated from deterministic token/byte construction (seed 138), then
-    // settled under fixed-support header response. No corpus bytes are used.
     vec![
         141, 133, 65, 18, 0, 32, 8, 2, 77, 35, 255, 255, 227, 26, 188, 53, 102, 2, 236, 202, 80,
         155, 88, 174, 6, 164, 230, 218, 172, 30, 61, 117, 52, 90, 99, 72, 228, 178, 60, 249, 15,

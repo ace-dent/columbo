@@ -67,8 +67,8 @@ fn literal_span_padding_saves_a_bit_without_changing_payload_codes() {
     )
     .unwrap();
     assert_eq!(control.bits, 1294);
-    // Longer zero runs alone are not sufficient: finding this saving also
-    // requires a different code-length tree. A fixed-CL shortcut misses it.
+    // Longer zero runs alone are not enough: this saving also needs a
+    // different code-length code, so a search with that code fixed misses it.
     let lengths: Vec<_> = result
         .literal_lengths
         .iter()
@@ -137,8 +137,8 @@ fn literal_span_search_respects_limits_and_retains_finished_prices() {
     let mut one = 1;
     assert!(plan_literal_span(&block, true, &mut one, &mut SearchStop::never()).is_none());
     assert_eq!(one, 0);
-    // The first eight prices reach HLIT=277. Exhaustion retains that
-    // complete winner without admitting any later span.
+    // The first eight prices reach 277 literal/length codes. Running out of
+    // prices keeps that complete winner and tries no later count.
     let mut eight = 8;
     let result = plan_literal_span(&block, true, &mut eight, &mut SearchStop::never()).unwrap();
     assert_eq!((result.hlit, result.bits, eight), (277, 1293, 0));
@@ -202,8 +202,8 @@ fn payload_swap_search_respects_stop_and_shared_price_budget() {
     assert!(
         plan_payload_header_tradeoff(&block, true, &mut 1024, &mut SearchStop::always()).is_none()
     );
-    // One price permits only the unchanged-tree control. Its fully priced
-    // parent already ties, so no speculative permutation may escape.
+    // One price covers only the unchanged-tree repack, which ties the fully
+    // priced parent, so no swap result may be returned.
     let mut budget = 1;
     assert!(
         plan_payload_header_tradeoff(&block, true, &mut budget, &mut SearchStop::never()).is_none()
@@ -226,8 +226,8 @@ fn payload_swap_search_respects_stop_and_shared_price_budget() {
 
 #[test]
 fn local_swap_transition_delta_matches_full_sequence_oracle() {
-    // Exhaustive short sequences include zero/nonzero runs, adjacent
-    // swaps, endpoints and positions on either side of an alphabet seam.
+    // Exhaustive short sequences include zero and nonzero runs, adjacent
+    // swaps, endpoints and positions on either side of an alphabet boundary.
     for mut code in 0..3_usize.pow(6) {
         let mut lengths = [0_u8; 6];
         for length in &mut lengths {
@@ -771,8 +771,8 @@ fn shortest_rle_matches_exhaustive_short_sequence_oracle() {
     }
 }
 
-/// Deliberately scan every legal edge and retain whole suffix spellings.
-/// This slow oracle shares no sliding-window state with the production DP.
+/// Slow oracle: scan every legal edge and keep whole suffix spellings. It
+/// shares no sliding-window state with `shortest_rle`.
 fn scanned_shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
     let mut suffixes = vec![None; lengths.len() + 1];
     suffixes[lengths.len()] = Some((0_u64, Vec::<RleToken>::new()));
@@ -1265,10 +1265,9 @@ fn columbo_zero_repeat_can_continue_a_literal_zero() {
 
 #[test]
 fn package_merge_can_win_the_code_length_alphabet() {
-    // This histogram is a reduced header-only regression for a block where
-    // Defluff's package-merge tree saves one bit over every heap tree. Lay
-    // the symbols out without adjacent repeats so this test isolates the
-    // nineteen-symbol tree choice rather than RLE packing.
+    // On this histogram Defluff's package-merge tree saves one bit over every
+    // heap tree. No adjacent repeats, so the test isolates the 19-symbol tree
+    // choice from RLE packing.
     let mut remaining = [134_u32, 2, 0, 1, 1, 6, 5, 39, 33, 21, 74];
     let mut lengths = Vec::new();
     lengths.try_reserve_exact(316).unwrap();
@@ -1356,8 +1355,8 @@ fn deflopt_local_rewrite_expands_only_a_strictly_dearer_repeat() {
     assert_eq!(rewritten.len(), 11);
     assert!(rewritten.iter().all(|token| token.symbol == 0));
 
-    // Ties are deliberately retained, matching the source optimizer's
-    // deterministic strict-improvement rule.
+    // A tie keeps the repeat code, matching DeflOpt's strict-improvement
+    // rule.
     code_lengths[0] = 1;
     code_lengths[18] = 4;
     assert!(rewrite_rle_deflopt_local(&input, &code_lengths).is_none());
@@ -1373,9 +1372,9 @@ fn deft4j_prune_can_rebuild_after_an_equal_cost_rewrite() {
     code_lengths[0] = 2;
     code_lengths[17] = 3;
 
-    // Three explicit zero codes and one repeat-17 code plus its three
-    // extra bits both cost six. The ordinary strict finalizer retains the
-    // repeat; deft4j's pre-rebuild prune deliberately expands the tie.
+    // Three explicit zero codes and one code 17 plus its three extra bits
+    // both cost six. The strict final pass keeps the repeat; deft4j's
+    // pre-rebuild prune expands the tie.
     assert!(rewrite_rle_deft4j_literals(&input, &code_lengths, false).is_none());
     assert_eq!(
         rewrite_rle_deft4j_literals(&input, &code_lengths, true).unwrap(),
@@ -1427,8 +1426,9 @@ fn strict_distance_completions_are_complete_uniform_and_cover_the_used_symbol() 
 
 #[test]
 fn strict_distance_completion_replaces_a_costly_one_bit_pair() {
-    // A literal-only block whose planned `[1, 1]` completion is the only
-    // reason code-length symbol 1, and therefore HCLEN 18, is transmitted.
+    // A literal-only block whose planned `[1, 1]` distance completion is the
+    // only reason code-length symbol 1 is sent, and so 18 code-length code
+    // lengths.
     let block = payload_tradeoff_test_block();
     let original = block.original_dynamic.as_ref().unwrap();
     assert_eq!(&original.distance_lengths[..2], &[1, 1]);
@@ -1498,10 +1498,8 @@ fn strict_completion_payload_adjustment_matches_a_full_token_scan() {
 
 #[test]
 fn strict_empty_dynamic_plan_uses_complete_huffman_codes() {
-    // This is the shape that exposed libdeflate issue #323: an
-    // all-literal block can otherwise advertise an empty distance code.
-    // The EOB-only literal tree is another RFC edge case covered by
-    // libdeflate's broader complete-code fix.
+    // An end-of-block-only literal/length code and an empty distance code, as
+    // in libdeflate issue #323. Strict output completes both codes.
     let mut literal_frequencies = [0_u32; 286];
     literal_frequencies[256] = 1;
     let distance_frequencies = [0_u32; 30];

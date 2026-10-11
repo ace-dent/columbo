@@ -1,8 +1,8 @@
 # Steam Stickers APNG Default-mode Benchmark
 
-This separate APNG phase runs plain Columbo Default mode and validates
-its output against the source APNG. Default results are not compared
-to deft4j. The completed Max row for the same source is used only for
+This separate APNG phase runs Columbo in Default mode and validates
+each output against its source APNG. Default results are not compared
+with deft4j. The completed Max row for the same source is used only for
 two gates: Default must be faster, and Max must be no larger than
 Default in both file bytes and meaningful Deflate bits.
 Gate failures are recorded and never interrupt the corpus run.

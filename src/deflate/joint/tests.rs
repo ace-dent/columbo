@@ -140,9 +140,9 @@ fn spelling_bits(rle: &[RleToken], costs: &[u8; 19]) -> u64 {
         .sum()
 }
 
-/// Independent enumeration of every complete length vector in both
-/// alphabets, followed by the existing fixed-sequence shortest-RLE solver.
-/// No joint states, suffix bounds, or seam transitions are reused here.
+/// Reference solver: enumerate every complete length vector for both
+/// alphabets, then run the shortest-RLE solver on each. It shares no states,
+/// suffix bounds or alphabet-boundary handling with `solve`.
 fn oracle(problem: &Problem<'_>) -> Option<u64> {
     let literals = complete_vectors(
         &problem.frequencies[..problem.split],

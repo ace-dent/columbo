@@ -7,9 +7,8 @@ use crate::deflate::block::{emit_block, stored_block_bits};
 use crate::deflate::model::OriginalBits;
 use crate::deflate::parse::parse_stream;
 
-/// Build the ordinary per-block result, joining consecutive fixed output plans
-/// as DeflOpt does. Removing the first block's seven-bit end code and the next
-/// block's three-bit header saves exactly ten bits.
+/// Build the ordinary per-block result, joining consecutive fixed plans as
+/// DeflOpt does (each join saves ten bits).
 fn sequential_plan(
     blocks: &[ParsedBlock],
     start_alignment: u8,
@@ -31,11 +30,7 @@ fn sequential_plan(
     )
 }
 
-/// Search kernel for `add_adaptive_split_cut`.
-///
-/// This independent Columbo implementation is substantially different from
-/// Turtledeflate's `turtledeflate_best_block_split`; it is not a translation
-/// or exact recreation.
+/// Return only the best split from `coarse_to_fine_split_search`.
 fn coarse_to_fine_split<S>(
     start: usize,
     end: usize,
@@ -613,8 +608,8 @@ fn strided_range_histograms_match_direct_recounting() {
     assert!(composite.range_frequencies(0, 701).is_none());
     assert!(composite.range_frequencies(701, 701).is_none());
 
-    // Near the optional-model ceiling, Columbo preserves the established
-    // structural route without the index and falls back to a direct scan.
+    // Without the checkpoint index (dropped near the model memory limit),
+    // range counts fall back to a direct scan.
     composite.frequency_checkpoints = None;
     let fallback = composite.range_frequencies(257, 699).unwrap();
     let direct = count_frequencies(&composite.tokens[257..699]);
@@ -823,7 +818,7 @@ fn coarse_to_fine_split_finds_an_off_grid_minimum_under_its_probe_cap() {
 }
 
 #[test]
-fn coarse_to_fine_split_centres_flat_ties() {
+fn coarse_to_fine_split_centers_flat_ties() {
     let candidate = coarse_to_fine_split(0, 2_048, &mut |_| Some(1), &mut SearchStop::never())
         .expect("a legal cut");
 
@@ -1036,8 +1031,8 @@ fn stored_only_floor_repacks_without_copying_literal_tokens() {
         .sum();
     assert!(total_bits(&plans) < source_bits);
 
-    // Repacking does not consult Huffman tables or alter LZ77 tokens, so
-    // it remains safe after a ZIP/APNG file-wide search budget is spent.
+    // Repacking needs no Huffman or token search, so it still runs after a
+    // file-wide search budget is spent.
     let relaxed = Options {
         strict: false,
         ..Options::default()
@@ -1066,9 +1061,9 @@ fn source_aligned_floor_prices_short_huffman_groups_before_search() {
         .sum();
     assert!(total_bits(&plans) < separate_bits);
 
-    // Exhaustive mode admits regrouping regardless of encoded source size.
-    // Once admitted at call entry, the complete structural floor remains
-    // available even if the next deadline check expires optional search.
+    // Max mode allows regrouping regardless of encoded source size. Once
+    // allowed at call entry, the complete structural floor remains available
+    // even if the next deadline check ends optional search.
     let exhaustive = Options {
         exhaustive: true,
         ..Options::default()
@@ -1213,9 +1208,8 @@ fn parallel_bounded_grouping_matches_the_serial_candidate() {
     )
     .unwrap();
 
-    // The same-distance floor can make each synthetic source block as cheap as
-    // its grouped form. This test requires identical serial and parallel
-    // decisions, whether or not a merge remains profitable.
+    // Serial and parallel decisions must match, whether or not a merge is
+    // profitable.
     assert_eq!(parallel.len(), serial.len());
     for (parallel, serial) in parallel.iter().zip(&serial) {
         assert_eq!(parallel.tokens, serial.tokens);
@@ -1495,9 +1489,9 @@ fn collected_floor_is_not_hidden_by_an_unrelated_strong_adjacent_win() {
         .map(|index| {
             let value = if index & 1 == 0 { b'a' } else { b'b' };
             let mut block = literal_block(&[value; 100], SourceBlockType::Dynamic);
-            // Deliberately expensive source serializations make the
-            // adjacent route a >512-byte win. That saving is independent of
-            // the alternating run's better collect-first grouping.
+            // Expensive source encodings make the adjacent route a
+            // >512-byte win. That saving is independent of the alternating
+            // run's better collect-first grouping.
             block.original = Some(OriginalBits {
                 start: source_start,
                 len: 16_000,
@@ -1539,7 +1533,7 @@ fn collected_floor_is_not_hidden_by_an_unrelated_strong_adjacent_win() {
 }
 
 #[test]
-fn long_run_search_rebuilds_profitable_dynamic_neighbours() {
+fn long_run_search_rebuilds_profitable_dynamic_neighbors() {
     let options = Options::default();
     let blocks = [
         literal_block(&vec![b'a'; 1_000], SourceBlockType::Dynamic),
@@ -1660,7 +1654,7 @@ fn terminal_merge_returns_only_a_strict_complete_stream_win() {
     let mut plan_cache = CanonicalPlanCache::new();
     let fallback = direct_structural_plan(&blocks, 0, &options, &mut plan_cache).unwrap();
     let merged = plan_terminal_merge_route(&blocks, 0, &options, &mut SearchStop::never())
-        .expect("equal neighbours have a profitable deterministic merge");
+        .expect("equal neighbors have a profitable deterministic merge");
 
     assert!(total_bits(&merged) < total_bits(&fallback));
     assert_eq!(merged.len(), 1);
@@ -1768,7 +1762,7 @@ fn forced_split_escape_is_max_only_and_deadline_bounded() {
 }
 
 #[test]
-fn long_huffman_route_does_not_join_large_stored_neighbours() {
+fn long_huffman_route_does_not_join_large_stored_neighbors() {
     let options = Options::default();
     let blocks = [
         literal_block(&vec![b'a'; 1_000], SourceBlockType::Stored),
@@ -1824,9 +1818,9 @@ fn eighth_target_keeps_snap_and_adds_exact_inside_match_cut() {
     let mut cuts = Vec::new();
     add_eighth_cuts(&mut cuts, &composite, 0, 69, 0, 128, true).unwrap();
 
-    // The first target is decoded offset 16, inside the 60-byte match.
-    // Retain the legacy boundary after the first literal and add an exact
-    // sibling that materializes only the selected edge fragments.
+    // The first target is decoded offset 16, inside the 60-byte match. Keep
+    // the token boundary after the first literal and add the exact
+    // inside-match cut.
     assert!(cuts.contains(&Cut { token: 1, plain: 1 }));
     assert!(cuts.contains(&Cut {
         token: 1,
@@ -1906,9 +1900,8 @@ fn eighth_target_keeps_the_strictly_preceding_exact_boundary() {
     let mut cuts = Vec::new();
     add_eighth_cuts(&mut cuts, &composite, 0, 128, 0, 128, true).unwrap();
 
-    // The original Columbo C probe treats decoded offset 16 as the
-    // inclusive end of the token beginning at offset 15, so the split
-    // stays before it.
+    // The probe treats decoded offset 16 as the inclusive end of the token
+    // starting at offset 15, so the cut stays before that token.
     assert!(cuts.contains(&Cut {
         token: 15,
         plain: 15,
@@ -2009,9 +2002,8 @@ fn compact_max_cut_set_reaches_late_32_token_probes() {
     let composite = Composite::new(&blocks).unwrap();
     let cuts = choose_cuts(&composite, true, true).unwrap();
 
-    // This boundary is deliberately near the end. Scoring all compact
-    // probes before deep whole-block searches keeps it reachable under a
-    // finite max-mode deadline.
+    // This cut is near the end. Scoring all compact probes before deep
+    // whole-block searches keeps it reachable under a finite Max deadline.
     assert!(cuts.contains(&Cut {
         token: 320,
         plain: 320,

@@ -21,7 +21,8 @@ fn seed(length: usize) -> Token {
     .unwrap()
 }
 
-/// Compare family endpoints with every legal canonical width.
+/// Oracle for `interval_bound` that tries every canonical length, not just
+/// each family's longest.
 fn scanning_interval_bound(interval: &Interval, literal: &[u8], distance: &[u8]) -> Option<u64> {
     let n = interval.seed.decoded_len();
     let mut ratio = interval.literal_min.map(|bits| (bits, 1_u64));
@@ -31,8 +32,6 @@ fn scanning_interval_bound(interval: &Interval, literal: &[u8], distance: &[u8])
             ratio = Some((bits, width));
         }
     };
-    // The exact source edge may include relaxed length-258 spelling, which
-    // is deliberately absent from the generated canonical edges below.
     if let Some(bits) = match_price(interval.seed, literal, distance) {
         consider(bits, n);
     }

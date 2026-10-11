@@ -10,9 +10,8 @@ description = "Structurally optimize existing Deflate streams without recompress
 license = "MIT"
 readme = false
 
-# Local corpora and reverse-engineering tools are intentionally private. This
-# allowlist keeps them out of source packages independently of Git's ignore
-# state.
+# Local corpora and reverse-engineering tools are private. This allowlist keeps
+# them out of source packages regardless of Git's ignore rules.
 include = [
     "/Cargo.toml",
     "/Cargo.lock",
@@ -28,9 +27,8 @@ include = [
 ]
 
 [profile.release]
-# Distribution builds prioritize runtime performance. Full LTO was neutral to
-# slightly faster on the representative GZIP and ZIP benchmarks while also
-# removing code that cannot be reached.
+# Release builds favor runtime speed. Full LTO measured neutral to slightly
+# faster and removes unreachable code.
 opt-level = 3
 codegen-units = 1
 lto = "fat"
@@ -38,9 +36,8 @@ overflow-checks = true
 panic = "unwind"
 strip = true
 
-# Published executables do not expose a recovery boundary for internal panics.
-# Aborting there removes the unwinder without changing optimization level or
-# normal error handling; developer and library release builds keep unwinding.
+# The CLI has no panic recovery boundary, so distribution builds abort instead
+# of unwinding. Development and library release builds keep unwinding.
 [profile.distribution]
 inherits = "release"
 panic = "abort"

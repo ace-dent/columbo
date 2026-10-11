@@ -76,9 +76,7 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
     let mut failed = false;
     let mut caution_printed = false;
     for (index, input) in command.inputs.iter().enumerate() {
-        // Each input owns its complete read/optimize/write lifetime. Besides
-        // making the processing order explicit, this releases potentially
-        // large buffers before the next file starts.
+        // One input at a time bounds peak memory.
         if execute_file(
             &command,
             report_mode,
@@ -157,8 +155,7 @@ fn execute_file(
         });
     }
 
-    // Strictness is a batch-wide policy, so one caution is sufficient even
-    // though each input receives its own detailed header and result.
+    // Strictness applies to the whole batch, so print the caution once.
     if !command.options.strict && !*caution_printed {
         let channel = OutputChannel::Stderr;
         channel.write(|output| print_strict_mode_caution(output, channel.color_enabled()));
@@ -166,7 +163,7 @@ fn execute_file(
     }
 
     let optimize_started = detailed.then(Instant::now);
-    // Detailed reporters start the same spinner once their output is ready.
+    // Verbose and visual reporters run their own spinner.
     let spinner_deadline = Instant::now()
         .checked_add(command.options.timeout)
         .unwrap_or_else(Instant::now);

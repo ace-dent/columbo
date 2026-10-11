@@ -4,15 +4,15 @@
 //! Deflate optimization with container-aware, compatibility-safe rewriting.
 //!
 //! Columbo is a structural optimizer, not a recompressor: it never searches
-//! for new LZ77 matches and never delegates to Zopfli, libdeflate, or a similar
-//! compressor. It only re-encodes choices already present in the input stream,
-//! such as block boundaries, Huffman tables, and spelling an existing match as
-//! its decoded literals when that is cheaper.
+//! for new LZ77 matches and never calls Zopfli, libdeflate, or a similar
+//! compressor. It re-encodes the input's existing tokens, choosing block
+//! boundaries and Huffman codes, and may spell an existing match as its
+//! decoded literals or as shorter matches at the same distance when that is
+//! cheaper.
 //!
-//! The public API deliberately separates format detection from optimization
-//! settings. This keeps callers deterministic while allowing the command-line
-//! program to retain the original Columbo C implementation's convenient
-//! auto-detection.
+//! The input [`Format`] is passed separately from [`Options`]. Callers can name
+//! it for deterministic handling, or pass [`Format::Auto`] to detect it as the
+//! CLI does.
 
 #![forbid(unsafe_code)]
 
@@ -35,21 +35,20 @@ pub use options::{
 pub struct Optimization {
     /// The selected file or stream bytes.
     pub data: Vec<u8>,
-    /// Bits saved by the selected output under Columbo's byte-first ordering.
+    /// Bits saved by the selected output, counting bytes first, then meaningful bits.
     ///
-    /// A shorter file saves eight bits per removed byte. When the file byte
-    /// length is unchanged, this instead reports the reduction in aggregate
-    /// meaningful compressed-payload bits across every optimized stream. For
-    /// Deflate this excludes final-byte padding; a ZIP member whose terminal
-    /// representation changes to Store is charged its decoded payload bits.
-    /// A value of zero means there was no physical compression saving. Call
-    /// [`Optimization::should_replace`] to also account for a mandatory,
-    /// equal-sized wrapper normalization.
+    /// A shorter file saves eight bits per removed byte. When the byte length
+    /// is unchanged, this is the total reduction in meaningful payload bits
+    /// across all optimized streams: Deflate bits excluding final-byte padding,
+    /// with a ZIP member converted to Store counted as its decoded size in
+    /// bits. Call [`Optimization::should_replace`] to also account for a
+    /// mandatory, equal-sized wrapper normalization.
     pub bits_saved: u64,
     /// Whether search reached its deadline.
     pub timed_out: bool,
-    /// Extraneous payload bytes removed by `--strip`, excluding metadata and
-    /// compression savings. Zeroed Deflate padding bits do not count as bytes.
+    /// Extraneous payload bytes removed by [`Options::strip_metadata`]
+    /// (`--strip`), excluding metadata and compression savings. Zeroed Deflate
+    /// padding bits are not counted.
     pub removed_data_bytes: u64,
     rewrite_required: bool,
     blocking_chunk: Option<[u8; 4]>,
@@ -81,10 +80,10 @@ impl Optimization {
 
     /// Whether the selected bytes should replace the source representation.
     ///
-    /// This is normally equivalent to `bits_saved != 0`. It is also true for
-    /// a mandatory equal-sized wrapper normalization, such as changing a
-    /// four-byte ZIP member from Deflate to Store when neither method can use
-    /// fewer physical payload bytes.
+    /// Usually equivalent to `bits_saved != 0`. Also true for a mandatory
+    /// equal-sized wrapper normalization (a ZIP member of at most four decoded
+    /// bytes changed from Deflate to Store), and for any changed output when
+    /// [`Options::strip_metadata`] is set.
     pub fn should_replace(&self) -> bool {
         self.bits_saved != 0 || self.rewrite_required
     }
@@ -115,13 +114,13 @@ impl Optimization {
     }
 }
 
-/// Optimize one raw stream or supported container.
+/// Optimize one raw Deflate stream or supported container.
 ///
-/// Strict mode may enlarge an input while completing a dynamic Huffman
-/// alphabet or canonicalizing a non-standard length-258 spelling. Relaxed
-/// mode and ordinary strict inputs retain the no-growth guarantee.
-/// Pathologically fragmented streams may also hit an internal parsed-model
-/// memory budget before reaching the configurable byte limits.
+/// The output is never larger than the input, except in strict mode when it
+/// must complete an incomplete dynamic Huffman code or rewrite the
+/// non-standard symbol-284 spelling of length 258. Highly fragmented streams
+/// can exceed an internal memory budget for the parsed model before reaching
+/// the configurable byte limits.
 pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optimization> {
     format::optimize(input, format, options)
 }
@@ -129,9 +128,9 @@ pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optim
 /// Count the independent Deflate streams Columbo can inspect in one input.
 ///
 /// Container declarations alone are not trusted: PNG/APNG and GZIP inputs are
-/// parsed far enough to distinguish physical streams, and encrypted or empty
-/// ZIP members that cannot expose a Deflate bitstream are not counted. The CLI
-/// uses this preflight only for verbose and visual headers.
+/// parsed far enough to distinguish physical streams, and only unencrypted,
+/// non-empty Deflate ZIP members are counted. PNG counts include fdAT frames
+/// and zlib-compressed metadata chunks.
 pub fn deflate_stream_count(input: &[u8], format: Format, options: &Options) -> Result<usize> {
     format::deflate_stream_count(input, format, options)
 }

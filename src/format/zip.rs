@@ -32,12 +32,8 @@ const LOCAL_ALLOCATION_ERROR: &str = "could not allocate ZIP local entry";
 const STORE_MIN_SAVINGS_PERCENT: u64 = 10;
 const ALWAYS_STORE_MAX_BYTES: u32 = 4;
 
-/// Max keeps an exact Default archive as a quality floor while exploring a
-/// separate direct-Max archive. The direct branch treats its validated source
-/// stream as an established floor instead of rebuilding ordinary work already
-/// owned by the Default branch. Bound both retained input and decoded models
-/// because the two complete branches still use separate archive and Deflate
-/// arenas.
+/// Size limits for parallel archive work (two Max branches or parallel members),
+/// which holds several archive and Deflate models at once.
 const PARALLEL_MAX_ARCHIVE_INPUT: usize = 8 * 1_024 * 1_024;
 const PARALLEL_MAX_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
 const PARALLEL_MEMBER_ARCHIVE_DECODED: u64 = 64 * 1_024 * 1_024;
@@ -79,14 +75,9 @@ impl ZipOptimization {
     }
 }
 
-/// Which structurally bounded member sets may use the parallel entry builder.
-///
-/// Ordinary archive work parallelizes only a broad, evenly distributed set,
-/// where member concurrency avoids leaving many small independent streams
-/// idle. During the bounded Max archive race, the caller also lets the
-/// mandatory Default sibling parallelize any set of at least two independent
-/// Deflate members. Completing that quality floor sooner leaves more of the
-/// same file-wide deadline for its distinct refinement lineage.
+/// Which member sets may be built in parallel. The parallel Max build's Default
+/// branch uses `AnyIndependentWork` so its floor finishes sooner, leaving more
+/// time to refine it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParallelMemberPolicy {
     UniformWorkOnly,
@@ -121,12 +112,11 @@ pub(super) struct ParsedZip {
     expanded_size: u64,
 }
 
-/// Recognize both ordinary archives and ZIP-family inputs that should receive
-/// a specific malformed/unsupported ZIP diagnostic.
+/// Recognize ZIP input, including malformed or unsupported archives that
+/// should get a specific ZIP error.
 ///
-/// A leading signature retains the old behavior for truncated inputs. Looking
-/// for the terminal record additionally recognizes valid archives with a
-/// self-extracting or other prepended stub.
+/// A leading signature catches truncated archives; a consistent end record
+/// catches archives with a prepended stub, such as a self-extractor.
 pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
     matches!(
         read_le32(input, 0),
@@ -137,9 +127,8 @@ pub(super) fn has_recognizable_structure(input: &[u8]) -> bool {
     ) || has_consistent_end_layout(input)
 }
 
-/// Require internally consistent EOCD fields before treating a terminal ZIP
-/// record as strong evidence. Signature-only inputs remain recognizable so
-/// callers can retain targeted diagnostics for truncated archives.
+/// Whether the end of central directory record is strong evidence of a ZIP
+/// archive. `has_recognizable_structure` accepts weaker evidence.
 pub(super) fn has_plausible_end_record(input: &[u8]) -> bool {
     let Some(offset) = find_end_of_central_directory(input) else {
         return false;
@@ -248,8 +237,8 @@ pub(super) fn preflight(
         }
     }
     let physical_order = preflight_local_entries(input, central_offset, &mut entries)?;
-    // Competing directory layouts cannot be resolved by choosing whichever
-    // signature happens to be last, particularly when a suffix is present.
+    // Reject a second plausible end of central directory record rather than
+    // guess which layout is real.
     if input.windows(4).enumerate().any(|(offset, signature)| {
         offset != eocd_offset
             && signature == END_OF_CENTRAL_DIRECTORY.to_le_bytes()
@@ -340,14 +329,9 @@ fn configure_stream_producers(options: &Options, producers: &[u8]) {
     }
 }
 
-/// Build Default-seeded and direct-Max archives inside the same wall-clock
-/// window, then retain the byte-first winner.
-///
-/// `Established` makes original-source Max routes available immediately while
-/// the caller owns all ordinary Default work. Refining the completed Default
-/// archive remains useful rather than duplicate work: its rewritten block and
-/// token choices expose a distinct search basin that the source branch cannot
-/// necessarily reach.
+/// Build the direct-Max archive on a worker while the caller builds the
+/// Default archive and refines it with Max, in one time window. The refined
+/// branch starts from rewritten tokens the direct branch may not reach.
 fn optimize_max_parallel(
     input: &[u8],
     options: &Options,
@@ -394,9 +378,6 @@ fn optimize_max_parallel(
 
         let max_worker = match max_worker {
             Ok(worker) => worker,
-            // Thread creation failure is not an optimization failure. Finish
-            // the established sequential route using the Default result and
-            // whatever part of the original allowance remains.
             Err(_) => {
                 configure_stream_producers(
                     options,
@@ -453,11 +434,8 @@ fn optimize_max_sequential(
         return refine_complete_floor(options, started, floor);
     }
 
-    // Large or nonuniform archives cannot retain two complete working copies
-    // concurrently, but sufficient time must still expose the original-source
-    // deft4j graph. Give that independent lineage half of the actual remainder,
-    // then refine the already-complete Default archive with whatever wall time
-    // is genuinely left. A local slice ending is not a file timeout.
+    // The direct branch (deft4j search on the original streams) gets half the
+    // remaining time; the end of its slice is not a file timeout.
     let mut direct_options = options.clone();
     direct_options.timeout = direct_allowance;
     let mut direct = crate::progress::with_route_lineage("direct max", || {
@@ -478,17 +456,13 @@ fn optimize_max_sequential(
     Ok(best_complete_optimization(refined, direct))
 }
 
+/// Refine a complete Default archive with Max in the time left, using `Shared`
+/// raw floors rather than rebuilding Default per member.
 fn refine_complete_floor(
     options: &Options,
     started: Instant,
     mut floor: ZipOptimization,
 ) -> Result<ZipOptimization> {
-    // Max benchmarks and interactive runs allocate one file-wide allowance,
-    // normally measured default time plus an extra search budget. Preserve
-    // that contract explicitly: establish the complete default archive once,
-    // then use only the actual remainder to refine its already-smaller Deflate
-    // members. The second phase starts from the finished floor and therefore
-    // uses `Shared` raw floors instead of rebuilding default work per member.
     let remaining = options.timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         floor.timed_out = true;
@@ -560,6 +534,9 @@ fn parallel_max_entry_work_is_bounded(entries: &[Entry]) -> bool {
     has_optimizable_entry && !uniformly_distributed_member_work(entries)
 }
 
+/// Whether member work is spread evenly. Such archives build members in
+/// parallel rather than run two archive branches, which duplicate per-member
+/// setup and pay off only when a few large members hold most of the work.
 fn uniformly_distributed_member_work(entries: &[Entry]) -> bool {
     let mut member_count = 0_usize;
     let mut total_compressed = 0_u64;
@@ -574,13 +551,6 @@ fn uniformly_distributed_member_work(entries: &[Entry]) -> bool {
         largest_compressed = largest_compressed.max(compressed);
     }
 
-    // Two complete archive branches duplicate parser and floor setup for every
-    // member. That overlap pays when a few substantial members own most work,
-    // because their independent basins can run together. On a broad, uniform
-    // set no member owns even one eighth of the compressed payload; completing
-    // Default once and refining it gives more members useful search time.
-    // This is a structural work-distribution rule, not a filename or elapsed-
-    // time gate, and sufficient Max time still evaluates the same lineages.
     member_count >= 8 && largest_compressed.saturating_mul(8) <= total_compressed
 }
 
@@ -624,20 +594,14 @@ fn optimize_once(
             }
         })
         .collect();
-    // Limit the sum before decoding any member. This avoids doing expensive
-    // work on an archive whose declared expansion is already unsafe.
-    // Resolve and validate every physical local range before copying or
-    // optimizing any payload. A hostile central directory may otherwise point
-    // many entries at the same large local record, multiplying work and owned
-    // buffers before the reconstruction loop finally notices the overlap.
+    // `preflight` already limited the declared expanded size and rejected
+    // overlapping local records, so a hostile central directory cannot point
+    // many entries at one large record.
     let physical_order = &parsed.physical_order;
 
-    // Search order is independent of archive layout. In normal mode the
-    // original Columbo C implementation gives the largest Deflate member first
-    // use of the shared deadline; max mode runs small members first and leaves
-    // the actual remainder for the final largest member. Local records are
-    // still emitted later in physical-offset order, and central records retain
-    // source order.
+    // Default runs the largest Deflate member first, as Columbo's C
+    // implementation did; Max runs small members first. The output keeps the
+    // source record order.
     let build_order = optimization_order(&entries, options.exhaustive)?;
     let schedule = options.exhaustive.then(|| ZipSchedule::new(&entries));
     let optimizable_members = build_order
@@ -727,11 +691,8 @@ fn optimize_once(
     })
 }
 
-/// Rebuild one classic archive from completed local-entry candidates.
-///
-/// Keeping this byte-only phase separate lets the terminal Store comparison
-/// reuse exactly the same prefix, padding, central-directory, and metadata
-/// rules as ordinary Deflate optimization.
+/// Rebuild a non-ZIP64 archive from completed local records. The Store pass
+/// reuses it, so both apply the same prefix, gap and metadata rules.
 fn rebuild_archive(
     input: &[u8],
     options: &Options,
@@ -744,9 +705,9 @@ fn rebuild_archive(
         .get(eocd_offset..eocd_offset + 22)
         .ok_or_else(|| Error::new("truncated ZIP end of central directory"))?;
 
-    // Local records need not appear in central-directory order. Rewrite them
-    // by physical offset. Unowned regions remain intact by default; --strip
-    // rebuilds only the referenced records, without interpreting dead bytes.
+    // Local records need not follow central directory order, so write them by
+    // physical offset. Unreferenced bytes between them are kept, or dropped
+    // uninterpreted with --strip.
     let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
     let mut cursor = 0_usize;
     for &index in physical_order {
@@ -804,8 +765,8 @@ fn rebuild_archive(
             if entry.strip_extra {
                 put_le16(&mut record, 30, 0);
             }
-            // Central per-file comments are metadata even when an unsupported
-            // entry needs to retain its extra field.
+            // Remove the file comment even when an unsupported entry keeps
+            // its extra field.
             put_le16(&mut record, 32, 0);
             46 + name_length + if entry.strip_extra { 0 } else { extra_length }
         } else {
@@ -851,22 +812,17 @@ fn rebuild_archive(
     Ok(output)
 }
 
-/// Apply ZIP's container-level Store alternatives after a complete archive
-/// lineage has exhausted its admitted Deflate work.
-///
-/// Raw, zlib, GZIP, and PNG have no equivalent wrapper choice: their supported
-/// payload syntax requires Deflate. Raw planning already compares RFC 1951
-/// stored blocks with fixed and dynamic blocks internally. Classic ZIP alone
-/// can replace an entire method-8 payload with method 0 while preserving the
-/// decoded member bytes.
+/// After an archive's Deflate work, replace Deflate members (method 8) with
+/// stored members (method 0) where allowed. Other formats require Deflate data
+/// and rely on the planner's stored blocks.
 fn finalize_store_fallback(
     mut optimized: ZipOptimization,
     options: &Options,
 ) -> Result<ZipOptimization> {
     let rebuilt = {
         let input = optimized.data.as_slice();
-        // Wrapper stripping and normalization have already happened. Parse
-        // this selected lineage without introducing another metadata policy.
+        // Stripping has already been applied to this archive, so parse it
+        // without --strip.
         let parsed = preflight(input, false, options.max_decoded_bytes)?;
         let mut entries = parsed.entries;
         let report_store_changes = options.verbose || options.visual;
@@ -898,13 +854,10 @@ fn finalize_store_fallback(
 
         for &index in &parsed.physical_order {
             let entry = &mut entries[index];
-            // Deflate needs at least one final block and an end marker, so it
-            // cannot occupy fewer physical bytes than Store for a decoded
-            // payload of at most four bytes. This deterministic route applies
-            // in both modes and supersedes Max's percentage threshold. Larger
-            // streams retain Deflate unless Max's terminal comparison saves
-            // at least 10% of the optimized payload bytes; header and
-            // descriptor savings do not count toward that threshold.
+            // Deflate needs at least a block header and an end-of-block code,
+            // so it never beats storing a payload of at most four bytes. Larger
+            // members are stored only in Max, when that saves at least 10% of
+            // the Deflate payload (header and descriptor savings excluded).
             let always_store = entry.uncompressed_size <= ALWAYS_STORE_MAX_BYTES;
             if entry.method != 8
                 || entry.flags & FLAG_ENCRYPTED != 0
@@ -966,9 +919,7 @@ fn finalize_store_fallback(
         }
 
         if changed {
-            // Preflight already validated every local range. Copy unchanged
-            // records only when a Store replacement requires reconstruction;
-            // the usual no-change case needs no payload staging at all.
+            // Preflight validated these ranges.
             for entry in &mut entries {
                 if entry.local.is_empty() {
                     let start = entry.local_offset_before;
@@ -1083,12 +1034,8 @@ fn build_entries_serial(
     Ok(timed_out)
 }
 
-/// Optimize a structurally bounded set of independent members concurrently.
-///
-/// This path is selected only after the archive-wide input and decoded-memory
-/// bounds have passed. Each worker owns cloned entry metadata and its output;
-/// immutable archive bytes are shared, and results rejoin
-/// before reconstruction.
+/// Optimize members in parallel. Workers update cloned entries, which are
+/// merged before reconstruction.
 #[allow(clippy::too_many_arguments)]
 fn build_entries_parallel(
     input: &[u8],
@@ -1107,9 +1054,8 @@ fn build_entries_parallel(
         .take_while(|&&index| entry_is_optimizable(&entries[index]))
         .count();
     let (optimizable, remaining) = build_order.split_at(optimizable_count);
-    // The structural caller currently guarantees at least eight jobs. Keep a
-    // serial fallback here as well so a future scheduling change cannot turn
-    // an empty worker set into a division by zero.
+    // Callers pass at least two optimizable members; this guards the division
+    // below.
     if optimizable.is_empty() {
         return build_entries_serial(
             input,
@@ -1232,9 +1178,8 @@ fn build_entry_batch(
     schedule: Option<ZipSchedule>,
     stream_producer: u8,
 ) -> Result<Vec<(usize, Entry, bool)>> {
-    // These jobs run serially on one worker while sibling slices overlap in
-    // wall time. Divide the worker's allowance among only this slice; using
-    // the whole archive denominator would underfund every parallel member.
+    // Weight timeouts over this worker's jobs only; weighting by the whole
+    // archive would shortchange parallel members.
     let schedule = schedule.map(|_| ZipSchedule::new_for_indices(entries, jobs));
     let mut completed = Vec::new();
     completed
@@ -1431,19 +1376,15 @@ fn entry_is_deflate_stream(entry: &Entry) -> bool {
     entry.method == 8 && entry.flags & FLAG_ENCRYPTED == 0 && entry.compressed_size_before != 0
 }
 
-/// Divide max mode's file-wide deadline between independent ZIP members.
+/// Divide Max's file deadline between ZIP members: each gets a slice
+/// proportional to its weight, and the last of the largest members gets the
+/// remaining time.
 ///
-/// Small members run first and receive a proportional slice. The final largest
-/// member inherits the actual initial remainder, then every member that yielded
-/// its slice is eligible for a weighted reclaim pass using actual time left.
-/// Thus unused time is not lost even when several members tie for largest.
-/// Nearly incompressible archives use their small amount of compression slack
-/// as the weight; otherwise huge stored-like members would crowd useful work on
-/// small, compressible entries out of the schedule. The proportional
-/// denominator counts every member once. Counting the reserved largest member
-/// twice can truncate another member's ordinary comparison floor, making max
-/// worse than normal even though the largest route later has
-/// unused search time.
+/// Weights are decoded sizes unless a largest member is nearly incompressible
+/// (compressed size at least 98% of decoded size). Then they are the
+/// compression slack plus 5% of the compressed size, so large stored-like
+/// members do not crowd out small, compressible ones. The total counts each
+/// member once, so the largest member cannot cut short another's Default floor.
 #[derive(Clone, Copy)]
 struct ZipSchedule {
     largest_size: u32,
@@ -1518,9 +1459,8 @@ impl ZipSchedule {
 
 fn zip_stream_weight(entry: &Entry, effective: bool) -> f64 {
     if !effective {
-        // Deflate planning repeatedly scans decoded bytes and their token
-        // model. Compressed size can badly underweight an efficient member
-        // whose optimization work is comparable to a larger neighbour.
+        // Planning work scales with decoded size; compressed size would
+        // underweight well-compressed members.
         return f64::from(entry.uncompressed_size.max(1));
     }
     let slack = entry
@@ -1540,9 +1480,8 @@ fn find_end_of_central_directory(input: &[u8]) -> Option<usize> {
             }
         }
     }
-    // A validated directory can precede an opaque suffix of any length within
-    // the file's input budget. This scan is linear and never scans payloads for
-    // local records or decompresses speculative candidates.
+    // Otherwise accept the last plausible record, followed by a suffix of any
+    // length.
     input
         .windows(4)
         .enumerate()
@@ -1553,7 +1492,8 @@ fn find_end_of_central_directory(input: &[u8]) -> Option<usize> {
         })
 }
 
-/// Cheap structural proof before accepting an EOCD away from the file end.
+/// Cheap structural check of an end of central directory record that is not
+/// at the end of the file.
 fn plausible_end_at(input: &[u8], offset: usize) -> bool {
     let Some(header) = input.get(offset..offset.saturating_add(22)) else {
         return false;
@@ -1673,10 +1613,9 @@ fn build_local_entry(
     let data_end = layout.data_end;
     let old_local_size = layout.total_size;
 
-    // ZipCrypto uses a different password-check byte when bit 3 is set. We
-    // cannot clear the data-descriptor flag without decrypting and rewriting
-    // its encryption header, so preserve encrypted local records exactly.
-    // Other entries can safely move the descriptor values into the header.
+    // ZipCrypto's password-check byte depends on bit 3 (data descriptor), so
+    // encrypted records stay unchanged. Other entries move the descriptor
+    // values into the local header.
     if entry.flags & FLAG_ENCRYPTED != 0 {
         entry.local = try_copy_bytes(
             &input[position..position + old_local_size],
@@ -1698,10 +1637,8 @@ fn build_local_entry(
             ));
         }
     } else if entry.method == 8 && entry.uncompressed_size <= ALWAYS_STORE_MAX_BYTES {
-        // No valid Deflate representation can be physically smaller than a
-        // zero-to-four-byte Store payload. Validate the stream and retain its
-        // exact source bytes only until the wrapper's mandatory Store pass;
-        // do not admit it to any Deflate optimization route.
+        // `finalize_store_fallback` stores payloads of at most four bytes, so
+        // only validate the stream here.
         let (decoded, deflate_bits, crc32) =
             decoded_bytes_for_storage(source_payload, u64::from(entry.uncompressed_size)).map_err(
                 |error| match error.kind() {
@@ -1868,9 +1805,9 @@ fn descriptor_length(input: &[u8], position: usize, limit: usize, entry: &Entry)
     if has_signature && descriptor_fields_match(input, position + 4, limit, entry) {
         return Ok(16);
     }
-    // The signature is optional. A signatureless descriptor is ambiguous when
-    // its CRC-32 happens to equal 0x08074b50, so fall back to interpreting that
-    // first word as the CRC if the signed layout did not match.
+    // The signature is optional, so a signatureless descriptor whose CRC-32
+    // equals 0x08074b50 is ambiguous; try the unsigned layout if the signed
+    // one did not match.
     if descriptor_fields_match(input, position, limit, entry) {
         return Ok(12);
     }

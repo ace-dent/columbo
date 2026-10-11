@@ -126,8 +126,8 @@ fn reusable_huffman_plan_still_selects_stored_per_alignment() {
     block.plain = std::sync::Arc::new(vec![0; 26]);
 
     // A 26-byte stored block costs 243 bits with no padding and 250 bits
-    // with seven padding bits. The reusable Huffman kernel must therefore
-    // remain a candidate rather than blindly reusing one aligned winner.
+    // with seven padding bits. The reusable Huffman plan must therefore stay
+    // a candidate rather than reusing the winner from one alignment.
     let (no_padding, no_padding_bits) = select_aligned_representation(
         block.plain.len(),
         reusable_original_bits(&block, 5, true),
@@ -209,9 +209,8 @@ fn canonical_cache_verifies_exact_state_after_a_hash_collision() {
     let mut cache = CanonicalPlanCache::new();
     cache.plan_reusable_complete(&first, &options);
 
-    // Force the first entry into the second state's bucket. Production
-    // hashes are only accelerators, so an exact-state mismatch must still
-    // miss and append a separate entry to the collision chain.
+    // Force the first entry into the second block's chain; the mismatched block
+    // must still miss and append a separate entry.
     let collision = canonical_plan_fingerprint(&second, &options);
     cache.entries[0].fingerprint = collision;
     cache.first_by_hash.clear();

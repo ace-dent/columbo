@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Range minima shared by searches over canonical match-length families.
+//! Range minima shared by searches over the lengths of one length symbol.
 
-/// Incremental suffix minima for the at-most-32-width length families.
-/// Six power-of-two ranges answer each family query with two lookups. Store
-/// positions rather than costs so equal prices retain the lowest position.
+/// Sparse table of range minima over positions, filled from the end backward.
+///
+/// One length symbol covers at most 32 lengths, so six power-of-two levels
+/// answer each query with two lookups. Entries store positions so that equal
+/// costs resolve to the lowest position.
 pub(crate) struct SuffixMinima {
     positions: [[u16; 259]; 6],
 }

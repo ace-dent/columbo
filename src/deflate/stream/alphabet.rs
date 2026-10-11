@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Discover coupled block cuts from the spatial support of payload symbols.
-//! A symbol or a group may occupy a short interval whose own tables cost less
-//! than carrying those symbols in both surrounding regions. New anchors lie
-//! between tokens; existing graph anchors may also split proven matches.
+//! Find pairs of block cuts around where payload symbols occur (R6).
+//!
+//! Giving a symbol group that occurs only within a short interval its own block
+//! can cost less than coding it in the tables of both surrounding regions. Cuts
+//! from the boundary graph may also split matches.
 
 use std::collections::HashMap;
 
@@ -18,6 +19,8 @@ const MAX_MENU: usize = (286 + 30) * 5;
 const MAX_CUTS: usize = 80;
 const ESTIMATE_WINDOW: u64 = 64;
 
+/// Work and exact-price budget shared by one terminal pass's alphabet-boundary
+/// searches.
 pub(crate) struct AlphabetBudget {
     work_left: usize,
     prices_left: usize,
@@ -124,8 +127,8 @@ fn cut(composite: &Composite, token: usize) -> Cut {
     }
 }
 
-/// The estimate ranks candidates; the window is a search heuristic, not a
-/// lower bound proving that omitted pairs cannot improve the stream.
+/// Estimate a token range's block bits as the cheaper of a fixed block and the
+/// histogram estimate, for ranking only.
 fn estimate(composite: &Composite, start: usize, end: usize, strict: bool) -> Option<u64> {
     if start == end {
         return Some(0);
@@ -190,10 +193,8 @@ impl EdgeCache<'_> {
             self.budget.spend(work)?;
             self.budget.prices_left -= 1;
             self.edges.try_reserve(1).ok()?;
-            // This cache owns exactly one source block. Reuse header kernels
-            // across its neighboring ranges: different histograms often build
-            // the same length lists, whose RLE description can be shared while
-            // each range still pays its own exact payload and extra bits.
+            // Different histograms often give the same code lengths, so ranges
+            // share header plans; each still pays its exact payload.
             let materialized;
             let range = if start.plain == 0 && end.plain == block.plain.len() {
                 block
@@ -264,7 +265,8 @@ fn refine(
         if let Some(&value) = estimates.get(&(start, end)) {
             return Some(value);
         }
-        // Two partial checkpoints and the complete LL/DD frequency arrays.
+        // Two partial checkpoint scans and the literal/length and distance
+        // frequency arrays.
         cache.budget.spend(2 * RANGE_HISTOGRAM_INTERVAL + 316)?;
         let value = estimate(composite, start, end, options.strict)?;
         estimates.insert((start, end), value);
@@ -302,8 +304,8 @@ fn refine(
             *best = Some(plans);
         }
     }
-    // A completed direct win pays for the denser coupled graph. The direct
-    // winner survives cancellation or exhaustion during the graph expansion.
+    // Build the denser cut graph only after a direct win, which survives
+    // cancellation or budget exhaustion in the graph.
     if best.is_none() {
         return Some(());
     }
@@ -339,8 +341,6 @@ fn refine(
             if stop.reached() {
                 return None;
             }
-            // This one-source graph deliberately admits middle slices so
-            // both sides of an interval can be selected in the same path.
             let edge = cache.get(block, composite, cuts[start], cuts[end], options, stop)?;
             graph.consider(start, end, edge, stop)?;
         }
@@ -352,6 +352,10 @@ fn refine(
     Some(())
 }
 
+/// Split one block at cuts found from symbol support intervals.
+///
+/// Returns a plan only when it is strictly smaller than the block's reusable
+/// original bits at `alignment`.
 pub(crate) fn plan_alphabet_boundaries(
     block: &ParsedBlock,
     alignment: u8,
@@ -368,9 +372,8 @@ pub(crate) fn plan_alphabet_boundaries(
     }
     budget.spend(block.tokens.len())?;
     let composite = Composite::new(std::slice::from_ref(block))?;
-    // Use the same bounded table grid in both modes. Geometry and table-search
-    // effort are independent: admitting coupled cuts does not start a Max
-    // token search at every edge.
+    // Both modes use the bounded table search, so paired cuts do not start a
+    // Max token search at every edge.
     let bounded = Options {
         exhaustive: false,
         ..options.clone()

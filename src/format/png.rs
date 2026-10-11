@@ -21,27 +21,21 @@ use chunks::{
     SIGNATURE,
 };
 
-/// Exact cross-frame reuse is optional. Bounding the retained comparison bytes
-/// keeps an APNG with many very large frames from doubling its memory use.
+/// Largest decoded frame held for exact frame reuse, so reuse cannot double memory use.
 const MAX_EXACT_REUSE_BYTES: usize = 32 * 1024 * 1024;
+/// Decoded plus compressed bytes that exact frame reuse may process.
 const MAX_EXACT_REUSE_WORK_BYTES: u64 = 64 * 1024 * 1024;
+/// Compressed plus decoded bytes that all quick metadata probes may process.
 const MAX_METADATA_PROBE_WORK_BYTES: u64 = 64 * 1024 * 1024;
-/// Max must not discard affordable Default savings in compressed metadata just
-/// because an image route spends the shared file deadline first. Precompute the
-/// complete non-Max metadata floors when their aggregate compressed size fits
-/// the same bounded work class as speculative metadata probes, then reuse those
-/// results during reconstruction. Larger metadata sets retain the streaming
-/// schedule so caching cannot duplicate an attacker-sized portion of the input.
+/// Largest total compressed metadata size for which Max caches Default floors.
 const MAX_CACHED_METADATA_FLOOR_BYTES: u64 = MAX_METADATA_PROBE_WORK_BYTES;
-/// A single-image Max run can retain exact Default and direct-Max raw models
-/// together. Keep that combined working set within the same broad bounds used
-/// for independent raw-route arenas.
+/// Limits for parallel image work, which holds several stream models at once;
+/// they match the raw optimizer's parallel-route limits.
 const PARALLEL_MAX_IMAGE_COMPRESSED: usize = 8 * 1024 * 1024;
 const PARALLEL_MAX_IMAGE_DECODED: u64 = 64 * 1024 * 1024;
 const PARALLEL_MAX_IMAGE_WORKERS: usize = 8;
-/// A fifth is enough to finish the inexpensive parent on representative image
-/// streams while reserving most of Max for the descendants that need it. This
-/// is the same follow-up reservation used by Deflate's bounded route schedule.
+/// Share of a single-image Max allowance given to the quick Default parent;
+/// its Max descendants use the rest. Chosen from measurements.
 const QUICK_FLOOR_SEARCH_FRACTION: f64 = 0.20;
 
 struct PngOptimization {
@@ -154,10 +148,8 @@ pub(super) fn optimize_preflight(
     options: &Options,
     parsed: ParsedPng<'_>,
 ) -> Result<Optimization> {
-    // A signature or an unknown unsafe-to-copy ancillary chunk may depend on
-    // the exact critical image representation. Columbo cannot update its
-    // contract, so it returns the source unchanged unless --strip removes that
-    // chunk, without decoding image streams it cannot rewrite.
+    // A signature chunk (caBX, dSIG) or unknown unsafe-to-copy chunk may depend
+    // on the exact critical chunks, so return the source unchanged.
     if let Some(kind) = parsed
         .rewrite_sensitive_chunk
         .filter(|_| !options.strip_metadata)
@@ -166,15 +158,10 @@ pub(super) fn optimize_preflight(
             .ok_or_else(|| Error::internal("could not allocate PNG output"))?;
         return Ok(Optimization::from_metrics(input.len(), data, 0, 0, false).blocked_by(kind));
     }
-    // A multi-image APNG splits Max's wall budget across independent image
-    // streams. Per-stream bounded floors cannot guarantee the same fixed point
-    // as the complete Default file pipeline: a small but complex frame may
-    // exhaust its proportional slice even when Default finishes the whole file
-    // before Max's deadline. Race that complete file result against an
-    // original-source Max pass with the full allowance, then retain Max only
-    // when the complete file is no worse in both bytes and aggregate
-    // meaningful Deflate bits. This keeps the quality floor without deducting
-    // Default's elapsed time from Max's search budget.
+    // Per-stream floors cannot guarantee the Default result when Max splits its
+    // time across APNG streams, so run a complete Default pass beside Max, each
+    // with the full allowance, and keep Max only if no worse in bytes and Deflate
+    // bits.
     if options.exhaustive
         && !parsed.fdat_frames.is_empty()
         && !options.timeout.is_zero()
@@ -185,8 +172,6 @@ pub(super) fn optimize_preflight(
         floor_options.exhaustive = false;
         floor_options.verbose = false;
         floor_options.visual = false;
-        // Both branches only read the validated model; each owns its decode
-        // budget, search state and output.
         let parsed = &parsed;
 
         return thread::scope(|scope| {
@@ -202,9 +187,6 @@ pub(super) fn optimize_preflight(
                     Ok(result) => result,
                     Err(payload) => std::panic::resume_unwind(payload),
                 },
-                // Thread creation failure is not an optimization failure.
-                // Preserve both quality contracts serially in this exceptional
-                // path; Max still receives its complete configured allowance.
                 Err(_) => optimize_preflight_once(input, &floor_options, parsed),
             }?;
             let maximum = maximum?;
@@ -217,13 +199,8 @@ pub(super) fn optimize_preflight(
     optimize_preflight_once(input, options, &parsed).map(|result| result.into_public(input.len()))
 }
 
-/// Whether a complete Default APNG pass may safely overlap Max.
-///
-/// Reuse the image-worker input and decoded-work bounds because the sibling
-/// shares only the validated container model; it builds its own decoded stream
-/// models, search state and complete output. A single-core process keeps the
-/// historical Max route instead of forcing two deadline-sensitive whole-file
-/// searches to time-slice one CPU.
+/// Whether the complete Default APNG pass may run beside Max. It holds its own
+/// stream models, so the parallel image-work limits apply.
 fn parallel_apng_file_floor_is_bounded(parsed: &ParsedPng<'_>) -> Result<bool> {
     if thread::available_parallelism().map_or(true, |parallelism| parallelism.get() < 2) {
         return Ok(false);
@@ -255,10 +232,10 @@ fn optimize_preflight_once(
     };
     let metadata_stream_ids = metadata_stream_ids(parsed)?;
 
-    // Small compressed metadata gets a short first pass in the original
-    // Columbo C implementation so a profile or text comment cannot consume the
-    // image stream's search time. If that pass finds no reduction,
-    // reconstruction gives it one normal pass.
+    // Default first gives small compressed metadata streams a short probe
+    // (limits from Columbo's C implementation), so a profile or text comment
+    // cannot use up the image search time. Streams the probe does not improve
+    // get a normal pass during reconstruction.
     let mut quick_replacements = empty_chunk_replacements(parsed.chunks.len())?;
     let mut probe_work_remaining = MAX_METADATA_PROBE_WORK_BYTES;
     for (index, chunk) in parsed.chunks.iter().enumerate() {
@@ -275,10 +252,8 @@ fn optimize_preflight_once(
             continue;
         }
 
-        // Quick probes are optional and may be retried. Give them a separate,
-        // monotonically decreasing compressed+decoded work allowance so a
-        // long list of non-winning metadata streams cannot repeatedly consume
-        // the complete file expansion budget.
+        // Failed probes are retried later, so probes draw on their own work
+        // allowance rather than the file's decoded-size budget.
         let compressed_work = (chunk.data.len() - offset) as u64;
         if compressed_work > probe_work_remaining {
             continue;
@@ -311,10 +286,8 @@ fn optimize_preflight_once(
         let replacement = match probe {
             Ok(replacement) => replacement,
             Err(error) if error.kind() == ErrorKind::ResourceLimit => {
-                // The lower-level decoder cannot report partial decoded bytes
-                // on this error. Conservatively spend the rest of the optional
-                // probe allowance so a second tiny high-expansion stream cannot
-                // repeat the same near-limit decode.
+                // The decoder does not report how much it decoded before this
+                // error, so spend the rest of the probe allowance.
                 probe_work_remaining = 0;
                 budget.remaining = remaining_before_probe;
                 continue;
@@ -324,11 +297,8 @@ fn optimize_preflight_once(
         quick_replacements[index] =
             replacement.filter(|replacement| replacement.replacement.is_some());
 
-        // A non-winning quick probe is retried later with the stream's normal
-        // search allowance. Charge its decoded bytes only on that definitive
-        // pass; otherwise the same metadata stream would consume the global
-        // expansion budget twice. The 100 ms probe also has a local deadline,
-        // so it must not report a file-wide timeout by itself.
+        // A probe without a replacement is charged when retried. The probe
+        // deadline never reports a file timeout.
         if quick_replacements[index].is_none() {
             budget.remaining = remaining_before_probe;
         } else {
@@ -343,21 +313,16 @@ fn optimize_preflight_once(
 
     let metadata_compressed_bytes = compressed_metadata_bytes(parsed, options);
     let parallel_metadata_floor = options.exhaustive
-        // APNG already parallelizes bounded independent image streams. Avoid
-        // nesting another worker layer, which would compete with those image
-        // routes and make deadline-sensitive quality less predictable.
+        // APNG image streams already run in parallel; another worker layer
+        // would compete with them.
         && parsed.fdat_frames.is_empty()
         && metadata_compressed_bytes
             .is_some_and(|bytes| bytes != 0 && bytes <= MAX_CACHED_METADATA_FLOOR_BYTES);
 
     let (optimized_idat, optimized_frames) = if parallel_metadata_floor {
-        // Image data and compressed metadata are independent Deflate streams.
-        // Building their mandatory Max-mode Default floors serially lets a
-        // tiny profile consume a material part of a short image allowance.
-        // Run the image work beside the bounded metadata-floor pass instead.
-        // Reserve the images' exact decoded size from the metadata worker's
-        // budget up front, so concurrency cannot weaken the file-wide safety
-        // limit or charge a physical stream twice.
+        // Build Max's metadata Default floors beside the image work, so a small
+        // profile cannot use much of a short image allowance. The worker's
+        // budget excludes the images' decoded size, so the file limit holds.
         let image_decoded_bytes =
             total_image_decoded_bytes(parsed.idat_decoded_size, &parsed.fdat_decoded_sizes)?;
         if image_decoded_bytes > budget.remaining {
@@ -366,16 +331,11 @@ fn optimize_preflight_once(
             ));
         }
         let image_budget_bytes = budget.remaining;
-        // Copy the container's clock, not merely its configured duration. A
-        // fresh deadline here would give the worker back time already spent
-        // parsing and probing metadata, weakening the file-wide timeout.
+        // Copy the file's clock: a fresh deadline would restore the time
+        // already spent.
         let image_deadline = budget.deadline;
 
         thread::scope(|scope| -> Result<_> {
-            // Keep the dominant image search on the caller thread. Besides
-            // avoiding a hand-off for the largest stream, this preserves warm
-            // parser and route state while the smaller ancillary floor moves
-            // to the worker.
             let metadata_budget_bytes = image_budget_bytes - image_decoded_bytes;
             let parsed_ref = parsed;
             let metadata_stream_ids_ref = &metadata_stream_ids;
@@ -489,8 +449,8 @@ fn optimize_preflight_once(
         match &chunk.kind {
             b"IDAT" => {
                 if !idat_written {
-                    // IDAT boundaries are only packetization. Coalescing them
-                    // saves twelve bytes for every redundant chunk.
+                    // The zlib stream is the concatenation of all IDAT data,
+                    // so one chunk saves 12 bytes per extra source chunk.
                     append_chunk(&mut output, *b"IDAT", &optimized_idat.data)?;
                     idat_written = true;
                 }
@@ -622,13 +582,8 @@ fn optimize_preflight_once(
     })
 }
 
-/// Whether image work must leave time for a mandatory metadata pass.
-///
-/// Max has already cached a complete Default floor for every supported
-/// compressed metadata stream before reaching image scheduling. Its later
-/// metadata refinement is optional and may consume only the actual remainder;
-/// it must not shorten the dominant image search. Default has no cached floor,
-/// so it still reserves time whenever compressed metadata follows.
+/// Whether image work must leave time for the metadata pass. Max does not:
+/// its metadata refinement uses only the time left.
 fn image_work_needs_metadata_reserve(options: &Options, metadata_bytes: u64) -> bool {
     !options.exhaustive && metadata_bytes != 0
 }
@@ -641,15 +596,7 @@ fn metadata_default_floor(exhaustive: bool) -> DefaultFloor {
     }
 }
 
-/// Cache the complete Default result for a bounded set of metadata streams.
-///
-/// PNG uses one file-wide search deadline. Without this phase, a single image
-/// Max route can spend that deadline before reconstruction reaches zTXt, iTXt,
-/// or iCCP, causing Max to return a worse whole file than Default. Building a
-/// complete metadata floor is broadly valid: Max retains every completed
-/// Default candidate and later optional work only adds alternatives. Bounded
-/// static-PNG Max runs may overlap this pass with independent image work in
-/// every reporting mode.
+/// Total compressed size of retained zTXt, iTXt and iCCP zlib streams.
 fn compressed_metadata_bytes(parsed: &ParsedPng<'_>, options: &Options) -> Option<u64> {
     parsed
         .chunks
@@ -662,6 +609,9 @@ fn compressed_metadata_bytes(parsed: &ParsedPng<'_>, options: &Options) -> Optio
         .try_fold(0_u64, u64::checked_add)
 }
 
+/// In Max, cache the complete Default result of each compressed metadata
+/// stream (zTXt, iTXt, iCCP). Otherwise image routes could use up the deadline
+/// before reconstruction reaches them and leave Max worse than Default.
 fn precompute_max_metadata_floors(
     parsed: &ParsedPng<'_>,
     metadata_stream_ids: &[Option<usize>],
@@ -709,13 +659,9 @@ fn precompute_max_metadata_floors(
     Ok(())
 }
 
-/// Continue a cached metadata floor through Max without rebuilding Default.
-///
-/// The definitive floor already charged this physical stream to the file's
-/// decoded-data budget. This replay decodes the same bytes for validation, so
-/// it uses the known exact size as a local ceiling and does not charge the
-/// container budget twice. If the image routes spent the shared deadline, the
-/// completed floor is returned immediately.
+/// Search Max candidates from a cached metadata floor. The floor already
+/// charged the decoded-size budget, so decoding is limited to the known size
+/// without charging it again.
 fn refine_cached_compressed_body(
     kind: [u8; 4],
     source_data: &[u8],
@@ -738,11 +684,8 @@ fn refine_cached_compressed_body(
     let mut best = try_clone_compressed_body(floor)
         .ok_or_else(|| Error::internal("could not allocate PNG metadata result"))?;
 
-    // The cached Default floor may have changed tokens before Max reaches
-    // metadata reconstruction. Preserve deft4j's original-source basin with a
-    // bounded independent slice, then use the actual remainder on the
-    // floor-seeded basin. Both are optional descendants of the retained floor;
-    // a local slice ending is not a file timeout.
+    // The floor may have changed the source tokens, so first search from the
+    // original stream (deft4j's starting point) for half the remaining time.
     if !direct_allowance.is_zero() {
         let mut direct_options = budget.deadline.options_for_call(options);
         direct_options.timeout = direct_options.timeout.min(direct_allowance);
@@ -859,14 +802,10 @@ fn image_job_stream_group(job: ImageJob, representatives: &[usize]) -> (usize, V
     }
 }
 
-/// Parsing, checksum validation, and PNG reconstruction also consume wall time,
-/// but only the raw Deflate searches receive the proportional slices below.
-/// Reserve ten percent outside the non-largest slices (twenty percent for a
-/// container with more than 32 unique image streams). The final largest stream
-/// receives the remaining initial search time. Streams that exhaust those fair
-/// shares are queued for weighted reclaim passes using real time left after all
-/// initial work. The raw optimizer's ten-percent-plus-one-second grace applies
-/// within each admitted slice; only the container deadline is a file timeout.
+/// Fraction of its proportional timeout share given to each image stream except
+/// the last (`MANY_IMAGE_SEARCH_FRACTION` above `MANY_IMAGE_JOB_THRESHOLD`
+/// streams). The rest covers parsing, checksums and reconstruction; the last,
+/// largest stream gets all remaining time.
 const NON_LARGEST_IMAGE_SEARCH_FRACTION: f64 = 0.90;
 const MANY_IMAGE_SEARCH_FRACTION: f64 = 0.80;
 const MANY_IMAGE_JOB_THRESHOLD: usize = 32;
@@ -880,10 +819,8 @@ fn total_image_decoded_bytes(idat: u64, frames: &[u64]) -> Result<u64> {
 
 fn image_default_floor(single_image: bool, exhaustive: bool) -> DefaultFloor {
     if single_image {
-        // Establish the genuine normal result before spending the remaining
-        // file budget on PNG's bounded max routes. This keeps max output no
-        // larger than default without allowing a slow normal floor to starve
-        // every max-only route.
+        // Max stays no larger than Default, and a slow floor cannot starve
+        // every Max-only route.
         DefaultFloor::CompleteThenBounded
     } else if exhaustive {
         DefaultFloor::ApngMax
@@ -894,9 +831,9 @@ fn image_default_floor(single_image: bool, exhaustive: bool) -> DefaultFloor {
 
 /// Optimize the IDAT stream and each unique APNG frame under one file budget.
 ///
-/// Small streams run first so a large IDAT cannot consume the whole deadline.
-/// Duplicate frames contribute their full byte weight to their representative
-/// because improving that one stream saves the same bytes at every occurrence.
+/// Small streams run first so a large stream cannot use up the deadline.
+/// Duplicate frames add their weight to their representative, whose savings
+/// repeat at every occurrence.
 fn optimize_image_streams(
     idat: &[u8],
     idat_decoded_size: u64,
@@ -949,10 +886,7 @@ fn optimize_image_streams(
         .iter()
         .try_fold(idat.len(), |total, frame| total.checked_add(frame.len()))
         .ok_or_else(|| Error::new("PNG frame data too large"))?;
-    // Include source order explicitly so the in-place unstable sort retains
-    // IDAT-before-fdAT ordering on ties without allocating a merge buffer.
-    // Normal and max mode share one file deadline, so both need small-first
-    // scheduling; otherwise the first large frame can starve every later one.
+    // The source-order key breaks ties without a stable sort's merge buffer.
     jobs.sort_unstable_by_key(|job| {
         let source_order = match job {
             ImageJob::Idat => 0,
@@ -960,9 +894,8 @@ fn optimize_image_streams(
         };
         (image_job_size(*job, idat, frames), source_order)
     });
-    // Only the final job receives the reserved remainder. Distinct streams can
-    // have the same largest byte length; treating every tie as the reserve sink
-    // would let an earlier tie consume the time intended for the final job.
+    // Only the final job gets the remainder, even when several streams tie
+    // for the largest size.
     let reserved_largest = *jobs.last().expect("the IDAT job is always present");
     let single_image = jobs.len() == 1;
     let non_largest_fraction = if jobs.len() > MANY_IMAGE_JOB_THRESHOLD {
@@ -984,9 +917,8 @@ fn optimize_image_streams(
             || thread::available_parallelism().is_ok_and(|cpus| cpus.get() >= 2));
     let mut results = if parallel_multi_image {
         let phase_fraction = if has_later_streams { 0.86 } else { 0.96 };
-        // Default uses the serial scheduler's source-weighted per-job timeout
-        // formula. Parallelizing independent frames must not grant every
-        // small frame a whole file allowance or change its search class.
+        // Default gives each job the serial schedule's size-weighted timeout,
+        // so running in parallel does not change its search.
         let mut default_timeouts = Vec::new();
         if !options.exhaustive {
             default_timeouts
@@ -1020,13 +952,12 @@ fn optimize_image_streams(
             options,
             image_floor,
             (!options.exhaustive).then_some(default_timeouts.as_slice()),
-            // Reserve a small container margin outside child raw-route grace
-            // for per-stream parsing, worker joins, and PNG reconstruction.
+            // Margin beyond the raw optimizer's grace for parsing, joining
+            // workers and reconstruction.
             scale_duration(budget.deadline.remaining(), phase_fraction),
         )?;
-        // Every unique stream was validated against its exact IHDR/fcTL size.
-        // Charge duplicate frames as well, but only once after all workers have
-        // rejoined so no thread mutates the shared file budget.
+        // Workers limit each stream to its IHDR/fcTL size. Charge all frames,
+        // duplicates included, here so no worker changes the shared budget.
         budget.remaining -= total_decoded_size;
         results
     } else {
@@ -1055,9 +986,8 @@ fn optimize_image_streams(
                 job == reserved_largest,
             );
 
-            // A spent search budget disables optional searches, not validation.
-            // Every IDAT/fdAT stream must still be fully decoded, checksum-
-            // checked, and charged to the file-wide expansion limit.
+            // An expired deadline skips search, not validation: every stream
+            // is still decoded, checksum-checked and charged.
             let (stream, expected_decoded_size) =
                 image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
             let mut optimize_job = || {
@@ -1128,9 +1058,8 @@ fn optimize_image_streams(
             let frame = optimized[representative]
                 .as_ref()
                 .expect("every duplicate frame has an optimized representative");
-            // Exact compressed duplicates share optimization work, not decode
-            // budget. Each fdAT stream is an independent decoded payload in
-            // the container and must count toward the file-wide safety limit.
+            // Duplicate frames share optimization work, but each counts toward
+            // the decoded-size limit (the parallel path already charged them).
             if !parallel_multi_image {
                 let decoded_size = frame
                     .info
@@ -1153,9 +1082,8 @@ fn optimize_image_streams(
         complete.push(frame.expect("every APNG frame has a representative result"));
     }
 
-    // Max must also retain every file-level saving available to Default.
-    // Exact-frame reuse has an explicit work cap, so finish that bounded pass
-    // even when Max-exclusive search has consumed the wall-clock allowance.
+    // Max must keep every saving Default finds. Exact-frame reuse has a work
+    // cap, so Max finishes it even after the deadline.
     let mandatory_default_comparison = options.exhaustive;
     let _ = reuse_best_exact_frames(&mut complete, &mut || {
         !mandatory_default_comparison && budget.deadline.remaining().is_zero()
@@ -1205,9 +1133,7 @@ fn reclaim_timed_out_image_jobs(
         return Ok(());
     }
 
-    // Leave a final share for compressed PNG metadata, which is reconstructed
-    // after the image streams. Files containing only image streams can reclaim
-    // the complete actual remainder.
+    // Leave a share for compressed metadata, which follows the image streams.
     let reclaim_started = Instant::now();
     let reclaim_allowance = if has_later_streams {
         scale_duration(deadline.remaining(), NON_LARGEST_IMAGE_SEARCH_FRACTION)
@@ -1276,9 +1202,7 @@ fn reclaim_timed_out_image_jobs(
             if zlib_optimization_is_better(&retry, &results[result_index].1) {
                 results[result_index].1 = retry;
             } else {
-                // The same search completed under the larger allowance. Even
-                // when its bytes tie the incumbent, this stream no longer
-                // needs another reclamation pass.
+                // A retry that finished needs no further pass, even if it tied.
                 results[result_index].1.timed_out = retry_timed_out;
             }
             if retry_timed_out && !deadline.is_expired() {
@@ -1314,13 +1238,9 @@ fn parallel_multi_image_is_bounded(total_compressed: usize, total_decoded: u64) 
     total_compressed <= PARALLEL_MAX_IMAGE_COMPRESSED && total_decoded <= PARALLEL_MAX_IMAGE_DECODED
 }
 
-/// Optimize independent APNG streams on a fixed number of CPU lanes.
-///
-/// Jobs are already sorted small-to-large. Contiguous balanced slices leave
-/// the largest stream in the shortest final slice when the division is uneven,
-/// preserving the serial scheduler's preference without a work-stealing queue
-/// or shared mutable state. Slice-limited results return to the caller for a
-/// work-conserving serial reclaim pass under the one file deadline.
+/// Optimize APNG image streams in parallel, one contiguous slice of jobs per
+/// worker. Jobs arrive sorted small to large and earlier slices take any extra
+/// jobs, so the largest stream lands in a shorter final slice.
 #[allow(clippy::too_many_arguments)]
 fn optimize_image_jobs_parallel(
     jobs: &[ImageJob],
@@ -1377,9 +1297,6 @@ fn optimize_image_jobs_parallel(
                 });
             match worker {
                 Ok(worker) => workers.push(worker),
-                // Thread exhaustion is not a format error. Run this disjoint
-                // slice on the caller while successfully spawned workers
-                // continue their own slices.
                 Err(_) => {
                     let mut results = optimize_image_job_slice(
                         worker_jobs,
@@ -1454,8 +1371,9 @@ fn optimize_image_job_slice(
     Ok(results)
 }
 
-/// Divide one worker's wall allowance while accounting for every child raw
-/// route's ten-percent-plus-one-second active-work grace.
+/// Split one worker's phase allowance across its jobs by weight, so the job
+/// timeouts plus their raw-optimizer grace (10% plus one second each) fit
+/// within the phase timeout plus its grace.
 fn parallel_image_job_timeout(
     phase_timeout: Duration,
     job_count: usize,
@@ -1473,8 +1391,8 @@ fn parallel_image_job_timeout(
     scale_duration(soft_budget, weight as f64 / total_weight as f64)
 }
 
-/// Keep the standard unstable sorter from specializing its relatively large
-/// implementation to the APNG frame comparator.
+/// Keeps the large unstable-sort implementation from being monomorphized for
+/// the frame comparator.
 #[inline(never)]
 fn sort_frame_indices(
     indices: &mut [usize],
@@ -1483,8 +1401,8 @@ fn sort_frame_indices(
     indices.sort_unstable_by(|&left, &right| compare(left, right));
 }
 
-/// Find the earliest exact-compressed representative in O(n log n) compares.
-/// Sorting slices directly avoids adversarial hash-collision buckets.
+/// Map each frame to the earliest frame with identical compressed bytes and
+/// decoded size. Sorting the slices, not hashing them, avoids collision attacks.
 fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Vec<usize>> {
     if frames.len() != decoded_sizes.len() {
         return Err(Error::new("invalid APNG frame model"));
@@ -1585,20 +1503,16 @@ fn image_stream_timeout(
     proportional.min(headroom)
 }
 
-/// Reuse a smaller frame representation only after exact decoded comparison.
+/// Give frames with identical decoded data the best compressed stream among
+/// them. Returns whether `expired` stopped the pass.
 ///
-/// CRC-32 and Adler-32 are useful filters, but together they are not an
-/// identity proof: deliberately different byte strings can collide. We decode
-/// one bounded reference for each checksum group and compare every candidate
-/// byte-for-byte before substituting its compressed bytes.
+/// Crafted inputs can collide, so CRC-32 and Adler-32 only group candidates;
+/// each is then compared with a decoded reference.
 fn reuse_best_exact_frames<F>(frames: &mut [FrameOptimization], expired: &mut F) -> bool
 where
     F: FnMut() -> bool,
 {
-    // Build and sort checksum summaries first. Singleton summaries cannot
-    // participate in reuse and therefore cost no extra decode. A fallible flat
-    // vector keeps this optional route deterministic without many tiny map
-    // allocations on an APNG containing thousands of frames.
+    // A sorted vector avoids map allocations for APNGs with thousands of frames.
     let mut summaries = Vec::<((u64, u32, u32), usize)>::new();
     if summaries.try_reserve_exact(frames.len()).is_err() {
         return false;
@@ -1781,16 +1695,12 @@ fn parallel_max_image_is_bounded(compressed_size: usize, decoded_size: u64) -> b
     compressed_size <= PARALLEL_MAX_IMAGE_COMPRESSED && decoded_size <= PARALLEL_MAX_IMAGE_DECODED
 }
 
-/// Race the independent lineages useful to a single-image Max run.
+/// Run two lineages in parallel for a single-image Max run.
 ///
-/// The main lineage retains the established CompleteThenBounded schedule: it
-/// finishes exact Default as the non-regression floor, then explores original-
-/// source Max states that an ordinary rewrite can remove. The worker finishes
-/// a cheaper transformed parent early, then spends the remainder in that
-/// distinct basin. We deliberately do not run Max again from the late exact-
-/// Default result: that lost broadly to the early parent while duplicating
-/// descendant work. Both lineages use the exact PNG scanline size as their
-/// decode ceiling; the file-wide safety budget is charged once after rejoin.
+/// The main lineage (`CompleteThenBounded`) finishes the exact Default floor,
+/// then searches Max candidates from the original source. The worker lineage
+/// refines a quick Default parent; measurements favored this over refining the
+/// late exact Default result.
 fn optimize_single_image_max_parallel(
     input: &[u8],
     expected_decoded_size: u64,
@@ -1799,19 +1709,13 @@ fn optimize_single_image_max_parallel(
 ) -> Result<zlib::StreamOptimization> {
     reserve_image_budget(expected_decoded_size, budget)?;
     let decoded_limit = expected_decoded_size;
-    // Start the transformed lineage only when its search basin is distinct or
-    // exact Default would otherwise serialize all work in a short allowance.
-    // Other sources keep the CPU for the already-concurrent direct routes.
     let (_, run_early_lineage) = inspect_early_max_lineage(&input[2..], decoded_limit)
         .map_err(map_png_zlib_error)
         .map_err(map_png_image_zlib_error)?;
     let selected = thread::scope(|scope| {
         let early_worker = run_early_lineage
             .then(|| {
-                // A child thread has no physical-stream presentation context,
-                // so suppress only its duplicate UI. These flags do not gate
-                // routes, deadlines, candidate selection, or memory policy;
-                // every optimization field remains identical to the caller.
+                // The worker has no progress context.
                 let mut quiet_options = options.clone();
                 quiet_options.verbose = false;
                 quiet_options.visual = false;
@@ -1844,9 +1748,6 @@ fn optimize_single_image_max_parallel(
     Ok(selected)
 }
 
-/// Establish an early complete transformed parent, then reserve most of this
-/// branch's allowance for Max descendants. The exact Default worker remains
-/// independent, so an interrupted quick floor cannot weaken the final result.
 fn optimize_quick_image_floor_lineage(
     input: &[u8],
     options: &Options,
@@ -1979,7 +1880,6 @@ fn optimize_scheduled_png_image_zlib(
     Ok(result)
 }
 
-/// Refuse an image stream whose IHDR-derived size exceeds the decode budget.
 fn reserve_image_budget(expected_decoded_size: u64, budget: &DecodeBudget) -> Result<()> {
     if expected_decoded_size > budget.remaining {
         return Err(Error::resource_limit(
@@ -1989,9 +1889,8 @@ fn reserve_image_budget(expected_decoded_size: u64, budget: &DecodeBudget) -> Re
     Ok(())
 }
 
-/// Require an image stream to decode to its IHDR size, then charge it.
-///
-/// Callers reserve the same size first, so a matching stream always fits.
+/// Require an image stream to decode to its IHDR size, then charge it. Callers
+/// reserve the same size first, so a matching stream always fits.
 fn charge_image_stream(
     result: &zlib::StreamOptimization,
     expected_decoded_size: u64,

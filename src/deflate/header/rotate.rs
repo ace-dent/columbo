@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Rotate three payload code lengths together, then price the complete header.
-//! A cycle preserves the alphabet's code space and support while exploring
-//! assignments that an improving sequence of pair swaps need not reach.
+//! Rotate three code lengths within one data alphabet, then price the complete
+//! header. A rotation keeps the alphabet's Kraft sum and set of used symbols,
+//! and reaches assignments that a sequence of improving pair swaps may not.
 
 use super::{dynamic_bits, plan_for_advertised_lengths, transitions_removed};
 use crate::deflate::model::{DynamicPlan, ParsedBlock, MAX_DYNAMIC_CODE_LENGTH_COUNT};
 use crate::deflate::stop::SearchStop;
 
-/// Bound candidate generation across all blocks in one terminal invocation.
+/// Rotation-generation work shared by all blocks of a stream.
 const STREAM_WORK: usize = 1 << 24;
-/// Bound complete header prices independently of candidate generation.
+/// Complete header prices per stream, separate from `STREAM_WORK`.
 const STREAM_PRICES: usize = 512;
-/// Retain a deterministic menu for each payload alphabet.
+/// Most rotations kept per alphabet.
 const MENU_SIZE: usize = 64;
-/// Admit nearby payload costs; complete header prices decide acceptance.
+/// Largest payload change, in bits either way, a rotation may make; the
+/// complete price decides acceptance.
 const MAX_PAYLOAD_TAX: i64 = 32;
 
 /// Shared generation and exact-pricing allowances for the stream.
@@ -38,7 +39,7 @@ impl RotationBudget {
     }
 }
 
-/// Sort by the heuristic score, payload cost, and finally source positions.
+/// Sorted by heuristic rank, payload change, positions, then direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Rotation {
     rank: i64,
@@ -65,9 +66,10 @@ impl Rotation {
     }
 }
 
-/// Enumerate cycles of three distinct positive lengths. Repeated lengths
-/// would produce a pair swap; zero lengths would change symbol support.
-/// Transition reduction ranks this bounded search and is not a lower bound.
+/// Enumerate rotations of three distinct nonzero lengths. A repeated length
+/// would make it a pair swap; a zero length would change the set of used
+/// symbols. Only rotations that remove run transitions are kept; the ranking
+/// is a heuristic, not a bound.
 fn proposals(
     lengths: &[u8],
     offset: usize,
@@ -147,9 +149,10 @@ fn proposals(
     Some(menu)
 }
 
-/// Price each retained cycle as a sibling of the unchanged parent. Preserve
-/// tokens, advertised spans, support, and the code-length histogram in each
-/// alphabet. A stop keeps every fully priced improvement already found.
+/// Price each kept rotation as a sibling of the unchanged parent. Rotations
+/// keep the tokens, HLIT and HDIST, the set of used symbols and each
+/// alphabet's length histogram. A stop returns the best fully priced
+/// improvement found so far.
 pub(crate) fn plan_code_length_rotations(
     block: &ParsedBlock,
     strict: bool,

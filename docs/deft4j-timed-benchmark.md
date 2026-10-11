@@ -1,17 +1,19 @@
 # deft4j Timed Benchmark
 
-This living report compares Columbo `--max` against timed `deft4j`
-references. The timeout is read from each reference filename, then
-two seconds are added and the result is clamped to 10..180 seconds.
-deft4j parity is a sufficiently timed max-mode target, not a
-normal/default-mode requirement.
-A state-carried regression receives up to two serial confirmation runs.
-Only a retry that is no larger in either size metric is retained.
+This living report compares Columbo `--max` with timed deft4j
+references. Each timeout is the deft4j time encoded in the reference
+filename plus two seconds, clamped to 10–180 seconds. deft4j parity is
+a target for Max given enough time, not a requirement for Default.
 
-Prior-result regression annotations are state-local: they are created
-only when a row replaces an older result in the same state file. A
-fresh state has no prior-row baseline, so the annotation count below
-does not replace the independent historical-state audit.
+A row that loses more than 10% of its earlier advantage is rerun serially
+up to twice. A retry replaces it if the retry clears that loss, or
+otherwise if it is smaller in one size metric and no larger in the
+other.
+
+Prior-result regression annotations are local to one state file: a
+row receives one only when it replaces an older result in the same
+state. A fresh state has no earlier rows, so the annotation count
+below does not replace the separate historical-state audit.
 
 - completed cases: 1621
 - misses: 12
@@ -54,7 +56,7 @@ Known-defective PNG source fixtures:
 - `png/PngSuite/deft4j/xd9n2c08-deft4j-t1s.png`
 - `png/oxipng/deft4j/palette_should_be_reduced_with_bkgd-deft4j-t1s.png`
 
-Intentionally unsupported ancient ZIP fixtures:
+Unsupported legacy ZIP fixtures:
 
 - `zip/oldunzip/deft4j/example-i-deft4j-t1s.zip`
 - `zip/oldunzip/deft4j/example-r-deft4j-t1s.zip`
@@ -65,17 +67,16 @@ ZIP references whose local headers cannot be validated:
 - `zip/kensilverman-zip/deft4j/kzipmix-20230322-mac-deft4j-t3s.zip`
 - `zip/kensilverman-zip/deft4j/pngout-20230322-mac-deft4j-t4s.zip`
 
-The following source has no timed comparison reference and is therefore
-not an eligible pair or a benchmark miss:
+This source has no timed reference, so it is neither an eligible pair
+nor a miss:
 
 - `zip/zip-format-challenge/mathiasbynens-small-zip.zip`
 
 ## State-carried Prior-result Regression Annotations
 
-These annotations were attached while replacing prior rows in the
-same state. Each row lost more than 10% of a previous
-Columbo advantage over the same timed deft4j reference. They do
-not replace the independent historical-state audit.
+Each row below replaced an earlier row in the same state and lost
+more than 10% of Columbo's earlier advantage over the same
+timed deft4j reference.
 
 | format | file | metric | previous saved | current saved | advantage lost |
 | --- | --- | --- | ---: | ---: | ---: |
@@ -105,12 +106,11 @@ not replace the independent historical-state audit.
 
 ## Strict-policy Differences
 
-These strict-output max rows are slightly larger than timed deft4j.
-Each was independently rerun with `--strict 0` under the same
-timeout and binary; relaxed output matched or beat the reference
-in both file bytes and meaningful Deflate bits. This explains the
-source of the difference but does not resolve the strict-output
-miss.
+These strict-output Max rows are slightly larger than timed deft4j.
+Each was rerun with `--strict 0` under the same timeout and binary,
+and the relaxed output matched or beat the reference in both file
+bytes and meaningful Deflate bits. This explains the difference, but
+the strict row still counts as a miss.
 
 | format | file | timeout | strict bytes | strict bits | relaxed bytes | relaxed bits |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -128,12 +128,12 @@ miss.
 
 ## PNG Preservation-policy Differences
 
-These rows contain an unknown ancillary chunk marked unsafe to
-copy after critical PNG data changes. Columbo preserves the
-complete source unless metadata stripping is explicitly requested;
-the smaller reference rewrites critical image data while retaining
-the private chunk, so it is not a safe parity target. The row remains
-an unresolved strict-output miss and is separately identified here.
+These rows contain an unknown ancillary chunk marked unsafe to copy
+once critical PNG data changes, so Columbo returns the source
+unchanged unless `--strip` is given. The smaller reference rewrites
+the critical image data but keeps that chunk, so it is not a safe
+parity target. The row still counts as an unresolved strict-output
+miss.
 
 | format | file | timeout | bytes vs deft4j | bits vs deft4j | chunks |
 | --- | --- | ---: | ---: | ---: | --- |

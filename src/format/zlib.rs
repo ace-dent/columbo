@@ -10,19 +10,19 @@ use super::{try_append_bytes, try_copy_bytes, try_vec_with_capacity};
 
 const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate zlib output";
 
-/// Extra facts needed by container formats that embed a zlib stream.
+/// Result of optimizing a zlib stream embedded in a container.
 #[derive(Debug)]
 pub(super) struct StreamOptimization {
     pub(super) data: Vec<u8>,
-    /// Decode facts are present whenever the raw parser ran successfully,
-    /// even if lenient metadata handling retained the original wrapper bytes.
+    /// Present whenever the raw parser succeeded, even if lenient handling
+    /// returned the original stream bytes.
     pub(super) info: Option<RawInfo>,
     pub(super) timed_out: bool,
     pub(super) removed_data_bytes: usize,
 }
 
 pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
-    // A strict embedded call applies the wrapper checks and their errors.
+    // A non-lenient embedded call reports every wrapper error.
     let optimized = optimize_embedded(
         input,
         options,
@@ -46,10 +46,9 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
 
 /// Optimize a zlib stream embedded in another container.
 ///
-/// PNG metadata is allowed to contain data that merely resembles a compressed
-/// stream. `lenient_header` therefore retains such data unchanged, matching
-/// the original Columbo C implementation, while the top-level zlib handler
-/// rejects it.
+/// PNG metadata may contain data that only resembles a zlib stream. With
+/// `lenient_header`, such data is returned unchanged; the top-level zlib
+/// handler rejects it.
 pub(super) fn optimize_embedded(
     input: &[u8],
     options: &Options,
@@ -76,10 +75,6 @@ pub(super) fn optimize_embedded(
         });
     }
 
-    // A zlib stream is exactly: two-byte header, raw Deflate data, Adler-32.
-    // FLEVEL is only an encoder-effort hint, so rewritten streams advertise
-    // Columbo's maximum optimization effort. CINFO records the smallest RFC
-    // 1950 window that can decode the emitted distances.
     let raw_input = &input[2..];
     let mut raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
     let checksum_start = 2 + raw.consumed;
@@ -87,8 +82,8 @@ pub(super) fn optimize_embedded(
         .checked_add(4)
         .filter(|&end| end <= input.len())
         .ok_or_else(|| Error::new("missing zlib Adler-32"))?;
-    // Optional PNG metadata can contain lookalikes. Preserve its historical
-    // opaque treatment, but never apply it to an image or standalone stream.
+    // In lenient mode (PNG metadata only), data after the Adler-32 marks a
+    // lookalike, which is returned unchanged.
     if lenient_header && stream_end != input.len() {
         raw.info.deflate_bits = raw.info.source_deflate_bits;
         return Ok(StreamOptimization {
@@ -130,8 +125,9 @@ pub(super) fn optimize_embedded(
     data.extend_from_slice(&raw.data);
     data.extend_from_slice(&input[checksum_start..stream_end]);
 
-    // Strict compatibility can require a slightly larger Huffman alphabet.
-    // Relaxed mode retains the project's no-growth guarantee.
+    // Strict output can grow, since it may need a larger Huffman alphabet.
+    // Without strict mode or --strip, a larger result falls back to the
+    // source stream.
     if data.len() > stream_end && !options.strict && !options.strip_metadata {
         data.clear();
         try_append_bytes(&mut data, &input[..stream_end], OUTPUT_ALLOCATION_ERROR)?;
@@ -156,11 +152,11 @@ pub(super) fn optimize_embedded(
     })
 }
 
-/// Advertise the smallest sufficient RFC 1950 window and maximum effort.
+/// Build a header with the smallest sufficient RFC 1950 window and FLEVEL 3
+/// (maximum compression).
 ///
-/// FCHECK occupies the low five bits of FLG and makes the two-byte header a
-/// multiple of 31. FDICT is clear because dictionary-backed streams are
-/// rejected before this helper is reached.
+/// FCHECK, the low five bits of FLG, makes the 16-bit header a multiple of 31.
+/// FDICT is clear because preset-dictionary streams are rejected earlier.
 fn optimized_header(cmf: u8, max_distance: u16) -> [u8; 2] {
     const MAXIMUM_FLEVEL: u8 = 0b11 << 6;
 
@@ -173,10 +169,10 @@ fn optimized_header(cmf: u8, max_distance: u16) -> [u8; 2] {
     [cmf, MAXIMUM_FLEVEL | fcheck as u8]
 }
 
-/// Recognize the complete two-byte RFC 1950 header.
+/// Recognize a valid two-byte RFC 1950 header (CM 8, CINFO at most 7, FCHECK).
 ///
-/// FDICT remains part of the wrapper signature even though Columbo cannot
-/// optimize a stream that depends on a caller-supplied preset dictionary.
+/// FDICT is accepted, so a preset-dictionary stream is detected as zlib and
+/// reported as unsupported.
 pub(super) fn has_rfc1950_header(input: &[u8]) -> bool {
     if input.len() < 2 {
         return false;

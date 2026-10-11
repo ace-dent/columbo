@@ -334,8 +334,8 @@ fn relaxed_distance_exceptions_still_emit_valid_headers() {
     for distance in [vec![0], vec![1]] {
         let data = token_bits(&tokens, &literal, &distance).unwrap();
         let mut original = plan_for_advertised_lengths(&literal, &distance, data).unwrap();
-        // A valid, deliberately redundant CL tree guarantees that both
-        // relaxed distance exceptions exercise an emitted improvement.
+        // A valid but wasteful code-length code makes sure both relaxed
+        // distance exceptions produce an emitted improvement.
         original.code_length_lengths = [4; 19];
         original.code_length_lengths[13..].fill(5);
         original.hclen = 19;

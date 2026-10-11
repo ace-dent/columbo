@@ -53,8 +53,8 @@ fn cycle_beats_every_fully_repriced_pair_on_generated_parent() {
         .unwrap();
         assert_eq!(dynamic_bits(data, &candidate), Some(candidate.bits));
     }
-    // Check whether the existing exact CL-tree search can remove this miss
-    // without changing any payload lengths.
+    // Check whether the exact code-length code search can remove this miss
+    // without changing any data code lengths.
     assert!(plan_header_tree(
         &block,
         true,
@@ -205,8 +205,8 @@ fn work_and_price_limits_preserve_completed_improvements() {
 fn relaxed_distance_exceptions_preserve_support() {
     for distance in [&[0][..], &[1][..]] {
         let mut block = rotation_test_block(distance);
-        // A valid but deliberately expensive CL tree ensures this test emits
-        // a completed contender for both relaxed distance exceptions.
+        // A valid but expensive code-length code makes sure both relaxed
+        // distance exceptions produce a completed contender.
         let parent = block.original_dynamic.as_mut().unwrap();
         parent.code_length_lengths = [5; 19];
         parent.code_length_lengths[..13].fill(4);

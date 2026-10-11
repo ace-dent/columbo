@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Shared terminal capability policy for library progress reporters and the
-//! CLI.
+//! Terminal capability checks shared by the library's progress reporters and
+//! the CLI.
 
 pub(crate) mod formatting;
 pub(crate) mod spinner;
@@ -22,7 +22,7 @@ pub(crate) fn stderr_color_enabled() -> bool {
 /// Whether stdout is a terminal that can show live, line-oriented output.
 ///
 /// This does not promise that the terminal interprets escape sequences; see
-/// [`stderr_escapes_enabled`].
+/// [`stdout_escapes_enabled`].
 pub(crate) fn stdout_interactive() -> bool {
     io::stdout().is_terminal() && !term_is_dumb(env::var_os("TERM").as_deref())
 }
@@ -39,7 +39,7 @@ fn stdout_escapes_enabled() -> bool {
     )
 }
 
-/// Whether stderr interprets ANSI escape sequences, colour or cursor control.
+/// Whether stderr interprets ANSI escape sequences for color and cursor control.
 pub(crate) fn stderr_escapes_enabled() -> bool {
     escapes_enabled_for(
         io::stderr().is_terminal(),
@@ -50,11 +50,10 @@ pub(crate) fn stderr_escapes_enabled() -> bool {
 
 /// Decide whether a terminal stream may receive ANSI escape sequences.
 ///
-/// A `TERM` value names the terminal either way: `dumb` cannot interpret
-/// escapes, and any other value can. Without `TERM`, a Unix terminal is
-/// assumed capable. A Windows console prints escapes literally until the
-/// program enables virtual-terminal processing, which needs FFI this crate
-/// forbids, so there the host must announce its own support.
+/// A `TERM` value decides when present: `dumb` cannot interpret escapes, any
+/// other value can. Without `TERM`, a Unix terminal is assumed capable; a
+/// Windows host must announce support, because enabling virtual-terminal
+/// processing needs FFI, which this crate forbids.
 pub(crate) fn escapes_enabled_for(
     is_terminal: bool,
     term: Option<&OsStr>,

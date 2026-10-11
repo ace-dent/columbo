@@ -3,11 +3,11 @@
 
 //! Structural Deflate optimization, from validated input to emitted candidates.
 //!
-//! `parse` and `model` retain the source spelling and decoded bytes. `huffman`
-//! and `header` price coding choices; `block` emits those representations.
-//! `search` changes token spelling within existing matches, while `stream`
-//! plans block boundaries. `optimize` schedules these routes and validates the
-//! selected result. All optional searches share the stop policies in `stop`.
+//! `parse` and `model` retain the source spelling and decoded bytes; `huffman`,
+//! `header` and `block` price and emit block representations; `search` and
+//! `stream` change token spelling and block boundaries; `optimize` schedules
+//! the routes and validates the result. `docs/architecture.md` lists every
+//! module.
 
 mod bitstream;
 mod block;

@@ -1,50 +1,46 @@
 # Turtledeflate methods and their relevance to Columbo
 
-This document audits Turtledeflate's current `main` source, identifies the
-methods that influenced Columbo, and separates compatible Deflate-stream
-optimizations from fresh compression.
+This audit of Turtledeflate's source identifies the methods that influenced
+Columbo and separates those that apply to an existing Deflate stream from fresh
+compression.
 
 The audited snapshot is commit
 [`756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1`](https://github.com/rwillenbacher/turtledeflate/tree/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1),
-dated 9 March 2026. Links below are pinned to that commit so later upstream
-changes cannot silently alter the evidence.
+dated 9 March 2026. Links below are pinned to that commit.
 
 ## Conclusions
 
-Turtledeflate is a compressor for raw input bytes, not an optimizer for an
-existing Deflate stream. Its principal compression gains come from discovering
-matches, repeatedly changing the LZ77 parse, and feeding new block boundaries
-back through the compressor. Those methods are outside Columbo's scope.
+Turtledeflate compresses raw input bytes; it does not optimize an existing
+Deflate stream. Most of its gains come from discovering matches, repeatedly
+changing the LZ77 parse, and feeding new block boundaries back through the
+compressor. Those methods are outside Columbo's scope.
 
-Columbo independently implements two related concepts also used by
-Turtledeflate's block splitter:
+Columbo independently implements two concepts from Turtledeflate's block
+splitter:
 
 1. cumulative symbol-frequency checkpoints at a 256-token stride; and
 2. a histogram-guided, locally smoothed, coarse-to-fine split search.
 
-The checkpoint representation is used by Columbo's general range planning.
-The adaptive splitter itself is an optional `--max` route. Columbo does not
-copy or translate Turtledeflate code: it retains the parsed token stream, uses
-different data structures, cost models, and search constants, applies hard
-work limits, and verifies a proposed boundary with its exact planner.
+The checkpoints serve Columbo's general range planning; the adaptive split is a
+Max-only route. Max mode also runs one bounded adjacent-boundary reseat and one
+forced-split escape, much smaller counterparts of Turtledeflate's boundary
+reseating and forced splits. Columbo copies or translates no Turtledeflate
+code ([licensing](#licensing)).
 
-Turtledeflate also uses `OptimizeHuffmanForRle`, but its source explicitly
-identifies that function as Google Zopfli code. Columbo's logarithmic
-adjacency-aware pseudo-frequency method is original and should not be labelled
-as a Turtledeflate method.
+Turtledeflate's `OptimizeHuffmanForRle` is Google Zopfli code, as its source
+states. Columbo's logarithmic, adjacency-aware pseudo-frequency method is
+original and is not a Turtledeflate method.
 
-No additional Turtledeflate route should be added to normal/default Columbo
-without evidence of a broad net benefit and no material speed loss. The most
-plausible future `--max` experiments are retaining one second split basin and
-performing one bounded adjacent-boundary reseat.
+The one remaining in-scope candidate is a
+[differential test of Turtledeflate's tree builder](#remaining-in-scope-candidate).
 
 ## Evidence and attribution policy
 
-The upstream C source is authoritative for implementation details. The README
-is used for the author's design and performance commentary, but active source
-controls where the prose and implementation differ.
+The upstream C source is authoritative. The README gives the author's design
+and performance commentary; where it differs from the active source, the
+source wins.
 
-The following labels are used:
+Classification labels:
 
 - **conceptually incorporated**: Columbo independently implements a method
   concept also used upstream, without copying or translating source code;
@@ -57,32 +53,29 @@ The following labels are used:
   incorporated; and
 - **out of scope**: requires match discovery or a fresh LZ77 parse.
 
-Generic RFC 1951 operations, such as canonical-code assignment or the existence
-of code-length repeat symbols 16, 17, and 18, are not treated as uniquely
+Generic RFC 1951 operations, such as canonical-code assignment or the
+code-length repeat symbols 16, 17 and 18, are not treated as
 Turtledeflate-inspired.
 
 ## Product and scope
 
-Turtledeflate describes itself as a slow Deflate compressor and says that its
-results depend on repeated path tracing and precise block boundaries
+Turtledeflate describes itself as a slow Deflate compressor whose results
+depend on repeated path tracing and precise block boundaries
 ([README lines 3-17](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/README.md#L3-L17)).
-The command-line program opens an ordinary input file and feeds raw bytes to
+The command-line program feeds the raw bytes of an ordinary input file to
 `turtledeflate_block`
-([application lines 205-288](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/src/turtledeflate_app.c#L205-L288)).
-It never parses an existing Deflate stream.
-
-Its final writer emits dynamic blocks directly; it does not compare stored,
-fixed, and dynamic output representations
+([application lines 205-288](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/src/turtledeflate_app.c#L205-L288))
+and never parses an existing Deflate stream. Its final writer emits dynamic
+blocks directly, without comparing stored, fixed and dynamic representations
 ([block writer lines 2419-2438](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2419-L2438)).
 
-Columbo starts from a parsed Deflate stream. It may rebuild trees, change block
-boundaries at legal token boundaries, and apply its documented token-preserving
-or token-simplifying routes. It does not search the decoded bytes for new
-matches. That distinction governs every classification below.
+Columbo starts from a parsed Deflate stream and never searches the decoded
+bytes for new matches ([scope](future-deflate-methods.md#scope-and-invariants)).
+That distinction governs every classification below.
 
 ## High-level Turtledeflate pipeline
 
-A simplified view of the active compressor is:
+A simplified view of the active compressor:
 
 ```text
 for each raw-input superblock:
@@ -103,13 +96,16 @@ for each raw-input superblock:
     write the best token ranges as dynamic Deflate blocks
 ```
 
-The outer feedback loop is visible in
+The outer feedback loop is in
 [`turtledeflate_block`](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate.c#L74-L310).
-The important scope boundary is the recompression step: a changed boundary
-causes the raw bytes to be parsed again, so later token streams need not retain
-the original matches.
+The scope boundary is the recompression step: a changed boundary causes the
+raw bytes to be parsed again, so later token streams need not keep the original
+matches.
 
 ## Match discovery and parse optimization
+
+All methods in this section select a new LZ77 representation from raw bytes
+and are out of scope.
 
 ### Hash-chain match enumeration
 
@@ -118,15 +114,11 @@ the 32 KiB window. It searches the chain for the longest match and records a
 distance for every attainable sub-length
 ([block source lines 339-503](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L339-L503)).
 
-This is fresh match discovery and is therefore out of scope for Columbo.
-
 ### Greedy and lazy seed
 
 The initial parse takes the longest current match unless the next byte starts a
 longer one. It also requires a minimum length of four for distances above 1024
 ([lines 552-607](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L552-L607)).
-
-This selects a new LZ77 representation from raw bytes and is out of scope.
 
 ### Iterative trellis parse
 
@@ -138,31 +130,20 @@ available match sub-length. Edge costs come from either:
 
 The trellis keeps two incoming choices at an endpoint. An optional backtrace can
 replace two primary matches with a second two-match decomposition of the same
-decoded length when the alternative has favourable length symbols and no worse
+decoded length when the alternative has favorable length symbols and no worse
 length extra-bit cost
 ([cost and trellis lines 757-1088](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L757-L1088)).
-
-These routes depend on the match set discovered from raw bytes. They are
-recompression, not existing-stream optimization.
 
 ### Precision-diverse and perturbed models
 
 The README calls the final parse slightly randomizing, but the implementation
-does not use a random-number generator. It starts deterministic model paths at
+uses no random-number generator. It starts deterministic model paths at
 different fixed-point precisions, advances their precision in stages,
 eliminates identical frequency models, perturbs models toward uniform
-frequencies at several weights, and finishes with exact refinement
-([lines 1282-1647](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1282-L1647)).
-
-The directly pinned ranges are:
-
-- [model perturbation lines 1282-1341](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1282-L1341);
-- [duplicate-model elimination lines 1344-1395](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1344-L1395); and
-- [precision-diverse search lines 1399-1647](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1399-L1647).
-
-The parse-changing machinery is out of scope. De-duplicating equivalent
-candidates before exact evaluation is a broadly useful engineering principle,
-but it is not a distinct compression method to port.
+frequencies at several weights, and finishes with exact refinement:
+[model perturbation lines 1282-1341](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1282-L1341),
+[duplicate-model elimination lines 1344-1395](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1344-L1395) and
+[precision-diverse search lines 1399-1647](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1399-L1647).
 
 ## Huffman and dynamic-header methods
 
@@ -174,64 +155,61 @@ its recorded merge order, and constructs canonical codes
 ([tree source lines 42-343](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_tree.c#L42-L343)).
 
 Rebuilding a Huffman tree for existing token frequencies is in scope. Columbo
-already prices several independently sourced tree builders, including its
-generic, order-sensitive, DeflOpt, Defluff, and deft4j families. The ordinary
-Turtledeflate result is likely duplicated by an existing family; its
-over-depth repair and leaf reassignment may still produce a unique candidate.
+already prices several independently sourced tree builders (generic,
+order-sensitive, DeflOpt, Defluff and deft4j families), and one of them
+probably duplicates the ordinary Turtledeflate result. Its over-depth repair
+and leaf reassignment may still produce a unique candidate.
 
-Status: not incorporated. Differential testing should demonstrate unique wins
-before another tree family is added to any production route.
+Status: not incorporated; see
+[Remaining in-scope candidate](#remaining-in-scope-candidate).
 
 ### Eight code-length-RLE masks
 
-Turtledeflate can independently enable or disable repeat symbols 16, 17, and
+Turtledeflate can independently enable or disable repeat symbols 16, 17 and
 18, tries all eight subsets, and keeps the shortest encoded dynamic header
 ([encoder lines 346-512](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_tree.c#L346-L512),
 [selection lines 2475-2486](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2475-L2486)).
 
-Columbo also evaluates the eight enable/disable masks, but that route existed
-in the original Columbo C implementation and its header planner now explores a
-wider family. This is independent convergence, not Turtledeflate provenance.
+Columbo also evaluates the eight masks, but that route comes from the original
+Columbo C implementation, and Columbo's header planner explores a wider family.
+This is independent convergence, not Turtledeflate provenance.
 
 ### RLE-friendly pseudo-frequencies are Zopfli-derived
 
-Turtledeflate copies `OptimizeHuffmanForRle` from Google Zopfli. The file
-retains Zopfli's Apache-2.0 notice and authorship
+Turtledeflate copies `OptimizeHuffmanForRle` from Google Zopfli, keeping
+Zopfli's Apache-2.0 notice and authorship
 ([notice lines 1-19](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1-L19),
-[function lines 230-335](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L230-L335)).
-The README confirms that provenance
+[function lines 230-335](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L230-L335));
+the README confirms this
 ([lines 105-110](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/README.md#L105-L110)).
 
 Turtledeflate's final writer builds one tree from the true counts and another
-from the RLE-friendly pseudo-counts. Its block-cost estimator also tries both
-when the configured compression level is above seven. In either route, the
-payloads are priced with the true frequencies, so a misleading pseudo-count
-reduction cannot be accepted without a complete bit-cost improvement
+from the RLE-friendly pseudo-counts; its block-cost estimator also tries both
+above compression level seven. Both price payloads with the true frequencies,
+so a misleading pseudo-count reduction cannot win without a complete bit-cost
+improvement
 ([estimator lines 715-751](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L715-L751),
 [writer lines 2441-2465](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2441-L2465)).
 
-Columbo's `make_columbo_rle_pseudofrequencies` does not implement that
-algorithm. It uses logarithmic buckets and changes a nonzero count only when an
-adjacent symbol shares its bucket. Columbo's quantizer, tree construction,
-complete header search, and strict scoring are original. The correct
-provenance is:
+Columbo's `make_columbo_rle_pseudofrequencies` is a different algorithm: it
+rounds counts onto a logarithmic grid and changes a nonzero count only when an
+adjacent symbol shares its bucket. Its provenance is the Zopfli pseudo-frequency
+concept, also used by Turtledeflate, with a Columbo-original adjacency-aware
+quantizer and candidate routing.
 
-```text
-Zopfli pseudo-frequency concept, also used by Turtledeflate;
-Columbo-original adjacency-aware quantizer and candidate routing.
-```
-
-An exact translation of `OptimizeHuffmanForRle` would be technically in scope
-and cheap enough to benchmark, but it would be a Zopfli-derived route and would
-need the applicable Apache-2.0 attribution. It must not be described as a
-Turtledeflate invention.
+Columbo separately implements the published `OptimizeHuffmanForRle` behavior
+as `make_zopfli_rle_pseudofrequencies` in
+[`src/deflate/huffman.rs`](../../src/deflate/huffman.rs). That is a Zopfli
+method, not a Turtledeflate one; the
+[method catalog](../routes-and-methods.md#block-huffman-and-token-methods)
+lists where it runs.
 
 ## Turtledeflate's block splitter
 
-The block splitter is the part of Turtledeflate most relevant to Columbo.
-Turtledeflate runs it over the token stream produced by its current compression
-pass. Boundaries are token indices, even though some upstream variable names
-call them "deflated" boundaries.
+The block splitter is the part of Turtledeflate most relevant to Columbo. It
+runs over the token stream produced by the current compression pass.
+Boundaries are token indices, even though some upstream variable names call
+them "deflated" boundaries.
 
 ### 256-token cumulative histograms
 
@@ -246,7 +224,7 @@ For an arbitrary token range, it:
 2. subtracts two cumulative checkpoints for the aligned middle; and
 3. scans the unaligned tail.
 
-It then inserts the end-of-block count and estimates the block cost
+It then adds the end-of-block count and estimates the block cost
 ([range query and cost lines 1690-1757](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1690-L1757)).
 
 ### Coarse-to-fine, locally smoothed boundary search
@@ -257,14 +235,15 @@ For a sufficiently large range, `turtledeflate_best_block_split`:
 2. prices the left and right token histograms at every sample;
 3. computes a moving sum around each sampled cost, using a default radius of
    three sample slots;
-4. selects the lowest smoothed basin;
+4. selects the sample with the lowest smoothed cost;
 5. narrows the position range to the samples eight slots either side of that
-   basin;
+   sample;
 6. repeats until the remaining range is no more than 1024 tokens; and
 7. exhaustively prices every split in the final range.
 
-If the selected basin lies near an edge, the function may save a range on the
-far side of a separating maximum and search that alternate basin later.
+If the selected minimum lies near an edge, the function may save the range on
+the far side of a separating maximum and later search that alternate local
+minimum.
 
 The complete method is
 [`turtledeflate_best_block_split`, lines 1791-1982](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1791-L1982).
@@ -275,15 +254,15 @@ and initialized by the application
 
 ### Split, merge, and boundary reseating
 
-Turtledeflate maintains cached costs and local invalidation flags for each
-current subblock. It repeatedly:
+Turtledeflate keeps cached costs and local invalidation flags for each current
+subblock. It repeatedly:
 
 - reseats an existing boundary by joining two adjacent ranges and finding a
   better split across their union;
 - chooses the globally best profitable split; and
 - chooses the globally best profitable adjacent merge.
 
-Boundary reseating alternates even and odd adjacent pairs so one pass can move
+Reseating alternates even and odd adjacent pairs, so one pass can move
 non-overlapping boundaries before the next parity is examined
 ([reseat lines 2019-2069](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2019-L2069)).
 The split, merge, and driver are at:
@@ -295,15 +274,17 @@ The split, merge, and driver are at:
 ### Forced-split escape
 
 In early splitter states, Turtledeflate can clone the current post-search
-state, force a locally losing split, reseat the resulting boundaries, and
-retain a later global improvement. It stops after five consecutive forced
-attempts fail to improve the best state
+state, force a locally losing split, reseat the resulting boundaries, and keep
+a later global improvement. It stops after five consecutive forced attempts
+fail to improve the best state
 ([lines 2331-2378](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2331-L2378)).
 
 The README says this usually wastes runtime but occasionally finds more and
 better blocks
 ([lines 113-119](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/README.md#L113-L119)).
-That tradeoff conflicts with Columbo's speed-first default policy.
+That tradeoff conflicts with Columbo's speed-first Default mode; Columbo's
+bounded Max version is under
+[Bounded reseat and forced-split escape](#bounded-reseat-and-forced-split-escape).
 
 ## Methods incorporated into Columbo
 
@@ -311,10 +292,9 @@ That tradeoff conflicts with Columbo's speed-first default policy.
 
 Columbo's [`Composite`](../../src/deflate/stream.rs) builds
 `frequency_checkpoints`, and its `prefix_frequencies` and `range_frequencies`
-methods answer token-range queries.
-
-This independently implements the cumulative-checkpoint concept used by
-Turtledeflate's `turtledeflate_create_global_histogram` and
+methods answer token-range queries. This independently implements the
+cumulative-checkpoint concept of Turtledeflate's
+`turtledeflate_create_global_histogram` and
 `turtledeflate_get_partial_histogram`:
 
 | Property | Turtledeflate | Columbo |
@@ -327,28 +307,27 @@ Turtledeflate's `turtledeflate_create_global_histogram` and
 | Allocation handling | fixed context allocation | checked optional allocation under a model budget |
 | Fallback | none | direct token scan when the index does not fit |
 
-The 256-token checkpoint concept and its use for bounded range queries were
-inspired by Turtledeflate. Columbo's Rust code, representation, overflow
-checks, memory gate, fallback, and extra-bit accounting are independent.
+`range_frequencies` also counts tokens directly when the range is no longer
+than its two partial prefixes. The 256-token checkpoints and their use for
+bounded range queries are Turtledeflate-inspired; Columbo's code,
+representation, overflow checks, memory gate, fallback and extra-bit
+accounting are independent.
 
 ### Bounded adaptive split
 
-Columbo's `add_adaptive_split_cut`, `coarse_to_fine_split`, and
-`cached_adaptive_split_score` in
+Columbo's `add_adaptive_split_cut`, `adaptive_histogram_split_search`,
+`coarse_to_fine_split_search`, and `cached_adaptive_split_score` in
 [`src/deflate/stream.rs`](../../src/deflate/stream.rs) independently implement
-the sample/smooth/narrow/scan concept used by
-`turtledeflate_best_block_split`.
-
-The shared skeleton is distinctive:
+the sample/smooth/narrow/scan skeleton of `turtledeflate_best_block_split`:
 
 ```text
 sample evenly spaced split costs
-smooth neighbouring samples
-narrow around the best basin
+smooth neighboring samples
+narrow around the best smoothed sample
 scan the terminal range exactly
 ```
 
-The implementations differ materially:
+The implementations differ:
 
 | Property | Turtledeflate default | Columbo |
 | --- | ---: | ---: |
@@ -358,101 +337,82 @@ The implementations differ materially:
 | Terminal exhaustive width | 1024 tokens | 16 tokens |
 | Probe cap | none | 128 distinct scores |
 | Deadline | none | caller deadline checked throughout |
-| Alternate basin | edge-triggered range stack | omitted |
+| Alternate local minimum | edge-triggered range stack | omitted |
 | Cost candidates | dynamic only | cheap stored/fixed/dynamic estimate |
 | Token source | newly compressed parse | frozen parsed source stream |
 | Acceptance | splitter/outer feedback | exact Columbo replanning and a 32-bit win |
 | Mode | compressor pipeline | `--max` only |
 
-The method must therefore be described as an independent,
-Turtledeflate-inspired Columbo implementation, not as a port or exact
-Turtledeflate parity.
+Columbo also picks one well-separated runner-up local minimum from the probes
+it has already scored, used only by the forced-split escape.
 
 ### Supporting boundary estimator
 
 Columbo's `estimate_boundary_block_bits` in
-[`src/deflate/header.rs`](../../src/deflate/header.rs) supplies the cheap score
-used by the adaptive search. It prices stored output, fixed output, and one
-simple dynamic candidate built with a DeflOpt-derived tree.
+[`src/deflate/header.rs`](../../src/deflate/header.rs) supplies the cheap
+Huffman score for the adaptive search. It prices the fixed tree and one simple
+dynamic candidate: DeflOpt variant-zero heap trees with one greedy
+code-length RLE spelling. Its caller, `estimate_histogram_range_bits` in
+[`src/deflate/stream.rs`](../../src/deflate/stream.rs), takes the smaller of
+that score and the stored-block size.
 
-This fills the same role as Turtledeflate's histogram block-cost estimator but
-does not recreate it. Its tree, header, representation, and alignment choices
-are Columbo-specific or separately attributed.
+This fills the role of Turtledeflate's histogram block-cost estimator without
+recreating it; its tree, header, representation and alignment choices are
+Columbo-specific or separately attributed.
+
+### Bounded reseat and forced-split escape
+
+Max mode runs two boundary routes in
+[`src/deflate/stream.rs`](../../src/deflate/stream.rs), each far more bounded
+than its Turtledeflate counterpart. Both accept only a strictly smaller
+complete plan.
+
+- `plan_selected_huffman_boundary_reseat` runs the adaptive split search over
+  each adjacent pair's union and keeps only the single best reseat;
+  Turtledeflate reseats repeatedly, alternating even and odd pairs.
+- `plan_forced_split_boundary_escape` forces one runner-up cut in the largest
+  eligible block, taken from `secondary_adaptive_split_cut` without a second
+  probe budget, plans both children exactly, then tries one reseat;
+  Turtledeflate repeats forced splits and reseating until five consecutive
+  attempts fail.
+
+[Routes and methods](../routes-and-methods.md#inner-stream-planner-gates) gives
+the exact gates and catalogs the reseat as a Columbo method and the escape as a
+Turtledeflate-inspired concept.
 
 ### What is not incorporated
 
-The following similarities must not be labelled as Turtledeflate-inspired:
+These similarities must not be labeled Turtledeflate-inspired:
 
 - Columbo's original eighth-position and 32-token split probes;
 - Columbo's boundary dynamic programming and exact alignment-aware acceptance;
 - the eight code-length-RLE masks already present in C Columbo;
 - Columbo's adjacency-aware logarithmic pseudo-frequency quantizer;
 - generic canonical Huffman construction; and
-- generic candidate caching or de-duplication.
+- generic candidate caching or deduplication.
 
-## Remaining in-scope candidates
+## Remaining in-scope candidate
 
-The audit found no missing method that should be added immediately to default
-mode. These experiments are compatible with a frozen token stream, listed in
-recommended order.
+The audit found no method to add to Default mode. Of its four experiments that
+keep the existing token stream, Columbo's Max mode implements three in bounded
+form (see
+[Bounded reseat and forced-split escape](#bounded-reseat-and-forced-split-escape)):
 
-### 1. Retain one second adaptive split basin
+- a second adaptive split minimum, used only as the forced-split escape's
+  runner-up cut; a standalone second-minimum route changed no outputs and was
+  not adopted
+  ([rejected experiments](future-deflate-methods.md#rejected-or-deferred-experiments));
+- one adjacent-boundary reseat; and
+- one forced split followed by one reseat.
 
-Turtledeflate can save a range on the other side of a separating maximum when
-the first smoothed minimum lies near an edge. Columbo currently keeps only the
-best candidate from its cached probe set.
+The fourth remains open: a differential test of Turtledeflate's tree builder,
+whose over-depth repair and merge-order reassignment are compatible with
+existing-token optimization. A standalone tool should first compare that tree
+with Columbo's tree-family outputs across the full frequency corpus. Add it
+only if it produces unique exact wins large enough to justify another tree
+candidate.
 
-A bounded Columbo experiment could retain at most one well-separated second
-local minimum and submit both boundaries to exact planning. It should:
-
-- remain `--max` only initially;
-- reuse already-computed histogram scores;
-- stay inside the existing deadline and total probe budget;
-- de-duplicate a cut already present in the ordinary cut set; and
-- accept only a strictly smaller exact complete plan.
-
-This is the most direct missing part of Turtledeflate's split-position search.
-Its runtime effect still requires whole-corpus measurement.
-
-### 2. Perform one bounded adjacent-boundary reseat
-
-Columbo's boundary DP can choose globally among known cuts. It does not
-currently discover a new adaptive cut by joining each adjacent winning pair and
-searching across their union in Turtledeflate's manner.
-
-A conservative experiment could run one parity pass over a small winning block
-list, reuse the existing range index, and exactly replan only the selected
-candidate. Repeated reseating should not be copied: it would add substantial
-work and duplicate parts of Columbo's boundary DP.
-
-### 3. Differential-test Turtledeflate's tree builder
-
-The exact over-depth repair and merge-order reassignment are technically
-compatible with existing-token optimization. Before production code is added,
-a standalone differential tool should compare that tree against Columbo's
-existing tree-family outputs across the full frequency corpus.
-
-Add it only if it creates unique exact wins large enough to justify another
-tree candidate. There is no current evidence that it will.
-
-### 4. Forced-split lookahead only for a diagnosed miss
-
-Forced splits can cross a local minimum, but upstream says the route usually
-wastes time. It should not be a general default-mode addition.
-
-If a substantial, reproducible corpus miss demonstrates the need, test at most
-one forced split followed by one bounded reseat in `--max`, with a strict
-deadline and exact final comparison.
-
-### Separately: exact Zopfli pseudo-frequencies
-
-An exact `OptimizeHuffmanForRle`-compatible candidate is now implemented, but
-it remains a Zopfli method rather than a Turtledeflate method. Columbo uses it
-as one paired Max-only literal/distance-tree candidate, not another
-cross-product of every tree family. It exact-prices the resulting tree against
-the original frequencies and keeps the source candidate as a fallback.
-
-## Explicitly out of scope
+## Out of scope
 
 Do not incorporate these Turtledeflate methods into Columbo:
 
@@ -467,13 +427,11 @@ Do not incorporate these Turtledeflate methods into Columbo:
 - raw-input superblock handling; or
 - gzip creation around newly compressed data.
 
-Adapting those methods would turn Columbo into a recompressor, contrary to its
-purpose.
+Adapting them would turn Columbo into a recompressor.
 
 ## Active, dormant, and proposed upstream code
 
-Several source passages should not be mistaken for active Turtledeflate
-methods:
+These source passages are not active Turtledeflate methods:
 
 - `turtledeflate_get_estimated_block_bits_internal____` is under `#if 0`;
 - `turtledeflate_block_deflate_merge_models` has no caller;
@@ -486,23 +444,18 @@ The active forced-split escape is the separate route at block-source lines
 The README also suggests parallelizing superblocks, skipping unnecessary late
 splitter work, and reusing unchanged subblocks
 ([lines 111-119](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/README.md#L111-L119)).
-Those are engineering suggestions, not implemented Turtledeflate methods. A
-future Columbo cache based on that observation should be labelled as a Columbo
-optimization inspired by the upstream note.
+These are suggestions, not implemented methods; a Columbo cache based on them
+should be labeled a Columbo optimization inspired by the upstream note.
 
 ## Licensing
 
 Turtledeflate is BSD 2-Clause, copyright 2022 Ralf Willenbacher
 ([LICENSE](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/LICENSE#L1-L25)).
-Columbo copies or translates none of its source code; the Rust implementation
-only uses independently expressed concepts. Turtledeflate's licence is
-therefore an upstream reference, not a Columbo distribution notice.
-
-Turtledeflate's embedded `OptimizeHuffmanForRle` has separate Google Zopfli
-Apache-2.0 provenance. Columbo retains its original adjacency quantizer and
-also independently implements the published Zopfli-compatible transform.
-Zopfli's source attribution, authorship, and Apache-2.0 provenance are recorded
-beside that implementation; no Turtledeflate source is copied or translated.
+Columbo copies or translates none of its source code and uses only
+independently expressed concepts, so the license is an upstream reference, not
+a Columbo distribution notice. Columbo's independent implementation of the
+embedded Zopfli transform records Zopfli's Apache-2.0 authorship beside the
+code.
 
 ## Primary-source index
 
@@ -513,7 +466,7 @@ beside that implementation; no Turtledeflate source is copied or translated.
 | [`turtledeflate_block.c` matching](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L339-L607) | match discovery and greedy seed |
 | [`turtledeflate_block.c` parsing](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L757-L1647) | cost models, trellis, alternative path, and precision/model search |
 | [`turtledeflate_block.c` histograms](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1650-L1757) | cumulative checkpoints and token-range cost |
-| [`turtledeflate_block.c` best split](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1791-L1982) | coarse sampling, smoothing, narrowing, alternate basin, and final scan |
+| [`turtledeflate_block.c` best split](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L1791-L1982) | coarse sampling, smoothing, narrowing, alternate local minimum, and final scan |
 | [`turtledeflate_block.c` routing](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_block.c#L2019-L2378) | boundary reseat, split, merge, cache invalidation, and forced lookahead |
 | [`turtledeflate_tree.c`](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/lib/turtledeflate_tree.c#L42-L512) | length-limited trees, canonical codes, and dynamic-header RLE |
 | [`turtledeflate_api.h`](https://github.com/rwillenbacher/turtledeflate/blob/756f844d0cb0cb0accb5cca6ce08bf7a6b9a6fa1/inc/turtledeflate_api.h#L39-L72) | splitter and precision configuration |
