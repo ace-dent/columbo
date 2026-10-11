@@ -154,3 +154,58 @@ Smoothing earlier, before the terminal searches, finds trees that the slide
 and ladder then build on: the early and both arms saved up to 5,145 PNG bytes
 more than R14 alone. Every such placement measured here also grew some
 outputs, so a monotone way to capture that extra gain remains open.
+
+## Follow-up: repeating the finish
+
+Date: 11 October 2026. Baseline: `a880bcf`, the first R14. Each R13 or R14
+win slides the blocks again, and the slid blocks can expose another collapse
+or smoothing win. Default now runs R13 and R14 one more pass after a pass in
+which either won. Max's later sweeps already revisit both, through R12, until
+neither wins; Max uses Default's one-pass bound only when no further sweep
+can start, and in its mandatory Default endpoints, so that an expired Max
+budget still reproduces Default exactly. Given time, Max's savings are never
+bounded by it: with a 300-second allowance, `4.2.03-deft4j-t15s.PNG` ended
+its last Max sweep with neither step finding a candidate, at 748,539 bytes,
+below the unbounded Default repetition's 748,929.
+
+Repeating to a fixed point in Default was measured first. On
+`4.2.03-deft4j-t15s.PNG` it took five passes: the second smoothing pass and
+its slide saved 4,401 bits, the three later passes 189, 13 and 25 bits. On the
+large PNGs and tar.gz archives, later passes cost seconds for a few bytes.
+
+| Set | Files | Unbounded: smaller, bytes | **One pass: smaller, bytes** | Two passes: smaller, bytes |
+| --- | ---: | --- | --- | --- |
+| Raw streams | 365 | 0, 0 | **0, 0** | 0, 0 |
+| PNG | 1,052 | 89, 4,844 | **88, 4,297** | 89, 4,799 |
+| GZIP, zlib, ZIP and APNG | 202 | 26, 1,474 | **26, 1,120** | 26, 1,278 |
+| Relaxed | 381 | 14, 1,167 | **14, 1,034** | 14, 1,167 |
+
+No output grew in any arm; every step still accepts only a strict win. The
+unbounded arm, measured against `a880bcf` on a quiet machine, raised CPU by
+4.5% on PNG, 4.5% on containers and 5.1% relaxed. The bounded arms ran on a
+loaded machine, so their corpus CPU is not comparable; serial timings of the
+costliest files decide between them:
+
+| File | `a880bcf` | One pass | Two passes | Unbounded |
+| --- | ---: | ---: | ---: | ---: |
+| Partnership card | 33.47 s | 35.30 s, −200 B | 36.97 s, −283 B | 39.57 s, −284 B |
+| `kzipmix-20200115-linux-static.tar.gz` | 12.25 s | 13.79 s, −259 B | 14.66 s, −274 B | 16.40 s, −275 B |
+| `floor pattern.png` | 13.46 s | 14.31 s, −339 B | 14.63 s, −341 B | 15.02 s, −341 B |
+| `FsqwhPuaIAIlojU-deflopt.png` | 16.33 s | 16.88 s, −192 B | 17.29 s, −199 B | 18.50 s, −208 B |
+| `BNDT_on_X…-deflopt.png` | 8.02 s | 8.51 s, −77 B | 8.84 s, −87 B | 9.90 s, −90 B |
+| `4.2.03-deft4j-t15s.PNG` | 2.03 s | 2.28 s, −584 B | 2.51 s, −607 B | 3.02 s, −612 B |
+
+One pass keeps 89% of the unbounded PNG gain for about half the extra time of
+two; the rest remains reachable in Max.
+
+On the 25-PNG Max sample at 60 seconds, two lanes, one pass changed 9 files:
+5 smaller by 35 bytes and 4 larger by 9, with process CPU 3,155.09 →
+3,154.88 s. Serial reruns did not reproduce the two largest losses:
+`4.2.07.PNG` gave 725,415 bytes in both arms, and `4.2.03.PNG` gave 748,531
+bytes with `a880bcf` and 748,530 with one pass in two further runs each, after
+one earlier one-pass run of 748,590.
+
+All 1,992 outputs of the one-pass arm decoded identically with Python's
+`zlib`, `gzip` and `zipfile`. The R14 test now also checks that its stream
+ends where neither R13 nor R14 improves the Default result. All tests pass,
+including the private-corpus regressions in debug and release.

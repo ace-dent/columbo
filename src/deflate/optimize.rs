@@ -56,6 +56,13 @@ pub(crate) use schedule::optimize_raw_prefix_with_floor_and_grace;
 /// settle their boundaries and tables. Every round below must strictly improve
 /// the complete stream, so the extra slot cannot oscillate or grow the output.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
+/// Further R13/R14 passes after a pass that won, when no later Max sweep can
+/// revisit the slid blocks: Default, Max's mandatory Default endpoint, and Max
+/// once its soft deadline has passed. A win re-slides under new trees, and the
+/// first repeat finds most of what the slid blocks expose; later passes find
+/// little for their cost. While time remains, Max's own sweeps revisit R13 and
+/// R14 through R12 until neither wins, so this bound never limits Max.
+const TREE_FINISH_REPEATS: usize = 1;
 /// Bound terminal header work even inside the mandatory Default comparison
 /// floor. The swap/span passes admit at most 1,024 full header prices each;
 /// joint tree/RLE search has its own shared operation and scratch bounds.
@@ -2258,6 +2265,8 @@ fn improve_with_terminal_searches(
     let mut parse_cache = TerminalParseCache::default();
     loop {
         let ordinary_work = if first_sweep { default_work } else { max_work };
+        // The score before the first R13/R14 step this sweep runs.
+        let mut finish_start = None;
         let before = (candidate.data.len(), candidate.bits);
         if visited[0] != Some(before) {
             visited[0] = Some(before);
@@ -2318,6 +2327,12 @@ fn improve_with_terminal_searches(
             }
             visited[index + 1] = Some(score);
             let work = if max_only { max_work } else { ordinary_work };
+            if matches!(
+                search,
+                TerminalHeaderSearch::DistanceBands | TerminalHeaderSearch::SmoothedTrees
+            ) {
+                finish_start.get_or_insert(score);
+            }
             candidate = if matches!(
                 search,
                 TerminalHeaderSearch::DistanceBands | TerminalHeaderSearch::SmoothedTrees
@@ -2342,6 +2357,24 @@ fn improve_with_terminal_searches(
                     candidate,
                 )?
             };
+            // A win slides the blocks again, which can expose another
+            // collapse or smoothing win. While time remains, Max's next sweep
+            // revisits those inputs with no round cap; when no sweep can
+            // follow, repeat the finish here a bounded number of times.
+            let finish_changed = matches!(search, TerminalHeaderSearch::SmoothedTrees)
+                && finish_start
+                    .is_some_and(|start| start != (candidate.data.len(), candidate.bits));
+            if finish_changed && (!options.exhaustive || !max_work.can_start_route()) {
+                candidate = improve_with_repeated_tree_finish(
+                    TREE_FINISH_REPEATS,
+                    source,
+                    options,
+                    work,
+                    progress,
+                    &mut parse_cache,
+                    candidate,
+                )?;
+            }
         }
         if !options.exhaustive
             || (candidate.data.len(), candidate.bits) == before
@@ -2472,6 +2505,41 @@ fn improve_with_tree_finish(
         parse_cache,
         candidate,
     )
+}
+
+/// Run R13 and R14, each with its re-slide, for at most `passes` passes,
+/// stopping after a pass in which neither wins. Every step keeps its parent
+/// unless strictly smaller.
+fn improve_with_repeated_tree_finish(
+    passes: usize,
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    for _ in 0..passes {
+        let before = (candidate.data.len(), candidate.bits);
+        for search in [
+            TerminalHeaderSearch::DistanceBands,
+            TerminalHeaderSearch::SmoothedTrees,
+        ] {
+            candidate = improve_with_tree_finish(
+                search,
+                source,
+                options,
+                floor_work,
+                progress,
+                parse_cache,
+                candidate,
+            )?;
+        }
+        if (candidate.data.len(), candidate.bits) == before {
+            break;
+        }
+    }
+    Ok(candidate)
 }
 
 /// The validated parse of an unchanged terminal candidate.
@@ -2672,7 +2740,7 @@ fn slid_default_endpoint(
     parse_cache: &mut TerminalParseCache,
     complete: &Candidate,
 ) -> Result<Option<Candidate>> {
-    let mut slid = improve_with_terminal_header_search(
+    let slid = improve_with_terminal_header_search(
         TerminalHeaderSearch::BoundarySlide,
         source,
         floor_options,
@@ -2681,20 +2749,15 @@ fn slid_default_endpoint(
         parse_cache,
         complete.clone(),
     )?;
-    for search in [
-        TerminalHeaderSearch::DistanceBands,
-        TerminalHeaderSearch::SmoothedTrees,
-    ] {
-        slid = improve_with_tree_finish(
-            search,
-            source,
-            floor_options,
-            DefaultFloorWork::Mandatory,
-            progress,
-            parse_cache,
-            slid,
-        )?;
-    }
+    let slid = improve_with_repeated_tree_finish(
+        1 + TREE_FINISH_REPEATS,
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        parse_cache,
+        slid,
+    )?;
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 

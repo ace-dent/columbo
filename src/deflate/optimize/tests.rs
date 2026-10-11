@@ -1085,6 +1085,23 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
     .unwrap();
     assert!(ordinary_sweep.bits <= parent.bits - saving);
     smoothed_blocks(&ordinary_sweep, true);
+    // On this stream the repeated finish ends where neither R13 nor R14
+    // improves it.
+    for search in [
+        TerminalHeaderSearch::DistanceBands,
+        TerminalHeaderSearch::SmoothedTrees,
+    ] {
+        assert!(refine_with_terminal_header_search(
+            search,
+            &ordinary_sweep,
+            &options,
+            1 << 20,
+            identity,
+            &mut SearchStop::never(),
+        )
+        .unwrap()
+        .is_none());
+    }
     let slid = slid_default_endpoint(
         source,
         &options,
