@@ -12,7 +12,7 @@ use crate::deflate::header::test_support::{
     rotation_test_block,
 };
 use crate::deflate::huffman::{fixed_trees, huffman_tree_shape_is_complete};
-use crate::deflate::model::Token;
+use crate::deflate::model::{count_frequencies, Token};
 use crate::deflate::stop::timeout_grace;
 use crate::deflate::symbol_set::test_support::{assert_proven_rewrite, symbol_set_test_block};
 use crate::progress::StreamProgress;
@@ -920,6 +920,182 @@ fn smoothed_tree_floor_rebuilds_multiple_huffman_blocks_exactly() {
         &mut SearchStop::never(),
     )
     .unwrap();
+}
+
+/// A literal-only block whose 40 symbols each occur 20–22 times. Raw-count
+/// trees mix two code lengths irregularly; both smoothers equalize the counts,
+/// which makes the code-length header cheaper than the payload it costs.
+fn near_uniform_literal_tokens() -> Vec<Token> {
+    let mut state = 0_u64;
+    let mut tokens = Vec::new();
+    for symbol in 0..40_u8 {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let count = 20 + ((state >> 33) as u32) % 3;
+        tokens.extend(std::iter::repeat(Token::Literal(symbol)).take(count as usize));
+    }
+    tokens
+}
+
+#[test]
+fn smoothed_tree_finish_follows_the_terminal_searches() {
+    let tokens = near_uniform_literal_tokens();
+    let plain: Vec<u8> = tokens
+        .iter()
+        .map(|token| match token {
+            Token::Literal(value) => *value,
+            Token::Match { .. } => unreachable!(),
+        })
+        .collect();
+    let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+    let block = ParsedBlock {
+        tokens: tokens.clone().into(),
+        plain: plain.into(),
+        literal_frequencies,
+        distance_frequencies,
+        original_literal_lengths: None,
+        original_distance_lengths: None,
+        original_dynamic: None,
+        original: None,
+        source_splits: Vec::new(),
+        source_type: SourceBlockType::Dynamic,
+    };
+    let ordinary = plan_block(&block, 0, &Options::default(), &mut SearchStop::never());
+    let smoothed = plan_rle_smoothed_tree_candidate(
+        &tokens,
+        &literal_frequencies,
+        &distance_frequencies,
+        true,
+    )
+    .unwrap();
+    let frontier = plan_bounded_depth_tree_candidate(
+        &tokens,
+        &literal_frequencies,
+        &distance_frequencies,
+        true,
+        false,
+        false,
+        &mut SearchStop::never(),
+    )
+    .unwrap();
+    assert!(smoothed.bits < ordinary.bits.min(frontier.bits));
+
+    // Nine blocks exceed the compact payload-tree floor's eight-block class,
+    // so only R14 prices the smoothed trees for this stream.
+    let saving = 9 * (ordinary.bits - smoothed.bits);
+    let (data, bits) = emit_plans(&[], &vec![ordinary; 9], true).unwrap();
+    let parsed = parse_stream(&data, 1 << 20).unwrap();
+    let identity = StreamIdentity {
+        decoded_size: parsed.decoded_size,
+        crc32: parsed.crc32,
+        adler32: parsed.adler32,
+    };
+    let parent = Candidate {
+        data: data.clone(),
+        bits,
+        output_max_distance: Some(parsed.max_distance),
+        plans: Vec::new(),
+        block_report: None,
+        route: "test",
+        max_planner_is_stable: false,
+    };
+    let (covered, compact) =
+        refine_with_compact_payload_tree_floor(&parent, &Options::default(), 1 << 20, identity)
+            .unwrap();
+    assert!(!covered);
+    assert!(compact.is_none());
+    let smoothed_blocks = |candidate: &Candidate, strict: bool| {
+        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        assert_eq!(candidate.bits, reparsed.meaningful_bits);
+        assert_eq!(reparsed.blocks.len(), 9);
+        for block in &reparsed.blocks {
+            assert!(block.original.unwrap().len <= smoothed.bits);
+            assert!(
+                !strict
+                    || block
+                        .original_dynamic
+                        .as_ref()
+                        .unwrap()
+                        .has_strictly_compatible_huffman_codes()
+            );
+        }
+    };
+
+    for strict in [false, true] {
+        let options = Options {
+            strict,
+            ..Options::default()
+        };
+        let refined = refine_with_terminal_header_search(
+            TerminalHeaderSearch::SmoothedTrees,
+            &parent,
+            &options,
+            1 << 20,
+            identity,
+            &mut SearchStop::never(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(refined.bits <= parent.bits - saving);
+        smoothed_blocks(&refined, strict);
+        assert!(refine_with_terminal_header_search(
+            TerminalHeaderSearch::SmoothedTrees,
+            &parent,
+            &options,
+            1 << 20,
+            identity,
+            &mut SearchStop::always(),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    // Default's single sweep and Max's Default endpoint both end with it.
+    let source = CandidateInput {
+        compressed: &data,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 1 << 20,
+        identity,
+    };
+    let options = Options::default();
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
+    let progress = Progress::begin(
+        &options,
+        deadline.started,
+        StreamProgress {
+            blocks: parsed.source_block_count,
+            compressed_bytes: data.len(),
+            decoded_bytes: parsed.decoded_size,
+            empty_blocks: parsed.source_empty_block_count,
+            meaningful_bits: parsed.meaningful_bits,
+            parse_elapsed: Duration::ZERO,
+        },
+        None,
+    );
+    let ordinary_sweep = improve_with_terminal_searches(
+        source,
+        &options,
+        DefaultFloorWork::Mandatory,
+        DefaultFloorWork::Timed(&deadline),
+        progress,
+        parent.clone(),
+    )
+    .unwrap();
+    assert!(ordinary_sweep.bits <= parent.bits - saving);
+    smoothed_blocks(&ordinary_sweep, true);
+    let slid = slid_default_endpoint(
+        source,
+        &options,
+        progress,
+        &mut TerminalParseCache::default(),
+        &parent,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(slid.bits <= parent.bits - saving);
+    smoothed_blocks(&slid, true);
 }
 
 #[test]
