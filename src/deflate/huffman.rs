@@ -1078,16 +1078,15 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         .enumerate()
         .filter_map(|(symbol, frequency)| (frequency != 0).then_some((frequency, symbol)))
         .collect();
-    // Assign lengths longest first to symbols in decreasing frequency order,
-    // so the longest codes go to the most frequent symbols. Equal
+    // Assign the shortest lengths to the most frequent symbols. Equal
     // frequencies are ordered by symbol, matching the `qsort` comparator of
     // Columbo's C implementation.
     leaves.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
     lengths.fill(0);
     let mut leaf = 0;
-    for bits in (1..=limit).rev() {
-        for _ in 0..count_by_length[bits] {
+    for (bits, &count) in count_by_length.iter().enumerate().take(limit + 1).skip(1) {
+        for _ in 0..count {
             if leaf == leaves.len() {
                 return;
             }

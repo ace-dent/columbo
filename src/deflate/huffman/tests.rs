@@ -600,6 +600,47 @@ fn length_families_match_original_columbo_c_on_overflow() {
 }
 
 #[test]
+fn generic_overflow_repair_gives_short_codes_to_frequent_symbols() {
+    // The unlimited code is [4, 4, 3, 2, 1]; repair at 3 bits leaves one
+    // 1-bit and four 3-bit codes. The 1-bit code belongs to the symbol with
+    // count 8: 32 payload bits, against 46 with the order reversed.
+    for variant in 0..4 {
+        assert_eq!(make_lengths(&[1, 1, 2, 4, 8], 3, variant), [3, 3, 3, 3, 1]);
+    }
+}
+
+#[test]
+fn generic_overflow_repair_keeps_lengths_ordered_by_frequency() {
+    let mut state = 0x2545_f491_u32;
+    let mut repaired = 0;
+    for _ in 0..2_000 {
+        let mut frequencies = [0_u32; 24];
+        for frequency in &mut frequencies {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            // Skewed counts make deep unlimited trees common.
+            *frequency = (1_u32 << (state % 14)) >> (state >> 28);
+        }
+        let max_bits = 5 + (state % 3) as u8;
+        let mut lengths = vec![0; frequencies.len()];
+        if !make_lengths_inner(&frequencies, &mut lengths, max_bits, 0) {
+            continue;
+        }
+        repaired += 1;
+        assert_bounded_lengths(&frequencies, &lengths, max_bits);
+        for (a, &frequency_a) in frequencies.iter().enumerate() {
+            for (b, &frequency_b) in frequencies.iter().enumerate() {
+                if frequency_a > frequency_b && frequency_b != 0 {
+                    assert!(lengths[a] <= lengths[b], "{frequencies:?} -> {lengths:?}");
+                }
+            }
+        }
+    }
+    assert!(repaired > 100, "only {repaired} inputs needed repair");
+}
+
+#[test]
 fn variants_match_original_columbo_c_equal_frequency_ties() {
     let frequencies = [4, 1, 9, 2, 2, 0];
     assert_eq!(make_lengths(&frequencies, 4, 0), [2, 4, 1, 4, 3, 0]);
