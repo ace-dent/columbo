@@ -956,8 +956,14 @@ fn optimize_image_streams(
             // workers and reconstruction.
             scale_duration(budget.deadline.remaining(), phase_fraction),
         )?;
-        // Workers limit each stream to its IHDR/fcTL size. Charge all frames,
-        // duplicates included, here so no worker changes the shared budget.
+        // Workers only cap each stream at its IHDR/fcTL size; require the exact
+        // size here. Charge all frames, duplicates included, after the join so
+        // no worker changes the shared budget.
+        for (job, result) in &results {
+            let (_, expected_decoded_size) =
+                image_job_source(*job, idat, idat_decoded_size, frames, frame_decoded_sizes);
+            check_image_size(result, expected_decoded_size)?;
+        }
         budget.remaining -= total_decoded_size;
         results
     } else {
@@ -1896,6 +1902,12 @@ fn charge_image_stream(
     expected_decoded_size: u64,
     budget: &mut DecodeBudget,
 ) -> Result<()> {
+    budget.remaining -= check_image_size(result, expected_decoded_size)?;
+    Ok(())
+}
+
+/// Return the decoded size of an image stream if it matches its IHDR/fcTL size.
+fn check_image_size(result: &zlib::StreamOptimization, expected_decoded_size: u64) -> Result<u64> {
     let info = result
         .info
         .as_ref()
@@ -1903,8 +1915,7 @@ fn charge_image_stream(
     if info.size != expected_decoded_size {
         return Err(Error::new("PNG image data size does not match IHDR"));
     }
-    budget.remaining -= info.size;
-    Ok(())
+    Ok(info.size)
 }
 
 fn optimize_png_zlib_with_options(

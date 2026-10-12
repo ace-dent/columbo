@@ -675,6 +675,46 @@ fn rejects_idat_size_mismatch_in_default_and_max() {
 }
 
 #[test]
+fn rejects_short_apng_frame_on_serial_and_parallel_paths() {
+    let mut input = SIGNATURE.to_vec();
+    input.extend(chunk(*b"IHDR", &ihdr()));
+    let mut actl = Vec::new();
+    actl.extend_from_slice(&2_u32.to_be_bytes());
+    actl.extend_from_slice(&0_u32.to_be_bytes());
+    input.extend(chunk(*b"acTL", &actl));
+    input.extend(chunk(*b"fcTL", &frame_control(0)));
+    input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+    input.extend(chunk(*b"fcTL", &frame_control(1)));
+    // The 1x1 frame needs a filter byte and one sample; this stream has only
+    // the filter byte.
+    let mut frame_data = 2_u32.to_be_bytes().to_vec();
+    frame_data.extend_from_slice(&stored_zlib(&[0]));
+    input.extend(chunk(*b"fdAT", &frame_data));
+    input.extend(chunk(*b"IEND", &[]));
+
+    // A zero timeout schedules the images serially; a nonzero one runs the
+    // two distinct streams in parallel.
+    for (exhaustive, timeout) in [
+        (false, Duration::ZERO),
+        (false, Duration::from_secs(10)),
+        (true, Duration::from_secs(10)),
+    ] {
+        let options = Options {
+            exhaustive,
+            timeout,
+            ..Options::default()
+        };
+        let case = format!("exhaustive {exhaustive}, timeout {timeout:?}");
+        let error = optimize(&input, &options).expect_err(&case);
+        assert_eq!(
+            error.message(),
+            "PNG image data size does not match IHDR",
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn parallel_max_image_requires_bounded_input_and_decoded_work() {
     assert!(parallel_max_image_is_bounded(
         PARALLEL_MAX_IMAGE_COMPRESSED,
