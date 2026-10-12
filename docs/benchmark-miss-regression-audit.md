@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 9 October 2026 entry is the current state. Entries from 30 September keep
+The 13 October 2026 entry is the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,79 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+## Smoothed-tree finish and Huffman repair on 13 October 2026
+
+### Benchmark state
+
+All three reports come from executable `3ceab7ae…` (`c3c6f60`), which adds
+R14, the repeated tree finish and the corrected length repair of the generic
+Huffman builder. Against the `2825c48f…` reports at the same allowances:
+
+| Benchmark | Result |
+| --- | --- |
+| Defluff, 66 pairs | Unchanged: 61 wins and five ties, −109 bytes / −932 bits; no misses |
+| DeflOpt Default, 957 rows | 252 smaller, 705 identical, none larger; net −30,170 bytes / −241,370 bits; runtime 1,254.3 → 1,286.1 s (+2.5%) |
+| DeflOpt Max, 937 rows with unchanged allowances | 148 smaller, 757 identical, 32 larger; net −1,658 bytes / −13,303 bits; runtime 9,210.2 → 9,226.0 s |
+| Timed deft4j, 1,621 pairs | 211 smaller, 1,362 identical, 48 larger; net −6,038 bytes / −48,332 bits; runtime 17,430.6 → 17,427.9 s |
+
+The misses are unchanged: four DeflOpt rows on two files and twelve deft4j
+rows. All strict misses reach parity in the relaxed audit; Max `T_Grass.png`
+narrows from 2 bits to 1.
+
+### Rows that grew
+
+The 68 Max rows that grew in either benchmark were rerun as quiet pairs, two
+repeats per executable. Together they favour the new executable, net
+−482 bytes over both repeats; `oxipng/interlaced_odd_width.png` alone is
+2,196 smaller. About half the losses do not repeat. Clean builds of each
+commit attribute the repeating ones:
+
+| File | Loss at 10 s | Cause |
+| --- | ---: | --- |
+| `css-ig-net/Peach512.png` | +138 bytes, also at 145 s | Huffman length repair (`8336d3a`) |
+| `css-ig-net/Sock.png` | +57 | Huffman length repair; 2 bytes smaller at 30 s |
+| `oxipng/grayscale_alpha_8_should_be_grayscale_alpha_8.png` | +200 | Repeated tree finish (+174) and R14 (+26), through the PNG early lineage |
+| `medium-zip/skinsrc.zip` | +25 (guard +20) | Repeated tree finish, through ZIP Max's refined Default |
+| `large/nerd.png` and smaller rows | mixed | Deadline-bound; vary between repeats |
+
+**Length repair.** When an unlimited Huffman tree exceeded its depth limit,
+the generic builder gave the longest repaired codes to the most frequent
+symbols. Giving them the shortest codes, as zlib does, is strictly better for
+every tree it builds. Default output is identical on all 957 DeflOpt
+fixtures. In Max, the builder supplies one of the 7-bit code-length trees
+that the exhaustive header search tries, and its feedback passes now settle
+elsewhere: on Peach512 the bounded no-split route ends 178 bytes larger.
+Paired Max runs of the commit alone, at the recorded allowances:
+
+| Sample | Smaller / larger | Net | CPU |
+| --- | --- | ---: | --- |
+| 131 deft4j cases | 24 / 24 | −404 bytes / −3,238 bits | 7,389 → 7,315 s |
+| 96 DeflOpt every-tenth Max cases | 1 / 3 | +156 bytes / +1,236 bits, of which Peach512 +148 | 1,717 → 1,714 s |
+
+The correction is kept. Peach512's loss is a stable different basin rather
+than a timing effect.
+
+**Parent basins.** The repeated finish makes Default endpoints smaller, and
+two lineages refine such an endpoint through `Established`: the PNG early
+lineage and ZIP Max's refined Default. On `skinsrc.zip`, member 2's Default
+falls from 106,980 to 106,975 bytes, but its refinement ends at 106,873
+instead of 106,848. This is the effect recorded on 8 and 9 October. Withholding
+finishing steps from such a parent, or refining both parents, lost on the
+corpus in each form tested, so no change is made.
+
+### Hundred-file guard
+
+89 of 100 floors pass at their recorded allowances. After this refresh the
+deft4j runner added five floors. Two are the repeating losses above:
+`grayscale_alpha_8` (+200 bytes) and `skinsrc.zip` (+20). Two predate this
+range: no build since `c28f1ad` reaches `medium/Gingerman.png`'s 80,828 bytes
+(all give 80,831) or `test-convertir-truecoloralpha-trns.png`'s 9,635 bytes
+(all give 9,636–9,637). `medium/Death.png` (+6) varies between repeats from
+R14 onward. The six earlier failures keep their recorded causes: Psyduck,
+Squirtle and Pikachu by one bit through the early lineage, Poliwrath's
+timing-dependent floor, and the two timed cases, which reach their floors
+with more time.
 
 ## Iterated slide and distance ladder on 9 October 2026
 
