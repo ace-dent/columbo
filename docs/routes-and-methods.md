@@ -672,8 +672,8 @@ block-type change is a new state and stays eligible.
 
 ## Candidate reuse and duplicate-work control
 
-Columbo has two bounded route-local caches and no global route DAG or interval
-cache. The block-plan cache stores completed alignment-independent fixed,
+Columbo has two bounded route-local caches, a bounded per-thread store of
+completed header plans, and no global route DAG or interval cache. The block-plan cache stores completed alignment-independent fixed,
 dynamic, and header results for identical token states within one planning run.
 
 ```mermaid
@@ -696,7 +696,13 @@ harmless. Timed work may use a completed entry but never stores a partial plan;
 each route worker has its own caches, with no shared lock. The header-plan
 cache (`HeaderPlanCache`, ≤512 entries) keys on the exact trimmed code-length
 sequences and header policy, so dynamic planning reuses header work across
-token orders; each caller adds its own checked payload cost. The deft4j state
+token orders; each caller adds its own checked payload cost. Most block
+planning starts a fresh route-local cache, yet more than half of all header
+plans repeat code lengths that another route on the same thread already
+planned. Misses therefore fall through to a per-thread store with the same
+exact key and verification, holding packed plans in two generations within an
+8 MiB charge; a top-level `optimize` call empties its thread's store on
+return. Header plans take no stop, so the store holds only completed plans. The deft4j state
 queue likewise compares complete token and code-length arrays after a
 fingerprint match.
 
@@ -785,7 +791,7 @@ expands the Provenance column.
 | All-stored repack | Rechunks adjacent stored payload into legal 65,535-byte blocks without token search. | 🟢 | **RFC 1951 / Columbo** |
 | Safe payload decode and emission hot paths | Bounded 258-byte match scratch, doubled overlap periods, and sliced history-ring updates in the validating parser; a decode entry consumes a codeword with its extra bits, and emission writes both at once. | 🟢 | Fast-Deflate techniques from **libdeflate**; safe **Columbo** implementation |
 | Strict/relaxed tree-shape policy | Strict completes required alphabets; relaxed permits the supported empty or singleton forms and the compatibility length-258 alias. | 🟢 | **RFC 1951 / Columbo** |
-| Route-local plan caches | Block-plan and header-plan caches ([Candidate reuse](#candidate-reuse-and-duplicate-work-control)). | 🟢 | **Columbo** |
+| Route-local plan caches | Block-plan and header-plan caches, with a bounded per-thread header-plan store behind them ([Candidate reuse](#candidate-reuse-and-duplicate-work-control)). | 🟢 | **Columbo** |
 | Length-limited Huffman families | Default tries the DeflOpt-heap and Columbo order-heap variants; Max adds generic, Columbo/Defluff, exact Defluff, deft4j Java-heap, and the package-first equal-payload shape under a capped, deduplicated cross-product. | 🔴 | **DeflOpt / Defluff / deft4j / Zopfli / Columbo** as labeled in source; Zopfli equality choice with **Columbo** package-list integration |
 | Reduced-depth payload-tree pair | Max only: an exact Defluff tree pair at maximum depths 10 and 9, outside the tree-family cross-product; adopted only on a complete-pricing win. | 🟡 | Reduced-depth dimension from **ECT**; **Columbo** implementation |
 | Bounded-depth terminal tree floor | After the main search, each dynamic block prices deduplicated leaf-first and package-first shapes on raw counts at every depth ceiling from the first feasible (`2^depth >= populated symbols`) through 14, beside the 15-bit parent; Max prices the cross-product of both tie families over all feasible literal/length and distance depths. A payload lower bound orders pairs and skips headers that cannot strictly win. Polls the hard stop between pairs and blocks. Max: at the hard deadline, a fixed rescue prices every dynamic block when the parent is ≤1 MiB compressed and decoded with ≤128 blocks. No token feedback; only an exact whole-stream win is selectable. | 🟡 | Bounded-depth dimension from **7-Zip**, equality choice from **Zopfli**; generalized **Columbo** implementation |

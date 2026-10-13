@@ -1691,3 +1691,132 @@ fn code_length_reorder_early_exit_matches_the_full_pass() {
     }
     assert!(early_exits > 50_000);
 }
+
+/// Trimmed literal/length and distance code lengths from random Huffman trees,
+/// with zero runs long enough for codes 17 and 18.
+fn random_trimmed_lengths(next: &mut impl FnMut() -> u64) -> (Vec<u8>, Vec<u8>) {
+    let mut literal_frequencies = [0_u32; 286];
+    for (symbol, frequency) in literal_frequencies.iter_mut().enumerate() {
+        let gap = (symbol / 8) % 3 == usize::try_from(next() % 3).unwrap();
+        if !gap && next() % 3 != 0 {
+            *frequency = u32::try_from(next() % 200).unwrap();
+        }
+    }
+    literal_frequencies[256] = 1;
+    let mut distance_frequencies = [0_u32; 30];
+    for frequency in distance_frequencies
+        .iter_mut()
+        .take(1 + (next() % 30) as usize)
+    {
+        *frequency = u32::try_from(next() % 50).unwrap();
+    }
+    let literal = make_lengths(&literal_frequencies, 15, 0);
+    let distance = make_lengths(&distance_frequencies, 15, 0);
+    let literal = literal[..trim_literal(&literal)].to_vec();
+    let distance = distance[..trim_distance(&distance)].to_vec();
+    (literal, distance)
+}
+
+#[test]
+fn stored_header_plans_round_trip_through_generation_turnover() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let cases: Vec<_> = (0..48).map(|_| random_trimmed_lengths(&mut next)).collect();
+    let plans: Vec<_> = cases
+        .iter()
+        .map(|(literal, distance)| {
+            plan_for_trimmed_lengths_uncached(literal, distance, 0, false, 0xff)
+                .expect("random trees give a valid header")
+        })
+        .collect();
+    // About six plans per generation, so lookups cross both generations and
+    // evicted plans.
+    let mut store = HeaderPlanStore::with_budget(8 << 10);
+    let mut inserted = [false; 48];
+    let (mut hits, mut evictions) = (0, 0);
+    for round in 0..400 {
+        let index = (next() % if round % 2 == 0 { 8 } else { 48 }) as usize;
+        let (literal, distance) = &cases[index];
+        let fingerprint = header_plan_fingerprint(literal, distance, false, 0xff);
+        match store.get(fingerprint, literal, distance, false, 0xff) {
+            Some(plan) => {
+                assert_eq!(plan, plans[index]);
+                hits += 1;
+            }
+            None => {
+                evictions += usize::from(inserted[index]);
+                inserted[index] = true;
+                store.insert(
+                    fingerprint,
+                    StoredHeaderPlan::pack(false, 0xff, &plans[index]).unwrap(),
+                );
+            }
+        }
+        assert!(store.current.bytes < store.max_bytes / 2);
+    }
+    assert!(
+        hits > 0 && evictions > 0,
+        "{hits} hits, {evictions} evictions"
+    );
+}
+
+#[test]
+fn stored_header_plan_rejects_a_fingerprint_collision() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (literal, distance) = random_trimmed_lengths(&mut next);
+    let (other_literal, other_distance) = random_trimmed_lengths(&mut next);
+    let plan = plan_for_trimmed_lengths_uncached(&literal, &distance, 0, false, 0xff).unwrap();
+    for move_to_previous in [false, true] {
+        let mut store = HeaderPlanStore::with_budget(usize::MAX);
+        store.insert(7, StoredHeaderPlan::pack(false, 0xff, &plan).unwrap());
+        if move_to_previous {
+            store.previous = std::mem::take(&mut store.current);
+        }
+        assert_eq!(
+            store.get(7, &other_literal, &other_distance, false, 0xff),
+            None
+        );
+        assert_eq!(store.get(7, &literal, &distance, true, 0xff), None);
+        let expected = (!move_to_previous).then(|| plan.clone());
+        // A rejected entry in the previous generation is dropped.
+        assert_eq!(store.get(7, &literal, &distance, false, 0xff), expected);
+    }
+}
+
+#[test]
+fn thread_header_plans_match_uncached_planning() {
+    let mut state = 0x6a09_e667_f3bc_c909_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    release_thread_header_plans();
+    for case in 0..40 {
+        let (literal, distance) = random_trimmed_lengths(&mut next);
+        let exhaustive = case % 8 == 0;
+        let rle_mask = [0xff, 0x01, 0x11][case % 3];
+        let data_bits = next() % 100_000;
+        let expected =
+            plan_for_trimmed_lengths_uncached(&literal, &distance, data_bits, exhaustive, rle_mask);
+        for _ in 0..2 {
+            let planned =
+                plan_for_trimmed_lengths(&literal, &distance, data_bits, exhaustive, rle_mask);
+            assert_eq!(planned, expected);
+        }
+    }
+    release_thread_header_plans();
+    assert!(HEADER_PLAN_STORE.with(|store| store.borrow().current.plans.is_empty()));
+}

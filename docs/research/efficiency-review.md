@@ -68,6 +68,7 @@ gains where established.
 | 15 Sep 2026 | [`da2eefc`](#da2eefc-15-september-2026) | Original-match restoration | Monotonic-queue minimum per length family, batched exact work charges, only the winning match built | 4,096-byte interval 3.85× (22.02× with only length 258); 12 bytes 0.91× | 50 API (21 inputs; 8 Max completed); 632 oracle, 18,504 charge, 4,736 harness; 591 Rust, 13 Python tests |
 | 1 Oct 2026 | [`62f772a`](#62f772a-1-october-2026) | `solve_proven_submatch_avoiding` | One `SuffixMinima` query per length family; stop checks every 32 positions instead of every 32 edges | Solver about 2×; whole-file CPU unchanged | 32 Default inputs, run twice; 400 oracle, 100,000 random |
 | 13 Oct 2026 | [`9ffa010`](#9ffa010-13-october-2026) | Code-length tree building (`huffman.rs`, `header.rs`) | 12-byte heap entries with child indices replace 88-byte linked nodes; code-length reordering returns early when lengths already follow frequencies; the order-key tree that duplicates DeflOpt variant 3 is no longer built | Default CPU 1.13× (33 inputs) | 104 API (52 inputs; 4 Default runs reached the deadline, 3 rerun to completion); 33 Default inputs; 640,000 heap-builder, 200,000 reorder; 659 Rust, 13 Python tests |
+| 13 Oct 2026 | [`dc68b5f`](#dc68b5f-13-october-2026) | Header-plan reuse across routes (`header.rs`) | Route-local header-cache misses fall through to a per-thread store of packed completed plans, two generations within an 8 MiB charge | Default CPU 1.38× (33 inputs); peak memory +3.8 MiB median, +20.0 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 662 Rust, 13 Python tests |
 
 ## Entries
 
@@ -418,3 +419,49 @@ Measured and rejected in the same review:
 
 Artifacts: `work/efficiency-review-code-length-heap/`,
 `target/efficiency-review-code-length-heap-baseline/`.
+
+### `dc68b5f`, 13 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the same 33 Default inputs, once per build in alternating order.
+
+| Store budget | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| 16 MiB, unpacked entries | 180.7 s | 123.4 s | 1.46× | +5.0 / +72.1 MiB |
+| 8 MiB, packed entries (retained) | 180.2 s | 130.8 s | 1.38× | +3.8 / +20.0 MiB |
+
+Instrumented Default runs of these inputs made 1.45 million uncached header
+plans. 56% repeated the code lengths and policy of a plan already completed
+earlier on the same thread, and took 56% of planning time, but the route-local
+caches answered only 1.2% of lookups: most block planning, such as structural
+ranges, owned-block planning and boundary-graph edges, calls `plan_block`
+after a canonical-cache miss, which starts a fresh 512-entry header cache.
+Header plans run on one thread per input in Default.
+
+A header plan depends only on the trimmed code lengths, Default or Max policy
+and RLE mask; payload bits only shift every candidate's cost, which the
+route-local cache already relies on. Misses there, and calls to
+`plan_for_trimmed_lengths`, now consult a thread-local store keyed the same
+way. Each entry packs the code lengths two per byte and the RLE tokens as byte
+pairs into one allocation. When the current generation reaches half the
+budget it replaces the previous one, and a hit in the previous generation moves
+forward. Replaying the logged plan sequences with unpacked plan sizes, this
+policy kept 38% of planning time at 8 MiB of plan data and 55% at 32 MiB,
+close to a true LRU of equal size and against 56% unbounded. Measured peak
+memory grew about 1.6 times the charged budget plus 5 MiB (4, 8 and 16 MiB on
+`ss1.png` and `y2rc2_large.png`), so the 16 MiB first trial was halved.
+`optimize` empties the calling thread's store on return; worker threads free
+theirs on exit.
+
+Equivalence: the store's tests cover generation turnover against
+uncached plans, rejection of a fingerprint match with different lengths or
+policy, and agreement with uncached planning across payload bits, Default and
+Max policies and RLE masks. API comparisons on 52 inputs (39 PNG, 7 raw
+Deflate, 4 ZIP, 1 GZIP, 1 zlib), in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs. Every CLI timing run matched byte for
+byte. Rust tests, including the private corpus, passed in release and debug
+modes, with documentation and Python tests, a locked build, formatting and
+all-feature Clippy with warnings denied.
+
+Artifacts: `work/efficiency-review-header-plan-store/`,
+`target/efficiency-review-header-plan-store-baseline/`.

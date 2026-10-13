@@ -40,7 +40,7 @@ never skips validation or produces partial output.
 | `bitstream` | Read and write least-significant-bit-first Deflate fields. |
 | `parse`, `model` | Validate the stream and retain decoded bytes, source symbols, and block metadata. |
 | `huffman` | Construct length-limited code lengths, canonical codes, and decoding tables. |
-| `header` | Construct dynamic headers and count header and payload bits. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11). |
+| `header` | Construct dynamic headers and count header and payload bits, reusing completed header plans per thread. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11). |
 | `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache. |
 | `minima` | Share range-minimum lookups between searches over match-length families. |
 | `search` | Change token spelling within existing matches. |

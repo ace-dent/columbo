@@ -122,7 +122,9 @@ impl Optimization {
 /// can exceed an internal memory budget for the parsed model before reaching
 /// the configurable byte limits.
 pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optimization> {
-    format::optimize(input, format, options)
+    let result = format::optimize(input, format, options);
+    deflate::release_thread_header_plans();
+    result
 }
 
 /// Count the independent Deflate streams Columbo can inspect in one input.
