@@ -67,6 +67,7 @@ gains where established.
 | 15 Sep 2026 | [`9860910`](#9860910-15-september-2026) | Same-distance partitions; saturated header caches | One range-minimum query per length family via the shared `minima.rs` helper; cache copy cloned only when the cache has room | Partition tables 5.68×; generated whole-file inputs 1.38× | 50 API (21 inputs; 8 Max completed); 2,639 partition-table; 588 Rust, 13 Python tests |
 | 15 Sep 2026 | [`da2eefc`](#da2eefc-15-september-2026) | Original-match restoration | Monotonic-queue minimum per length family, batched exact work charges, only the winning match built | 4,096-byte interval 3.85× (22.02× with only length 258); 12 bytes 0.91× | 50 API (21 inputs; 8 Max completed); 632 oracle, 18,504 charge, 4,736 harness; 591 Rust, 13 Python tests |
 | 1 Oct 2026 | [`62f772a`](#62f772a-1-october-2026) | `solve_proven_submatch_avoiding` | One `SuffixMinima` query per length family; stop checks every 32 positions instead of every 32 edges | Solver about 2×; whole-file CPU unchanged | 32 Default inputs, run twice; 400 oracle, 100,000 random |
+| 13 Oct 2026 | [`9ffa010`](#9ffa010-13-october-2026) | Code-length tree building (`huffman.rs`, `header.rs`) | 12-byte heap entries with child indices replace 88-byte linked nodes; code-length reordering returns early when lengths already follow frequencies; the order-key tree that duplicates DeflOpt variant 3 is no longer built | Default CPU 1.13× (33 inputs) | 104 API (52 inputs; 4 Default runs reached the deadline, 3 rerun to completion); 33 Default inputs; 640,000 heap-builder, 200,000 reorder; 659 Rust, 13 Python tests |
 
 ## Entries
 
@@ -356,3 +357,64 @@ Measured and rejected in the same review:
   memory unchanged on a 600 MB input.
 - Comparing APNG frame sizes before contents is unnecessary: frame sorting
   already stops at the first differing byte of each zlib stream.
+
+### `9ffa010`, 13 October 2026
+
+Batches: none; whole-file CPU (user plus system) over 33 stratified Default
+inputs, alternating baseline and candidate order. The first two rows ran each
+input twice per build and the last row once.
+
+| Candidate | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| Compact heap builder | 410.5 s | 398.6 s | 1.03× |
+| Plus reorder early exit | 408.4 s | 374.9 s | 1.09× |
+| Plus variant-3 reuse | 203.5 s | 180.7 s | 1.13× |
+
+A sampled Default profile of the same inputs put 38% of self time in the
+DeflOpt-style heap builder: sift-down 20.8%, the builder 11.4% and depth
+assignment 5.8%. Almost all of it builds 19-symbol code-length trees. On
+`ss1.png`, 267,921 header plans built 19.3 million heaps, 18.9 million of them
+for the code-length alphabet.
+
+- **Heap builder.** Heap entries hold frequency, height and node index
+  (12 bytes, was an 88-byte node with optional symbol, child and parent links,
+  side, order and height). Branches record their two child indices, depths are
+  assigned in one reverse pass from the root, and overflow repair indexes
+  symbols directly. Leaves still enter in symbol order and branches in
+  creation order, so the frequency, height and order ties are unchanged.
+- **Reorder early exit.** `reorder_code_length_lengths` exchanges lengths
+  where a more frequent symbol has a longer code. When every symbol at each
+  length is at least as frequent as every symbol at any longer length, no
+  exchange lowers the cost and the full pass changes nothing, so a check of
+  per-length frequency minima and maxima returns first. Lengths of 8 or more
+  fall through to the full pass.
+- **Variant-3 reuse.** Heap variant 3 breaks both sift-down ties by frequency
+  alone, so its DeflOpt and order-key builders return the same tree.
+  `push_unique` already discarded the second copy, so candidate order and the
+  earlier-wins rule are unchanged; the copy is no longer built.
+
+Equivalence: the original builder and reorder pass are kept as test-only
+references. The compact builder matched on 40,000 random frequency sets ×
+4 variants × 2 tie rules × maximum lengths 7 and 15, and the early exit matched
+the full pass on 200,000 cases, over 50,000 of which took it. API comparisons
+ran Default with a ten-second budget and zero-budget Max on 52 inputs; 100 of
+104 runs matched, and in the other four Default runs at least one side reached
+the deadline. Rerun with the 180-second default budget, `world-fs8.png`,
+`Banana512.png` and `y2rc2_large.png` completed on both sides with identical
+output; the 2.7 MB `Partnership_Card___John_Lewis_Finance.png` does not
+complete Default within that budget and was not rerun. Every CLI timing run
+matched byte for byte. Rust tests, including the private corpus, passed in
+release and debug modes, with documentation and Python tests, a locked build,
+formatting and all-feature Clippy with warnings denied. Release executables
+grew from 1,843,888 to 1,860,464 bytes.
+
+Measured and rejected in the same review:
+
+- Memoizing heap builds within a header plan: only 1.3 million of the
+  19.3 million builds on `ss1.png` repeated an earlier input.
+- A shortcut for frequency sets without ties: 408,560 builds, about 2%.
+- Counting RLE frequencies inside the local rewriters: a few percent of self
+  time, for a changed interface at every call site.
+
+Artifacts: `work/efficiency-review-code-length-heap/`,
+`target/efficiency-review-code-length-heap-baseline/`.

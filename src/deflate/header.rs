@@ -1001,6 +1001,10 @@ fn ensure_distance_symbols(frequencies: &mut [u32; 30], strict: bool) {
     ensure_code_symbols(frequencies, strict);
 }
 
+/// The heap variant whose sift-downs both break ties by frequency alone, so
+/// its DeflOpt and order-key builders return the same tree.
+const FREQUENCY_ONLY_HEAP_VARIANT: u32 = 3;
+
 fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<Vec<u8>> {
     let mut candidates = Vec::with_capacity(if exhaustive { 16 } else { 8 });
     let mut heap_scratch = DefloptHeapScratch::default();
@@ -1018,7 +1022,9 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
         );
         push_unique(&mut candidates, lengths);
     }
-    for variant in 0..4 {
+    // Variant 3 breaks both ties by frequency alone, so its order-key tree is
+    // the DeflOpt tree already listed, which `push_unique` would discard.
+    for variant in 0..FREQUENCY_ONLY_HEAP_VARIANT {
         let mut lengths = vec![0_u8; frequencies.len()];
         make_lengths_order_heap_into_with_scratch(
             frequencies,
@@ -2708,14 +2714,23 @@ fn consider_rle(
         let variants = 4;
         code_length_candidates.clear();
         for variant in 0..variants {
-            let mut order_lengths = [0_u8; 19];
-            make_lengths_order_heap_into_with_scratch(
-                &frequencies,
-                &mut order_lengths,
-                7,
-                variant,
-                &mut search.heap_scratch,
-            );
+            // Variant 3 breaks both ties by frequency alone, so on the same
+            // frequencies its order-key tree is the DeflOpt tree the local
+            // rewrite built first.
+            let prescored_order_tree = (pass == 0 && variant == FREQUENCY_ONLY_HEAP_VARIANT)
+                .then_some(prescored_deflopt_trees[variant as usize])
+                .flatten();
+            let order_lengths = prescored_order_tree.unwrap_or_else(|| {
+                let mut order_lengths = [0_u8; 19];
+                make_lengths_order_heap_into_with_scratch(
+                    &frequencies,
+                    &mut order_lengths,
+                    7,
+                    variant,
+                    &mut search.heap_scratch,
+                );
+                order_lengths
+            });
             push_unique(&mut code_length_candidates, order_lengths);
             // deft4j's tree builder is slow on the data alphabets but cheap
             // on the code-length alphabet, so every header search includes it.
@@ -2747,7 +2762,8 @@ fn consider_rle(
                     if let Some(lengths) = prescored_deflopt_trees[variant as usize] {
                         push_unique(&mut code_length_candidates, lengths);
                     }
-                } else {
+                } else if variant != FREQUENCY_ONLY_HEAP_VARIANT {
+                    // Variant 3's DeflOpt tree is the order-key tree above.
                     let mut deflopt_lengths = [0_u8; 19];
                     make_lengths_deflopt_heap_into_with_scratch(
                         &frequencies,
@@ -3170,7 +3186,40 @@ fn repeat_rank(rle: &[RleToken]) -> usize {
         .sum()
 }
 
+/// Whether no two coded symbols have a longer code for a strictly larger
+/// frequency: every length's smallest frequency is at least the largest
+/// frequency of any longer code.
+fn code_lengths_follow_frequencies(lengths: &[u8; 19], frequencies: &[u32; 19]) -> bool {
+    let mut smallest = [u32::MAX; 8];
+    let mut largest = [0_u32; 8];
+    for (&length, &frequency) in lengths.iter().zip(frequencies) {
+        let length = usize::from(length);
+        if length == 0 {
+            continue;
+        }
+        if length >= smallest.len() {
+            return false;
+        }
+        smallest[length] = smallest[length].min(frequency);
+        largest[length] = largest[length].max(frequency);
+    }
+    let mut largest_longer = 0;
+    for length in (1..smallest.len()).rev() {
+        if smallest[length] < largest_longer {
+            return false;
+        }
+        largest_longer = largest_longer.max(largest[length]);
+    }
+    true
+}
+
 fn reorder_code_length_lengths(lengths: &mut [u8; 19], frequencies: &[u32; 19]) -> bool {
+    // The loop swaps a pair only when its lengths and frequencies differ in
+    // the same direction. When no pair does, nothing ever swaps, so a linear
+    // check returns the same result; optimal trees always pass it.
+    if code_lengths_follow_frequencies(lengths, frequencies) {
+        return false;
+    }
     let mut changed = false;
     for left in 0..18 {
         if lengths[left] == 0 {

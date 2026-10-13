@@ -184,17 +184,17 @@ fn assert_bounded_lengths(frequencies: &[u32], lengths: &[u8], max_bits: u8) {
     }
 }
 
-fn swapping_heap_sift_down(nodes: &[Node], heap: &mut [usize], start: usize, tie: HeapTie) {
+fn swapping_heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             return;
         }
-        if child + 1 < heap.len() && heap_node_less(nodes, heap[child + 1], heap[child], tie) {
+        if child + 1 < heap.len() && heap_entry_less(heap[child + 1], heap[child], tie) {
             child += 1;
         }
-        if !heap_node_less(nodes, heap[child], heap[root], tie) {
+        if !heap_entry_less(heap[child], heap[root], tie) {
             return;
         }
         heap.swap(root, child);
@@ -204,16 +204,17 @@ fn swapping_heap_sift_down(nodes: &[Node], heap: &mut [usize], start: usize, tie
 
 #[test]
 fn hole_heap_sift_matches_the_swapping_reference() {
-    let mut nodes = Vec::new();
-    for index in 0..64 {
-        let mut node = Node::leaf(((index * 17 + 5) % 13) as u32, index, 63 - index);
-        node.height = (index * 7 + 3) % 11;
-        nodes.push(node);
-    }
+    let entries: Vec<HeapEntry> = (0..64_u32)
+        .map(|index| HeapEntry {
+            frequency: (index * 17 + 5) % 13,
+            height: (index * 7 + 3) % 11,
+            index: 63 - index,
+        })
+        .collect();
 
-    for len in 1..=nodes.len() {
+    for len in 1..=entries.len() {
         for seed in 0..4_u64 {
-            let mut heap = (0..len).collect::<Vec<_>>();
+            let mut heap = entries[..len].to_vec();
             let mut random = seed + len as u64;
             for index in (1..len).rev() {
                 random ^= random << 13;
@@ -225,9 +226,11 @@ fn hole_heap_sift_matches_the_swapping_reference() {
                 for tie in [HeapTie::FrequencyOnly, HeapTie::Height, HeapTie::Order] {
                     let mut expected = heap.clone();
                     let mut actual = heap.clone();
-                    swapping_heap_sift_down(&nodes, &mut expected, start, tie);
-                    heap_sift_down(&nodes, &mut actual, start, tie);
-                    assert_eq!(actual, expected);
+                    swapping_heap_sift_down(&mut expected, start, tie);
+                    heap_sift_down(&mut actual, start, tie);
+                    let index =
+                        |heap: &[HeapEntry]| heap.iter().map(|e| e.index).collect::<Vec<_>>();
+                    assert_eq!(index(&actual), index(&expected));
                 }
             }
         }
@@ -853,6 +856,344 @@ fn reused_deflopt_heap_scratch_matches_standalone_builds() {
                 &mut scratch,
             );
             assert_eq!(actual, expected);
+        }
+    }
+}
+
+// The DeflOpt-style heap builder before its compact rewrite, kept to prove
+// that the rewrite returns identical lengths.
+#[derive(Debug, Clone, Copy)]
+enum ReferenceHeapTie {
+    FrequencyOnly,
+    Height,
+    Order,
+}
+
+#[derive(Default)]
+struct ReferenceHeapScratch {
+    nodes: Vec<Node>,
+    heap: Vec<usize>,
+    leaf_order: Vec<usize>,
+}
+
+#[inline]
+fn reference_heap_node_less(nodes: &[Node], a: usize, b: usize, tie: ReferenceHeapTie) -> bool {
+    if nodes[a].frequency != nodes[b].frequency {
+        return nodes[a].frequency < nodes[b].frequency;
+    }
+    match tie {
+        ReferenceHeapTie::FrequencyOnly => false,
+        ReferenceHeapTie::Height => nodes[a].height < nodes[b].height,
+        ReferenceHeapTie::Order => nodes[a].order < nodes[b].order,
+    }
+}
+
+fn reference_heap_sift_down(
+    nodes: &[Node],
+    heap: &mut [usize],
+    start: usize,
+    tie: ReferenceHeapTie,
+) {
+    let node = heap[start];
+    let mut root = start;
+    loop {
+        let mut child = root * 2 + 1;
+        if child >= heap.len() {
+            break;
+        }
+        if child + 1 < heap.len()
+            && reference_heap_node_less(nodes, heap[child + 1], heap[child], tie)
+        {
+            child += 1;
+        }
+        if !reference_heap_node_less(nodes, heap[child], node, tie) {
+            break;
+        }
+        heap[root] = heap[child];
+        root = child;
+    }
+    heap[root] = node;
+}
+
+fn reference_heapify_frequency_only(nodes: &[Node], heap: &mut [usize]) {
+    for start in (0..heap.len() / 2).rev() {
+        reference_heap_sift_down(nodes, heap, start, ReferenceHeapTie::FrequencyOnly);
+    }
+}
+
+fn reference_variant_heap(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    variant: u32,
+    use_order_tie: bool,
+    scratch: &mut ReferenceHeapScratch,
+) {
+    assert_eq!(frequencies.len(), lengths.len());
+    lengths.fill(0);
+
+    let ReferenceHeapScratch {
+        nodes,
+        heap,
+        leaf_order,
+    } = scratch;
+    nodes.clear();
+    heap.clear();
+    leaf_order.clear();
+    nodes.reserve(frequencies.len().saturating_mul(2));
+    heap.reserve(frequencies.len());
+    for (symbol, &frequency) in frequencies.iter().enumerate() {
+        if frequency != 0 {
+            heap.push(nodes.len());
+            nodes.push(Node::leaf(frequency, symbol, nodes.len()));
+        }
+    }
+    let leaf_count = heap.len();
+    match leaf_count {
+        0 => return,
+        1 => {
+            lengths[nodes[heap[0]].symbol.expect("leaf has a symbol")] = 1;
+            return;
+        }
+        _ => {}
+    }
+
+    leaf_order.resize(leaf_count, 0);
+    let mut leaf_order_position = leaf_count;
+    reference_heapify_frequency_only(nodes, heap);
+
+    // Variant bit 1 sets the tie rule of the sift-down after removing the
+    // first child, and bit 0 the one after inserting the parent.
+    let first_tie = if variant & 2 != 0 {
+        ReferenceHeapTie::FrequencyOnly
+    } else if use_order_tie {
+        ReferenceHeapTie::Order
+    } else {
+        ReferenceHeapTie::Height
+    };
+    let second_tie = if variant & 1 != 0 {
+        ReferenceHeapTie::FrequencyOnly
+    } else if use_order_tie {
+        ReferenceHeapTie::Order
+    } else {
+        ReferenceHeapTie::Height
+    };
+
+    while heap.len() > 1 {
+        let left = heap[0];
+        if nodes[left].symbol.is_some() {
+            leaf_order_position -= 1;
+            leaf_order[leaf_order_position] = left;
+        }
+        let last = heap.pop().expect("heap is non-empty");
+        heap[0] = last;
+
+        reference_heap_sift_down(nodes, heap, 0, first_tie);
+
+        let right = heap[0];
+        if nodes[right].symbol.is_some() {
+            leaf_order_position -= 1;
+            leaf_order[leaf_order_position] = right;
+        }
+        let index = nodes.len();
+        let mut parent = Node::branch(
+            nodes[left].frequency.wrapping_add(nodes[right].frequency),
+            left,
+            right,
+            index,
+        );
+        parent.height = nodes[left].height.max(nodes[right].height) + 1;
+        nodes.push(parent);
+        heap[0] = index;
+
+        reference_heap_sift_down(nodes, heap, 0, second_tie);
+    }
+
+    debug_assert_eq!(leaf_order_position, 0);
+    let max_depth = assign_depths(nodes, heap[0], 0, lengths);
+    if max_depth <= usize::from(max_bits) {
+        return;
+    }
+    reference_repair_deflopt_overflow(nodes, leaf_order, lengths, max_bits, max_depth);
+}
+
+fn reference_repair_deflopt_overflow(
+    nodes: &[Node],
+    leaf_order: &[usize],
+    lengths: &mut [u8],
+    max_bits: u8,
+    max_depth: usize,
+) {
+    let limit = usize::from(max_bits);
+    if limit == 0 || limit > MAX_TRACKED_DEPTH {
+        lengths.fill(0);
+        return;
+    }
+
+    let mut count_by_length = [0_usize; MAX_TRACKED_DEPTH + 1];
+    for &length in lengths.iter() {
+        if length != 0 {
+            count_by_length[usize::from(length).min(MAX_TRACKED_DEPTH)] += 1;
+        }
+    }
+
+    let mut deepest = max_depth.min(MAX_TRACKED_DEPTH);
+    // Until no code exceeds `limit`, split one shorter code into two and
+    // merge two of the deepest codes into their parent, as DeflOpt's loop at
+    // 0x407a80 does.
+    while deepest > limit {
+        let mut bits = limit - 1;
+        while bits > 0 && count_by_length[bits] == 0 {
+            bits -= 1;
+        }
+        if bits == 0 {
+            break;
+        }
+        count_by_length[bits] -= 1;
+        count_by_length[bits + 1] += 2;
+        if count_by_length[deepest] >= 2 {
+            count_by_length[deepest] -= 2;
+            count_by_length[deepest - 1] += 1;
+        }
+        while deepest > limit && count_by_length[deepest] == 0 {
+            deepest -= 1;
+        }
+    }
+    count_by_length[limit + 1..].fill(0);
+
+    // Like DeflOpt, assign the shortest lengths in reverse heap-removal order.
+    lengths.fill(0);
+    let mut leaf = 0;
+    for (bits, &count) in count_by_length.iter().enumerate().take(limit + 1).skip(1) {
+        for _ in 0..count {
+            if leaf == leaf_order.len() {
+                return;
+            }
+            let symbol = nodes[leaf_order[leaf]]
+                .symbol
+                .expect("leaf order contains only leaves");
+            lengths[symbol] = bits as u8;
+            leaf += 1;
+        }
+    }
+}
+
+#[test]
+fn compact_variant_heap_matches_the_reference_builder() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut scratch = DefloptHeapScratch::default();
+    let mut reference_scratch = ReferenceHeapScratch::default();
+    for case in 0..40_000 {
+        let size = match case % 4 {
+            0 => 19,
+            1 => 30,
+            2 => 286,
+            _ => 1 + (next() % 320) as usize,
+        };
+        // Small ranges make equal counts and deep, overflowing trees common;
+        // large ones exercise wrapping parent sums.
+        let range = match case % 5 {
+            0 => 2,
+            1 => 5,
+            2 => 40,
+            3 => 1 << 20,
+            _ => u64::from(u32::MAX),
+        };
+        let mut frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        if case % 7 == 0 {
+            // Fibonacci-like counts force overflow repair.
+            let (mut a, mut b) = (1_u32, 1_u32);
+            for frequency in frequencies.iter_mut().take(30) {
+                *frequency = a;
+                (a, b) = (b, a.saturating_add(b));
+            }
+        }
+        for max_bits in [7_u8, 15] {
+            for variant in 0..4 {
+                for use_order_tie in [false, true] {
+                    let mut lengths = vec![0; size];
+                    let mut expected = vec![0; size];
+                    make_lengths_variant_heap_inner(
+                        &frequencies,
+                        &mut lengths,
+                        max_bits,
+                        variant,
+                        use_order_tie,
+                        &mut scratch,
+                    );
+                    reference_variant_heap(
+                        &frequencies,
+                        &mut expected,
+                        max_bits,
+                        variant,
+                        use_order_tie,
+                        &mut reference_scratch,
+                    );
+                    assert_eq!(
+                        lengths, expected,
+                        "case {case}, variant {variant}, order tie {use_order_tie}, limit {max_bits}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn frequency_only_heap_variant_ignores_the_tie_key() {
+    // Header and tree candidate lists skip one of these two builds.
+    let mut state = 0x6a09_e667_f3bc_c908_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut scratch = DefloptHeapScratch::default();
+    for case in 0..20_000 {
+        let size = [19, 30, 286][case % 3];
+        let range = [2, 6, 50, 1 << 16][case % 4];
+        let frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        for max_bits in [7_u8, 15] {
+            let mut deflopt = vec![0; size];
+            let mut order = vec![0; size];
+            make_lengths_deflopt_heap_into_with_scratch(
+                &frequencies,
+                &mut deflopt,
+                max_bits,
+                3,
+                &mut scratch,
+            );
+            make_lengths_order_heap_into_with_scratch(
+                &frequencies,
+                &mut order,
+                max_bits,
+                3,
+                &mut scratch,
+            );
+            assert_eq!(deflopt, order, "case {case}, limit {max_bits}");
         }
     }
 }

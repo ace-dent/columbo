@@ -1551,51 +1551,61 @@ enum HeapTie {
     Order,
 }
 
+/// One live subtree in the DeflOpt-style heap. Leaves take indices
+/// `0..leaf_count` in symbol order and each branch the next index, so `index`
+/// is also the node's creation order; carrying the compared fields in the
+/// entry keeps every heap comparison local.
+#[derive(Debug, Clone, Copy)]
+struct HeapEntry {
+    frequency: u32,
+    height: u32,
+    index: u32,
+}
+
 /// Reusable buffers for the DeflOpt-style heap builder; no state carries over
 /// between builds.
 #[derive(Default)]
 pub(crate) struct DefloptHeapScratch {
-    nodes: Vec<Node>,
-    heap: Vec<usize>,
-    leaf_order: Vec<usize>,
+    heap: Vec<HeapEntry>,
+    /// The symbol of each leaf, by leaf index.
+    symbols: Vec<u32>,
+    /// The two children of each branch, by branch index minus the leaf count.
+    children: Vec<[u32; 2]>,
+    depths: Vec<u32>,
+    /// Leaf symbols in reverse heap-removal order.
+    leaf_order: Vec<u32>,
 }
 
 #[inline]
-fn heap_node_less(nodes: &[Node], a: usize, b: usize, tie: HeapTie) -> bool {
-    if nodes[a].frequency != nodes[b].frequency {
-        return nodes[a].frequency < nodes[b].frequency;
+fn heap_entry_less(a: HeapEntry, b: HeapEntry, tie: HeapTie) -> bool {
+    if a.frequency != b.frequency {
+        return a.frequency < b.frequency;
     }
     match tie {
         HeapTie::FrequencyOnly => false,
-        HeapTie::Height => nodes[a].height < nodes[b].height,
-        HeapTie::Order => nodes[a].order < nodes[b].order,
+        HeapTie::Height => a.height < b.height,
+        HeapTie::Order => a.index < b.index,
     }
 }
 
-fn heap_sift_down(nodes: &[Node], heap: &mut [usize], start: usize, tie: HeapTie) {
-    let node = heap[start];
+fn heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
+    let entry = heap[start];
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             break;
         }
-        if child + 1 < heap.len() && heap_node_less(nodes, heap[child + 1], heap[child], tie) {
+        if child + 1 < heap.len() && heap_entry_less(heap[child + 1], heap[child], tie) {
             child += 1;
         }
-        if !heap_node_less(nodes, heap[child], node, tie) {
+        if !heap_entry_less(heap[child], entry, tie) {
             break;
         }
         heap[root] = heap[child];
         root = child;
     }
-    heap[root] = node;
-}
-
-fn heapify_frequency_only(nodes: &[Node], heap: &mut [usize]) {
-    for start in (0..heap.len() / 2).rev() {
-        heap_sift_down(nodes, heap, start, HeapTie::FrequencyOnly);
-    }
+    heap[root] = entry;
 }
 
 pub(crate) fn make_lengths_deflopt_heap_into(
@@ -1646,26 +1656,32 @@ fn make_lengths_variant_heap_inner(
     lengths.fill(0);
 
     let DefloptHeapScratch {
-        nodes,
         heap,
+        symbols,
+        children,
+        depths,
         leaf_order,
     } = scratch;
-    nodes.clear();
     heap.clear();
+    symbols.clear();
+    children.clear();
     leaf_order.clear();
-    nodes.reserve(frequencies.len().saturating_mul(2));
-    heap.reserve(frequencies.len());
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
-            heap.push(nodes.len());
-            nodes.push(Node::leaf(frequency, symbol, nodes.len()));
+            let index = u32::try_from(symbols.len()).expect("alphabet fits u32");
+            heap.push(HeapEntry {
+                frequency,
+                height: 0,
+                index,
+            });
+            symbols.push(u32::try_from(symbol).expect("alphabet fits u32"));
         }
     }
-    let leaf_count = heap.len();
+    let leaf_count = symbols.len();
     match leaf_count {
         0 => return,
         1 => {
-            lengths[nodes[heap[0]].symbol.expect("leaf has a symbol")] = 1;
+            lengths[symbols[0] as usize] = 1;
             return;
         }
         _ => {}
@@ -1673,7 +1689,9 @@ fn make_lengths_variant_heap_inner(
 
     leaf_order.resize(leaf_count, 0);
     let mut leaf_order_position = leaf_count;
-    heapify_frequency_only(nodes, heap);
+    for start in (0..heap.len() / 2).rev() {
+        heap_sift_down(heap, start, HeapTie::FrequencyOnly);
+    }
 
     // Variant bit 1 sets the tie rule of the sift-down after removing the
     // first child, and bit 0 the one after inserting the parent.
@@ -1692,51 +1710,56 @@ fn make_lengths_variant_heap_inner(
         HeapTie::Height
     };
 
+    let leaves = leaf_count as u32;
     while heap.len() > 1 {
         let left = heap[0];
-        if nodes[left].symbol.is_some() {
+        if left.index < leaves {
             leaf_order_position -= 1;
-            leaf_order[leaf_order_position] = left;
+            leaf_order[leaf_order_position] = symbols[left.index as usize];
         }
         let last = heap.pop().expect("heap is non-empty");
         heap[0] = last;
 
-        heap_sift_down(nodes, heap, 0, first_tie);
+        heap_sift_down(heap, 0, first_tie);
 
         let right = heap[0];
-        if nodes[right].symbol.is_some() {
+        if right.index < leaves {
             leaf_order_position -= 1;
-            leaf_order[leaf_order_position] = right;
+            leaf_order[leaf_order_position] = symbols[right.index as usize];
         }
-        let index = nodes.len();
-        let mut parent = Node::branch(
-            nodes[left].frequency.wrapping_add(nodes[right].frequency),
-            left,
-            right,
+        let index = leaves + u32::try_from(children.len()).expect("alphabet fits u32");
+        children.push([left.index, right.index]);
+        heap[0] = HeapEntry {
+            frequency: left.frequency.wrapping_add(right.frequency),
+            height: left.height.max(right.height) + 1,
             index,
-        );
-        parent.height = nodes[left].height.max(nodes[right].height) + 1;
-        nodes.push(parent);
-        heap[0] = index;
+        };
 
-        heap_sift_down(nodes, heap, 0, second_tie);
+        heap_sift_down(heap, 0, second_tie);
     }
 
     debug_assert_eq!(leaf_order_position, 0);
-    let max_depth = assign_depths(nodes, heap[0], 0, lengths);
+    // Every branch is created after both children, so one pass from the root,
+    // the last branch, down to the first assigns every depth.
+    depths.clear();
+    depths.resize(leaf_count + children.len(), 0);
+    for (branch, &[left, right]) in children.iter().enumerate().rev() {
+        let depth = depths[leaf_count + branch] + 1;
+        depths[left as usize] = depth;
+        depths[right as usize] = depth;
+    }
+    let mut max_depth = 0;
+    for (&symbol, &depth) in symbols.iter().zip(depths.iter()) {
+        lengths[symbol as usize] = depth.min(u32::from(u8::MAX)) as u8;
+        max_depth = max_depth.max(depth as usize);
+    }
     if max_depth <= usize::from(max_bits) {
         return;
     }
-    repair_deflopt_overflow(nodes, leaf_order, lengths, max_bits, max_depth);
+    repair_deflopt_overflow(leaf_order, lengths, max_bits, max_depth);
 }
 
-fn repair_deflopt_overflow(
-    nodes: &[Node],
-    leaf_order: &[usize],
-    lengths: &mut [u8],
-    max_bits: u8,
-    max_depth: usize,
-) {
+fn repair_deflopt_overflow(leaf_order: &[u32], lengths: &mut [u8], max_bits: u8, max_depth: usize) {
     let limit = usize::from(max_bits);
     if limit == 0 || limit > MAX_TRACKED_DEPTH {
         lengths.fill(0);
@@ -1782,10 +1805,7 @@ fn repair_deflopt_overflow(
             if leaf == leaf_order.len() {
                 return;
             }
-            let symbol = nodes[leaf_order[leaf]]
-                .symbol
-                .expect("leaf order contains only leaves");
-            lengths[symbol] = bits as u8;
+            lengths[leaf_order[leaf] as usize] = bits as u8;
             leaf += 1;
         }
     }

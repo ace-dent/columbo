@@ -1624,3 +1624,70 @@ fn deft4j_zero_runs_use_maximal_repeat_chunks() {
         }
     }
 }
+
+/// `reorder_code_length_lengths` before its linear early exit.
+fn reference_reorder_code_length_lengths(lengths: &mut [u8; 19], frequencies: &[u32; 19]) -> bool {
+    let mut changed = false;
+    for left in 0..18 {
+        if lengths[left] == 0 {
+            continue;
+        }
+        for right in (left + 1)..19 {
+            if lengths[right] == 0 {
+                continue;
+            }
+            let should_swap = if lengths[right] < lengths[left] {
+                frequencies[right] < frequencies[left]
+            } else if lengths[right] > lengths[left] {
+                frequencies[right] > frequencies[left]
+            } else {
+                false
+            };
+            if should_swap {
+                lengths.swap(left, right);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+#[test]
+fn code_length_reorder_early_exit_matches_the_full_pass() {
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut early_exits = 0;
+    for case in 0..200_000 {
+        let mut frequencies = [0_u32; 19];
+        let mut lengths = [0_u8; 19];
+        for frequency in frequencies.iter_mut() {
+            if next() % 4 != 0 {
+                *frequency = (next() % [3, 8, 60][case % 3]) as u32;
+            }
+        }
+        if case % 2 == 0 {
+            // Trees from the builders themselves, which mostly pass the check.
+            make_lengths_into(&frequencies, &mut lengths, 7, (case % 4) as u32);
+        } else {
+            for length in lengths.iter_mut() {
+                *length = (next() % 8) as u8;
+            }
+        }
+        let mut expected = lengths;
+        let mut actual = lengths;
+        let expected_changed = reference_reorder_code_length_lengths(&mut expected, &frequencies);
+        let actual_changed = reorder_code_length_lengths(&mut actual, &frequencies);
+        assert_eq!(
+            (actual_changed, actual),
+            (expected_changed, expected),
+            "case {case}"
+        );
+        early_exits += usize::from(code_lengths_follow_frequencies(&lengths, &frequencies));
+    }
+    assert!(early_exits > 50_000);
+}
