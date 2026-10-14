@@ -1006,12 +1006,17 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
             .unwrap();
     assert!(!covered);
     assert!(compact.is_none());
-    let smoothed_blocks = |candidate: &Candidate, strict: bool| {
+    // R15 may then split blocks of a whole sweep.
+    let smoothed_blocks = |candidate: &Candidate, strict: bool, cut: bool| {
         let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
         assert_eq!(candidate.bits, reparsed.meaningful_bits);
-        assert_eq!(reparsed.blocks.len(), 9);
+        if cut {
+            assert!(reparsed.blocks.len() >= 9);
+        } else {
+            assert_eq!(reparsed.blocks.len(), 9);
+        }
         for block in &reparsed.blocks {
-            assert!(block.original.unwrap().len <= smoothed.bits);
+            assert!(cut || block.original.unwrap().len <= smoothed.bits);
             assert!(
                 !strict
                     || block
@@ -1039,7 +1044,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
         .unwrap()
         .unwrap();
         assert!(refined.bits <= parent.bits - saving);
-        smoothed_blocks(&refined, strict);
+        smoothed_blocks(&refined, strict, false);
         assert!(refine_with_terminal_header_search(
             TerminalHeaderSearch::SmoothedTrees,
             &parent,
@@ -1085,12 +1090,13 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
     )
     .unwrap();
     assert!(ordinary_sweep.bits <= parent.bits - saving);
-    smoothed_blocks(&ordinary_sweep, true);
-    // On this stream the repeated finish ends where neither R13 nor R14
+    smoothed_blocks(&ordinary_sweep, true, true);
+    // On this stream the repeated finish ends where none of R13–R15
     // improves it.
     for search in [
         TerminalHeaderSearch::DistanceBands,
         TerminalHeaderSearch::SmoothedTrees,
+        TerminalHeaderSearch::EntropyCuts,
     ] {
         assert!(refine_with_terminal_header_search(
             search,
@@ -1113,7 +1119,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
     .unwrap()
     .unwrap();
     assert!(slid.bits <= parent.bits - saving);
-    smoothed_blocks(&slid, true);
+    smoothed_blocks(&slid, true, true);
 }
 
 #[test]

@@ -20,7 +20,7 @@ const MAX_CUTS: usize = 80;
 const ESTIMATE_WINDOW: u64 = 64;
 
 /// Work and exact-price budget shared by one terminal pass's alphabet-boundary
-/// searches.
+/// searches; R15 keeps its own.
 pub(crate) struct AlphabetBudget {
     work_left: usize,
     prices_left: usize,
@@ -28,13 +28,17 @@ pub(crate) struct AlphabetBudget {
 
 impl AlphabetBudget {
     pub(crate) fn new() -> Self {
+        Self::with_limits(1 << 26, 4096)
+    }
+
+    pub(super) fn with_limits(work_left: usize, prices_left: usize) -> Self {
         Self {
-            work_left: 1 << 26,
-            prices_left: 4096,
+            work_left,
+            prices_left,
         }
     }
 
-    fn spend(&mut self, work: usize) -> Option<()> {
+    pub(super) fn spend(&mut self, work: usize) -> Option<()> {
         self.work_left = self.work_left.checked_sub(work)?;
         Some(())
     }
@@ -120,7 +124,7 @@ fn support_intervals(
     Some(pairs)
 }
 
-fn cut(composite: &Composite, token: usize) -> Cut {
+pub(super) fn cut(composite: &Composite, token: usize) -> Cut {
     Cut {
         token,
         plain: composite.token_plain_offsets[token],
@@ -165,10 +169,12 @@ fn estimate(composite: &Composite, start: usize, end: usize, strict: bool) -> Op
     )))
 }
 
-struct EdgeCache<'a> {
-    edges: HashMap<(usize, usize), PreparedEdge>,
-    headers: HeaderPlanCache,
-    budget: &'a mut AlphabetBudget,
+/// Exactly planned ranges of one block, keyed by decoded start and end, with
+/// the header plans they share.
+pub(super) struct EdgeCache<'a> {
+    pub(super) edges: HashMap<(usize, usize), PreparedEdge>,
+    pub(super) headers: HeaderPlanCache,
+    pub(super) budget: &'a mut AlphabetBudget,
 }
 
 impl EdgeCache<'_> {
@@ -229,10 +235,43 @@ fn price_pair(
 ) -> Option<Vec<PlannedBlock>> {
     let mut points = [0, pair.0, pair.1, composite.tokens.len()];
     points.sort_unstable();
+    let mut unique = [0; 4];
+    let mut count = 0;
+    for point in points {
+        if count == 0 || unique[count - 1] != point {
+            unique[count] = point;
+            count += 1;
+        }
+    }
+    price_cuts(
+        block,
+        composite,
+        &unique[..count],
+        alignment,
+        options,
+        cache,
+        stop,
+    )
+}
+
+/// Plan the block cut at strictly increasing token `points`, which include its
+/// start and end, carrying the bit alignment from range to range.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn price_cuts(
+    block: &ParsedBlock,
+    composite: &Composite,
+    points: &[usize],
+    alignment: u8,
+    options: &Options,
+    cache: &mut EdgeCache,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
     let mut plans = Vec::new();
-    plans.try_reserve_exact(3).ok()?;
+    plans
+        .try_reserve_exact(points.len().saturating_sub(1))
+        .ok()?;
     let mut bits = u64::from(alignment);
-    for range in points.windows(2).filter(|p| p[0] != p[1]) {
+    for range in points.windows(2) {
         let (start, end) = (cut(composite, range[0]), cut(composite, range[1]));
         let plan = cache
             .get(block, composite, start, end, options, stop)?

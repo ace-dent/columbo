@@ -256,10 +256,15 @@ flowchart TD
     LADDER -- "No win" --> R14
     RESLIDE --> R14
     R14 -- "Yes" --> SMOOTH["🟡 Adopt strictly smaller smoothed payload trees"]
-    R14 -- "No" --> REPEAT{"R13 or R14 won this pass;<br/>no repeat yet"}
+    R14 -- "No" --> R15{"R15 · entropy cuts until hard stop"}
     SMOOTH -- "Win" --> RESLIDE14["🟢 Slide once more under the new trees"]
-    SMOOTH -- "No win" --> REPEAT
-    RESLIDE14 --> REPEAT
+    SMOOTH -- "No win" --> R15
+    RESLIDE14 --> R15
+    R15 -- "Yes" --> CUTS["🟡 Cut blocks where symbol statistics change;<br/>cut kept halves again"]
+    R15 -- "No" --> REPEAT{"R13, R14 or R15 won this pass;<br/>no repeat yet"}
+    CUTS -- "Win" --> RESLIDE15["🟢 Slide once more under the new trees"]
+    CUTS -- "No win" --> REPEAT
+    RESLIDE15 --> REPEAT
     REPEAT -- "Yes" --> R13
     REPEAT -- "No" --> DEFAULTEND["Retain complete Default result"]
 
@@ -428,8 +433,11 @@ flowchart TD
     R13MAX -- "No" --> R14MAX{"R14 · R1–R11, R1c and R13 settled or last sweep;<br/>smoothed-tree finish until hard stop"}
     LADDERMAX --> R14MAX
     R14MAX -- "Yes" --> SMOOTHMAX["🟡 Adopt smoothed payload trees; slide once more after a win"]
-    R14MAX -- "No" --> R12{"R12 · sweep improved + G0"}
-    SMOOTHMAX --> R12
+    R14MAX -- "No" --> R15MAX{"R15 · R1–R11, R1c, R13 and R14 settled or last sweep;<br/>entropy cuts until hard stop"}
+    SMOOTHMAX --> R15MAX
+    R15MAX -- "Yes" --> CUTSMAX["🟡 Cut blocks where symbol statistics change; slide once more after a win"]
+    R15MAX -- "No" --> R12{"R12 · sweep improved + G0"}
+    CUTSMAX --> R12
     R12 -- "Yes" --> R1
     R12 -- "No" --> PICKMAX["Select byte/meaningful-bit winner,<br/>including Default's final competitor,<br/>or relaxed raw source"]
 ```
@@ -439,17 +447,17 @@ the bounded phase, not started on those four arrows. Eligible independent
 branches may overlap where M5 and the thread-site gates allow, then rejoin in a
 fixed comparison order.
 
-The terminal methods run as one ordered sweep: R1, R1b, R2–R11, R1c, R13, R14.
-Default runs one sweep without the Max-only R6–R11; when R13 or R14 wins, R13
-and R14 run one more pass, each sliding (R1c) once more after a win. In Max,
-R10, R11, R1c, R13, and R14 run only when nothing earlier in the same sweep
-changed the candidate; R1c, R13, and R14 also run once no further sweep can
+The terminal methods run as one ordered sweep: R1, R1b, R2–R11, R1c, R13, R14,
+R15. Default runs one sweep without the Max-only R6–R11; when R13, R14 or R15
+wins, R13–R15 run one more pass, each sliding (R1c) once more after a win. In
+Max, R10, R11, R1c, and R13–R15 run only when nothing earlier in the same sweep
+changed the candidate; R1c and R13–R15 also run once no further sweep can
 start, then with Default's one-pass repeat bound. R12 repeats the sweep after
 any improvement while G0 permits, revisiting only methods whose input changed
 and never rerunning the primary planner.
 
 Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`,
-`SharedExact`, and `ApngMax`) run Default's sweep but keep its R1c, R13, and R14
+`SharedExact`, and `ApngMax`) run Default's sweep but keep its R1c and R13–R15
 finish, and an R1b win, only as a final competitor compared after Max's terminal
 sweeps; Max's own sweep applies those steps to its final incumbent. Max may also
 strengthen a completed ordinary or APNG Default endpoint with R6–R9, within the
@@ -459,7 +467,7 @@ deadline from the terminal tree floors onward.
 
 ### Route-gate reference
 
-Rules shared by the terminal methods R1b–R14: run on the complete incumbent;
+Rules shared by the terminal methods R1b–R15: run on the complete incumbent;
 skipped when parsing it drops redundant empty blocks (every planned block must
 map to one wire block); keep completed work at the stop; reprice stored-block
 padding; no primary-planner replay; replace the parent only with a strictly
@@ -472,8 +480,8 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 
 | Gate | Condition | Effect |
 | --- | --- | --- |
-| G0 · timed-route start | New independent timed route: before its soft deadline; no sibling cancellation. Hard stop for active work: timeout + 10% + 1 second (no grace for a zero timeout or the G0t search phase). Linear finalization (bounded-depth tree floor, R1c, R13, R14) may start until the hard stop. Multi-route bounded phases: 4/5 of the remaining soft time; 1/5 kept for follow-up. | Blocks new timed starts only; parsing, validation, and the complete fallback always run, and an active atomic price or validation may finish. One accepted compact-split parent may use the file grace for M10c's rescue ([Boundary polishing](#boundary-polishing-inside-proven-matches)). |
-| G0t · Max terminal share | Max; `Complete`, `CompleteThenBounded`, or `ApngMax`; nonzero timeout. Search share: source ≤1 MiB compressed and decoded, ≤128 blocks. Finalization share: the same policies outside that class, and any `Established` continuation outside it. Judged on the source; R1b–R11 still gate on the candidate. | Search share: primary routes get 4/5 of the allowance (`ApngMax` child: 19/20 of its slice) without grace; tree floors and R1–R14 get the full deadline and grace. Finalization share: primary routes get 19/20 of the allowance with grace; the bounded-depth tree floor, R1c, R13, and R14 finish in the last 1/20. `Established` applies this to its own window. A primary yield is not a file timeout and does not change other container children. [Validation](research/terminal-closure-validation.md#follow-up-on-13-september-2026-the-larger-max-work-class); [APNG evidence](benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026); [finalization evidence](benchmark-miss-regression-audit.md#linear-finalization-share-on-8-october-2026). |
+| G0 · timed-route start | New independent timed route: before its soft deadline; no sibling cancellation. Hard stop for active work: timeout + 10% + 1 second (no grace for a zero timeout or the G0t search phase). Linear finalization (bounded-depth tree floor, R1c, R13–R15) may start until the hard stop. Multi-route bounded phases: 4/5 of the remaining soft time; 1/5 kept for follow-up. | Blocks new timed starts only; parsing, validation, and the complete fallback always run, and an active atomic price or validation may finish. One accepted compact-split parent may use the file grace for M10c's rescue ([Boundary polishing](#boundary-polishing-inside-proven-matches)). |
+| G0t · Max terminal share | Max; `Complete`, `CompleteThenBounded`, or `ApngMax`; nonzero timeout. Search share: source ≤1 MiB compressed and decoded, ≤128 blocks. Finalization share: the same policies outside that class, and any `Established` continuation outside it. Judged on the source; R1b–R11 still gate on the candidate. | Search share: primary routes get 4/5 of the allowance (`ApngMax` child: 19/20 of its slice) without grace; tree floors and R1–R14 get the full deadline and grace. Finalization share: primary routes get 19/20 of the allowance with grace; the bounded-depth tree floor, R1c, and R13–R15 finish in the last 1/20. `Established` applies this to its own window. A primary yield is not a file timeout and does not change other container children. [Validation](research/terminal-closure-validation.md#follow-up-on-13-september-2026-the-larger-max-work-class); [APNG evidence](benchmark-miss-regression-audit.md#apng-terminal-share-follow-up-on-22-september-2026); [finalization evidence](benchmark-miss-regression-audit.md#linear-finalization-share-on-8-october-2026). |
 | D1 · match-preserving default feedback | Complete Default floor pass; one parsed block; ≥1 match; ≤4,000 tokens; ≤80,000 decoded bytes. | Adds proven-before-feedback and ordinary endpoint orders as independent candidates, in Default and in the exact Max floors (`Complete`, `CompleteThenBounded`, `SharedExact`), where it is mandatory and skips G0. |
 | D2 · integrated default feedback | Complete Default floor pass; 2–4 parsed blocks; ≤16 KiB compressed; ≤128 KiB decoded; ≤16 Ki tokens; ≥1 block within D1's limits. | Adds a compact multi-block integrated-proven candidate, scheduled like D1. The second endpoint replay runs only if the first did not beat the incumbent and hard time remains. |
 | D3 · strict literal-only balanced tree | Strict; complete Default floor pass; ≤8 KiB compressed; one nonempty block: dynamic, ≤4,096 tokens, no distance symbols. | ≤4 strictly improving balanced-tree rounds (pair and quad moves on the ordinary header grid; only the winner exhaustively finalized and reparsed); stops at a fixed point. |
@@ -490,9 +498,10 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | R9 · coupled code-length swaps | Max; after R8; same parents; G0; dynamic only. | Swaps lengths in both payload alphabets at once: ≤32 swaps per alphabet, ≤256 pairs, individual and combined deltas −32…+32 bits; 2^20 generation units and 512 header prices per stream. Tokens, support, histograms, and spans fixed. [Validation](research/coupled-code-length-swaps-validation.md). |
 | R10 · header-directed match response | Max; final Max incumbent; R1–R9 changed nothing this sweep; G0; dynamic blocks with ≤4,096 decoded bytes, ≤1,024 tokens, 1–128 matches. | For the current tree and each nonzero single swap, re-solves every match's certified spelling: ≤256 profiles (payload tax ≤128 bits, no added transitions); 2^25 work units and 512 header prices per stream. Support, histograms, spans, boundaries, and submatch intervals and distances fixed; no missing codes. [Validation](research/header-response-validation.md). |
 | R11 · length-symbol exchange | Max; final incumbent; R1–R10 changed nothing this sweep; G0; dynamic blocks with ≤4,096 decoded bytes, ≤1,024 tokens, 1–128 matches. | Moves a used length symbol's code length to an absent one (including an unused spare), then fits certified spellings: ≤210 pairs, bound-ranked before the exact DP; 2^25 units and 512 header prices per stream. Literal, end-of-block, and distance prices, the literal/length length histogram, and boundaries fixed; a source code may vanish only if another spelling exists. [Validation](research/length-symbol-exchange-validation.md). |
-| R12 · terminal method closure | Max; final incumbent after R1–R11, R1c, R13, R14; repeats only after a strict complete-stream improvement while G0 allows. | Reruns, in order and with usual bounds, methods whose input changed; 15 input-score slots skip repeats. No round cap, primary replay, extra grace, or mandatory Default rework; earlier floors unchanged. A completed unexpired sweep without change is a fixed point for these methods only. [Validation](research/terminal-closure-validation.md). |
+| R12 · terminal method closure | Max; final incumbent after R1–R11, R1c, R13–R15; repeats only after a strict complete-stream improvement while G0 allows. | Reruns, in order and with usual bounds, methods whose input changed; 15 input-score slots skip repeats. No round cap, primary replay, extra grace, or mandatory Default rework; earlier floors unchanged. A completed unexpired sweep without change is a fixed point for these methods only. [Validation](research/terminal-closure-validation.md). |
 | R13 · distance-alphabet ladder | After R1c; no size or block limit; non-stored blocks using ≥2 distance symbols. Also ends the PNG early lineage's quick floor, a seed only ([evidence](benchmark-miss-regression-audit.md#iterated-slide-and-distance-ladder-on-9-october-2026)). | Estimates three ladders of kept distance-symbol sets (shortest first, most frequent first, singletons; ≤88 sets) in one pass, with DeflOpt variant-0 trees and a greedy header or the fixed tree; plans ≤2 rungs not above the parent's estimate with the non-exhaustive planner in both modes (ties: smaller set). Adopts only a strictly smaller block plan. Polls the stop every 4,096 tokens and between rungs. A win triggers one more R1c. [Validation](research/distance-ladder-validation.md). |
 | R14 · smoothed-tree finish | After R13; no size or block limit; non-stored blocks (the compact payload-tree floor keeps its earlier pass and closure). | Prices Brotli fixed-point and Zopfli nearby-count smoothed trees at maximum depths 15–9 on true counts; adopts the cheapest if strictly smaller and, in strict mode, strictly compatible. Polls the stop between blocks. A win triggers one more R1c. [Validation](research/smoothed-tree-finish-validation.md). |
+| R15 · entropy cuts | After R14; no size or block limit; non-stored blocks with ≥32 tokens. | One linear pass over a token range keeps both sides' literal/length and distance histograms and fixed-point `c log2 c` sums, giving the zeroth-order entropy of every token cut, each side with one end-of-block. The lowest cut that saves ≥32 estimated bits, with ≥16 tokens per side, is priced with the bounded planner in both modes and kept only if the block's planned sequence is strictly smaller; each kept half is then cut the same way, left first. Per stream 2^28 work units and 4,096 range prices; polls the stop every 65,536 scanned tokens and before each price. A win triggers one more R1c. [Validation](research/entropy-cut-validation.md). |
 | M0 · bounded-floor prebuild | Max. `Shared`: bounded floor. `SharedExact`: complete Default endpoint and Max seed. `ApngMax`: complete APNG Default endpoint and bounded floor. `CompleteThenBounded`: when ≤1 nonempty block, decoded ≤768 KiB or >2 MiB, or >512 matches in same-distance runs (plus complete Default endpoint and Max seed). `Established`: caller's floor. `Complete`: exact floor later, in the serial tree. | Builds the floor before the bounded phase; otherwise the multi-block single-image PNG floor is built inside it. |
 | M1 · deft4j source | Max; any wrapper or policy; one nonempty fixed or dynamic block, or ≥2 nonempty blocks of any type and count. Rejected: all-empty stream; lone stored block. Bounded by a 128 MiB route arena and G0 only. | Adds the direct deft4j-derived source candidate. |
 | M2 · no-split source | Max; `CompleteThenBounded`; ≤1 MiB compressed; 2–128 nonempty blocks, all fixed or dynamic. | Deft4j-derived per-block seed, then length-family pruning (individual first for 2–3 blocks, cumulative first for ≥4) and adjacent source-order merges; late Max time also tries the other order as an independent topology. Changed boundaries or spellings get one Default refinement (route window if parallel, hard deadline if serial); header-only rewrites do not. |
@@ -810,6 +819,7 @@ expands the Provenance column.
 | Terminal methods R1, R1b, R1c, and R2–R12 | Bounded post-search methods on the complete incumbent; see the [route-gate reference](#route-gate-reference). | 🟢–🟡 | **Columbo** |
 | Distance-alphabet ladder | Spells every match outside a kept set of distance symbols as literals, shrinking the distance alphabet (R13). | 🟡 | Inspired by **zenflate**'s runs-only guard; **Columbo** method |
 | Smoothed-tree finish | Adopts strictly smaller Brotli or Zopfli smoothed trees for every completed block (R14). | 🟡 | Smoothers by **Google Brotli** and **Google Zopfli**; every-block comparison as in **ECT** and **zenzop**; **Columbo** placement |
+| Entropy cuts | Cuts completed blocks where their symbol statistics change: a linear exact-entropy scan proposes each cut, exact pricing decides, and kept halves are cut again (R15). | 🟡 | Top-down recursive splitting as in **Google Zopfli**'s block splitter; linear entropy scan and terminal placement **Columbo** |
 | Terminal tree tightening | Applies bounded feedback trees and one strictly improving existing-match-to-literal replay to eligible final Huffman blocks. | 🟡 | DeflOpt-inspired primitive; **Columbo** scheduling |
 | Table replay ladder | Follows the selected table through up to four token-expansion and rebuild states, keeping the best intermediate. | 🟡 | **Columbo** |
 | Compact pair lengthening | One dynamic block, per data alphabet: one length-L code to L−1 and two others to L+1 (Kraft sum kept); bounded frequency-ranked candidates; ≤18 extra payload bits; complete header-plus-payload win. | 🟡 | **Columbo Rust** |

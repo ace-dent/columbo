@@ -227,7 +227,7 @@ enum TerminalShare {
     /// (an APNG child nineteen twentieths) of its slice.
     Search,
     /// Outside that limit only linear finalization (the bounded-depth tree
-    /// floor, R1c, R13 and R14) uses terminal time, so primary work keeps
+    /// floor, R1c and R13–R15) uses terminal time, so primary work keeps
     /// nineteen twentieths.
     Finalization,
 }
@@ -1799,9 +1799,9 @@ fn refine_with_original_match_restoration(
         .then(|| restored.named("Original-match restoration")))
 }
 
-/// Terminal methods R1b–R11, R1c, R13 and R14, run in that order after R1 by
+/// Terminal methods R1b–R11, R1c and R13–R15, run in that order after R1 by
 /// [`improve_with_terminal_searches`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminalHeaderSearch {
     StrictDistanceCompletion,
     PayloadTradeoff,
@@ -1810,6 +1810,7 @@ enum TerminalHeaderSearch {
     SymbolSets,
     DistanceBands,
     SmoothedTrees,
+    EntropyCuts,
     AlphabetBoundaries,
     HeaderTree,
     CodeLengthRotations,
@@ -1824,6 +1825,7 @@ struct TerminalSearchBudget {
     joint: super::joint::JointBudget,
     symbols: super::symbol_set::SymbolSetBudget,
     alphabet: super::stream::AlphabetBudget,
+    entropy_cuts: super::stream::EntropyCutBudget,
     header_tree: super::header::HeaderTreeBudget,
     rotations: super::header::RotationBudget,
     coupled_swaps: super::header::CoupledSwapBudget,
@@ -1840,6 +1842,7 @@ impl TerminalHeaderSearch {
             Self::SymbolSets => "Symbol set removal",
             Self::DistanceBands => "Distance-alphabet ladder",
             Self::SmoothedTrees => "Smoothed-tree finish",
+            Self::EntropyCuts => "Entropy cuts",
             Self::AlphabetBoundaries => "Alphabet boundary search",
             Self::HeaderTree => "Code-length tree search",
             Self::CodeLengthRotations => "Code-length rotations",
@@ -1851,11 +1854,11 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // R1c, R13 and R14 are linear and parse one candidate, costing no more
+        // R1c and R13–R15 are linear and parse one candidate, costing no more
         // than a replay round, so they have no size limit.
         if matches!(
             self,
-            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees
+            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts
         ) {
             return usize::MAX;
         }
@@ -1875,7 +1878,9 @@ impl TerminalHeaderSearch {
 
     fn max_blocks(self) -> usize {
         match self {
-            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees => usize::MAX,
+            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts => {
+                usize::MAX
+            }
             _ => TERMINAL_HEADER_MAX_BLOCKS,
         }
     }
@@ -1887,9 +1892,18 @@ impl TerminalHeaderSearch {
             self,
             Self::DistanceBands
                 | Self::SmoothedTrees
+                | Self::EntropyCuts
                 | Self::HeaderResponse
                 | Self::LengthExchange
                 | Self::BoundarySlide
+        )
+    }
+
+    /// R13–R15: linear finishing steps, each followed by R1c after a win.
+    fn is_tree_finish(self) -> bool {
+        matches!(
+            self,
+            Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts
         )
     }
 
@@ -1945,6 +1959,15 @@ impl TerminalHeaderSearch {
             Self::DistanceBands => {
                 super::distance_band::plan_distance_bands(block, alignment, options, stop)?
             }
+            Self::EntropyCuts => {
+                return super::stream::plan_entropy_cuts(
+                    block,
+                    alignment,
+                    options,
+                    &mut budget.entropy_cuts,
+                    stop,
+                )
+            }
             _ => {
                 let dynamic = match self {
                     Self::StrictDistanceCompletion => {
@@ -1989,6 +2012,7 @@ impl TerminalHeaderSearch {
                     Self::BoundarySlide
                     | Self::SymbolSets
                     | Self::DistanceBands
+                    | Self::EntropyCuts
                     | Self::AlphabetBoundaries
                     | Self::HeaderResponse
                     | Self::LengthExchange => {
@@ -2011,7 +2035,7 @@ impl TerminalHeaderSearch {
     }
 }
 
-/// Run the terminal methods (R1, R1b–R11, R1c, R13, R14) on the final
+/// Run the terminal methods (R1, R1b–R11, R1c, R13–R15) on the final
 /// candidate. Max repeats the sweep while it improves and time remains (R12);
 /// Default runs one sweep. Every accepted candidate strictly decreases (bytes,
 /// meaningful bits), so a method's input score identifies an unchanged
@@ -2024,7 +2048,7 @@ fn improve_with_terminal_searches(
     progress: Progress,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
-    let mut visited = [None; 15];
+    let mut visited = [None; 16];
     let mut first_sweep = true;
     let mut parse_cache = TerminalParseCache::default();
     loop {
@@ -2059,6 +2083,7 @@ fn improve_with_terminal_searches(
             TerminalHeaderSearch::BoundarySlide,
             TerminalHeaderSearch::DistanceBands,
             TerminalHeaderSearch::SmoothedTrees,
+            TerminalHeaderSearch::EntropyCuts,
         ]
         .into_iter()
         .enumerate()
@@ -2069,7 +2094,7 @@ fn improve_with_terminal_searches(
             }
             let score = (candidate.data.len(), candidate.bits);
             // Fitting payloads, boundaries or trees too early can redirect a
-            // later search. R1c, R13 and R14 still run once no later sweep can
+            // later search. R1c and R13–R15 still run once no later sweep can
             // start, as in Default.
             let later_sweep_possible = options.exhaustive
                 && !(matches!(
@@ -2077,6 +2102,7 @@ fn improve_with_terminal_searches(
                     TerminalHeaderSearch::BoundarySlide
                         | TerminalHeaderSearch::DistanceBands
                         | TerminalHeaderSearch::SmoothedTrees
+                        | TerminalHeaderSearch::EntropyCuts
                 ) && !max_work.can_start_route());
             if later_sweep_possible && search.waits_for_settled_sweep() && score != before {
                 continue;
@@ -2086,16 +2112,10 @@ fn improve_with_terminal_searches(
             }
             visited[index + 1] = Some(score);
             let work = if max_only { max_work } else { ordinary_work };
-            if matches!(
-                search,
-                TerminalHeaderSearch::DistanceBands | TerminalHeaderSearch::SmoothedTrees
-            ) {
+            if search.is_tree_finish() {
                 finish_start.get_or_insert(score);
             }
-            candidate = if matches!(
-                search,
-                TerminalHeaderSearch::DistanceBands | TerminalHeaderSearch::SmoothedTrees
-            ) {
+            candidate = if search.is_tree_finish() {
                 improve_with_tree_finish(
                     search,
                     source,
@@ -2116,9 +2136,9 @@ fn improve_with_terminal_searches(
                     candidate,
                 )?
             };
-            // A win re-slides the blocks, which can expose another R13 or R14
-            // win; repeat here when no later sweep can revisit them.
-            let finish_changed = matches!(search, TerminalHeaderSearch::SmoothedTrees)
+            // A win re-slides the blocks, which can expose another R13, R14 or
+            // R15 win; repeat here when no later sweep can revisit them.
+            let finish_changed = matches!(search, TerminalHeaderSearch::EntropyCuts)
                 && finish_start
                     .is_some_and(|start| start != (candidate.data.len(), candidate.bits));
             if finish_changed && (!options.exhaustive || !max_work.can_start_route()) {
@@ -2156,14 +2176,9 @@ fn improve_with_terminal_header_search(
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
-    // R1c, R13 and R14 are linear finalization: they may start until the hard
+    // R1c and R13–R15 are linear finalization: they may start until the hard
     // stop, not only before the soft deadline.
-    let may_start = if matches!(
-        search,
-        TerminalHeaderSearch::BoundarySlide
-            | TerminalHeaderSearch::DistanceBands
-            | TerminalHeaderSearch::SmoothedTrees
-    ) {
+    let may_start = if search == TerminalHeaderSearch::BoundarySlide || search.is_tree_finish() {
         floor_work.can_finalize()
     } else {
         floor_work.can_start_route()
@@ -2257,8 +2272,8 @@ fn improve_with_tree_finish(
     )
 }
 
-/// Run R13 and R14, each with its re-slide, for at most `passes` passes,
-/// stopping after a pass in which neither wins.
+/// Run R13, R14 and R15, each with its re-slide, for at most `passes` passes,
+/// stopping after a pass in which none wins.
 fn improve_with_repeated_tree_finish(
     passes: usize,
     source: CandidateInput<'_>,
@@ -2273,6 +2288,7 @@ fn improve_with_repeated_tree_finish(
         for search in [
             TerminalHeaderSearch::DistanceBands,
             TerminalHeaderSearch::SmoothedTrees,
+            TerminalHeaderSearch::EntropyCuts,
         ] {
             candidate = improve_with_tree_finish(
                 search,
@@ -2360,6 +2376,7 @@ fn plan_terminal_blocks(
         joint: super::joint::JointBudget::new(),
         symbols: super::symbol_set::SymbolSetBudget::new(),
         alphabet: super::stream::AlphabetBudget::new(),
+        entropy_cuts: super::stream::EntropyCutBudget::new(),
         header_tree: super::header::HeaderTreeBudget::new(),
         rotations: super::header::RotationBudget::new(),
         coupled_swaps: super::header::CoupledSwapBudget::new(),
@@ -2459,11 +2476,11 @@ struct CompleteDefaultFloor {
     /// Max allowance.
     complete: Candidate,
     /// Default's exact endpoint when it differs from `complete` (after R1c,
-    /// R13 and R14, or with R1b), kept only as a final competitor.
+    /// R13–R15, or with R1b), kept only as a final competitor.
     slid: Option<Candidate>,
 }
 
-/// Default's final R1c, R13 and R14 on `complete`, returned only when strictly
+/// Default's final R1c and R13–R15 on `complete`, returned only when strictly
 /// smaller. It is only a final competitor: boundaries fitted to the current
 /// trees can hide an improvement that Max's own tree floors would find.
 fn slid_default_endpoint(

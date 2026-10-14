@@ -15,7 +15,9 @@
 //! boundary search. The deft4j-derived greedy merge is in `source_recode`.
 
 mod alphabet;
+mod entropy_cut;
 pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
+pub(crate) use entropy_cut::{plan_entropy_cuts, EntropyCutBudget};
 
 use std::borrow::Cow;
 use std::sync::Arc;
