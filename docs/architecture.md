@@ -44,7 +44,7 @@ never skips validation or produces partial output.
 | `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache. |
 | `minima` | Share range-minimum lookups between searches over match-length families. |
 | `search` | Change token spelling within existing matches. |
-| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), and `stream/entropy_cut` cuts blocks where their symbol statistics change (R15). |
+| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), `stream/entropy_cut` cuts blocks where their symbol statistics change (R15), and `stream/merge` merges neighbors after the finish (R16). |
 | `source_recode` | Run the deft4j-derived source-order recoding and merge route. |
 | `restore` | Restore original match choices after other routes settle (R1). |
 | `joint` | Search payload code lengths and header run-length encoding together (R4). |
@@ -81,7 +81,8 @@ Code comments and the route documentation rely on these project terms.
 - **Proven submatch**: a shorter match at an existing match's distance, inside
   that match's decoded interval; the source match proves those bytes repeat.
 - **Sweep**: one ordered pass of the terminal methods (R1–R15) over the
-  incumbent. Max repeats the sweep (R12) while it improves and time remains.
+  incumbent. Max repeats the sweep (R12) while it improves and time remains;
+  R16 follows the settled sweeps.
 - **Default / Max**: the two search modes. Max (`--max`, `Options::exhaustive`)
   adds slower routes.
 - **Strict mode**: `--strict 1`, the default (`Options::strict`). Output uses
@@ -89,7 +90,7 @@ Code comments and the route documentation rely on these project terms.
 - **Deadline and grace**: the soft deadline stops new routes from starting;
   active work may continue for a grace of 10% of the timeout plus one second,
   until the hard stop.
-- **Route labels**: D1–D3, G0, R1–R15, M0–M13, S0, and their suffixed variants
+- **Route labels**: D1–D3, G0, R1–R16, M0–M13, S0, and their suffixed variants
   name gates and routes in the
   [route-gate reference](routes-and-methods.md#route-gate-reference).
 

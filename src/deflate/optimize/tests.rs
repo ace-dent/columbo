@@ -1123,6 +1123,107 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
 }
 
 #[test]
+fn terminal_merges_follow_the_settled_finish() {
+    // Two dynamic blocks with the same statistics: R1c can move their
+    // boundary but not remove it, and R15 finds nothing to cut, so only R16
+    // joins them.
+    let plain: Vec<u8> = (0..300).map(|i| (i % 8) as u8).collect();
+    let tokens: Vec<_> = plain.iter().copied().map(Token::Literal).collect();
+    let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+    let block = ParsedBlock {
+        tokens: tokens.into(),
+        plain: plain.into(),
+        literal_frequencies,
+        distance_frequencies,
+        original_literal_lengths: None,
+        original_distance_lengths: None,
+        original_dynamic: None,
+        original: None,
+        source_splits: Vec::new(),
+        source_type: SourceBlockType::Dynamic,
+    };
+    let half = plan_block(&block, 0, &Options::default(), &mut SearchStop::never());
+    let (data, bits) = emit_plans(&[], &[half.clone(), half], true).unwrap();
+    let parsed = parse_stream(&data, 1 << 20).unwrap();
+    assert_eq!(parsed.blocks.len(), 2);
+    let identity = StreamIdentity {
+        decoded_size: parsed.decoded_size,
+        crc32: parsed.crc32,
+        adler32: parsed.adler32,
+    };
+    let parent = Candidate {
+        data: data.clone(),
+        bits,
+        output_max_distance: Some(parsed.max_distance),
+        plans: Vec::new(),
+        block_report: None,
+        route: "test",
+        max_planner_is_stable: false,
+    };
+    let merged_blocks = |candidate: &Candidate| {
+        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        assert_eq!(candidate.bits, reparsed.meaningful_bits);
+        assert!(candidate.bits < parent.bits);
+        reparsed.blocks.len()
+    };
+    let options = Options::default();
+    let merged = refine_with_terminal_header_search(
+        TerminalHeaderSearch::Merges,
+        &parent,
+        &options,
+        1 << 20,
+        identity,
+        &mut SearchStop::never(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(merged_blocks(&merged), 1);
+
+    let source = CandidateInput {
+        compressed: &data,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 1 << 20,
+        identity,
+    };
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
+    let progress = Progress::begin(
+        &options,
+        deadline.started,
+        StreamProgress {
+            blocks: parsed.source_block_count,
+            compressed_bytes: data.len(),
+            decoded_bytes: parsed.decoded_size,
+            empty_blocks: parsed.source_empty_block_count,
+            meaningful_bits: parsed.meaningful_bits,
+            parse_elapsed: Duration::ZERO,
+        },
+        None,
+    );
+    let ordinary_sweep = improve_with_terminal_searches(
+        source,
+        &options,
+        DefaultFloorWork::Mandatory,
+        DefaultFloorWork::Timed(&deadline),
+        progress,
+        parent.clone(),
+    )
+    .unwrap();
+    assert_eq!(merged_blocks(&ordinary_sweep), 1);
+    // Max's Default endpoint ends the same way.
+    let slid = slid_default_endpoint(
+        source,
+        &options,
+        progress,
+        &mut TerminalParseCache::default(),
+        &parent,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(merged_blocks(&slid), 1);
+}
+
+#[test]
 fn changed_parent_no_split_requires_a_new_best_topology() {
     let parent = comparison_candidate(12, 90, 1);
     let no_split = comparison_candidate(10, 80, 2);

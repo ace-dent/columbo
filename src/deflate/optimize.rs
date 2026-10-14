@@ -227,7 +227,7 @@ enum TerminalShare {
     /// (an APNG child nineteen twentieths) of its slice.
     Search,
     /// Outside that limit only linear finalization (the bounded-depth tree
-    /// floor, R1c and R13–R15) uses terminal time, so primary work keeps
+    /// floor, R1c and R13–R16) uses terminal time, so primary work keeps
     /// nineteen twentieths.
     Finalization,
 }
@@ -1800,7 +1800,7 @@ fn refine_with_original_match_restoration(
 }
 
 /// Terminal methods R1b–R11, R1c and R13–R15, run in that order after R1 by
-/// [`improve_with_terminal_searches`].
+/// [`improve_with_terminal_searches`], and R16 once the sweep settles.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminalHeaderSearch {
     StrictDistanceCompletion,
@@ -1811,6 +1811,7 @@ enum TerminalHeaderSearch {
     DistanceBands,
     SmoothedTrees,
     EntropyCuts,
+    Merges,
     AlphabetBoundaries,
     HeaderTree,
     CodeLengthRotations,
@@ -1843,6 +1844,7 @@ impl TerminalHeaderSearch {
             Self::DistanceBands => "Distance-alphabet ladder",
             Self::SmoothedTrees => "Smoothed-tree finish",
             Self::EntropyCuts => "Entropy cuts",
+            Self::Merges => "Terminal merges",
             Self::AlphabetBoundaries => "Alphabet boundary search",
             Self::HeaderTree => "Code-length tree search",
             Self::CodeLengthRotations => "Code-length rotations",
@@ -1854,12 +1856,9 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // R1c and R13–R15 are linear and parse one candidate, costing no more
+        // R1c and R13–R16 are linear and parse one candidate, costing no more
         // than a replay round, so they have no size limit.
-        if matches!(
-            self,
-            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts
-        ) {
+        if self == Self::BoundarySlide || self.is_tree_finish() {
             return usize::MAX;
         }
         if exhaustive {
@@ -1878,9 +1877,7 @@ impl TerminalHeaderSearch {
 
     fn max_blocks(self) -> usize {
         match self {
-            Self::BoundarySlide | Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts => {
-                usize::MAX
-            }
+            _ if self == Self::BoundarySlide || self.is_tree_finish() => usize::MAX,
             _ => TERMINAL_HEADER_MAX_BLOCKS,
         }
     }
@@ -1899,11 +1896,11 @@ impl TerminalHeaderSearch {
         )
     }
 
-    /// R13–R15: linear finishing steps, each followed by R1c after a win.
+    /// R13–R16: linear finishing steps, each followed by R1c after a win.
     fn is_tree_finish(self) -> bool {
         matches!(
             self,
-            Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts
+            Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts | Self::Merges
         )
     }
 
@@ -2013,6 +2010,7 @@ impl TerminalHeaderSearch {
                     | Self::SymbolSets
                     | Self::DistanceBands
                     | Self::EntropyCuts
+                    | Self::Merges
                     | Self::AlphabetBoundaries
                     | Self::HeaderResponse
                     | Self::LengthExchange => {
@@ -2035,7 +2033,7 @@ impl TerminalHeaderSearch {
     }
 }
 
-/// Run the terminal methods (R1, R1b–R11, R1c, R13–R15) on the final
+/// Run the terminal methods (R1, R1b–R11, R1c, R13–R16) on the final
 /// candidate. Max repeats the sweep while it improves and time remains (R12);
 /// Default runs one sweep. Every accepted candidate strictly decreases (bytes,
 /// meaningful bits), so a method's input score identifies an unchanged
@@ -2049,6 +2047,7 @@ fn improve_with_terminal_searches(
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     let mut visited = [None; 16];
+    let mut merged = None;
     let mut first_sweep = true;
     let mut parse_cache = TerminalParseCache::default();
     loop {
@@ -2153,11 +2152,31 @@ fn improve_with_terminal_searches(
                 )?;
             }
         }
-        if !options.exhaustive
+        let settled = !options.exhaustive
             || (candidate.data.len(), candidate.bits) == before
-            || !max_work.can_start_route()
-        {
-            return Ok(candidate);
+            || !max_work.can_start_route();
+        if settled {
+            // R16 waits for the settled finish, so it never redirects R13–R15.
+            let score = (candidate.data.len(), candidate.bits);
+            if merged != Some(score) {
+                merged = Some(score);
+                candidate = improve_with_terminal_merges(
+                    source,
+                    options,
+                    ordinary_work,
+                    progress,
+                    &mut parse_cache,
+                    candidate,
+                )?;
+            }
+            // A merge win is a strict improvement, so Max sweeps again while
+            // it can.
+            if !options.exhaustive
+                || (candidate.data.len(), candidate.bits) == score
+                || !max_work.can_start_route()
+            {
+                return Ok(candidate);
+            }
         }
         first_sweep = false;
     }
@@ -2176,7 +2195,7 @@ fn improve_with_terminal_header_search(
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
-    // R1c and R13–R15 are linear finalization: they may start until the hard
+    // R1c and R13–R16 are linear finalization: they may start until the hard
     // stop, not only before the soft deadline.
     let may_start = if search == TerminalHeaderSearch::BoundarySlide || search.is_tree_finish() {
         floor_work.can_finalize()
@@ -2263,6 +2282,40 @@ fn improve_with_tree_finish(
     }
     improve_with_terminal_header_search(
         TerminalHeaderSearch::BoundarySlide,
+        source,
+        options,
+        floor_work,
+        progress,
+        parse_cache,
+        candidate,
+    )
+}
+
+/// R16 after the settled finish: merge adjacent blocks, slide once more after
+/// a win, then let R15 re-cut the merged blocks.
+fn improve_with_terminal_merges(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    let before = (candidate.data.len(), candidate.bits);
+    let candidate = improve_with_tree_finish(
+        TerminalHeaderSearch::Merges,
+        source,
+        options,
+        floor_work,
+        progress,
+        parse_cache,
+        candidate,
+    )?;
+    if (candidate.data.len(), candidate.bits) == before {
+        return Ok(candidate);
+    }
+    improve_with_tree_finish(
+        TerminalHeaderSearch::EntropyCuts,
         source,
         options,
         floor_work,
@@ -2454,6 +2507,9 @@ fn refine_with_terminal_header_search_cached(
         TerminalHeaderSearch::BoundarySlide => {
             super::slide::plan_boundary_slide(&selected.blocks, options, stop)
         }
+        TerminalHeaderSearch::Merges => {
+            super::stream::plan_terminal_merges(&selected.blocks, options, stop)
+        }
         _ => plan_terminal_blocks(search, &selected.blocks, options, stop),
     };
     let Some(plans) = plans else {
@@ -2476,11 +2532,11 @@ struct CompleteDefaultFloor {
     /// Max allowance.
     complete: Candidate,
     /// Default's exact endpoint when it differs from `complete` (after R1c,
-    /// R13–R15, or with R1b), kept only as a final competitor.
+    /// R13–R16, or with R1b), kept only as a final competitor.
     slid: Option<Candidate>,
 }
 
-/// Default's final R1c and R13–R15 on `complete`, returned only when strictly
+/// Default's final R1c and R13–R16 on `complete`, returned only when strictly
 /// smaller. It is only a final competitor: boundaries fitted to the current
 /// trees can hide an improvement that Max's own tree floors would find.
 fn slid_default_endpoint(
@@ -2501,6 +2557,14 @@ fn slid_default_endpoint(
     )?;
     let slid = improve_with_repeated_tree_finish(
         1 + TREE_FINISH_REPEATS,
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        parse_cache,
+        slid,
+    )?;
+    let slid = improve_with_terminal_merges(
         source,
         floor_options,
         DefaultFloorWork::Mandatory,

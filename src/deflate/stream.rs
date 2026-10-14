@@ -16,8 +16,10 @@
 
 mod alphabet;
 mod entropy_cut;
+mod merge;
 pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
 pub(crate) use entropy_cut::{plan_entropy_cuts, EntropyCutBudget};
+pub(crate) use merge::plan_terminal_merges;
 
 use std::borrow::Cow;
 use std::sync::Arc;
