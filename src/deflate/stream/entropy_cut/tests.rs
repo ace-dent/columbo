@@ -225,7 +225,7 @@ fn entropy_cuts_split_each_regime_into_its_own_block() {
             &block,
             0,
             &options,
-            &mut EntropyCutBudget::new(),
+            &mut EntropyCutBudget::for_stream(&[]),
             &mut SearchStop::never(),
         )
         .unwrap();
@@ -255,7 +255,7 @@ fn entropy_cuts_split_each_regime_into_its_own_block() {
             &block,
             0,
             &options,
-            &mut EntropyCutBudget::new(),
+            &mut EntropyCutBudget::for_stream(&[]),
             &mut SearchStop::always(),
         )
         .is_none());
@@ -267,7 +267,7 @@ fn entropy_cuts_keep_completed_cuts_when_prices_run_out() {
     let block = literal_parent(&three_regime_plain(), true);
     let options = Options::default();
     // Room for the first cut's two ranges only.
-    let mut budget = EntropyCutBudget::new();
+    let mut budget = EntropyCutBudget::for_stream(&[]);
     budget.ranges = AlphabetBudget::with_limits(1 << 28, 2);
     let plans =
         plan_entropy_cuts(&block, 0, &options, &mut budget, &mut SearchStop::never()).unwrap();
@@ -283,7 +283,7 @@ fn entropy_cuts_leave_a_single_regime_block_alone() {
         &block,
         0,
         &Options::default(),
-        &mut EntropyCutBudget::new(),
+        &mut EntropyCutBudget::for_stream(&[]),
         &mut SearchStop::never(),
     )
     .is_none());

@@ -14,10 +14,6 @@
 use super::super::block::{plan_reusable_block, stored_block_bits};
 use super::*;
 
-/// Planned token and decoded-byte volume allowed per pass; consecutive merges
-/// re-plan a growing block.
-const MERGE_WORK: usize = 1 << 28;
-
 /// A block of the pass and, once merged, its plan at the bit alignment where
 /// it starts, which no later merge changes.
 struct Pending {
@@ -76,14 +72,18 @@ fn finish(pending: Pending, alignment: u8, strict: bool) -> Option<PlannedBlock>
 
 /// R16: merge adjacent non-stored blocks left to right while each merge is
 /// strictly smaller than the pair as encoded. Returns the plans of every
-/// block when at least one merge was kept; when the stop or work budget ends
-/// the pass, completed merges are kept and later blocks keep their encoding.
+/// block when at least one merge was kept; when the stop or the work budget
+/// ([`terminal_layout_work`] units of planned token and decoded-byte volume)
+/// ends the pass, completed merges are kept and later blocks keep their
+/// encoding.
 pub(crate) fn plan_terminal_merges(
     blocks: &[ParsedBlock],
     options: &Options,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
-    plan_terminal_merges_with_work(blocks, options, MERGE_WORK, stop)
+    // Consecutive merges re-plan a growing block.
+    let work = terminal_layout_work(blocks);
+    plan_terminal_merges_with_work(blocks, options, work, stop)
 }
 
 fn plan_terminal_merges_with_work(

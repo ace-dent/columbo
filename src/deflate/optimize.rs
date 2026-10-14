@@ -2429,7 +2429,7 @@ fn plan_terminal_blocks(
         joint: super::joint::JointBudget::new(),
         symbols: super::symbol_set::SymbolSetBudget::new(),
         alphabet: super::stream::AlphabetBudget::new(),
-        entropy_cuts: super::stream::EntropyCutBudget::new(),
+        entropy_cuts: super::stream::EntropyCutBudget::for_stream(blocks),
         header_tree: super::header::HeaderTreeBudget::new(),
         rotations: super::header::RotationBudget::new(),
         coupled_swaps: super::header::CoupledSwapBudget::new(),

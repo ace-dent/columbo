@@ -2048,3 +2048,32 @@ fn combined_histograms_match_the_joined_token_stream() {
     assert_eq!(appended.literal_frequencies, expected.0);
     assert_eq!(appended.distance_frequencies, expected.1);
 }
+
+#[test]
+fn terminal_layout_work_scales_with_stream_volume() {
+    assert_eq!(terminal_layout_work(&[]), MIN_TERMINAL_LAYOUT_WORK);
+    let block = |tokens: usize, plain: usize| {
+        let tokens: Vec<_> = vec![Token::Literal(0); tokens];
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![0; plain].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        }
+    };
+    // Small streams keep the floor; large ones get 64 units per token and
+    // decoded byte, summed over blocks.
+    assert_eq!(
+        terminal_layout_work(&[block(1_000, 4_000)]),
+        MIN_TERMINAL_LAYOUT_WORK
+    );
+    let large = [block(3_000_000, 4_000_000), block(1_000_000, 1_000_000)];
+    assert_eq!(terminal_layout_work(&large), 64 * 9_000_000);
+}

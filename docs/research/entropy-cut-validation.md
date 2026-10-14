@@ -66,10 +66,11 @@ finding savings, so R15 cuts each kept half recursively.
   pricing, in both modes) and kept only if the block's planned sequence,
   including bit alignment, is strictly smaller. Each kept half is cut the same
   way, left first.
-- **Bounds.** Per stream, 2^28 work units (tokens scanned and range prices'
-  token and byte volumes) and 4,096 range prices; the stop is polled every
-  65,536 scanned tokens and before each price. Completed cuts are kept when
-  either ends the search.
+- **Bounds.** Per pass, work units (tokens scanned and range prices' token
+  and byte volumes) were first fixed at 2^28 and now scale with the stream
+  ([follow-up](#follow-up-work-that-scales-with-the-stream)), with 4,096
+  range prices; the stop is polled every 65,536 scanned tokens and before each
+  price. Completed cuts are kept when either ends the search.
 - **Placement.** After R14, as part of the linear finish: a win slides the
   blocks once more (R1c); in Default, a pass in which R13, R14 or R15 wins
   repeats all three once; Max's R12 sweeps revisit them while time remains.
@@ -150,3 +151,43 @@ card saved 3,666 bytes and `FsqwhPuaIAIlojU.png` 3,440. One further file,
 
 Harness, lists, arm crates and logs: `work/entropy-cut-validation/`; the
 probes and estimators: `work/entropy-cut-probe/`.
+
+## Follow-up: work that scales with the stream
+
+Date: 14 October 2026. Baseline: `b212cee`, R16. A second Default pass over
+R16 outputs and an uncapped probe showed that R15's fixed 2^28 work units per
+stream stopped its recursion on the largest streams. Without a cap, R15's
+first pass used 840 million units on the deft4j copy of the Partnership card
+(48 blocks, 7.2 million tokens, 9.6 MB decoded), 338 million on the original
+(171 blocks), 49 million on the 2.3 MB `kzipmix` tar.gz and 27 million on
+`FsqwhPuaIAIlojU.png`: about 7–50 units per token and decoded byte, since
+each recursion level costs work in proportion to the stream. The 4,096 range
+prices never bound.
+
+R15 and R16 now allow 64 work units per token and decoded byte of the stream
+per pass, at least 2^28, in both modes. A bounded pass leaves time for the
+slides and merges that follow it, which matters when Max's time is limited;
+in Max, R12 repeats a pass that changed the stream, so further cuts and merges
+stay reachable as time allows. Max keeps Default's endpoint as a final
+competitor, and its mandatory Default floors use the same Default work, so Max
+does not end above Default.
+
+| Set | Files | Smaller / larger | Bytes saved | Process CPU |
+| --- | ---: | --- | ---: | --- |
+| Raw streams | 365 | 0 / 0 | 0 | 45.62 → 45.39 s |
+| PNG | 1,052 | 3 / 0 | 21,159 | 1,126.27 → 1,135.75 s |
+| GZIP, zlib, ZIP and APNG | 202 | 0 / 0 | 0 | 612.27 → 614.09 s |
+| Relaxed | 381 | 0 / 0 | 0 | 178.39 → 178.12 s |
+
+Every other Default output was byte-identical. The three Partnership card
+copies saved 18,794 bytes (deft4j copy, 0.7%), 1,195 and 1,170; serially, the
+deft4j copy took 24.38 → 27.37 s and the original 39.66 → 40.05 s.
+
+On the 25-PNG Max sample at 60 seconds, the deft4j Partnership card also saved
+18,794 bytes; four other files moved by 1–4 bytes in either direction, within
+the deadline variance those files showed in earlier repeats. Every Max output
+was no larger than the same file's Default output from this run. All outputs
+decoded independently, and all 674 Rust tests pass in debug and release,
+including `terminal_layout_work_scales_with_stream_volume`.
+
+Harness and logs: `work/layout-budget-validation/`.

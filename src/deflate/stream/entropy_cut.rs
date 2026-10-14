@@ -28,6 +28,9 @@ const WEIGHTED_LOG_TABLE_LEN: usize = 4096;
 /// Tokens scanned between stop polls.
 const SCAN_POLL_TOKENS: usize = 1 << 16;
 
+/// Exact range prices per pass.
+const RANGE_PRICES: usize = 4096;
+
 /// Work and exact-price budget shared by one terminal pass's entropy cuts.
 pub(crate) struct EntropyCutBudget {
     ranges: AlphabetBudget,
@@ -35,9 +38,11 @@ pub(crate) struct EntropyCutBudget {
 }
 
 impl EntropyCutBudget {
-    pub(crate) fn new() -> Self {
+    /// The budget for one pass over `blocks`: [`terminal_layout_work`] units
+    /// and [`RANGE_PRICES`] prices.
+    pub(crate) fn for_stream(blocks: &[ParsedBlock]) -> Self {
         Self {
-            ranges: AlphabetBudget::with_limits(1 << 28, 4096),
+            ranges: AlphabetBudget::with_limits(terminal_layout_work(blocks), RANGE_PRICES),
             weighted_logs: Vec::new(),
         }
     }

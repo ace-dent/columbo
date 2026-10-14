@@ -21,6 +21,28 @@ pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
 pub(crate) use entropy_cut::{plan_entropy_cuts, EntropyCutBudget};
 pub(crate) use merge::plan_terminal_merges;
 
+/// Smallest work budget for one R15 or R16 pass.
+const MIN_TERMINAL_LAYOUT_WORK: usize = 1 << 28;
+/// Work units per token and decoded byte for one R15 or R16 pass.
+const TERMINAL_LAYOUT_WORK_PER_UNIT: usize = 64;
+
+/// Work allowed for one R15 or R16 pass over `blocks`. Each recursion level or
+/// merge chain costs work in proportion to the stream, so the budget scales
+/// with its tokens and decoded bytes. A bounded pass leaves time for the
+/// slides and merges that follow it; in Max, R12 repeats a pass that changed
+/// the stream, so further cuts and merges remain reachable with more time.
+fn terminal_layout_work(blocks: &[ParsedBlock]) -> usize {
+    blocks
+        .iter()
+        .fold(0_usize, |volume, block| {
+            volume
+                .saturating_add(block.tokens.len())
+                .saturating_add(block.plain.len())
+        })
+        .saturating_mul(TERMINAL_LAYOUT_WORK_PER_UNIT)
+        .max(MIN_TERMINAL_LAYOUT_WORK)
+}
+
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::thread;

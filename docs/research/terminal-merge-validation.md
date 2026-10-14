@@ -56,9 +56,11 @@ every R16 step only lowers the finished result, so no output can grow.
 - **Exact reuse.** Unchanged blocks keep their encoding. A merged block keeps
   the plan it was accepted with, since nothing after it changes its starting
   alignment.
-- **Bounds.** One pass per invocation; 2^28 units of planned token and
-  decoded-byte volume, since consecutive merges re-plan a growing block; the
-  stop is polled before each pair, and completed merges are kept.
+- **Bounds.** One pass per invocation; planned token and decoded-byte
+  volume, since consecutive merges re-plan a growing block, was first fixed at
+  2^28 units and now scales with the stream like R15's
+  ([follow-up](entropy-cut-validation.md#follow-up-work-that-scales-with-the-stream));
+  the stop is polled before each pair, and completed merges are kept.
 - **Placement.** Once the sweeps settle: after Default's sweep and its
   repeated finish, and in Max when no further sweep can start or a sweep
   changed nothing. A win slides once more (R1c), then runs R15 once more with
