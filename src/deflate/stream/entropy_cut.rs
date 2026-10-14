@@ -9,7 +9,10 @@
 //! cut, with their sums of `c log2 c`, so the zeroth-order entropy of every
 //! token cut is known exactly. The cut with the lowest total is priced with the
 //! bounded planner and kept only if the whole block becomes strictly smaller;
-//! each kept half is then cut the same way.
+//! each kept half is then cut the same way. Entropy ignores the header each
+//! side must send, so when that cut fails, the cut with the lowest entropy plus
+//! a header estimate is priced instead; it favors cuts that shrink a side's
+//! alphabet.
 
 use std::collections::HashMap;
 
@@ -27,6 +30,12 @@ const LOG_FRACTION_BITS: u32 = 16;
 const WEIGHTED_LOG_TABLE_LEN: usize = 4096;
 /// Tokens scanned between stop polls.
 const SCAN_POLL_TOKENS: usize = 1 << 16;
+/// A dynamic header's fixed part, in bits: block type and the HLIT, HDIST and
+/// HCLEN fields (17 bits) and about fifteen 3-bit code-length-code lengths.
+const HEADER_BASE_BITS: u64 = 64;
+/// Header bits per used literal/length or distance symbol: its code-length
+/// codeword. Runs of unused symbols cost little under the repeat codes.
+const HEADER_BITS_PER_SYMBOL: u64 = 4;
 
 /// Exact range prices per pass.
 const RANGE_PRICES: usize = 4096;
@@ -98,6 +107,8 @@ struct Side {
     distance_total: u64,
     literal_weighted: u64,
     distance_weighted: u64,
+    /// Symbols with a nonzero count, end-of-block included.
+    used: u64,
 }
 
 impl Side {
@@ -111,6 +122,7 @@ impl Side {
             distance_total: 0,
             literal_weighted: weighted_log(table, 1),
             distance_weighted: 0,
+            used: 1,
         }
     }
 
@@ -119,12 +131,14 @@ impl Side {
         let count = &mut self.literal[literal];
         self.literal_weighted +=
             weighted_log(table, u64::from(*count) + 1) - weighted_log(table, u64::from(*count));
+        self.used += u64::from(*count == 0);
         *count += 1;
         self.literal_total += 1;
         if let Some(distance) = distance {
             let count = &mut self.distance[distance];
             self.distance_weighted +=
                 weighted_log(table, u64::from(*count) + 1) - weighted_log(table, u64::from(*count));
+            self.used += u64::from(*count == 0);
             *count += 1;
             self.distance_total += 1;
         }
@@ -136,12 +150,14 @@ impl Side {
         self.literal_weighted -=
             weighted_log(table, u64::from(*count)) - weighted_log(table, u64::from(*count) - 1);
         *count -= 1;
+        self.used -= u64::from(*count == 0);
         self.literal_total -= 1;
         if let Some(distance) = distance {
             let count = &mut self.distance[distance];
             self.distance_weighted -=
                 weighted_log(table, u64::from(*count)) - weighted_log(table, u64::from(*count) - 1);
             *count -= 1;
+            self.used -= u64::from(*count == 0);
             self.distance_total -= 1;
         }
     }
@@ -151,6 +167,12 @@ impl Side {
         weighted_log(table, self.literal_total) - self.literal_weighted
             + weighted_log(table, self.distance_total)
             - self.distance_weighted
+    }
+
+    /// A first-order estimate of the side's dynamic header, in fixed-point
+    /// bits.
+    fn header_estimate(&self) -> u64 {
+        (HEADER_BASE_BITS + HEADER_BITS_PER_SYMBOL * self.used) << LOG_FRACTION_BITS
     }
 }
 
@@ -168,19 +190,21 @@ fn token_symbols(token: &Token) -> (usize, Option<usize>) {
     }
 }
 
-/// The token cut in `start..end` that minimizes the two sides' total entropy,
-/// when it saves at least [`MIN_ESTIMATED_SAVING_BITS`]. The outer `None`
-/// means the stop or budget ended the search.
-fn best_entropy_cut(
+/// The cuts to price for `start..end`, in order: the token cut that minimizes
+/// the two sides' total entropy, when it saves at least
+/// [`MIN_ESTIMATED_SAVING_BITS`]; then, if different, the cut that minimizes
+/// their entropy plus header estimates, when that total is below the whole
+/// range's. The outer `None` means the stop or budget ended the search.
+fn best_entropy_cuts(
     tokens: &[Token],
     start: usize,
     end: usize,
     table: &[u64],
     budget: &mut AlphabetBudget,
     stop: &mut SearchStop<'_>,
-) -> Option<Option<usize>> {
+) -> Option<[Option<usize>; 2]> {
     if end - start < 2 * MIN_SIDE_TOKENS {
-        return Some(None);
+        return Some([None; 2]);
     }
     budget.spend(2 * (end - start))?;
     let mut right = Side::end_of_block(table);
@@ -188,8 +212,10 @@ fn best_entropy_cut(
         right.add(table, token);
     }
     let whole = right.entropy(table);
+    let whole_with_header = whole + right.header_estimate();
     let mut left = Side::end_of_block(table);
     let mut best: Option<(u64, usize)> = None;
+    let mut best_with_headers: Option<(u64, usize)> = None;
     for (offset, token) in tokens[start..end - MIN_SIDE_TOKENS].iter().enumerate() {
         if offset % SCAN_POLL_TOKENS == 0 && stop.reached() {
             return None;
@@ -203,16 +229,25 @@ fn best_entropy_cut(
         if best.map_or(true, |(cost, _)| split < cost) {
             best = Some((split, start + offset + 1));
         }
+        let with_headers = split + left.header_estimate() + right.header_estimate();
+        if best_with_headers.map_or(true, |(cost, _)| with_headers < cost) {
+            best_with_headers = Some((with_headers, start + offset + 1));
+        }
     }
-    Some(best.and_then(|(split, cut)| {
+    let entropy_cut = best.and_then(|(split, cut)| {
         (whole.saturating_sub(split) >= MIN_ESTIMATED_SAVING_BITS << LOG_FRACTION_BITS)
             .then_some(cut)
-    }))
+    });
+    let header_cut = best_with_headers
+        .filter(|&(split, cut)| split < whole_with_header && Some(cut) != entropy_cut)
+        .map(|(_, cut)| cut);
+    Some([entropy_cut, header_cut])
 }
 
 /// R15 for one block: cut it where the zeroth-order entropy of the two sides
-/// falls most, keep the cut if the exactly planned block sequence is strictly
-/// smaller, and cut each kept half again. Returns the plans of the smallest
+/// falls most, or else where entropy plus header estimates falls most, keep
+/// the first cut whose exactly planned block sequence is strictly smaller, and
+/// cut each kept half again. Returns the plans of the smallest
 /// accepted split; completed cuts are kept when the stop or budget ends the
 /// search.
 pub(crate) fn plan_entropy_cuts(
@@ -254,8 +289,8 @@ pub(crate) fn plan_entropy_cuts(
     pending.push((0, token_count));
     let mut best_bits = parent_bits;
     let mut best = None;
-    while let Some((start, end)) = pending.pop() {
-        let Some(found) = best_entropy_cut(
+    'ranges: while let Some((start, end)) = pending.pop() {
+        let Some(cuts) = best_entropy_cuts(
             &composite.tokens,
             start,
             end,
@@ -265,27 +300,26 @@ pub(crate) fn plan_entropy_cuts(
         ) else {
             break;
         };
-        let Some(at) = found else {
-            continue;
-        };
-        if points.try_reserve(1).is_err() || pending.try_reserve(2).is_err() {
-            break;
-        }
-        let index = points.partition_point(|&point| point < at);
-        points.insert(index, at);
-        let Some(plans) = price_cuts(
-            block, &composite, &points, alignment, &bounded, &mut cache, stop,
-        ) else {
-            break;
-        };
-        let bits = total_bits(&plans);
-        if bits < best_bits {
-            best_bits = bits;
-            best = Some(plans);
-            // Left half first.
-            pending.push((at, end));
-            pending.push((start, at));
-        } else {
+        for at in cuts.into_iter().flatten() {
+            if points.try_reserve(1).is_err() || pending.try_reserve(2).is_err() {
+                break 'ranges;
+            }
+            let index = points.partition_point(|&point| point < at);
+            points.insert(index, at);
+            let Some(plans) = price_cuts(
+                block, &composite, &points, alignment, &bounded, &mut cache, stop,
+            ) else {
+                break 'ranges;
+            };
+            let bits = total_bits(&plans);
+            if bits < best_bits {
+                best_bits = bits;
+                best = Some(plans);
+                // Left half first.
+                pending.push((at, end));
+                pending.push((start, at));
+                continue 'ranges;
+            }
             points.remove(index);
         }
     }

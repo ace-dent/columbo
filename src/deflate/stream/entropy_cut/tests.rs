@@ -78,6 +78,20 @@ fn fixed_point_logarithm_matches_log2() {
     }
 }
 
+/// Symbols used by `tokens`, end-of-block included.
+fn direct_used(tokens: &[Token]) -> u64 {
+    let mut used = std::collections::HashSet::new();
+    used.insert((false, 256));
+    for token in tokens {
+        let (l, d) = token_symbols(token);
+        used.insert((false, l));
+        if let Some(d) = d {
+            used.insert((true, d));
+        }
+    }
+    used.len() as u64
+}
+
 /// The two sides' entropy recomputed from their histograms.
 fn direct_entropy(table: &[u64], tokens: &[Token]) -> u64 {
     let mut literal = [0_u64; 286];
@@ -146,6 +160,8 @@ fn moving_cut_entropy_matches_direct_histograms() {
                 right.entropy(&table),
                 direct_entropy(&table, &tokens[cut..])
             );
+            assert_eq!(left.used, direct_used(&tokens[..cut]));
+            assert_eq!(right.used, direct_used(&tokens[cut..]));
         }
         if let Some(token) = tokens.get(cut) {
             left.add(&table, token);
@@ -155,7 +171,7 @@ fn moving_cut_entropy_matches_direct_histograms() {
 }
 
 #[test]
-fn best_entropy_cut_finds_a_regime_change_and_ignores_one_regime() {
+fn best_entropy_cuts_find_a_regime_change_and_ignore_one_regime() {
     let table = table();
     let regime = |range: std::ops::Range<u8>, count: usize| {
         range
@@ -169,21 +185,21 @@ fn best_entropy_cut_finds_a_regime_change_and_ignores_one_regime() {
     let mut budget = AlphabetBudget::with_limits(1 << 20, 16);
     let mut never = SearchStop::never();
     assert_eq!(
-        best_entropy_cut(&tokens, 0, tokens.len(), &table, &mut budget, &mut never),
-        Some(Some(300))
+        best_entropy_cuts(&tokens, 0, tokens.len(), &table, &mut budget, &mut never),
+        Some([Some(300), None])
     );
     // A range is scanned from its own start.
     assert_eq!(
-        best_entropy_cut(&tokens, 100, tokens.len(), &table, &mut budget, &mut never),
-        Some(Some(300))
+        best_entropy_cuts(&tokens, 100, tokens.len(), &table, &mut budget, &mut never),
+        Some([Some(300), None])
     );
     let uniform = regime(0..8, 600);
     assert_eq!(
-        best_entropy_cut(&uniform, 0, uniform.len(), &table, &mut budget, &mut never),
-        Some(None)
+        best_entropy_cuts(&uniform, 0, uniform.len(), &table, &mut budget, &mut never),
+        Some([None, None])
     );
     assert_eq!(
-        best_entropy_cut(
+        best_entropy_cuts(
             &tokens,
             0,
             2 * MIN_SIDE_TOKENS - 1,
@@ -191,15 +207,15 @@ fn best_entropy_cut_finds_a_regime_change_and_ignores_one_regime() {
             &mut budget,
             &mut never
         ),
-        Some(None)
+        Some([None, None])
     );
     let mut exhausted = AlphabetBudget::with_limits(2 * tokens.len() - 1, 16);
     assert_eq!(
-        best_entropy_cut(&tokens, 0, tokens.len(), &table, &mut exhausted, &mut never),
+        best_entropy_cuts(&tokens, 0, tokens.len(), &table, &mut exhausted, &mut never),
         None
     );
     assert_eq!(
-        best_entropy_cut(
+        best_entropy_cuts(
             &tokens,
             0,
             tokens.len(),
@@ -287,4 +303,60 @@ fn entropy_cuts_leave_a_single_regime_block_alone() {
         &mut SearchStop::never(),
     )
     .is_none());
+}
+
+#[test]
+fn best_entropy_cuts_match_an_exhaustive_scan() {
+    let table = table();
+    let mut next = xorshift(0x6a09_e667_f3bc_c909);
+    let header = |tokens: &[Token]| {
+        (HEADER_BASE_BITS + HEADER_BITS_PER_SYMBOL * direct_used(tokens)) << LOG_FRACTION_BITS
+    };
+    let mut header_cuts = 0;
+    for case in 0..300 {
+        // Two or three regimes over small, partly shared alphabets.
+        let mut tokens = Vec::new();
+        for part in 0..2 + case % 2 {
+            let base = (next() % 40) as u8;
+            let width = 2 + (next() % 12) as u8;
+            let length = 20 + (next() % 120) as usize;
+            tokens.extend(
+                (0..length).map(|_| Token::Literal(base + (next() % u64::from(width)) as u8)),
+            );
+            if part == 0 && case % 3 == 0 {
+                tokens.extend(random_tokens(&mut next, 30));
+            }
+        }
+        let n = tokens.len();
+        let whole = direct_entropy(&table, &tokens);
+        let mut entropy_best: Option<(u64, usize)> = None;
+        let mut header_best: Option<(u64, usize)> = None;
+        for cut in MIN_SIDE_TOKENS..=n - MIN_SIDE_TOKENS {
+            let split =
+                direct_entropy(&table, &tokens[..cut]) + direct_entropy(&table, &tokens[cut..]);
+            if entropy_best.map_or(true, |(cost, _)| split < cost) {
+                entropy_best = Some((split, cut));
+            }
+            let with_headers = split + header(&tokens[..cut]) + header(&tokens[cut..]);
+            if header_best.map_or(true, |(cost, _)| with_headers < cost) {
+                header_best = Some((with_headers, cut));
+            }
+        }
+        let entropy_cut = entropy_best
+            .filter(|&(split, _)| {
+                whole.saturating_sub(split) >= MIN_ESTIMATED_SAVING_BITS << LOG_FRACTION_BITS
+            })
+            .map(|(_, cut)| cut);
+        let header_cut = header_best
+            .filter(|&(split, cut)| split < whole + header(&tokens) && Some(cut) != entropy_cut)
+            .map(|(_, cut)| cut);
+        header_cuts += usize::from(header_cut.is_some());
+        let mut budget = AlphabetBudget::with_limits(usize::MAX, 16);
+        assert_eq!(
+            best_entropy_cuts(&tokens, 0, n, &table, &mut budget, &mut SearchStop::never()),
+            Some([entropy_cut, header_cut]),
+            "case {case}"
+        );
+    }
+    assert!(header_cuts > 0);
 }

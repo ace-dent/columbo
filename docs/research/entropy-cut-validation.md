@@ -191,3 +191,56 @@ decoded independently, and all 674 Rust tests pass in debug and release,
 including `terminal_layout_work_scales_with_stream_volume`.
 
 Harness and logs: `work/layout-budget-validation/`.
+
+## Follow-up: a header-aware fallback cut
+
+Date: 14 October 2026. Baseline: `23e4993`. R15 chooses its cut by entropy
+alone, which ignores the header each side must send, and abandons a range when
+exact pricing rejects that one cut. A dynamic header costs about 64 bits of
+fixed fields and code-length-code lengths, plus a code-length codeword for
+each used symbol, while runs of unused symbols cost little. The scan now also
+tracks each side's used symbols and the cut minimizing entropy plus
+`64 + 4 × used` bits per side. When the entropy cut fails exact pricing, or no
+cut saves the 32-bit estimate, that header-aware cut is priced instead,
+provided its estimated total is below the whole range's.
+
+Probes against `23e4993` compared it with the alternatives:
+
+| Probe, Default | 33-file sample | 120 random PNGs |
+| --- | --- | --- |
+| Header-aware cut first, instead of the entropy cut | 7 smaller / 3 larger, −5,581 bytes (`skinsrc.zip` +296) | 24 / 10, −1,364 |
+| Up to two more entropy cuts after a failed one | 2 / 0, −2,967, CPU +6% | 15 / 1, −338, CPU +6% |
+| **Header-aware cut as the fallback (retained)** | **4 / 0, −5,814** | **23 / 1, −1,285** |
+
+| Set | Files | Smaller / larger | Bytes saved | Process CPU |
+| --- | ---: | --- | ---: | --- |
+| Raw streams | 365 | 5 / 0 | 146 | 46.19 → 46.34 s |
+| PNG | 1,052 | 70 / 2 | 27,300, 2 lost | 1,209.76 → 1,242.64 s |
+| GZIP, zlib, ZIP and APNG | 202 | 54 / 0 | 5,378 | 561.52 → 574.47 s |
+| Relaxed | 381 | 11 / 0 | 2,198 | 148.25 → 153.25 s |
+
+On PNG, the three Partnership card copies saved 22,798 bytes (11,232 on the
+deft4j copy), and 66 of 387 medium images 4,495; among containers, 18 of 21
+GZIP files saved 4,243 bytes. Serially, the Partnership card took
+40.18 → 42.73 s and its deft4j copy 28.23 → 31.95 s.
+
+Both copies of `ColorTestCard.png` grew by one byte, deterministically: a
+header-aware cut saving 4 bits leaves blocks on which the repeated finish's
+R14 no longer finds the 8 bits it finds without that cut. The two-byte loss
+is kept for the corpus gain.
+
+On the 25-PNG Max sample at 60 seconds, eight files saved 12,181 bytes (the
+deft4j Partnership card 11,232) and three grew by 305; none of the three
+reproduced in two further side-by-side runs of each build (`floor
+pattern.png` 519,633 for both, then 519,635 and 519,636; `4.2.07-deft4j-t8s.PNG`
+725,417 for both twice; `nascar.png` 22,759 and 22,760 for both). Every Max
+output was no larger than the same file's Default output.
+
+`best_entropy_cuts_match_an_exhaustive_scan` checks both returned cuts
+against an exhaustive scan of 300 random multi-regime ranges, and the
+moving-cut test now checks the used-symbol counts. All outputs decoded
+independently; all 675 Rust tests pass in debug and release. The release
+executable grows from 1,877,024 to 1,893,536 bytes.
+
+Harness and logs: `work/header-fallback-validation/`; probes:
+`work/after-r15-probes/`.
