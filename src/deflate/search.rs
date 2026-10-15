@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::Options;
 
-use super::block::{plan_block, plan_owned_block};
+use super::block::{plan_block, plan_owned_block, reusable_original_bits};
 use super::header::{
     best_dynamic_plan_cached, estimate_boundary_block_bits, plan_for_explicit_lengths,
     plan_for_explicit_lengths_with_cost, token_bits_from_frequencies, HeaderPlanCache,
@@ -2441,6 +2441,46 @@ fn consider_proven_submatch_tokens(
     Some(canonical_tokens)
 }
 
+/// Blocks with at least this many tokens get R17's extended floor
+/// unconditionally; smaller ones only when a match costs more than its
+/// literals under their current codes.
+const TOKEN_REPLAY_FULL_MIN_TOKENS: usize = 4096;
+
+/// R17 for one block: replay the extended floor from the block's final codes.
+/// R13–R16 re-cut, merge and re-tree blocks after the main planner chose their
+/// spellings, so the floor's match expansions and feedback trees can find a
+/// cheaper spelling for the block as it now stands. Large blocks always get
+/// the floor, whose grouped expansions refit their trees; a smaller block gets
+/// it only when one of its matches costs more than its literals. Returns the
+/// new plan when it is strictly smaller than the block's current bits.
+pub(crate) fn plan_terminal_token_replay(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Option<PlannedBlock> {
+    if stop.reached()
+        || block.tokens.len() > MANDATORY_FLOOR_MAX_TOKENS
+        || block.plain.len() > MANDATORY_FLOOR_MAX_PLAIN
+    {
+        return None;
+    }
+    let codes = block.original_dynamic.as_ref()?;
+    if block.tokens.len() < TOKEN_REPLAY_FULL_MIN_TOKENS
+        && !has_dearer_match(
+            &block.tokens,
+            &block.plain,
+            &codes.literal_lengths,
+            &codes.distance_lengths,
+        )
+    {
+        return None;
+    }
+    let current = reusable_original_bits(block, alignment, options.strict)?.len;
+    let plan = plan_block_with_floor(block, alignment, options, true);
+    (!matches!(plan.representation, Representation::Stored) && plan.bits < current).then_some(plan)
+}
+
 /// Plan a block with the cheap floor: same-distance runs and match-to-literal
 /// expansions, plus the feedback-tree and replay floor if `extended`. It runs
 /// even after a container's shared search deadline, so every ZIP member or
@@ -4490,6 +4530,48 @@ fn expand_matches_with_token_limit(
             literal_bits < match_bits || (include_equal && literal_bits == match_bits)
         },
     )
+}
+
+/// Whether any match costs strictly more than its literals under the given
+/// code lengths, priced as the table replay prices them.
+fn has_dearer_match(
+    tokens: &[Token],
+    plain: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> bool {
+    let mut offset = 0_usize;
+    for token in tokens {
+        match *token {
+            Token::Literal(_) => offset += 1,
+            Token::Match {
+                length,
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } => {
+                let end = offset + usize::from(length);
+                let Some(decoded) = plain.get(offset..end) else {
+                    return false;
+                };
+                let literal_bits: u64 = decoded
+                    .iter()
+                    .map(|&byte| estimated_length(literal_lengths, usize::from(byte)))
+                    .sum();
+                let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
+                    + u64::from(length_extra_bits)
+                    + estimated_length(distance_lengths, usize::from(distance_symbol))
+                    + u64::from(distance_extra_bits);
+                if literal_bits < match_bits {
+                    return true;
+                }
+                offset = end;
+            }
+        }
+    }
+    false
 }
 
 fn estimated_length(lengths: &[u8], symbol: usize) -> u64 {

@@ -1895,3 +1895,119 @@ fn short_family_stats_add_across_source_blocks() {
     );
     assert_eq!(aggregate, direct);
 }
+
+/// A 3-byte match at distance 2 copying "aba".
+fn aba_match() -> Token {
+    Token::Match {
+        length: 3,
+        distance: 2,
+        length_symbol: 257,
+        distance_symbol: 1,
+        length_extra: 0,
+        distance_extra: 0,
+        length_extra_bits: 0,
+        distance_extra_bits: 0,
+    }
+}
+
+/// Literal codes a = 1 bit, b = 2, end-of-block = 3; the length code 4 bits,
+/// with symbol 258 completing the tree; two 1-bit distance codes.
+fn aba_codes() -> (Vec<u8>, Vec<u8>) {
+    let mut literal = vec![0_u8; 259];
+    literal[usize::from(b'a')] = 1;
+    literal[usize::from(b'b')] = 2;
+    literal[256] = 3;
+    literal[257] = 4;
+    literal[258] = 4;
+    (literal, vec![1, 1])
+}
+
+#[test]
+fn dearer_matches_are_found_with_the_table_replay_estimate() {
+    let tokens = [Token::Literal(b'a'), Token::Literal(b'b'), aba_match()];
+    let plain = b"ababa";
+    let (literal, distance) = aba_codes();
+    // The match costs 4 + 1 bits; its literals a, b, a cost 1 + 2 + 1.
+    assert!(has_dearer_match(&tokens, plain, &literal, &distance));
+    let mut dear_literals = literal.clone();
+    dear_literals[usize::from(b'a')] = 2;
+    assert!(!has_dearer_match(&tokens, plain, &dear_literals, &distance));
+    // An absent literal is priced at 15 bits.
+    let mut absent = literal;
+    absent[usize::from(b'b')] = 0;
+    assert!(!has_dearer_match(&tokens, plain, &absent, &distance));
+}
+
+#[test]
+fn terminal_token_replay_respells_a_block_under_its_codes() {
+    let (literal, distance) = aba_codes();
+    let parsed_block = |tokens: Vec<Token>| {
+        let mut plain = Vec::new();
+        for token in &tokens {
+            match *token {
+                Token::Literal(value) => plain.push(value),
+                Token::Match {
+                    length, distance, ..
+                } => {
+                    for _ in 0..length {
+                        plain.push(plain[plain.len() - usize::from(distance)]);
+                    }
+                }
+            }
+        }
+        let dynamic = plan_for_explicit_lengths(&tokens, &literal, &distance, false).unwrap();
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let block = ParsedBlock {
+            tokens: tokens.into(),
+            plain: plain.into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: SourceBlockType::Dynamic,
+        };
+        let plan = PlannedBlock {
+            tokens: block.tokens.clone(),
+            plain: block.plain.clone(),
+            bits: dynamic.bits,
+            representation: Representation::Dynamic(dynamic),
+            source_type: SourceBlockType::Dynamic,
+        };
+        let mut writer = crate::deflate::bitstream::BitWriter::default();
+        crate::deflate::block::emit_block(&mut writer, &[], &plan, true).unwrap();
+        crate::deflate::parse::parse_stream(&writer.into_bytes(), 1 << 20)
+            .unwrap()
+            .blocks
+            .remove(0)
+    };
+    // Mostly a and b, so the given codes fit, with matches that cost more
+    // than their literals under them.
+    let mut tokens = Vec::new();
+    for round in 0..200 {
+        tokens.extend([
+            Token::Literal(b'a'),
+            Token::Literal(b'a'),
+            Token::Literal(b'b'),
+        ]);
+        if round % 10 == 9 {
+            tokens.push(aba_match());
+        }
+    }
+    let block = parsed_block(tokens);
+    let current = block.original.unwrap().len;
+    let options = Options::default();
+    let plan = plan_terminal_token_replay(&block, 0, &options, &mut SearchStop::never()).unwrap();
+    assert!(plan.bits < current);
+    assert_eq!(&plan.plain[..], &block.plain[..]);
+    assert!(plan_terminal_token_replay(&block, 0, &options, &mut SearchStop::always()).is_none());
+
+    // Without a dearer match, a block below the full-floor size is left alone.
+    let literals_only: Vec<_> = (0..600)
+        .map(|i| Token::Literal(if i % 3 == 2 { b'b' } else { b'a' }))
+        .collect();
+    let block = parsed_block(literals_only);
+    assert!(plan_terminal_token_replay(&block, 0, &options, &mut SearchStop::never()).is_none());
+}

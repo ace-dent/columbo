@@ -35,8 +35,8 @@ use super::restore::{
 use super::search::{
     compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
-    plan_block_with_integrated_proven_search, rewrite_258_symbols, same_distance_opportunities,
-    PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    plan_block_with_integrated_proven_search, plan_terminal_token_replay, rewrite_258_symbols,
+    same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::source_recode::plan_source_blocks;
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
@@ -1812,6 +1812,7 @@ enum TerminalHeaderSearch {
     SmoothedTrees,
     EntropyCuts,
     Merges,
+    TokenReplay,
     AlphabetBoundaries,
     HeaderTree,
     CodeLengthRotations,
@@ -1845,6 +1846,7 @@ impl TerminalHeaderSearch {
             Self::SmoothedTrees => "Smoothed-tree finish",
             Self::EntropyCuts => "Entropy cuts",
             Self::Merges => "Terminal merges",
+            Self::TokenReplay => "Terminal token replay",
             Self::AlphabetBoundaries => "Alphabet boundary search",
             Self::HeaderTree => "Code-length tree search",
             Self::CodeLengthRotations => "Code-length rotations",
@@ -1900,7 +1902,11 @@ impl TerminalHeaderSearch {
     fn is_tree_finish(self) -> bool {
         matches!(
             self,
-            Self::DistanceBands | Self::SmoothedTrees | Self::EntropyCuts | Self::Merges
+            Self::DistanceBands
+                | Self::SmoothedTrees
+                | Self::EntropyCuts
+                | Self::Merges
+                | Self::TokenReplay
         )
     }
 
@@ -1956,6 +1962,7 @@ impl TerminalHeaderSearch {
             Self::DistanceBands => {
                 super::distance_band::plan_distance_bands(block, alignment, options, stop)?
             }
+            Self::TokenReplay => plan_terminal_token_replay(block, alignment, options, stop)?,
             Self::EntropyCuts => {
                 return super::stream::plan_entropy_cuts(
                     block,
@@ -2011,6 +2018,7 @@ impl TerminalHeaderSearch {
                     | Self::DistanceBands
                     | Self::EntropyCuts
                     | Self::Merges
+                    | Self::TokenReplay
                     | Self::AlphabetBoundaries
                     | Self::HeaderResponse
                     | Self::LengthExchange => {
@@ -2292,7 +2300,8 @@ fn improve_with_tree_finish(
 }
 
 /// R16 after the settled finish: merge adjacent blocks, slide once more after
-/// a win, then let R15 re-cut the merged blocks.
+/// a win, and let R15 re-cut the merged blocks; then R17 replays the token
+/// floor on the blocks as they stand, sliding once more after a win.
 fn improve_with_terminal_merges(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2302,7 +2311,7 @@ fn improve_with_terminal_merges(
     candidate: Candidate,
 ) -> Result<Candidate> {
     let before = (candidate.data.len(), candidate.bits);
-    let candidate = improve_with_tree_finish(
+    let mut candidate = improve_with_tree_finish(
         TerminalHeaderSearch::Merges,
         source,
         options,
@@ -2311,11 +2320,19 @@ fn improve_with_terminal_merges(
         parse_cache,
         candidate,
     )?;
-    if (candidate.data.len(), candidate.bits) == before {
-        return Ok(candidate);
+    if (candidate.data.len(), candidate.bits) != before {
+        candidate = improve_with_tree_finish(
+            TerminalHeaderSearch::EntropyCuts,
+            source,
+            options,
+            floor_work,
+            progress,
+            parse_cache,
+            candidate,
+        )?;
     }
     improve_with_tree_finish(
-        TerminalHeaderSearch::EntropyCuts,
+        TerminalHeaderSearch::TokenReplay,
         source,
         options,
         floor_work,

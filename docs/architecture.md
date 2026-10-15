@@ -82,7 +82,7 @@ Code comments and the route documentation rely on these project terms.
   that match's decoded interval; the source match proves those bytes repeat.
 - **Sweep**: one ordered pass of the terminal methods (R1–R15) over the
   incumbent. Max repeats the sweep (R12) while it improves and time remains;
-  R16 follows the settled sweeps.
+  R16 and R17 follow the settled sweeps.
 - **Default / Max**: the two search modes. Max (`--max`, `Options::exhaustive`)
   adds slower routes.
 - **Strict mode**: `--strict 1`, the default (`Options::strict`). Output uses
@@ -90,7 +90,7 @@ Code comments and the route documentation rely on these project terms.
 - **Deadline and grace**: the soft deadline stops new routes from starting;
   active work may continue for a grace of 10% of the timeout plus one second,
   until the hard stop.
-- **Route labels**: D1–D3, G0, R1–R16, M0–M13, S0, and their suffixed variants
+- **Route labels**: D1–D3, G0, R1–R17, M0–M13, S0, and their suffixed variants
   name gates and routes in the
   [route-gate reference](routes-and-methods.md#route-gate-reference).
 
