@@ -30,24 +30,25 @@ use super::{
     build_compact_proven_feedback_candidate, build_complementary_narrow_source_candidate,
     build_complete_apng_default_floor_candidate, build_complete_default_floor_candidate,
     build_deft4j_source_candidate, build_prepared_compact_source_split_floors,
-    build_source_max_candidate, candidate_exposes_new_parent, candidate_progress,
-    capture_source_block_report, changed_narrow_parent_should_continue,
+    build_source_family_candidate, build_source_max_candidate, candidate_exposes_new_parent,
+    candidate_progress, capture_source_block_report, changed_narrow_parent_should_continue,
     compact_balanced_tree_source_eligible, compact_dependent_deft4j_work_class,
     compact_split_parent_is_completed, complete_png_parallel_source_max_work_class,
-    deft4j_source_route_eligible, established_floor_candidate, floor_exposes_new_search_states,
-    floor_seeded_priority_with_structural_sibling, gain_is_below, has_multiple_nonempty_blocks,
-    improve_default_floor_with_feedback, improve_with_terminal_searches,
-    improve_with_terminal_tree_floors, independent_deft4j_refinement_can_overlap,
-    is_strictly_better, join_route, narrow_source_route_eligible, normalize_258_aliases,
-    parallel_route_is_bounded, parse_validated_rewrite, prebuild_bounded_floor,
-    prepare_compact_source_split_seed, refine_bounded_deft4j_lineage,
-    refine_with_compact_balanced_tree_floor, refine_with_compact_proven_feedback,
-    refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
-    refine_with_max_planner, refine_with_no_split_route,
-    refine_with_terminal_source_split_floor_until, replace_optional_if_smaller,
-    source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
-    BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, DefaultFloor,
-    DefaultFloorWork, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalShare,
+    default_source_topology_eligible, deft4j_source_route_eligible, established_floor_candidate,
+    floor_exposes_new_search_states, floor_seeded_priority_with_structural_sibling, gain_is_below,
+    has_multiple_nonempty_blocks, improve_default_floor_with_feedback,
+    improve_with_terminal_searches, improve_with_terminal_tree_floors,
+    independent_deft4j_refinement_can_overlap, is_strictly_better, join_route,
+    narrow_source_route_eligible, normalize_258_aliases, parallel_route_is_bounded,
+    parse_validated_rewrite, prebuild_bounded_floor, prepare_compact_source_split_seed,
+    refine_bounded_deft4j_lineage, refine_with_compact_balanced_tree_floor,
+    refine_with_compact_proven_feedback, refine_with_compact_source_split_floor,
+    refine_with_compact_source_split_floor_until, refine_with_max_planner,
+    refine_with_no_split_route, refine_with_terminal_source_split_floor_until,
+    replace_optional_if_smaller, source_run_match_count_exceeds, spawn_route,
+    BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy, BoundedRoutes,
+    Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork, RawInfo,
+    RawOptimization, ReplayPlanner, StreamIdentity, TerminalShare,
     COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
     WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
@@ -297,6 +298,8 @@ struct RouteEligibility {
     compact_tree: bool,
     compact_proven_feedback: bool,
     deft4j: bool,
+    /// D4; Max runs it in its complete Default floor instead.
+    default_source_topology: bool,
     narrow_source: bool,
     parallel_routes: bool,
 }
@@ -326,6 +329,12 @@ impl RouteEligibility {
             // M1 applies under every floor policy, so a longer timeout can
             // always reach the deft4j endpoint.
             deft4j: options.exhaustive && deft4j_source_route_eligible(source.blocks),
+            default_source_topology: !options.exhaustive
+                && default_source_topology_eligible(
+                    source.blocks,
+                    source.compressed.len(),
+                    source.identity.decoded_size,
+                ),
             narrow_source: bounded_png_max
                 && narrow_source_route_eligible(source.blocks, source.compressed.len()),
             parallel_routes: options.exhaustive
@@ -497,11 +506,45 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
     if let Some(parent) = deferred_split_parent {
         run_deferred_source_max_split(context, deadlines, &parent, &mut candidate)?;
     }
+    let source_topology = build_default_source_topology(context, &eligibility, &candidate)?;
     let mut candidate = finish_terminal_searches(context, deadlines, candidate)?;
+    if let Some(source_topology) = source_topology {
+        let finished = finish_terminal_searches(context, deadlines, source_topology)?;
+        candidate.replace_if_smaller(finished);
+    }
     if let Some(slid_default) = state.slid_default.take() {
         candidate.replace_if_smaller(slid_default);
     }
     Ok(candidate)
+}
+
+/// Build Default's source topology (D4), returned only when it is already
+/// strictly smaller than the selected candidate. The source's own blocks,
+/// each re-spelled by a length-family chain, can reach a different basin from
+/// the planner's, whose match-by-match expansion stops where every remaining
+/// match is cheaper than its literals alone. Both endpoints are then finished
+/// and the smaller kept, so the planner's endpoint is never lost.
+fn build_default_source_topology(
+    context: &RouteContext<'_>,
+    eligibility: &RouteEligibility,
+    candidate: &Candidate,
+) -> Result<Option<Candidate>> {
+    if !(eligibility.default_source_topology && context.deadline.can_start_route()) {
+        return Ok(None);
+    }
+    let step = context.progress.start("Source family chains");
+    let topology = build_source_family_candidate(
+        context.source,
+        context.options,
+        &mut context.deadline.hard_stop(),
+    )?;
+    step.finish(context.report_optional(topology.as_ref()));
+    Ok(topology
+        .filter(|topology| topology.is_strictly_smaller_than(candidate))
+        .map(|mut topology| {
+            topology.plans.clear();
+            topology
+        }))
 }
 
 /// Build the comparison floor that some policies need before the bounded

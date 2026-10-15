@@ -228,7 +228,10 @@ flowchart TD
     D3 -- "Yes" --> D3RUN["🟡 Up to 4 improving balanced-tree rounds"]
     D3 -- "No" --> TFLOORS
     D3RUN --> TFLOORS["🟡 Terminal tree floors"]
-    TFLOORS --> R1{"R1 · original-match restoration + G0"}
+    TFLOORS --> D4{"D4 · ≥128 KiB decoded, M2's class + G0"}
+    D4 -- "Yes" --> D4RUN["🟡 Re-spell each source block by a length-family chain;<br/>if strictly smaller, finish it through R1–R17 too<br/>and keep the smaller endpoint"]
+    D4 -- "No" --> R1
+    D4RUN --> R1{"R1 · original-match restoration + G0"}
     R1 -- "Yes" --> RESTORE["🟢 Restore certified matches under unchanged trees"]
     R1 -- "No" --> R1B{"R1b · strict degenerate distance tree + G0"}
     RESTORE --> R1B
@@ -288,7 +291,7 @@ flowchart TD
 ```
 
 `ApngDefault` skips D1–D3 and the terminal tree floors; Max runs them for
-APNG.
+APNG. D4 applies under every Default policy.
 
 #### Bounded max
 
@@ -507,6 +510,7 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | D1 · match-preserving default feedback | Complete Default floor pass; one parsed block; ≥1 match; ≤4,000 tokens; ≤80,000 decoded bytes. | Adds proven-before-feedback and ordinary endpoint orders as independent candidates, in Default and in the exact Max floors (`Complete`, `CompleteThenBounded`, `SharedExact`), where it is mandatory and skips G0. |
 | D2 · integrated default feedback | Complete Default floor pass; 2–4 parsed blocks; ≤16 KiB compressed; ≤128 KiB decoded; ≤16 Ki tokens; ≥1 block within D1's limits. | Adds a compact multi-block integrated-proven candidate, scheduled like D1. The second endpoint replay runs only if the first did not beat the incumbent and hard time remains. |
 | D3 · strict literal-only balanced tree | Strict; complete Default floor pass; ≤8 KiB compressed; one nonempty block: dynamic, ≤4,096 tokens, no distance symbols. | ≤4 strictly improving balanced-tree rounds (pair and quad moves on the ordinary header grid; only the winner exhaustively finalized and reparsed); stops at a fixed point. |
+| D4 · source topology | Default; source ≥128 KiB decoded; in M2's class (≤1 MiB compressed; 2–128 nonempty blocks, all fixed or dynamic); after D1–D3 and the terminal tree floors; G0. | Keeps the source's own block layout and gives each nonempty block the smaller of its ordinary plan and its [length-family chain](#block-huffman-and-token-methods). Only if that candidate is strictly smaller than the selected candidate is it also finished through R1–R17, and the smaller finished endpoint is kept. A reached stop leaves no candidate. Max runs it in its complete Default floor as mandatory work without G0, finishing both lineages and keeping the one whose Default endpoint is smaller, so Max never ends above Default; Max's own routes use M1, whose graph explores the same transforms more widely. [Validation](research/source-family-chain-validation.md). |
 | R1 · original-match restoration | Parent differs from the original; both ≤128 KiB compressed and decoded; each layout ≤128 blocks; ≥1 original match certificate; parser keeps every wire block; Huffman blocks ≤16 Ki tokens; a certificate clipped to its block spans 3–4,096 decoded bytes, meets token boundaries, and includes selected literals; G0 (not in Max's mandatory Default floor). | Restores certified source matches under the final trees and headers: ≤2^20 DP edge evaluations per stream; no replay; source stored and literal bytes uncertified. Keeps completed repairs at the hard stop. Must strictly improve bytes and bits, including stored alignment; reports the actual maximum distance to wrappers. [Validation](research/permanent-match-proofs-validation.md). |
 | R1b · strict distance completion | Strict; after R1; G0. Each dynamic block using ≤1 distance symbol with a strictly compatible parent header. | Prices, against planning's two one-bit distance codes, the four uniform complete trees of depth 1–4 (contiguous, covering the used symbol), literal/length tree kept: ≤4 prices per block, 1,024 per stream. [Validation](benchmark-miss-regression-audit.md#strict-distance-completion-on-30-september-2026); [final-competitor evidence](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor). |
 | R1c · fixed-tree boundary slide | After R5 (Default) or R11 (Max); also ends the PNG early lineage's quick floor, a seed only ([evidence](benchmark-miss-regression-audit.md#rows-that-grew-1)). No size or block limit; linear per round. Boundaries between two non-stored blocks only. | Moves each boundary to the cheapest token cut both fixed trees can price (blocks stay nonempty; ties keep the cut), ≤16 sweeps while payload falls; re-plans moved blocks, keeping the cheaper code (ties keep the header), and repeats, ≤16 strictly improving rounds. Tokens keep their spelling; a match joining the neighbor costs the cheaper of its spelling and its literals. Stored blocks (including blocks re-planned as stored) and their boundaries stay fixed. Polls the hard stop between boundaries and every 64 Ki tokens. [Validation](research/boundary-slide-validation.md). |
@@ -553,7 +557,7 @@ Broad, floor-seeded, and fragmented Max lineages continue until a metric fixed
 point or the deadline, capped at eight times the initially emitted byte length.
 A replay round is adopted only on a strict byte/meaningful-bit win, and only an
 unexpired exhaustive round can establish a fixed point. Standalone `Complete`
-Max keeps every eligible D1/D2/D3 endpoint and R1 in its complete Default
+Max keeps every eligible D1/D2/D3/D4 endpoint and R1 in its complete Default
 endpoint, then continues Max from the Max seed; `SharedExact` does the same for
 scheduled multi-stream work.
 
@@ -837,6 +841,7 @@ expands the Provenance column.
 | Equal-frequency and code-length adjustments | Payload-neutral equal-frequency assignments and bounded length swaps, kept when their complete header-plus-payload cost wins. | 🔴 | **Columbo** |
 | Same-distance normalization | Coalesces or cost-repartitions adjacent matches that already use one proven distance ([details](#same-distance-match-run-normalization)). | 🟢 | **Columbo** |
 | Cumulative short-length bands | Prices cumulative length-symbol families (short-family, short-band, and no-split rows of [Inner token-search gates](#inner-token-search-gates)). | 🟡 | **Columbo**, inspired by deft4j least-family pruning |
+| Length-family chain | D4 only. A prune chain expands every match no cheaper than its literals under the current codes and rebuilds deft4j's heap codes from the new counts, up to 32 times. One runs from the block's own codes; then, up to three times, every match of the length symbol whose matches cost least as literals in total is expanded and another runs. Every state is exactly planned; the smallest is kept if strictly smaller. Expanding a whole family frees its code space, so the rebuilt codes can make matches dearer that no single expansion would. | 🟡 | deft4j's least-expensive family and pruning transforms; **Columbo** chain and placement |
 | Match-to-literal alternatives | Emits known literals for selected existing matches when complete repricing wins; never finds a new match. | 🔴 | **Columbo**; labeled primitives keep DeflOpt/deft4j attribution |
 | Preflighted all-literals endpoint | Replaces every existing match by its literals; a one-tree estimate rejects distant candidates, and tokens are expanded only for a strict complete-block win. | 🟡 | Idea from **libdeflate**; **Columbo** implementation |
 | Proven-submatch resegmentation and compositions | Literal/match paths inside a proven match at its distance, as an endpoint lineage, D1/D2/M3 state orders, and Max compositions ([details](#proven-submatch-resegmentation-and-feedback)). | 🟡–🔴 | **Columbo**; closed-loop search shape from **Google Guetzli** |

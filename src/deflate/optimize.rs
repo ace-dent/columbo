@@ -35,8 +35,8 @@ use super::restore::{
 use super::search::{
     compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
-    plan_block_with_integrated_proven_search, plan_terminal_token_replay, rewrite_258_symbols,
-    same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    plan_block_with_integrated_proven_search, plan_length_family_chain, plan_terminal_token_replay,
+    rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::source_recode::plan_source_blocks;
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
@@ -78,6 +78,9 @@ const WEAK_DEFT4J_GAIN_BASIS_POINTS: u64 = 200;
 /// With [`NARROW_SOURCE_LIST_MAX_BLOCKS`], keeps the no-split route's
 /// candidates well inside [`PARALLEL_ROUTE_MAX_MODEL`].
 const NARROW_SOURCE_MAX_COMPRESSED: usize = 1_024 * 1_024;
+/// Smallest decoded stream for Default's source-topology route (D4). Below
+/// it, the build costs more than its rare gains, as on APNG frames.
+const DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED: u64 = 128 * 1024;
 /// Limits for the compact split floor (M10c).
 const COMPACT_SPLIT_FLOOR_MAX_COMPRESSED: usize = 16 * 1024;
 const COMPACT_SPLIT_FLOOR_MAX_DECODED: u64 = 128 * 1024;
@@ -371,6 +374,19 @@ fn deft4j_source_route_eligible(blocks: &[ParsedBlock]) -> bool {
     }
     // A lone stored block gives the deft4j graph nothing to improve.
     nonempty >= 2 || (nonempty == 1 && huffman == 1)
+}
+
+/// D4: Default prices the source's own block layout, re-spelled by
+/// length-family chains, for multi-block sources in the no-split route's
+/// class (M2) that decode to at least [`DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED`]
+/// bytes.
+fn default_source_topology_eligible(
+    blocks: &[ParsedBlock],
+    compressed_len: usize,
+    decoded_size: u64,
+) -> bool {
+    decoded_size >= DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED
+        && narrow_source_route_eligible(blocks, compressed_len)
 }
 
 fn narrow_source_route_eligible(blocks: &[ParsedBlock], compressed_len: usize) -> bool {
@@ -2627,6 +2643,25 @@ fn finish_mandatory_default_endpoint(
     Ok((parent, Some(slid.unwrap_or(endpoint))))
 }
 
+/// R1, then [`finish_mandatory_default_endpoint`], for one complete Default
+/// lineage.
+fn finish_complete_default_lineage(
+    source: CandidateInput<'_>,
+    floor_options: &Options,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    base: Candidate,
+) -> Result<(Candidate, Option<Candidate>)> {
+    let restored = improve_with_original_match_restoration(
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        base,
+    )?;
+    finish_mandatory_default_endpoint(source, floor_options, progress, parse_cache, restored)
+}
+
 /// Default's R2–R5 terminal header searches, in their sweep order.
 fn finish_default_header_searches(
     source: CandidateInput<'_>,
@@ -2676,21 +2711,48 @@ fn build_complete_default_floor_candidate(
         progress,
         candidate,
     )?;
-    let complete = improve_with_original_match_restoration(
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        complete,
-    )?;
+    // D4 as in Default, but mandatory, so Max never ends above Default.
+    let topology = if default_source_topology_eligible(
+        source.blocks,
+        source.compressed.len(),
+        source.identity.decoded_size,
+    ) {
+        build_source_family_candidate(source, &floor_options, &mut SearchStop::never())?
+            .filter(|topology| topology.is_strictly_smaller_than(&complete))
+    } else {
+        None
+    };
     let mut parse_cache = TerminalParseCache::default();
-    let (complete, slid) = finish_mandatory_default_endpoint(
+    let (complete, slid) = finish_complete_default_lineage(
         source,
         &floor_options,
         progress,
         &mut parse_cache,
         complete,
     )?;
+    let (complete, slid) = match topology {
+        Some(mut topology) => {
+            topology.plans.clear();
+            let (topology, topology_slid) = finish_complete_default_lineage(
+                source,
+                &floor_options,
+                progress,
+                &mut parse_cache,
+                topology,
+            )?;
+            let endpoint = slid.as_ref().unwrap_or(&complete);
+            if topology_slid
+                .as_ref()
+                .unwrap_or(&topology)
+                .is_strictly_smaller_than(endpoint)
+            {
+                (topology, topology_slid)
+            } else {
+                (complete, slid)
+            }
+        }
+        None => (complete, slid),
+    };
     // R6–R9 run under the caller's Max allowance, not as mandatory work.
     let mut complete = complete;
     for search in [
@@ -2975,6 +3037,33 @@ fn build_deft4j_source_candidate(
     };
     build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
         .map(|candidate| Some(candidate.named("deft4j-derived source")))
+}
+
+/// Build D4's candidate in the source's own block layout: each nonempty block
+/// gets the smaller of its ordinary plan and its length-family chain. A
+/// reached stop leaves no candidate.
+fn build_source_family_candidate(
+    source: CandidateInput<'_>,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Result<Option<Candidate>> {
+    let mut plans = Vec::new();
+    if plans.try_reserve_exact(source.blocks.len()).is_err() {
+        return Ok(None);
+    }
+    let mut alignment = 0_u8;
+    for block in source.blocks.iter().filter(|block| !block.plain.is_empty()) {
+        if stop.reached() {
+            return Ok(None);
+        }
+        let ordinary = plan_block(block, alignment, options, &mut *stop);
+        let plan = plan_length_family_chain(block, alignment, options, ordinary.bits, stop)
+            .unwrap_or(ordinary);
+        alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
+        plans.push(plan);
+    }
+    build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)
+        .map(|candidate| Some(candidate.named("source family chains")))
 }
 
 /// Build the no-split source candidate (M2) with the pruning policy chosen by

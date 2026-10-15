@@ -1928,6 +1928,29 @@ fn no_split_route_uses_bounded_source_size_and_topology() {
 }
 
 #[test]
+fn default_source_topology_uses_the_no_split_class_above_a_decoded_floor() {
+    let parsed = parse_stream(&[0x4b, 0x04, 0x00], 1).unwrap();
+    let blocks = vec![
+        parsed.blocks[0].try_clone_shared().unwrap(),
+        parsed.blocks[0].try_clone_shared().unwrap(),
+    ];
+    let floor = DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED;
+    assert!(default_source_topology_eligible(&blocks, 1, floor));
+    // Small streams such as APNG frames are left to the planner.
+    assert!(!default_source_topology_eligible(&blocks, 1, floor - 1));
+    // The no-split route's size and topology bounds still apply.
+    assert!(!default_source_topology_eligible(
+        &blocks,
+        NARROW_SOURCE_MAX_COMPRESSED + 1,
+        floor
+    ));
+    assert!(!default_source_topology_eligible(&blocks[..1], 1, floor));
+    let mut stored = blocks;
+    stored[0].source_type = SourceBlockType::Stored;
+    assert!(!default_source_topology_eligible(&stored, 1, floor));
+}
+
+#[test]
 fn max_replay_ceiling_covers_every_strict_stream_score() {
     assert_eq!(resolved_replay_limit(MAX_RAW_REPLAY_LIMIT, 10), 80);
     assert_eq!(resolved_replay_limit(DEFAULT_RAW_REPLAY_LIMIT, 10), 3);
