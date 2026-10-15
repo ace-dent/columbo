@@ -35,8 +35,9 @@ use super::restore::{
 use super::search::{
     compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
-    plan_block_with_integrated_proven_search, plan_length_family_chain, plan_terminal_token_replay,
-    rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    plan_block_with_integrated_proven_search, plan_block_with_seeded_narrow_search,
+    plan_length_family_chain, plan_terminal_token_replay, rewrite_258_symbols,
+    same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::source_recode::plan_source_blocks;
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
@@ -3039,9 +3040,11 @@ fn build_deft4j_source_candidate(
         .map(|candidate| Some(candidate.named("deft4j-derived source")))
 }
 
-/// Build D4's candidate in the source's own block layout: each nonempty block
-/// gets the smaller of its ordinary plan and its length-family chain. A
-/// reached stop leaves no candidate.
+/// Build D4's candidate in the source's own block layout. Each nonempty block
+/// is seeded with the smaller of its ordinary plan and its length-family
+/// chain, then searched from that seed with the no-split route's narrow
+/// whole-block search, which adds the large-source length bands. A reached
+/// stop leaves no candidate.
 fn build_source_family_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3057,13 +3060,15 @@ fn build_source_family_candidate(
             return Ok(None);
         }
         let ordinary = plan_block(block, alignment, options, &mut *stop);
-        let plan = plan_length_family_chain(block, alignment, options, ordinary.bits, stop)
+        let seed = plan_length_family_chain(block, alignment, options, ordinary.bits, stop)
             .unwrap_or(ordinary);
+        let plan =
+            plan_block_with_seeded_narrow_search(block, alignment, options, false, seed, stop);
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
         plans.push(plan);
     }
     build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)
-        .map(|candidate| Some(candidate.named("source family chains")))
+        .map(|candidate| Some(candidate.named("source layout")))
 }
 
 /// Build the no-split source candidate (M2) with the pruning policy chosen by

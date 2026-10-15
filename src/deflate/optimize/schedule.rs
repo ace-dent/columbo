@@ -520,10 +520,11 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
 
 /// Build Default's source topology (D4), returned only when it is already
 /// strictly smaller than the selected candidate. The source's own blocks,
-/// each re-spelled by a length-family chain, can reach a different basin from
-/// the planner's, whose match-by-match expansion stops where every remaining
-/// match is cheaper than its literals alone. Both endpoints are then finished
-/// and the smaller kept, so the planner's endpoint is never lost.
+/// each re-spelled by a length-family chain and searched from it, can reach a
+/// different basin from the planner's, whose match-by-match expansion stops
+/// where every remaining match is cheaper than its literals alone. Both
+/// endpoints are then finished and the smaller kept, so the planner's endpoint
+/// is never lost.
 fn build_default_source_topology(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -532,7 +533,7 @@ fn build_default_source_topology(
     if !(eligibility.default_source_topology && context.deadline.can_start_route()) {
         return Ok(None);
     }
-    let step = context.progress.start("Source family chains");
+    let step = context.progress.start("Source-layout search");
     let topology = build_source_family_candidate(
         context.source,
         context.options,
