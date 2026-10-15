@@ -2086,3 +2086,38 @@ fn length_family_chain_respells_a_block_below_its_bound() {
     )
     .is_none());
 }
+
+#[test]
+fn respell_from_literals_keeps_only_paying_matches_below_its_bound() {
+    let block = parsed_aba_block(aba_tokens_with_dearer_matches());
+    let options = Options::default();
+    let ordinary = plan_block(&block, 0, &options, &mut SearchStop::never());
+    let plan =
+        plan_respell_from_literals(&block, 0, &options, ordinary.bits, &mut SearchStop::never())
+            .unwrap();
+    assert!(plan.bits < ordinary.bits);
+    assert_eq!(&plan.plain[..], &block.plain[..]);
+    let decoded_len: usize = plan.tokens.iter().map(|token| token.decoded_len()).sum();
+    assert_eq!(decoded_len, block.plain.len());
+    assert!(
+        plan_respell_from_literals(&block, 0, &options, plan.bits, &mut SearchStop::never())
+            .is_none()
+    );
+    assert!(plan_respell_from_literals(
+        &block,
+        0,
+        &options,
+        ordinary.bits,
+        &mut SearchStop::always()
+    )
+    .is_none());
+    // A block without matches has nothing to re-spell.
+    let literals_only: Vec<_> = (0..600)
+        .map(|i| Token::Literal(if i % 3 == 2 { b'b' } else { b'a' }))
+        .collect();
+    let block = parsed_aba_block(literals_only);
+    assert!(
+        plan_respell_from_literals(&block, 0, &options, u64::MAX, &mut SearchStop::never())
+            .is_none()
+    );
+}

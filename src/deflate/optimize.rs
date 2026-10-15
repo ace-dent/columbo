@@ -36,8 +36,8 @@ use super::search::{
     compact_proven_submatch_route_eligible, improve_plan_with_header_aware_proven_composition,
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
     plan_block_with_integrated_proven_search, plan_block_with_seeded_narrow_search,
-    plan_length_family_chain, plan_terminal_token_replay, rewrite_258_symbols,
-    same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    plan_length_family_chain, plan_respell_from_literals, plan_terminal_token_replay,
+    rewrite_258_symbols, same_distance_opportunities, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::source_recode::plan_source_blocks;
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
@@ -3041,10 +3041,10 @@ fn build_deft4j_source_candidate(
 }
 
 /// Build D4's candidate in the source's own block layout. Each nonempty block
-/// is seeded with the smaller of its ordinary plan and its length-family
-/// chain, then searched from that seed with the no-split route's narrow
-/// whole-block search, which adds the large-source length bands. A reached
-/// stop leaves no candidate.
+/// is seeded with the smallest of its ordinary plan, its length-family chain
+/// and its re-spell from literals, then searched from that seed with the
+/// no-split route's narrow whole-block search, which adds the large-source
+/// length bands. A reached stop leaves no candidate.
 fn build_source_family_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3060,8 +3060,13 @@ fn build_source_family_candidate(
             return Ok(None);
         }
         let ordinary = plan_block(block, alignment, options, &mut *stop);
-        let seed = plan_length_family_chain(block, alignment, options, ordinary.bits, stop)
+        let mut seed = plan_length_family_chain(block, alignment, options, ordinary.bits, stop)
             .unwrap_or(ordinary);
+        if let Some(respelled) =
+            plan_respell_from_literals(block, alignment, options, seed.bits, stop)
+        {
+            seed = respelled;
+        }
         let plan =
             plan_block_with_seeded_narrow_search(block, alignment, options, false, seed, stop);
         alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;

@@ -3381,6 +3381,64 @@ pub(crate) fn plan_length_family_chain(
     best
 }
 
+/// D4's re-spell from literals for one block. Starting from deft4j's heap
+/// codes for the block's bytes as literals, where no match has a code, each
+/// pass keeps exactly the source matches that cost less than their literals
+/// under the current codes, then rebuilds the codes from the new counts, until
+/// the spelling repeats or after [`PRUNE_CHAIN_PASSES`] passes. Unlike the
+/// prune chains, a match dropped in one pass can return in the next. Starting
+/// from literals keeps only matches that clearly pay before their codes shape
+/// the tree, which can reach a smaller spelling than pruning down from the
+/// source's matches. Every state is planned exactly; the smallest plan is
+/// returned if it is strictly below `bound`.
+pub(crate) fn plan_respell_from_literals(
+    block: &ParsedBlock,
+    alignment: u8,
+    options: &Options,
+    bound: u64,
+    stop: &mut SearchStop<'_>,
+) -> Option<PlannedBlock> {
+    if block
+        .distance_frequencies
+        .iter()
+        .all(|&frequency| frequency == 0)
+    {
+        return None;
+    }
+    let mut byte_frequencies = [0_u32; 286];
+    for &byte in block.plain.iter() {
+        byte_frequencies[usize::from(byte)] += 1;
+    }
+    byte_frequencies[256] += 1;
+    let (mut literal, _) = deft4j_heap_lengths(&byte_frequencies, &[0; 30], options.strict);
+    let mut distance = vec![0_u8; 30];
+    let mut previous: Option<Vec<Token>> = None;
+    let mut best: Option<PlannedBlock> = None;
+    for _ in 0..PRUNE_CHAIN_PASSES {
+        if stop.reached() {
+            break;
+        }
+        let tokens = match expand_matches(&block.tokens, &block.plain, &literal, &distance, true) {
+            Some(tokens) => tokens,
+            None => try_clone_token_candidate(&block.tokens, block.plain.len())?,
+        };
+        if previous.as_ref() == Some(&tokens) {
+            break;
+        }
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let state = try_clone_token_candidate(&tokens, block.plain.len())?;
+        if let Some(plan) = deft4j_rebuild(block, state, alignment, options, stop) {
+            if plan.bits < best.as_ref().map_or(bound, |best| best.bits) {
+                best = Some(plan);
+            }
+        }
+        (literal, distance) =
+            deft4j_heap_lengths(&literal_frequencies, &distance_frequencies, options.strict);
+        previous = Some(tokens);
+    }
+    best
+}
+
 /// The length symbol whose matches together cost least, or save most, when
 /// spelled as literals under these codes, priced as the table replay prices
 /// them; ties keep the lowest symbol.
