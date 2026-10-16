@@ -1221,6 +1221,17 @@ fn terminal_merges_follow_the_settled_finish() {
     .unwrap()
     .unwrap();
     assert_eq!(merged_blocks(&slid), 1);
+    // R18 ends the finish at the bounded-depth tree floor's fixed point, so
+    // the merged block has no strictly smaller depth-limited tree left.
+    assert!(refine_with_bounded_depth_tree_floor(
+        &slid,
+        &options,
+        1 << 20,
+        identity,
+        &mut SearchStop::never(),
+    )
+    .unwrap()
+    .is_none());
 }
 
 #[test]

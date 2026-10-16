@@ -90,7 +90,7 @@ Code comments and the route documentation rely on these project terms.
 - **Deadline and grace**: the soft deadline stops new routes from starting;
   active work may continue for a grace of 10% of the timeout plus one second,
   until the hard stop.
-- **Route labels**: D1–D4, G0, R1–R17, M0–M13, S0, and their suffixed variants
+- **Route labels**: D1–D4, G0, R1–R18, M0–M13, S0, and their suffixed variants
   name gates and routes in the
   [route-gate reference](routes-and-methods.md#route-gate-reference).
 

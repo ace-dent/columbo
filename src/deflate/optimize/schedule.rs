@@ -1958,7 +1958,8 @@ fn run_deferred_source_max_split(
     Ok(())
 }
 
-/// Apply the terminal tree floors (Max only), then the terminal methods.
+/// Apply the terminal tree floors (Max only), then the terminal methods, then
+/// the tree floors once more (R18).
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -1985,14 +1986,18 @@ fn finish_terminal_searches(
     } else {
         terminal_work
     };
-    improve_with_terminal_searches(
+    let candidate = improve_with_terminal_searches(
         source,
         options,
         restoration_work,
         terminal_work,
         progress,
         candidate,
-    )
+    )?;
+    // R18: the blocks R13–R17 cut, merged or re-spelled have not had the
+    // bounded-depth and compact tree families, nor have APNG Default frames,
+    // which skip the first floors.
+    improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)
 }
 
 #[cfg(test)]

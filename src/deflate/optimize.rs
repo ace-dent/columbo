@@ -2606,6 +2606,14 @@ fn slid_default_endpoint(
         parse_cache,
         slid,
     )?;
+    // R18, as Default's finish ends.
+    let slid = improve_with_terminal_tree_floors(
+        source,
+        floor_options,
+        DefaultFloorWork::Mandatory,
+        progress,
+        slid,
+    )?;
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 
