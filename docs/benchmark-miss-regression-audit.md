@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 13 October 2026 entry is the current state. Entries from 30 September keep
+The 16 October 2026 entry is the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,96 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+## R15–R17 and D4 on 16 October 2026
+
+### Benchmark state
+
+All four reports come from executable `f6ce13ca…` (`9d5f818`), which adds R15
+entropy cuts and their header-aware fallback, R16 terminal merges, R17
+terminal token replay, and D4 with its length-family chains, narrow search
+and re-spell from literals. Against the `3ceab7ae…` reports at the same
+allowances:
+
+| Benchmark | Result |
+| --- | --- |
+| Defluff, 66 pairs | Bytes unchanged: −109 against Defluff, no misses; `047-Parasect.png` 6 bits smaller |
+| DeflOpt Default, 957 rows | 337 smaller, 620 identical, none larger; net −191,908 bytes / −1,535,205 bits; runtime 1,286.1 → 876.2 s |
+| DeflOpt Max, 904 rows with unchanged allowances | 282 smaller, 609 identical, 13 larger; net −21,485 bytes / −171,813 bits; runtime 8,717.6 → 8,374.4 s |
+| Timed deft4j, 1,621 pairs | 390 smaller, 1,213 identical, 18 larger; net −111,035 bytes / −888,259 bits; runtime 17,427.9 → 16,313.6 s |
+
+The largest gains are the Partnership card (−60,156 bytes Default, −57,413
+timed deft4j), `floor pattern.png`, `kzipmix-20200115-linux-static.tar.gz`
+(−16,888) and `download_webp`. Every Max row is no larger than its Default
+row. The runtimes come from separate complete runs and are observations, not
+isolated speedups.
+
+### Reference misses
+
+Unchanged: `samplelib-png/sample-green-400x300.png` and `small/T_Grass.png`
+in both DeflOpt modes, and `sample-green` and
+`pkmn-col-hard/066-Machop-2.png` in timed deft4j, one byte each. All are
+strict-policy floors: each reference sends a single one-bit distance code or
+an empty distance alphabet, which strict output must complete. With
+`--strict 0` the current executable matches or beats every reference in
+Default and Max (`sample-green` 360 = 360, `T_Grass` 443 < 444, `Machop-2`
+449 = 449 bytes).
+
+### Rows that grew
+
+34 Max rows grew in bytes or bits across DeflOpt Max and timed deft4j. Quiet
+serial reruns of both executables at each recorded allowance, two repeats
+each, net +27 bytes over both repeats; half the losses do not repeat or
+reverse (`sample_39-fs8.png` −11, `284.png` −15, `filter_0_for_rgba_16.png`
+−25 at its earlier 19-second allowance). Builds of every intermediate commit
+attribute the repeating ones at 10 seconds to the code-length tree speedup
+(`dc68b5f`: `sample_60.png` +10, `crossroads.png` +5), the header-plan store
+(`2b40fb0`: `paperplane-fs8.png` +16, three oxipng files 1–3) and R15
+(`kpic_src.zip` +1). Neither speedup changes an output given time: both are
+deadline paths. At 60 seconds every repeating loss ties or reverses
+(`sample_60.png` −6, `interlaced_grayscale_16_should_be_grayscale_8.png` −8)
+except two:
+
+- `css-ig-net/Apple512.png`, +36 bytes, stable at 60 and 240 seconds, from
+  `9d5f818`. Both lineages of single-image PNG Max select the same main
+  stream; the loss is the [early-lineage parent effect](#early-lineage-parent-8-october)
+  again. The quick Default parent now includes D4's re-spelled endpoint
+  (Default 224,375 → 221,438 bytes), and its `Established` refinement ends at
+  218,338 bytes of image data instead of 218,302.
+- `kensilverman-zip/kpic_src.zip`, +1 byte, stable, from R15 through ZIP
+  Max's refined Default.
+
+Rejected alternative: leaving D4 out of the early lineage's quick parent,
+which the main lineage's mandatory floor already covers. It restored
+Apple512 (221,245 bytes) and was neutral on 116 D4-eligible validation PNGs
+in Max at 10 seconds (8 smaller, 10 larger, net 0), but on the 130 benchmark
+PNGs whose Default output shrank and that decode to at least 128 KiB it was
+11 smaller and 13 larger, net +220 bytes (`Cherry512.png` +113,
+`file05.png` +155). The refined D4 parent helps more than it hurts, so the
+two losses are accepted against the corpus gains.
+
+### Hundred-file guard
+
+88 of 100 floors pass at their recorded allowances; the two repeating losses
+of 13 October (`grayscale_alpha_8`, `skinsrc.zip`) now pass. The previous
+benchmark executable (`c3c6f60`) fails 11 of the same 12 floors and is equal
+or further from nine of them (`paperplane-fs8.png` +48 against +1 now,
+`test-conversion-truecoloralpha-grayscalealpha.png` +10 against +2). Psyduck,
+Squirtle and Pikachu keep their one-bit early-lineage cause, and Poliwrath's
+2-bit floor is timing-dependent. At four times the recorded allowance, six of
+the eight byte failures reach or beat their floors: `paperplane-fs8.png`
+9,053 = 9,053, `Gingerman.png` 80,823 < 80,828, `Death.png` 21,056 < 21,057,
+`sample_71.png` 52,573 < 52,594, `test-conversion-truecoloralpha-paletted.png`
+2,996 < 3,004 and `sample_25.png` 11,798 < 11,806. The others:
+
+- `crossroads.png` (floor 2,123): every build's complete Max search, 48
+  seconds, ends at 2,128. At 10 seconds the deadline cuts the source-max
+  route at 16,381 bits and the terminal methods take that parent to 16,215;
+  given time the route reaches a better parent, 16,358 bits, which finishes
+  at 16,221. A better parent finishing worse is the path dependence recorded
+  for the early lineage; only refining both parents would recover it.
+- `test-conversion-truecoloralpha-grayscalealpha.png` stays 2 bytes above its
+  floor at 40 seconds.
 
 ## Smoothed-tree finish and Huffman repair on 13 October 2026
 
@@ -129,6 +219,8 @@ boundary slide and R13, the distance-alphabet ladder. Against the
 Misses are unchanged: four DeflOpt rows on two files and twelve deft4j rows,
 all strict misses.
 
+<a id="rows-that-grew-9-october"></a>
+
 ### Rows that grew
 
 Quiet runs of both executables at each recorded allowance:
@@ -144,7 +236,7 @@ Quiet runs of both executables at each recorded allowance:
   executables.
 
 All three repeating losses are the
-[early-lineage parent effect](#rows-that-grew-1) of 8 October. R13 also
+[early-lineage parent effect](#early-lineage-parent-8-october) of 8 October. R13 also
 improves the PNG early lineage's quick floor (Apricot512 300,389 → 300,284
 bytes; Psyduck 1,567 → 1,566 bits). The `Established` refinement then ends
 worse from that better parent (Apricot512: 296,654 instead of 296,293 bytes of
@@ -175,6 +267,8 @@ alternatives:
   Squirtle and Apricot512 refine until the deadline, so only Pikachu recovered
   (2,090 → 2,089 bits), for 2.9 seconds more wall time on that file. One bit
   does not justify extra wall time on every image that finishes early.
+
+<a id="guard-9-october"></a>
 
 ### Hundred-file guard
 
@@ -332,6 +426,8 @@ whose mandatory floor overran a 14-second allowance to 22 seconds.
 | DeflOpt, 1,914 rows, against the `c2678492…` journal | Default identical on all 957 rows. Max 242 smaller, 701 identical, 14 larger; net −11,602 bytes / −92,826 bits; Max runtime 9,634.1 → 9,596.9 s. The same four strict misses remain; the relaxed audit, included in this run, shows all four reach parity. No Max row is worse than Default |
 | Defluff, 66 pairs | Unchanged: 61 wins and five ties, −109 bytes / −932 bits |
 
+<a id="early-lineage-parent-8-october"></a>
+
 ### Rows that grew
 
 Ten of the eleven larger deft4j rows are not regressions of this change: quiet
@@ -369,6 +465,8 @@ other twelve. The deft4j runner then rotated `grayscale_alpha_8` and the three
 accepted build misses for these reasons.
 
 ## Strict distance completion on 30 September 2026
+
+<a id="reference-misses-30-september"></a>
 
 ### Reference misses
 
@@ -537,16 +635,16 @@ Current:
   better parent: `grayscale_alpha_8` on 8 October, and Apricot512, Psyduck,
   Squirtle and Pikachu on 9 October. Parent size does not predict the better
   endpoint, and each fix tried cost more bytes or time than it recovered
-  ([8 October](#rows-that-grew-1), [9 October](#rows-that-grew)).
+  ([8 October](#early-lineage-parent-8-october), [9 October](#rows-that-grew-9-october)).
 - **Timing.** Poliwrath's floor depends on timing, `sample_61-fs8.png` and
   `LevelLoading.png` reach theirs only with more time
-  ([guard](#hundred-file-guard)), and `my-computer-on-fs8.png` is
+  ([guard](#guard-9-october)), and `my-computer-on-fs8.png` is
   time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets a
   file-specific rule.
 - **Strict policy.** The strict misses are the cost of strict output; relaxed
   output reaches parity on all but the signed PNG
   ([DeflOpt](#deflopt-misses-are-strict-policy-floors),
-  [deft4j](#reference-misses)).
+  [deft4j](#reference-misses-30-september)).
 
 Accepted on 8 September 2026 and since superseded:
 
