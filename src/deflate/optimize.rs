@@ -147,6 +147,18 @@ pub(crate) struct RawOptimization {
     pub(crate) timed_out: bool,
 }
 
+/// Where Default runs R2–R4, which fit code lengths and headers to the codes a
+/// tree family has chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderFit {
+    /// In the sweep, after R1b: the floor phase has already run the terminal
+    /// tree floors.
+    InSweep,
+    /// After R18: `ApngDefault` skips the first tree floors, so only R14 and
+    /// R18 choose the codes, and a fit made before them is replaced.
+    AfterTreeFloors,
+}
+
 /// How a caller establishes the Default comparison floor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DefaultFloor {
@@ -1927,6 +1939,14 @@ impl TerminalHeaderSearch {
         )
     }
 
+    /// R2–R4: fits to the codes as they stand ([`HeaderFit`]).
+    fn fits_codes(self) -> bool {
+        matches!(
+            self,
+            Self::PayloadTradeoff | Self::LiteralSpan | Self::JointTreeRle
+        )
+    }
+
     fn max_only(self) -> bool {
         matches!(
             self,
@@ -2069,6 +2089,7 @@ fn improve_with_terminal_searches(
     default_work: DefaultFloorWork<'_>,
     max_work: DefaultFloorWork<'_>,
     progress: Progress,
+    header_fit: HeaderFit,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     let mut visited = [None; 16];
@@ -2114,6 +2135,12 @@ fn improve_with_terminal_searches(
         {
             let max_only = search.max_only();
             if max_only && !options.exhaustive {
+                continue;
+            }
+            if !options.exhaustive
+                && header_fit == HeaderFit::AfterTreeFloors
+                && search.fits_codes()
+            {
                 continue;
             }
             let score = (candidate.data.len(), candidate.bits);
@@ -2579,6 +2606,7 @@ fn slid_default_endpoint(
     progress: Progress,
     parse_cache: &mut TerminalParseCache,
     complete: &Candidate,
+    header_fit: HeaderFit,
 ) -> Result<Option<Candidate>> {
     let slid = improve_with_terminal_header_search(
         TerminalHeaderSearch::BoundarySlide,
@@ -2607,14 +2635,51 @@ fn slid_default_endpoint(
         slid,
     )?;
     // R18, as Default's finish ends.
-    let slid = improve_with_terminal_tree_floors(
+    let mut slid = improve_with_terminal_tree_floors(
         source,
         floor_options,
         DefaultFloorWork::Mandatory,
         progress,
         slid,
     )?;
+    if header_fit == HeaderFit::AfterTreeFloors {
+        slid = improve_with_final_header_fit(
+            source,
+            floor_options,
+            DefaultFloorWork::Mandatory,
+            progress,
+            parse_cache,
+            slid,
+        )?;
+    }
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
+}
+
+/// R2–R4 after R18, for [`HeaderFit::AfterTreeFloors`].
+fn improve_with_final_header_fit(
+    source: CandidateInput<'_>,
+    options: &Options,
+    work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    for search in [
+        TerminalHeaderSearch::PayloadTradeoff,
+        TerminalHeaderSearch::LiteralSpan,
+        TerminalHeaderSearch::JointTreeRle,
+    ] {
+        candidate = improve_with_terminal_header_search(
+            search,
+            source,
+            options,
+            work,
+            progress,
+            parse_cache,
+            candidate,
+        )?;
+    }
+    Ok(candidate)
 }
 
 /// Default's R1b–R5 finish for one of Max's mandatory endpoints, returning
@@ -2630,6 +2695,7 @@ fn finish_mandatory_default_endpoint(
     progress: Progress,
     parse_cache: &mut TerminalParseCache,
     base: Candidate,
+    header_fit: HeaderFit,
 ) -> Result<(Candidate, Option<Candidate>)> {
     let completed = improve_with_terminal_header_search(
         TerminalHeaderSearch::StrictDistanceCompletion,
@@ -2641,9 +2707,47 @@ fn finish_mandatory_default_endpoint(
         base.clone(),
     )?;
     let completion_won = completed.is_strictly_smaller_than(&base);
+    if header_fit == HeaderFit::AfterTreeFloors {
+        // Default's endpoint runs R5, the finish and R18, then R2–R4; Max's
+        // parent keeps R2–R5 in Max's sweep order.
+        let symbol_sets = improve_with_terminal_header_search(
+            TerminalHeaderSearch::SymbolSets,
+            source,
+            floor_options,
+            DefaultFloorWork::Mandatory,
+            progress,
+            parse_cache,
+            completed.clone(),
+        )?;
+        let exact = slid_default_endpoint(
+            source,
+            floor_options,
+            progress,
+            parse_cache,
+            &symbol_sets,
+            header_fit,
+        )?
+        .unwrap_or(symbol_sets);
+        let parent = finish_default_header_searches(
+            source,
+            floor_options,
+            progress,
+            parse_cache,
+            if completion_won { base } else { completed },
+        )?;
+        let slid = exact.is_strictly_smaller_than(&parent).then_some(exact);
+        return Ok((parent, slid));
+    }
     let endpoint =
         finish_default_header_searches(source, floor_options, progress, parse_cache, completed)?;
-    let slid = slid_default_endpoint(source, floor_options, progress, parse_cache, &endpoint)?;
+    let slid = slid_default_endpoint(
+        source,
+        floor_options,
+        progress,
+        parse_cache,
+        &endpoint,
+        header_fit,
+    )?;
     if !completion_won {
         return Ok((endpoint, slid));
     }
@@ -2668,7 +2772,14 @@ fn finish_complete_default_lineage(
         progress,
         base,
     )?;
-    finish_mandatory_default_endpoint(source, floor_options, progress, parse_cache, restored)
+    finish_mandatory_default_endpoint(
+        source,
+        floor_options,
+        progress,
+        parse_cache,
+        restored,
+        HeaderFit::InSweep,
+    )
 }
 
 /// Default's R2–R5 terminal header searches, in their sweep order.
@@ -2815,6 +2926,7 @@ fn build_complete_apng_default_floor_candidate(
         progress,
         &mut parse_cache,
         restored,
+        HeaderFit::AfterTreeFloors,
     )?;
     for search in [
         TerminalHeaderSearch::AlphabetBoundaries,

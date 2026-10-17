@@ -37,20 +37,20 @@ use super::{
     default_source_topology_eligible, deft4j_source_route_eligible, established_floor_candidate,
     floor_exposes_new_search_states, floor_seeded_priority_with_structural_sibling, gain_is_below,
     has_multiple_nonempty_blocks, improve_default_floor_with_feedback,
-    improve_with_terminal_searches, improve_with_terminal_tree_floors,
-    independent_deft4j_refinement_can_overlap, is_strictly_better, join_route,
-    narrow_source_route_eligible, normalize_258_aliases, parallel_route_is_bounded,
-    parse_validated_rewrite, prebuild_bounded_floor, prepare_compact_source_split_seed,
-    refine_bounded_deft4j_lineage, refine_with_compact_balanced_tree_floor,
-    refine_with_compact_proven_feedback, refine_with_compact_source_split_floor,
-    refine_with_compact_source_split_floor_until, refine_with_max_planner,
-    refine_with_no_split_route, refine_with_terminal_source_split_floor_until,
-    replace_optional_if_smaller, source_run_match_count_exceeds, spawn_route,
-    BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy, BoundedRoutes,
-    Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork, RawInfo,
-    RawOptimization, ReplayPlanner, StreamIdentity, TerminalShare,
-    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
-    WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    improve_with_final_header_fit, improve_with_terminal_searches,
+    improve_with_terminal_tree_floors, independent_deft4j_refinement_can_overlap,
+    is_strictly_better, join_route, narrow_source_route_eligible, normalize_258_aliases,
+    parallel_route_is_bounded, parse_validated_rewrite, prebuild_bounded_floor,
+    prepare_compact_source_split_seed, refine_bounded_deft4j_lineage,
+    refine_with_compact_balanced_tree_floor, refine_with_compact_proven_feedback,
+    refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
+    refine_with_max_planner, refine_with_no_split_route,
+    refine_with_terminal_source_split_floor_until, replace_optional_if_smaller,
+    source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
+    BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, DefaultFloor,
+    DefaultFloorWork, HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity,
+    TerminalParseCache, TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED,
+    DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
 use crate::deflate::model::{ParsedBlock, ParsedStream};
@@ -1959,7 +1959,7 @@ fn run_deferred_source_max_split(
 }
 
 /// Apply the terminal tree floors (Max only), then the terminal methods, then
-/// the tree floors once more (R18).
+/// the tree floors once more (R18), then, for `ApngDefault`, R2–R4.
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -1986,18 +1986,36 @@ fn finish_terminal_searches(
     } else {
         terminal_work
     };
+    let header_fit = if !options.exhaustive && default_floor == DefaultFloor::ApngDefault {
+        HeaderFit::AfterTreeFloors
+    } else {
+        HeaderFit::InSweep
+    };
     let candidate = improve_with_terminal_searches(
         source,
         options,
         restoration_work,
         terminal_work,
         progress,
+        header_fit,
         candidate,
     )?;
     // R18: the blocks R13–R17 cut, merged or re-spelled have not had the
     // bounded-depth and compact tree families, nor have APNG Default frames,
     // which skip the first floors.
-    improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)
+    let candidate =
+        improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
+    if header_fit == HeaderFit::InSweep {
+        return Ok(candidate);
+    }
+    improve_with_final_header_fit(
+        source,
+        options,
+        restoration_work,
+        progress,
+        &mut TerminalParseCache::default(),
+        candidate,
+    )
 }
 
 #[cfg(test)]

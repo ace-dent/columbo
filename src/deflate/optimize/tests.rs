@@ -1086,6 +1086,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
         DefaultFloorWork::Mandatory,
         DefaultFloorWork::Timed(&deadline),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -1115,6 +1116,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
         progress,
         &mut TerminalParseCache::default(),
         &parent,
+        HeaderFit::InSweep,
     )
     .unwrap()
     .unwrap();
@@ -1206,6 +1208,7 @@ fn terminal_merges_follow_the_settled_finish() {
         DefaultFloorWork::Mandatory,
         DefaultFloorWork::Timed(&deadline),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -1217,6 +1220,7 @@ fn terminal_merges_follow_the_settled_finish() {
         progress,
         &mut TerminalParseCache::default(),
         &parent,
+        HeaderFit::InSweep,
     )
     .unwrap()
     .unwrap();
@@ -1225,6 +1229,29 @@ fn terminal_merges_follow_the_settled_finish() {
     // the merged block has no strictly smaller depth-limited tree left.
     assert!(refine_with_bounded_depth_tree_floor(
         &slid,
+        &options,
+        1 << 20,
+        identity,
+        &mut SearchStop::never(),
+    )
+    .unwrap()
+    .is_none());
+    // With `ApngDefault`'s order the endpoint still merges, and R2–R4 run
+    // last, so R4 has nothing left to fit.
+    let apng_slid = slid_default_endpoint(
+        source,
+        &options,
+        progress,
+        &mut TerminalParseCache::default(),
+        &parent,
+        HeaderFit::AfterTreeFloors,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(merged_blocks(&apng_slid), 1);
+    assert!(refine_with_terminal_header_search(
+        TerminalHeaderSearch::JointTreeRle,
+        &apng_slid,
         &options,
         1 << 20,
         identity,
@@ -3813,6 +3840,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&deadline),
         DefaultFloorWork::Timed(&deadline),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -3836,6 +3864,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&deadline),
         DefaultFloorWork::Timed(&deadline),
         progress,
+        HeaderFit::InSweep,
         closed.clone(),
     )
     .unwrap();
@@ -3855,6 +3884,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Mandatory,
         DefaultFloorWork::Timed(&expired),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -3864,6 +3894,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Mandatory,
         DefaultFloorWork::Timed(&expired),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -3875,6 +3906,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&expired),
         DefaultFloorWork::Timed(&expired),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -3940,6 +3972,7 @@ fn default_sweep_finishes_with_the_distance_ladder() {
         DefaultFloorWork::Mandatory,
         DefaultFloorWork::Timed(&deadline),
         progress,
+        HeaderFit::InSweep,
         parent.clone(),
     )
     .unwrap();
@@ -3954,6 +3987,7 @@ fn default_sweep_finishes_with_the_distance_ladder() {
         progress,
         &mut TerminalParseCache::default(),
         &parent,
+        HeaderFit::InSweep,
     )
     .unwrap()
     .unwrap();

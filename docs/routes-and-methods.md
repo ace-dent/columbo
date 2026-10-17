@@ -293,7 +293,9 @@ flowchart TD
 
 `ApngDefault` skips D1–D3 and the terminal tree floors; Max runs them for
 APNG. R18 runs the tree floors at the end of every finish, APNG frames
-included. D4 applies under every Default policy.
+included. Because only R14 and R18 choose `ApngDefault`'s codes, it runs R2–R4,
+which fit lengths and headers to the chosen codes, after R18 instead of in the
+sweep. D4 applies under every Default policy.
 
 #### Bounded max
 
@@ -488,7 +490,9 @@ floors once more on the final blocks.
 Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`,
 `SharedExact`, and `ApngMax`) run Default's sweep but keep its R1c and R13–R18
 finish, and an R1b win, only as a final competitor compared after Max's terminal
-sweeps; Max's own sweep applies those steps to its final incumbent. Max may also
+sweeps; Max's own sweep applies those steps to its final incumbent. `ApngMax`'s
+APNG Default endpoint follows `ApngDefault`'s order, R2–R4 after R18, while
+Max's parent keeps them in the sweep. Max may also
 strengthen a completed ordinary or APNG Default endpoint with R6–R9, within the
 existing deadline or route window, before continuing from its Max seed. With a
 G0t share, G0 uses the primary phase deadline through M10d and the full
@@ -518,7 +522,7 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | R1 · original-match restoration | Parent differs from the original; both ≤128 KiB compressed and decoded; each layout ≤128 blocks; ≥1 original match certificate; parser keeps every wire block; Huffman blocks ≤16 Ki tokens; a certificate clipped to its block spans 3–4,096 decoded bytes, meets token boundaries, and includes selected literals; G0 (not in Max's mandatory Default floor). | Restores certified source matches under the final trees and headers: ≤2^20 DP edge evaluations per stream; no replay; source stored and literal bytes uncertified. Keeps completed repairs at the hard stop. Must strictly improve bytes and bits, including stored alignment; reports the actual maximum distance to wrappers. [Validation](research/permanent-match-proofs-validation.md). |
 | R1b · strict distance completion | Strict; after R1; G0. Each dynamic block using ≤1 distance symbol with a strictly compatible parent header. | Prices, against planning's two one-bit distance codes, the four uniform complete trees of depth 1–4 (contiguous, covering the used symbol), literal/length tree kept: ≤4 prices per block, 1,024 per stream. [Validation](benchmark-miss-regression-audit.md#strict-distance-completion-on-30-september-2026); [final-competitor evidence](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor). |
 | R1c · fixed-tree boundary slide | After R5 (Default) or R11 (Max); also ends the PNG early lineage's quick floor, a seed only ([evidence](benchmark-miss-regression-audit.md#early-lineage-parent-8-october)). No size or block limit; linear per round. Boundaries between two non-stored blocks only. | Moves each boundary to the cheapest token cut both fixed trees can price (blocks stay nonempty; ties keep the cut), ≤16 sweeps while payload falls; re-plans moved blocks, keeping the cheaper code (ties keep the header), and repeats, ≤16 strictly improving rounds. Tokens keep their spelling; a match joining the neighbor costs the cheaper of its spelling and its literals. Stored blocks (including blocks re-planned as stored) and their boundaries stay fixed. Polls the hard stop between boundaries and every 64 Ki tokens. [Validation](research/boundary-slide-validation.md). |
-| R2 · payload/header tradeoff | After R1; G0. | Reprices unchanged dynamic trees, then ≤32 length swaps per alphabet (two unequal nonzero lengths, no reserved distances, 1–18 payload bits, fewer adjacent transitions); 1,024 header prices per stream. Tokens, support, and code-length histogram fixed. Max may price its final result after keeping the Default floor. [Validation](research/payload-header-tradeoff-validation.md); [size-class validation](research/terminal-header-work-class-validation.md). |
+| R2 · payload/header tradeoff | After R1, or after R18 under `ApngDefault`; G0. | Reprices unchanged dynamic trees, then ≤32 length swaps per alphabet (two unequal nonzero lengths, no reserved distances, 1–18 payload bits, fewer adjacent transitions); 1,024 header prices per stream. Tokens, support, and code-length histogram fixed. Max may price its final result after keeping the Default floor. [Validation](research/payload-header-tradeoff-validation.md); [size-class validation](research/terminal-header-work-class-validation.md); [APNG order](research/apng-header-fit-validation.md). |
 | R3 · literal/length span | After R2; G0 for timed work. | Tries every legal HLIT from the minimum to 286 except the parent's, with complete header pricing; 1,024 prices. Tokens, codewords, distance lengths, and HDIST fixed; strict trees stay complete. [Validation](research/literal-span-validation.md). |
 | R4 · joint tree/RLE | After R3; G0 for timed work. | Jointly chooses complete payload code lengths (depth ≤9) and their RLE under the parent's code-length tree; repeats may cross the alphabet seam and unused positions may gain codes. HLIT/HDIST, tokens, boundaries, and zero reserved distances fixed. 2^27 shared work units; ≤24 MiB scratch per solver; ≤1 full header reprice per successful block. [Validation](research/joint-tree-rle-validation.md). |
 | R5 · symbol set removal | After R4; G0 for timed work; dynamic parent blocks with strictly compatible codes, ≤128 KiB decoded, ≤8,192 tokens. | Tries removing 2–4-symbol sets (intervals and mixed literal/length–distance sets): distances become literals, lengths become same-distance submatches. Per proposal ≤64 matches and ≤8,192 bytes; 8 proposals, one feedback attempt each; per stream 2^25 rewrite units and 128 spelling prices. Prices on the Default table grid plus bounded-depth and RLE-smoothed families (strict codes); boundaries fixed. [Validation](research/symbol-set-validation.md). |
