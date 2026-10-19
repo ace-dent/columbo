@@ -1236,7 +1236,7 @@ fn terminal_merges_follow_the_settled_finish() {
     )
     .unwrap()
     .is_none());
-    // With `ApngDefault`'s order the endpoint still merges, and R2–R4 run
+    // With `ApngDefault`'s order the endpoint still merges, and R2–R5 run
     // last, so R4 has nothing left to fit.
     let apng_slid = slid_default_endpoint(
         source,

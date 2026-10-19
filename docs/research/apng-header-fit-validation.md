@@ -5,7 +5,8 @@
 Date: 16 October 2026. Baseline: `6c81dfa`. Under `ApngDefault`, R2–R4 now
 run after R18 instead of in the terminal sweep; the
 [route catalog](../routes-and-methods.md#route-gate-reference) describes the
-order.
+order. On 17 October R5 moved with them, after the full APNG benchmark showed
+R5 acting on the unfitted parent ([R5 follows the fit](#r5-follows-the-fit)).
 
 ## Why it saves bits
 
@@ -23,6 +24,12 @@ that will not last. Run after R18, R2–R4 fit the codes that stay.
 The rule follows the pipeline, not a size class: R2–R4 come after the stream's
 first tree-family choice. Every other policy already satisfies it and is
 unchanged.
+
+R5 (symbol set removal) keeps a token rewrite only if it is strictly smaller
+than its parent, so it needs the fitted parent too. Against an unfitted header
+a rewrite can win a few bits that the fit would have won anyway, and the
+rewrite then leaves the fit less to gain. In every sweep R5 already follows R4;
+`ApngDefault` keeps that order and moves R2–R5 together.
 
 ## Origin
 
@@ -54,13 +61,14 @@ rather than derived from this effect.
 
 ## Design
 
-- **`ApngDefault`.** The terminal sweep skips R2–R4; after R18 they run once,
-  in order, on the final candidate, with the sweep's work class.
-- **Other policies.** Unchanged: R2–R4 stay in the sweep after R1b.
+- **`ApngDefault`.** The terminal sweep skips R2–R5; after R18 they run once,
+  in order, on the final candidate, with the sweep's work class. (The first
+  form, `b831d49`, moved only R2–R4.)
+- **Other policies.** Unchanged: R2–R5 stay in the sweep after R1b.
 - **Max.** Max's sweeps are unchanged. `ApngMax`'s APNG Default endpoint, the
   final competitor that keeps Max from ending above Default, follows
-  `ApngDefault`'s order: R1b, R5, the finish, R18, then R2–R4. Max's parent
-  keeps R2–R5 in its sweep order.
+  `ApngDefault`'s order: R1b, the finish, R18, then R2–R5. Max's parent keeps
+  R2–R5 in its sweep order.
 
 ## Measurements
 
@@ -115,3 +123,73 @@ largest sticker 187,611 against 188,046.
 
 Harness, lists, arm crates, load log and suite log:
 `work/final-header-fit-validation/`.
+
+## R5 follows the fit
+
+The full Steam stickers APNG benchmark on `b831d49` found 110 Default rows
+larger than in the previous report. Builds of `357561d`, `c3c6f60`,
+`9d5f818`, `6c81dfa` and `b831d49` on those files placed 103 of the losses,
+1,315 bytes, at `b831d49`; one other, `4162040_4062577…`, keeps its
+152-byte payload after `IEND`, which Default has preserved since `44b26f0`.
+
+The frames that grew show the cause. In the first frame of
+`1016180_195793…`, `6c81dfa` runs R2 (1,465 bits) and R4 (1,449), and R18's
+compact floor ends at 1,447. Under `b831d49` R5 runs first, rewrites the
+tokens (148 instead of 142) for 1,465 bits, and the late R4 reaches only
+1,459. Three more frames end at R5's result, 10 to 15 bits above `6c81dfa`.
+Moving R5 after R4 again, so R2–R5 run after R18, restores the sweep's
+internal order.
+
+Full corpus, 2,431 stickers in Default, the three executables alternating per
+file in three lanes:
+
+| Change | Smaller / larger | Bytes | Bits | Median time per file |
+| --- | --- | ---: | ---: | ---: |
+| `6c81dfa` → `b831d49` (R2–R4 late) | 2,154 / 216 (+3,072 bytes) | −193,301 | −1,545,674 | 0.995 |
+| `6c81dfa` → R2–R5 late | 2,338 / 58 (+1,059 bytes) | −261,016 | −2,089,046 | 1.000 |
+| `b831d49` → R2–R5 late | 1,826 / 254 (+3,717 bytes) | −67,715 | −543,372 | 1.008 |
+
+The summed wall times, under the same shared load, were 8,769, 9,009 and
+9,032 seconds. The largest remaining losses against `6c81dfa` are 119 bytes
+(`1644500_219935…`) and 111 bytes (`683320_79814…`).
+
+The 11 APNGs whose Max rows grew in the benchmark, rerun serially at their
+recorded allowances, total 2,083,465 bytes with `9d5f818`, 2,083,459 with
+`6c81dfa`, 2,083,409 with `b831d49` and 2,083,300 with R2–R5 late.
+
+Paired runs against `b831d49` (`work/apng-r5-validation/`), four lanes at the
+180-second Default allowance and two lanes for Max at 30 seconds, while other
+heavy work loaded the machine:
+
+| Set | Smaller / larger | Bytes saved | Process CPU |
+| --- | --- | ---: | --- |
+| 202 GZIP, zlib, ZIP and APNG containers | 21 / 11 | 230 | 574.6 → 582.4 s |
+| 58 APNGs (28 container APNGs, 30 stickers), Default | 35 / 9 | 675 | 387.9 → 393.8 s |
+| The same 58, Max at 30 seconds | 25 / 20 | 210 | 6,745.3 → 6,660.1 s |
+
+Every changed container file is an APNG. Against `6c81dfa`, the container set
+is 33 smaller and 4 larger, 1,551 bytes saved, against 1,321 for `b831d49`. The
+largest container loss is `apng-medium/ball.png` (62,550 bytes with `b831d49`,
+62,578 with `6c81dfa`, 62,628 now): there R5's rewrites gain from the tree
+floors that follow them in the sweep and from the late R2 refit, which a late
+R5 no longer gets. Max hit its deadline on 56 of the 58 Max files, so those
+differences are deadline variance; Max was no larger than Default on every file
+for both executables.
+
+Rejected refinement: rerunning R2–R4 after a late R5 win. It can only shrink
+the result, and on 178 APNG-heavy files it saved 599 bytes on 60, none larger,
+`ball.png` 12 of its 78. That is 0.0025% of their size for 1.7% more median and
+4% more total CPU, the ratio at which the
+[R2–R5 rerun after R13–R16](future-deflate-methods.md) was rejected.
+
+Validation:
+
+- Python's decoders read back every candidate output of the container and
+  APNG runs, 194 + 58 + 58, with no mismatch.
+- Formatting, Clippy and all 681 Rust tests, including the private-corpus
+  regressions, pass in debug and release, with the Python tests and a locked
+  build. The release executable keeps its size, 1,910,064 bytes.
+
+Harness, lists, arm crates and logs: `work/apng-r5-validation/`; the
+three-executable sticker run's per-file results are kept with its scratch
+data.

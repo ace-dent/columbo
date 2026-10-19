@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 16 October 2026 entry is the current state. Entries from 30 September keep
+The 17 October 2026 entry is the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,79 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+## APNG and Defluff refresh on 17 October 2026
+
+### Benchmark state
+
+The reports come from executable `ab9a0cd7…` (`b831d49`), which adds R18 and
+the first form of the APNG header fit. The Defluff report is unchanged in
+bytes and bits: −109 bytes and −938 bits against Defluff, no misses. Against
+the APNG reports of `e3325451…` (22 September):
+
+| Benchmark | Result |
+| --- | --- |
+| APNG Max, 2,431 pairs | 2,261 smaller, 11 larger; net −577,288 bytes / −4,620,121 bits; no deft4j misses; lead over deft4j 3,072,150 → 3,649,438 bytes; runtime 50,235 → 49,977 s |
+| APNG Default, 2,431 files | 2,298 smaller, 99 larger by 996 bytes (109 larger in bits); net −2,047,932 bytes / −16,385,692 bits; runtime 13,686 → 3,899 s; Default-not-faster flags 4 → 0; Max no larger than Default on every file |
+
+Other heavy work shared the machine during the Max run (load average median
+16, peak 60), so its deadline-bound rows were rerun serially before any loss
+was attributed.
+
+<a id="rows-that-grew-17-october"></a>
+
+### Rows that grew
+
+APNG Default: builds of `357561d`, `c3c6f60`, `9d5f818`, `6c81dfa` and
+`b831d49` on the 110 rows that grew in bytes or bits place 103 of them, 1,315
+bytes, at `b831d49`. Its late R2–R4 left R5 in the sweep, so R5 compared token
+rewrites against an unfitted header and kept rewrites that blocked the late
+fit. The accepted change moves R5 with R2–R4
+([R5 follows the fit](research/apng-header-fit-validation.md#r5-follows-the-fit)):
+on all 2,431 stickers it saves 261,016 bytes against `6c81dfa` with 58 files
+larger, and 67,715 bytes against `b831d49`. One more row,
+`4162040_4062577…`, carries 152 bytes after `IEND`; Default has preserved
+such payloads since `44b26f0`, unless `--strip` is given, and the older report
+predates that. Its Deflate data is smaller than before.
+
+APNG Max: serial reruns of the 11 grown rows at their recorded allowances,
+with the accepted change:
+
+- Six reach or beat the earlier result: the three `1293230_*` rows besides
+  `103418`, `1145350_430383…` (−11), `321360_1896007…` (−29) and
+  `3331000_416373…` (−6). Their benchmark losses came from the shared load.
+- `1293230_103418…` (+11) and `2666510_360454…` (+21) beat it at twice the
+  allowance (−54, −7): deadline-limited.
+- `2286780_434610…` reaches its 6,362 bytes on a rerun.
+- `230410_370927…` stays at 3,409 bytes against 3,408 with every build from
+  `357561d` on, at 10 and 40 seconds; the earlier result does not reproduce.
+- `4162040_4062577…` is 116 bytes above, all from its preserved 152-byte
+  payload.
+
+<a id="guard-17-october"></a>
+
+### Hundred-file guard
+
+`b831d49` passes 92 of 100 floors, against 88 for `9d5f818`; `Gingerman.png`,
+`Death.png`, both `test-conversion-truecoloralpha-*` files and `sample_25.png`
+now pass. The guard has no APNG entries, so the accepted change cannot alter
+it. Of the eight failures, `crossroads.png` (+5 bytes), Psyduck, Squirtle and
+Pikachu (1 bit each) and Poliwrath (2 bits) keep the causes recorded on
+16 October. The others:
+
+- `paperplane-fs8.png`, +14 bytes at 10 seconds, beats its floor at 20
+  seconds (9,053 bytes, 64,610 bits against 64,611).
+- `074-Geodude-1.png`, +6 bits. Its floor came from `c3c6f60` at 10 seconds,
+  and `c3c6f60` itself ends 6 bits above it at 20 and 40 seconds. Builds up to
+  `dc68b5f` pass; from `2b40fb0`, whose header-plan reuse speeds the
+  source-max route, that route has time at 10 seconds for a replay (1,854 →
+  1,852 bits), and from the better parent the tree floors and R4 end at 1,848
+  bits instead of 1,842. Every later build ends at 1,848 at every allowance
+  from 2 to 40 seconds. It is the parent path dependence recorded for
+  `crossroads.png`.
+- `041-Zubat-0.png`, +3 bits. `c3c6f60`, which set the floor, now misses it by
+  3 bits as well; the current build reaches 1,734 bits, 1 above, at 40
+  seconds.
 
 ## R15–R17 and D4 on 16 October 2026
 
@@ -104,6 +177,8 @@ PNGs whose Default output shrank and that decode to at least 128 KiB it was
 11 smaller and 13 larger, net +220 bytes (`Cherry512.png` +113,
 `file05.png` +155). The refined D4 parent helps more than it hurts, so the
 two losses are accepted against the corpus gains.
+
+<a id="guard-16-october"></a>
 
 ### Hundred-file guard
 
@@ -641,6 +716,15 @@ Current:
   ([guard](#guard-9-october)), and `my-computer-on-fs8.png` is
   time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets a
   file-specific rule.
+- **Source-max replay parent.** `crossroads.png` and `074-Geodude-1.png` end
+  better from a source-max parent that the deadline cut short than from the
+  replayed one; only refining both parents would recover them
+  ([16 October](#guard-16-october), [17 October](#guard-17-october)).
+- **APNG fit order.** With R2–R5 after R18, R5's late rewrites miss the tree
+  floors and refit that the sweep order gave them: `apng-medium/ball.png` is
+  50 bytes above `6c81dfa`, against 261,016 bytes saved on the sticker corpus;
+  a refit after R5 recovered too little for its cost
+  ([17 October](#rows-that-grew-17-october)).
 - **Strict policy.** The strict misses are the cost of strict output; relaxed
   output reaches parity on all but the signed PNG
   ([DeflOpt](#deflopt-misses-are-strict-policy-floors),

@@ -147,15 +147,18 @@ pub(crate) struct RawOptimization {
     pub(crate) timed_out: bool,
 }
 
-/// Where Default runs R2–R4, which fit code lengths and headers to the codes a
-/// tree family has chosen.
+/// Where Default runs R2–R5. R2–R4 fit code lengths and headers to the codes a
+/// tree family has chosen, and R5 keeps a token rewrite only if it beats that
+/// fitted parent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeaderFit {
     /// In the sweep, after R1b: the floor phase has already run the terminal
     /// tree floors.
     InSweep,
     /// After R18: `ApngDefault` skips the first tree floors, so only R14 and
-    /// R18 choose the codes, and a fit made before them is replaced.
+    /// R18 choose the codes, and a fit made before them is replaced. R5 moves
+    /// with the fit, since against an unfitted parent it keeps rewrites that
+    /// block the fit.
     AfterTreeFloors,
 }
 
@@ -1939,11 +1942,12 @@ impl TerminalHeaderSearch {
         )
     }
 
-    /// R2–R4: fits to the codes as they stand ([`HeaderFit`]).
+    /// R2–R5: fits to the codes as they stand, or compares against that fit
+    /// ([`HeaderFit`]).
     fn fits_codes(self) -> bool {
         matches!(
             self,
-            Self::PayloadTradeoff | Self::LiteralSpan | Self::JointTreeRle
+            Self::PayloadTradeoff | Self::LiteralSpan | Self::JointTreeRle | Self::SymbolSets
         )
     }
 
@@ -2655,7 +2659,7 @@ fn slid_default_endpoint(
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 
-/// R2–R4 after R18, for [`HeaderFit::AfterTreeFloors`].
+/// R2–R5 after R18, for [`HeaderFit::AfterTreeFloors`].
 fn improve_with_final_header_fit(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2668,6 +2672,7 @@ fn improve_with_final_header_fit(
         TerminalHeaderSearch::PayloadTradeoff,
         TerminalHeaderSearch::LiteralSpan,
         TerminalHeaderSearch::JointTreeRle,
+        TerminalHeaderSearch::SymbolSets,
     ] {
         candidate = improve_with_terminal_header_search(
             search,
@@ -2708,26 +2713,17 @@ fn finish_mandatory_default_endpoint(
     )?;
     let completion_won = completed.is_strictly_smaller_than(&base);
     if header_fit == HeaderFit::AfterTreeFloors {
-        // Default's endpoint runs R5, the finish and R18, then R2–R4; Max's
-        // parent keeps R2–R5 in Max's sweep order.
-        let symbol_sets = improve_with_terminal_header_search(
-            TerminalHeaderSearch::SymbolSets,
-            source,
-            floor_options,
-            DefaultFloorWork::Mandatory,
-            progress,
-            parse_cache,
-            completed.clone(),
-        )?;
+        // Default's endpoint runs the finish and R18, then R2–R5; Max's parent
+        // keeps R2–R5 in Max's sweep order.
         let exact = slid_default_endpoint(
             source,
             floor_options,
             progress,
             parse_cache,
-            &symbol_sets,
+            &completed,
             header_fit,
         )?
-        .unwrap_or(symbol_sets);
+        .unwrap_or_else(|| completed.clone());
         let parent = finish_default_header_searches(
             source,
             floor_options,

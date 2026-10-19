@@ -1959,7 +1959,7 @@ fn run_deferred_source_max_split(
 }
 
 /// Apply the terminal tree floors (Max only), then the terminal methods, then
-/// the tree floors once more (R18), then, for `ApngDefault`, R2–R4.
+/// the tree floors once more (R18), then, for `ApngDefault`, R2–R5.
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,

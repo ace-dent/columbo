@@ -293,9 +293,10 @@ flowchart TD
 
 `ApngDefault` skips D1–D3 and the terminal tree floors; Max runs them for
 APNG. R18 runs the tree floors at the end of every finish, APNG frames
-included. Because only R14 and R18 choose `ApngDefault`'s codes, it runs R2–R4,
-which fit lengths and headers to the chosen codes, after R18 instead of in the
-sweep. D4 applies under every Default policy.
+included. Because only R14 and R18 choose `ApngDefault`'s codes, it runs R2–R5
+after R18 instead of in the sweep: R2–R4 fit lengths and headers to the chosen
+codes, and R5 keeps a token rewrite only if it beats that fitted parent. D4
+applies under every Default policy.
 
 #### Bounded max
 
@@ -491,12 +492,12 @@ Max's mandatory Default endpoints (`Complete`, `CompleteThenBounded`,
 `SharedExact`, and `ApngMax`) run Default's sweep but keep its R1c and R13–R18
 finish, and an R1b win, only as a final competitor compared after Max's terminal
 sweeps; Max's own sweep applies those steps to its final incumbent. `ApngMax`'s
-APNG Default endpoint follows `ApngDefault`'s order, R2–R4 after R18, while
-Max's parent keeps them in the sweep. Max may also
-strengthen a completed ordinary or APNG Default endpoint with R6–R9, within the
-existing deadline or route window, before continuing from its Max seed. With a
-G0t share, G0 uses the primary phase deadline through M10d and the full
-deadline from the terminal tree floors onward.
+APNG Default endpoint follows `ApngDefault`'s order, R2–R5 after R18, while
+Max's parent keeps them in the sweep. Max may also strengthen a completed
+ordinary or APNG Default endpoint with R6–R9, within the existing deadline or
+route window, before continuing from its Max seed. With a G0t share, G0 uses
+the primary phase deadline through M10d and the full deadline from the terminal
+tree floors onward.
 
 ### Route-gate reference
 
@@ -525,7 +526,7 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | R2 · payload/header tradeoff | After R1, or after R18 under `ApngDefault`; G0. | Reprices unchanged dynamic trees, then ≤32 length swaps per alphabet (two unequal nonzero lengths, no reserved distances, 1–18 payload bits, fewer adjacent transitions); 1,024 header prices per stream. Tokens, support, and code-length histogram fixed. Max may price its final result after keeping the Default floor. [Validation](research/payload-header-tradeoff-validation.md); [size-class validation](research/terminal-header-work-class-validation.md); [APNG order](research/apng-header-fit-validation.md). |
 | R3 · literal/length span | After R2; G0 for timed work. | Tries every legal HLIT from the minimum to 286 except the parent's, with complete header pricing; 1,024 prices. Tokens, codewords, distance lengths, and HDIST fixed; strict trees stay complete. [Validation](research/literal-span-validation.md). |
 | R4 · joint tree/RLE | After R3; G0 for timed work. | Jointly chooses complete payload code lengths (depth ≤9) and their RLE under the parent's code-length tree; repeats may cross the alphabet seam and unused positions may gain codes. HLIT/HDIST, tokens, boundaries, and zero reserved distances fixed. 2^27 shared work units; ≤24 MiB scratch per solver; ≤1 full header reprice per successful block. [Validation](research/joint-tree-rle-validation.md). |
-| R5 · symbol set removal | After R4; G0 for timed work; dynamic parent blocks with strictly compatible codes, ≤128 KiB decoded, ≤8,192 tokens. | Tries removing 2–4-symbol sets (intervals and mixed literal/length–distance sets): distances become literals, lengths become same-distance submatches. Per proposal ≤64 matches and ≤8,192 bytes; 8 proposals, one feedback attempt each; per stream 2^25 rewrite units and 128 spelling prices. Prices on the Default table grid plus bounded-depth and RLE-smoothed families (strict codes); boundaries fixed. [Validation](research/symbol-set-validation.md). |
+| R5 · symbol set removal | After R4 (so after R18 under `ApngDefault`); G0 for timed work; dynamic parent blocks with strictly compatible codes, ≤128 KiB decoded, ≤8,192 tokens. | Tries removing 2–4-symbol sets (intervals and mixed literal/length–distance sets): distances become literals, lengths become same-distance submatches. Per proposal ≤64 matches and ≤8,192 bytes; 8 proposals, one feedback attempt each; per stream 2^25 rewrite units and 128 spelling prices. Prices on the Default table grid plus bounded-depth and RLE-smoothed families (strict codes); boundaries fixed. [Validation](research/symbol-set-validation.md). |
 | R6 · alphabet boundaries | Max; after R5; completed Default or APNG Default endpoint, or final Max incumbent; G0; non-stored blocks with 16–32,768 tokens. | Tries cuts at first/last occurrences of symbols, symbol groups, and high-symbol tails: ≤8 exact-priced pairs within a 64-bit estimate window, then the eight-residue boundary graph (≤80 cuts). Per stream 2^26 work units and 4,096 range prices; 512-entry header cache. [Validation](research/alphabet-boundary-validation.md). |
 | R7 · code-length tree | Max; after R6; same parents; G0; dynamic only. | Optimizes the code-length tree (symbols 0, 16, 17, 18 enumerated, the rest by an exact 128-unit Kraft DP); data codes, tokens, and spans fixed. 2^24 work units per stream. [Validation](research/code-length-tree-validation.md). |
 | R8 · code-length rotations | Max; after R7; same parents; G0; dynamic only. | Rotates three distinct positive payload lengths in one alphabet: ≤64 cycles per alphabet, payload delta −32…+32 bits; 2^24 generation units and 512 header prices per stream. Tokens, support, length histogram, and spans fixed. [Validation](research/code-length-rotation-validation.md). |
