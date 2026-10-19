@@ -217,7 +217,8 @@ pub(super) fn finish(
         view.finished = true;
         view.work = None;
         view.status = format!(
-            "✓ {route} · {} · {}{}",
+            "{} {route} · {} · {}{}",
+            super::success(false),
             bit_change(source_bits, output_bits),
             super::format_duration(elapsed),
             if timed_out {
@@ -1416,7 +1417,7 @@ fn display_text(text: &str, glyphs: Glyphs) -> String {
             '↓' => output.push('-'),
             '↑' => output.push('+'),
             '—' | '–' => output.push('-'),
-            '✓' => output.push_str("OK"),
+            '✓' | '√' => output.push_str("OK"),
             'µ' => output.push('u'),
             '…' => output.push_str("..."),
             other if other.is_ascii() => output.push(other),

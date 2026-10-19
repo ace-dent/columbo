@@ -1614,10 +1614,14 @@ fn arrow(color: bool) -> &'static str {
 }
 
 fn success(color: bool) -> &'static str {
-    if color {
-        "\x1b[32m✓\x1b[0m"
-    } else {
-        "✓"
+    // The classic Windows console's default fonts, Consolas and Lucida Console,
+    // have no check mark (U+2713) and draw an empty box; the square root sign
+    // stands in, as it did in code page 437.
+    match (cfg!(windows), color) {
+        (false, true) => "\x1b[32m✓\x1b[0m",
+        (false, false) => "✓",
+        (true, true) => "\x1b[32m√\x1b[0m",
+        (true, false) => "√",
     }
 }
 

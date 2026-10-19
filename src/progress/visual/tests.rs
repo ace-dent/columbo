@@ -353,8 +353,8 @@ fn incompatible_locales_use_an_ascii_one_cell_fallback() {
     assert!(!unicode_enabled_for(Some("ja_JP.UTF-8")));
     assert!(unicode_enabled_for(Some("en_GB.UTF-8")));
     assert_eq!(
-        display_text("▓│◆▲·→↓✓µs", Glyphs::for_unicode(false)),
-        "D|*^|->-OKus"
+        display_text("▓│◆▲·→↓✓√µs", Glyphs::for_unicode(false)),
+        "D|*^|->-OKOKus"
     );
 }
 
