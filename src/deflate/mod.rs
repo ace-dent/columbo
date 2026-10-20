@@ -19,6 +19,7 @@ mod minima;
 mod model;
 mod optimize;
 mod parse;
+mod plan_store;
 mod restore;
 mod search;
 mod slide;
@@ -27,6 +28,7 @@ mod stop;
 pub(crate) mod stream;
 mod symbol_set;
 
+pub(crate) use block::release_thread_block_plans;
 pub(crate) use header::release_thread_header_plans;
 pub(crate) use optimize::{
     inspect_early_max_lineage, inspect_raw_prefix, optimize_raw, optimize_raw_prefix_with_floor,

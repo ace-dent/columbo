@@ -69,6 +69,7 @@ gains where established.
 | 1 Oct 2026 | [`62f772a`](#62f772a-1-october-2026) | `solve_proven_submatch_avoiding` | One `SuffixMinima` query per length family; stop checks every 32 positions instead of every 32 edges | Solver about 2×; whole-file CPU unchanged | 32 Default inputs, run twice; 400 oracle, 100,000 random |
 | 13 Oct 2026 | [`9ffa010`](#9ffa010-13-october-2026) | Code-length tree building (`huffman.rs`, `header.rs`) | 12-byte heap entries with child indices replace 88-byte linked nodes; code-length reordering returns early when lengths already follow frequencies; the order-key tree that duplicates DeflOpt variant 3 is no longer built | Default CPU 1.13× (33 inputs) | 104 API (52 inputs; 4 Default runs reached the deadline, 3 rerun to completion); 33 Default inputs; 640,000 heap-builder, 200,000 reorder; 659 Rust, 13 Python tests |
 | 13 Oct 2026 | [`dc68b5f`](#dc68b5f-13-october-2026) | Header-plan reuse across routes (`header.rs`) | Route-local header-cache misses fall through to a per-thread store of packed completed plans, two generations within an 8 MiB charge | Default CPU 1.38× (33 inputs); peak memory +3.8 MiB median, +20.0 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 662 Rust, 13 Python tests |
+| 20 Oct 2026 | [`04d63bd`](#04d63bd-20-october-2026) | Repeated block plans, terminal reparses, entropy-cut logarithms (`block.rs`, `optimize.rs`, `stream/entropy_cut.rs`) | A per-thread store of completed block plans keyed by symbol counts, extra bits, source header and policy; an accepted terminal candidate's validated parse handed to the next method; the `c log2 c` table grown to the block's counts | Default CPU 1.29× (33 inputs); Partnership card 1.52× with 100 MiB less peak memory; peak memory +1.9 MiB median, +11.9 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 APNG inputs; 685 Rust, 13 Python tests |
 
 ## Entries
 
@@ -465,3 +466,90 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `04d63bd`, 20 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the 33 stratified Default inputs, once per build in alternating order, with no
+competing load except where noted.
+
+| Candidate | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| Block-plan store, 4 MiB | 167.1 s | 149.6 s | 1.12× | +2.0 / +44.1 MiB |
+| Block-plan store, 8 MiB | 167.1 s | 138.1 s | 1.21× | +2.2 / +11.8 MiB |
+| Plus the kept terminal parse | 162.5 s | 129.9 s | 1.25× | +2.6 / +12.6 MiB |
+| Plus the grown logarithm table | 160.0 s | 124.4 s | 1.29× | +2.7 / +12.0 MiB |
+| Plus per-stream release (retained) | 164.5 s | 128.0 s | 1.29× | +1.9 / +11.9 MiB |
+
+A sampled Default profile of the same inputs put 64% of samples under
+`best_dynamic_plan_cached`, 52% in its uncached header plans, and 6% in
+`parse_validated_rewrite`. An instrumented build logged every block plan:
+149,738 plans took 118 seconds, and 35.4 seconds of that re-planned a token
+state the same run had already planned. Plans with equal symbol counts, source
+header and policy always had equal cost, and no Default run reached its stop.
+By call site, `plan_block`, which the token-spelling searches and owned-block
+planning use, repeated 26.0 of its 76.5 seconds; the boundary graph's and
+structural ranges' edges 6.3 of 32.4; alphabet-cut edges 1.5 of 6.4; the
+canonical cache 1.1 of 3.3; merges 0.1 of 1.4. Replaying the logged plans
+through a two-generation store kept 6.0 seconds at 1 MiB, 15.3 at 2 MiB, 29.5
+at 4 MiB and 35.0 at 8 MiB, against 35.3 unbounded.
+
+- **Block-plan store.** Planning reads a block's tokens only through their
+  symbol counts and extra bits: the fixed cost, the source tree's cost and
+  every candidate tree's payload are sums over symbols. A plan therefore
+  depends on the counts, the source block's own header and the strict and
+  Default/Max policy, not on token order. Misses in
+  `plan_reusable_block_with_header_cache` fall through to a per-thread store
+  keyed by those inputs, the token count and the extra bits; a hit compares the
+  used-symbol set, every count, the packed source header and the policy. Plans
+  are packed like stored header plans, in two generations within an 8 MiB
+  charge, and the header store now shares the generation logic
+  (`plan_store.rs`). A plan is stored only when its stop is still unreached
+  after planning (stops only move forward), and a call whose stop is already
+  reached plans without the store, so it returns the plan its deadline allows.
+- **Kept terminal parse.** Building a candidate validates it by parsing the
+  emitted bytes, then dropped the parse; the next terminal method parsed the
+  same bytes again. An accepted terminal candidate now hands its validated
+  parse to the terminal parse cache. On the Partnership card this also removed
+  the overlap of the two parses: peak memory fell from 1,042 to about 940 MiB,
+  and CPU from 42.5 to 27.9 seconds with the store.
+- **Grown logarithm table.** R15's scans read `c log2 c` for each side's
+  totals and its frequent symbols' counts at every token, and the table
+  covered counts below 4,096 only, so large blocks computed the logarithm by
+  repeated squaring at each cut. The table now grows to the block's token
+  count (at most 2^19 entries) with the same values. On 12 of the inputs, run
+  twice under load, the entropy-cut step fell from 16.0 to 9.8 seconds.
+- **Per-stream release.** APNG Default runs up to eight worker lanes, each
+  with its own store kept across frames, and the largest stickers' peak memory
+  rose by 20 to 42 MiB. Plans rarely repeat across streams, so each stream's
+  optimization now empties its thread's store on return: on five large APNG
+  files peak memory differed from the baseline by −9 to +8 MiB, within its
+  run-to-run spread of up to 15 MiB, and CPU fell 0–8% (`976310_99309…` 52.3
+  → 48.3 seconds).
+
+Equivalence: new tests compare stored plans with uncached planning for random
+blocks in both token orders, with and without a source header, across
+policies; reject a fingerprint match with different counts, source header or
+policy; check that reached stops neither use nor fill the store; and check
+the grown table and the kept parse against direct computation. API
+comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs. Every CLI timing run and five large
+APNG files matched byte for byte. Rust tests, including the private corpus,
+passed in release and debug modes, with documentation and Python tests, a
+locked build, formatting, all-feature Clippy with warnings denied and a package
+list without private fixtures or scratch artifacts. The final source matches
+the tested snapshot. The release executable grew from 1,910,064 to 1,926,608
+bytes, all of it the store's code: without it the build is 1,910,080 bytes.
+
+Measured and rejected in the same review:
+
+- Skipping the validation parse of a strict candidate that already loses to
+  its source: 4 of 399 validations, 0.12 seconds.
+- A 4 MiB store: 11.5 seconds less saving than 8 MiB on the same inputs.
+- Pruning tree pairs in `best_dynamic_plan_cached` by payload plus a header
+  lower bound: the cheapest header is 26 bits, while candidate trees differ by a
+  few payload bits against headers of hundreds, so it would skip almost none.
+- Prefix sums of literal costs for match expansion: each call already visits
+  each decoded byte once, so they would not reduce its work.
+
+Artifacts: `work/efficiency-review-block-plan-store/`.

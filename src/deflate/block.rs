@@ -3,20 +3,22 @@
 
 //! Planning and emission for one structural Deflate block.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
-use super::header::{best_dynamic_plan_cached, token_bits, HeaderPlanCache};
+use super::header::{best_dynamic_plan_cached, token_bits, HeaderPlanCache, PackedDynamicPlan};
 use super::huffman::{
     fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
-    CODE_LENGTH_ORDER,
+    token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation,
+    SourceBlockType, Token, CODE_LENGTH_ORDER,
 };
+use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
 
 /// Per-route limits for [`CanonicalPlanCache`]. Keys hold `Arc` token buffers,
@@ -24,6 +26,9 @@ use super::stop::SearchStop;
 /// sharing one `Arc` are each charged in full.
 const MAX_CANONICAL_PLAN_CACHE_ENTRIES: usize = 512;
 const MAX_CANONICAL_PLAN_CACHE_TOKEN_BYTES: usize = 16 * 1024 * 1024;
+
+/// Charged bytes of completed block plans each thread keeps across routes.
+const MAX_THREAD_BLOCK_PLAN_BYTES: usize = 8 << 20;
 
 /// Return the original block's bit range if it can be copied verbatim at
 /// `alignment` (validity only, not cost). A stored block's padding depends on
@@ -167,7 +172,41 @@ pub(crate) fn plan_reusable_block(
     plan_reusable_block_with_header_cache(block, options, stop, &mut HeaderPlanCache::new())
 }
 
+/// Plan `block`, reusing this thread's copy of a plan that finished before its
+/// stop. A call whose stop has already been reached plans without the store,
+/// so it still returns the plan its deadline allows.
 pub(crate) fn plan_reusable_block_with_header_cache(
+    block: &ParsedBlock,
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+    header_cache: &mut HeaderPlanCache,
+) -> ReusableBlockPlan {
+    let key = (!stop.reached()).then(|| BlockPlanKey::new(block, options));
+    if let Some(key) = &key {
+        let stored = BLOCK_PLAN_STORE
+            .try_with(|store| store.try_borrow_mut().ok()?.get(key, block))
+            .ok()
+            .flatten();
+        if let Some(plan) = stored {
+            return plan;
+        }
+    }
+    let plan = plan_reusable_block_uncached(block, options, stop, header_cache);
+    // Stops only move forward, so one that is not reached now was not reached
+    // while planning: the plan is complete.
+    if let Some(key) = key.filter(|_| !stop.reached()) {
+        if let Some(entry) = StoredBlockPlan::pack(&key, block, &plan) {
+            let _ = BLOCK_PLAN_STORE.try_with(|store| {
+                if let Ok(mut store) = store.try_borrow_mut() {
+                    store.insert(key.fingerprint, entry);
+                }
+            });
+        }
+    }
+    plan
+}
+
+fn plan_reusable_block_uncached(
     block: &ParsedBlock,
     options: &Options,
     stop: &mut SearchStop<'_>,
@@ -200,6 +239,210 @@ pub(crate) fn plan_reusable_block_with_header_cache(
         representation,
         bits,
     }
+}
+
+/// The inputs of a block plan besides its symbol counts. Planning reads the
+/// tokens only through their symbol counts and extra bits, so two blocks with
+/// equal counts, extra bits, source header and policy get the same plan in
+/// any token order.
+struct BlockPlanKey {
+    fingerprint: u64,
+    token_count: usize,
+    extra_bits: u64,
+    strict: bool,
+    exhaustive: bool,
+}
+
+impl BlockPlanKey {
+    fn new(block: &ParsedBlock, options: &Options) -> Self {
+        let token_count = block.tokens.len();
+        let extra_bits = token_extra_bits(&block.tokens);
+        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        for &count in block
+            .literal_frequencies
+            .iter()
+            .chain(&block.distance_frequencies)
+        {
+            mix_plan_fingerprint(&mut fingerprint, u64::from(count));
+        }
+        mix_plan_fingerprint(&mut fingerprint, token_count as u64);
+        mix_plan_fingerprint(&mut fingerprint, extra_bits);
+        mix_plan_fingerprint(
+            &mut fingerprint,
+            u64::from(options.strict) | (u64::from(options.exhaustive) << 1),
+        );
+        if let Some(original) = &block.original_dynamic {
+            mix_plan_fingerprint(&mut fingerprint, original.bits);
+            for &length in original
+                .literal_lengths
+                .iter()
+                .chain(&original.distance_lengths)
+                .chain(&original.code_length_lengths)
+            {
+                mix_plan_fingerprint(&mut fingerprint, u64::from(length));
+            }
+            for token in &original.rle {
+                mix_plan_fingerprint(
+                    &mut fingerprint,
+                    u64::from(token.symbol) | (u64::from(token.extra) << 8),
+                );
+            }
+        }
+        Self {
+            fingerprint,
+            token_count,
+            extra_bits,
+            strict: options.strict,
+            exhaustive: options.exhaustive,
+        }
+    }
+}
+
+/// A completed block plan with its complete key: the used symbols as a bit
+/// set and their counts in symbol order, and the source header packed.
+struct StoredBlockPlan {
+    token_count: usize,
+    extra_bits: u64,
+    strict: bool,
+    exhaustive: bool,
+    used_symbols: [u64; 5],
+    counts: Box<[u32]>,
+    original: Option<PackedDynamicPlan>,
+    bits: u64,
+    /// `None` for fixed codes.
+    dynamic: Option<PackedDynamicPlan>,
+}
+
+fn used_symbols(block: &ParsedBlock) -> [u64; 5] {
+    let mut used = [0_u64; 5];
+    for (symbol, &count) in block
+        .literal_frequencies
+        .iter()
+        .chain(&block.distance_frequencies)
+        .enumerate()
+    {
+        if count != 0 {
+            used[symbol / 64] |= 1 << (symbol % 64);
+        }
+    }
+    used
+}
+
+impl StoredBlockPlan {
+    fn pack(key: &BlockPlanKey, block: &ParsedBlock, plan: &ReusableBlockPlan) -> Option<Self> {
+        let dynamic = match &plan.representation {
+            Representation::Fixed => None,
+            Representation::Dynamic(dynamic) => Some(PackedDynamicPlan::pack(dynamic)?),
+            Representation::Original(_) | Representation::Stored => return None,
+        };
+        let original = match &block.original_dynamic {
+            Some(original) => Some(PackedDynamicPlan::pack(original)?),
+            None => None,
+        };
+        let mut counts = Vec::new();
+        let frequencies = block
+            .literal_frequencies
+            .iter()
+            .chain(&block.distance_frequencies);
+        counts
+            .try_reserve_exact(frequencies.clone().filter(|&&count| count != 0).count())
+            .ok()?;
+        counts.extend(frequencies.filter(|&&count| count != 0));
+        Some(Self {
+            token_count: key.token_count,
+            extra_bits: key.extra_bits,
+            strict: key.strict,
+            exhaustive: key.exhaustive,
+            used_symbols: used_symbols(block),
+            counts: counts.into_boxed_slice(),
+            original,
+            bits: plan.bits,
+            dynamic,
+        })
+    }
+
+    fn matches(&self, key: &BlockPlanKey, block: &ParsedBlock) -> bool {
+        self.token_count == key.token_count
+            && self.extra_bits == key.extra_bits
+            && self.strict == key.strict
+            && self.exhaustive == key.exhaustive
+            && self.used_symbols == used_symbols(block)
+            && block
+                .literal_frequencies
+                .iter()
+                .chain(&block.distance_frequencies)
+                .filter(|&&count| count != 0)
+                .eq(self.counts.iter())
+            && match (&self.original, &block.original_dynamic) {
+                (None, None) => true,
+                (Some(stored), Some(original)) => stored.matches(original),
+                _ => false,
+            }
+    }
+
+    fn unpack(&self) -> Option<ReusableBlockPlan> {
+        let representation = match &self.dynamic {
+            None => Representation::Fixed,
+            Some(dynamic) => Representation::Dynamic(dynamic.unpack()?),
+        };
+        Some(ReusableBlockPlan {
+            representation,
+            bits: self.bits,
+        })
+    }
+}
+
+impl Charged for StoredBlockPlan {
+    /// A table slot with growth slack, and the count and plan allocations.
+    fn charge(&self) -> usize {
+        2 * std::mem::size_of::<(u64, Self)>()
+            + (4 * self.counts.len() + 16).next_multiple_of(16)
+            + self
+                .original
+                .as_ref()
+                .map_or(0, PackedDynamicPlan::heap_charge)
+            + self
+                .dynamic
+                .as_ref()
+                .map_or(0, PackedDynamicPlan::heap_charge)
+    }
+}
+
+/// Completed block plans shared by every route on one thread. Token-spelling
+/// searches return to spellings they have planned, and the boundary graph and
+/// structural ranges replan ranges; most of those calls run under a stop, so
+/// [`CanonicalPlanCache`] does not keep them.
+type BlockPlanStore = PlanStore<StoredBlockPlan>;
+
+impl Default for BlockPlanStore {
+    fn default() -> Self {
+        Self::with_budget(MAX_THREAD_BLOCK_PLAN_BYTES)
+    }
+}
+
+impl BlockPlanStore {
+    fn get(&mut self, key: &BlockPlanKey, block: &ParsedBlock) -> Option<ReusableBlockPlan> {
+        self.lookup(
+            key.fingerprint,
+            |entry| entry.matches(key, block),
+            StoredBlockPlan::unpack,
+        )
+    }
+}
+
+thread_local! {
+    static BLOCK_PLAN_STORE: RefCell<BlockPlanStore> = RefCell::new(BlockPlanStore::default());
+}
+
+/// Drop this thread's stored block plans. A top-level optimization calls this
+/// on return, so library callers keep no plans between inputs; worker threads
+/// free theirs when they exit.
+pub(crate) fn release_thread_block_plans() {
+    let _ = BLOCK_PLAN_STORE.try_with(|store| {
+        if let Ok(mut store) = store.try_borrow_mut() {
+            *store = BlockPlanStore::default();
+        }
+    });
 }
 
 /// Counters for [`CanonicalPlanCache`], read by tests to confirm real hits.

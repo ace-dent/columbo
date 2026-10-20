@@ -2,14 +2,22 @@
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
 use super::*;
+use crate::deflate::distance_band::test_support::matched;
 use crate::deflate::model::count_frequencies;
 
 fn literal_block(bytes: &[u8]) -> ParsedBlock {
     let tokens: Vec<_> = bytes.iter().copied().map(Token::Literal).collect();
+    let mut block = counted_block(tokens);
+    block.plain = Arc::new(bytes.to_vec());
+    block
+}
+
+/// A block of `tokens` with their counts; planning does not read `plain`.
+fn counted_block(tokens: Vec<Token>) -> ParsedBlock {
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
     ParsedBlock {
         tokens: Arc::new(tokens),
-        plain: Arc::new(bytes.to_vec()),
+        plain: Arc::new(Vec::new()),
         literal_frequencies,
         distance_frequencies,
         original_literal_lengths: None,
@@ -192,6 +200,8 @@ fn header_cache_reuses_trees_across_distinct_token_orders() {
     let mut cache = CanonicalPlanCache::new();
     cache.plan_reusable_complete(&first, &options);
     let first_header_stats = cache.header_cache.stats();
+    // The thread's block plans would answer the reordered block first.
+    release_thread_block_plans();
     cache.plan_reusable_complete(&second, &options);
     let second_header_stats = cache.header_cache.stats();
 
@@ -336,4 +346,161 @@ fn cache_saturation_recomputes_without_changing_the_plan() {
 #[test]
 fn empty_fixed_block_has_only_a_header_and_end_code() {
     assert_eq!(fixed_block_bits(&[]), Some(10));
+}
+
+fn assert_same_reusable(left: &ReusableBlockPlan, right: &ReusableBlockPlan) {
+    assert_eq!(left.bits, right.bits);
+    match (&left.representation, &right.representation) {
+        (Representation::Fixed, Representation::Fixed) => {}
+        (Representation::Dynamic(left), Representation::Dynamic(right)) => {
+            assert_eq!(left, right);
+        }
+        pair => panic!("different representations: {pair:?}"),
+    }
+}
+
+/// Random literals and matches of a few lengths and distances.
+fn random_tokens(next: &mut impl FnMut() -> u64) -> Vec<Token> {
+    let count = 1 + (next() % 400) as usize;
+    let alphabet = 2 + next() % 60;
+    (0..count)
+        .map(|_| {
+            if next() % 3 == 0 {
+                let length = 3 + (next() % 60) as u16;
+                let distance = 1 + (next() % 3_000) as u16;
+                matched(length, distance)
+            } else {
+                Token::Literal((next() % alphabet) as u8)
+            }
+        })
+        .collect()
+}
+
+fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+    let mut state = seed;
+    move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    }
+}
+
+#[test]
+fn stored_block_plans_match_uncached_planning_in_any_token_order() {
+    let mut next = xorshift(0x243f_6a88_85a3_08d3);
+    release_thread_block_plans();
+    for case in 0..48 {
+        let tokens = random_tokens(&mut next);
+        let mut reversed = tokens.clone();
+        reversed.reverse();
+        let mut block = counted_block(tokens);
+        let mut reordered = counted_block(reversed);
+        if case % 4 == 3 {
+            let original = plan_reusable_block_uncached(
+                &block,
+                &Options::default(),
+                &mut SearchStop::never(),
+                &mut HeaderPlanCache::new(),
+            );
+            if let Representation::Dynamic(original) = original.representation {
+                block.original_dynamic = original.try_clone();
+                reordered.original_dynamic = Some(original);
+            }
+        }
+        let options = Options {
+            strict: case % 3 != 1,
+            exhaustive: case % 8 == 0,
+            ..Options::default()
+        };
+        let expected = plan_reusable_block_uncached(
+            &block,
+            &options,
+            &mut SearchStop::never(),
+            &mut HeaderPlanCache::new(),
+        );
+        for planned in [&block, &block, &reordered] {
+            let plan = plan_reusable_block(planned, &options, &mut SearchStop::never());
+            assert_same_reusable(&plan, &expected);
+        }
+    }
+    let stored = BLOCK_PLAN_STORE.with(|store| store.borrow().current.plans.len());
+    assert!(stored > 0);
+    release_thread_block_plans();
+    assert!(BLOCK_PLAN_STORE.with(|store| store.borrow().current.plans.is_empty()));
+}
+
+#[test]
+fn stored_block_plan_rejects_a_fingerprint_collision() {
+    let mut next = xorshift(0x1319_8a2e_0370_7344);
+    let block = counted_block(random_tokens(&mut next));
+    let options = Options::default();
+    let key = BlockPlanKey::new(&block, &options);
+    let plan = plan_reusable_block_uncached(
+        &block,
+        &options,
+        &mut SearchStop::never(),
+        &mut HeaderPlanCache::new(),
+    );
+
+    let mut other_count = block.try_clone_shared().unwrap();
+    other_count.literal_frequencies[256] += 1;
+    let mut seeded = block.try_clone_shared().unwrap();
+    seeded.original_dynamic = match &plan.representation {
+        Representation::Dynamic(dynamic) => dynamic.try_clone(),
+        _ => block_with_original(SourceBlockType::Dynamic, 0, Some(vec![1, 1])).original_dynamic,
+    };
+    let relaxed = Options {
+        strict: false,
+        ..Options::default()
+    };
+
+    let mut store = BlockPlanStore::with_budget(usize::MAX);
+    store.insert(7, StoredBlockPlan::pack(&key, &block, &plan).unwrap());
+    let forced = |block: &ParsedBlock, options: &Options| BlockPlanKey {
+        fingerprint: 7,
+        ..BlockPlanKey::new(block, options)
+    };
+    for (other, other_options) in [
+        (&other_count, &options),
+        (&seeded, &options),
+        (&block, &relaxed),
+    ] {
+        assert!(store.get(&forced(other, other_options), other).is_none());
+    }
+    let stored = store.get(&forced(&block, &options), &block).unwrap();
+    assert_same_reusable(&stored, &plan);
+}
+
+#[test]
+fn reached_stops_neither_use_nor_fill_stored_block_plans() {
+    let mut next = xorshift(0xa409_3822_299f_31d0);
+    let block = counted_block(random_tokens(&mut next));
+    let options = Options::default();
+    release_thread_block_plans();
+
+    let truncated = plan_reusable_block(&block, &options, &mut SearchStop::always());
+    assert!(BLOCK_PLAN_STORE.with(|store| store.borrow().current.plans.is_empty()));
+
+    let complete = plan_reusable_block(&block, &options, &mut SearchStop::never());
+    assert_eq!(
+        BLOCK_PLAN_STORE.with(|store| store.borrow().current.plans.len()),
+        1
+    );
+    let expected = plan_reusable_block_uncached(
+        &block,
+        &options,
+        &mut SearchStop::always(),
+        &mut HeaderPlanCache::new(),
+    );
+    assert_same_reusable(&truncated, &expected);
+    assert_same_reusable(
+        &plan_reusable_block(&block, &options, &mut SearchStop::always()),
+        &expected,
+    );
+    assert_same_reusable(
+        &plan_reusable_block(&block, &options, &mut SearchStop::never()),
+        &complete,
+    );
+    release_thread_block_plans();
 }

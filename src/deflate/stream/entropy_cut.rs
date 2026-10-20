@@ -28,6 +28,9 @@ const MIN_ESTIMATED_SAVING_BITS: u64 = 32;
 const LOG_FRACTION_BITS: u32 = 16;
 /// Counts below this read `c log2 c` from a table.
 const WEIGHTED_LOG_TABLE_LEN: usize = 4096;
+/// The table grows to cover a block's counts and totals, up to this length;
+/// larger counts are computed.
+const MAX_WEIGHTED_LOG_TABLE_LEN: usize = 1 << 19;
 /// Tokens scanned between stop polls.
 const SCAN_POLL_TOKENS: usize = 1 << 16;
 /// A dynamic header's fixed part, in bits: block type and the HLIT, HDIST and
@@ -88,12 +91,28 @@ fn weighted_log(table: &[u64], count: u64) -> u64 {
     }
 }
 
-fn weighted_log_table(table: &mut Vec<u64>) -> Option<()> {
-    if table.is_empty() {
-        table.try_reserve_exact(WEIGHTED_LOG_TABLE_LEN).ok()?;
-        table.push(0);
-        table.extend((1..WEIGHTED_LOG_TABLE_LEN as u64).map(|count| count * log2_fixed(count)));
+/// Fill `table` with `c log2 c` for every count below `len`: at least
+/// [`WEIGHTED_LOG_TABLE_LEN`] entries, and as many as the allocator gives up
+/// to [`MAX_WEIGHTED_LOG_TABLE_LEN`]. Scans read each side's totals and its
+/// frequent symbols' counts at every token, so a block's counts are
+/// computed once, not at each cut.
+fn weighted_log_table(table: &mut Vec<u64>, len: usize) -> Option<()> {
+    let len = len.clamp(WEIGHTED_LOG_TABLE_LEN, MAX_WEIGHTED_LOG_TABLE_LEN);
+    if table.len() >= len {
+        return Some(());
     }
+    if table.try_reserve_exact(len - table.len()).is_err() {
+        if !table.is_empty() {
+            return Some(());
+        }
+        table.try_reserve_exact(WEIGHTED_LOG_TABLE_LEN).ok()?;
+    }
+    if table.is_empty() {
+        table.push(0);
+    }
+    let end = len.min(table.capacity()) as u64;
+    let start = table.len() as u64;
+    table.extend((start..end).map(|count| count * log2_fixed(count)));
     Some(())
 }
 
@@ -275,7 +294,8 @@ pub(crate) fn plan_entropy_cuts(
         ranges,
         weighted_logs,
     } = budget;
-    weighted_log_table(weighted_logs)?;
+    // A side's totals reach the token count plus its end-of-block code.
+    weighted_log_table(weighted_logs, token_count + 2)?;
     let mut cache = EdgeCache {
         edges: HashMap::new(),
         headers: HeaderPlanCache::new(),

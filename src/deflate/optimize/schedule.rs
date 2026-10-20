@@ -52,6 +52,7 @@ use super::{
     TerminalParseCache, TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED,
     DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
+use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
 use crate::deflate::model::{ParsedBlock, ParsedStream};
 use crate::deflate::parse::parse_stream;
@@ -63,6 +64,20 @@ use crate::deflate::stop::{initial_bounded_phase_share, Deadline, SearchStop};
 use crate::deflate::stream::fragmented_collect_seed;
 
 pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
+    input: &[u8],
+    options: &Options,
+    decoded_limit: u64,
+    default_floor: DefaultFloor,
+    grace: Duration,
+) -> Result<RawOptimization> {
+    let result = optimize_stream(input, options, decoded_limit, default_floor, grace);
+    // Block plans repeat within a stream, rarely across streams, and APNG
+    // frames and ZIP members reuse worker threads: release this thread's.
+    release_thread_block_plans();
+    result
+}
+
+fn optimize_stream(
     input: &[u8],
     options: &Options,
     decoded_limit: u64,

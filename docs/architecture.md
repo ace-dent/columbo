@@ -41,7 +41,8 @@ never skips validation or produces partial output.
 | `parse`, `model` | Validate the stream and retain decoded bytes, source symbols, and block metadata. |
 | `huffman` | Construct length-limited code lengths, canonical codes, and decoding tables. |
 | `header` | Construct dynamic headers and count header and payload bits, reusing completed header plans per thread. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11). |
-| `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache. |
+| `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache and completed plans reused per thread. |
+| `plan_store` | Bound the per-thread stores of completed block and header plans: two generations within a byte budget. |
 | `minima` | Share range-minimum lookups between searches over match-length families. |
 | `search` | Change token spelling within existing matches. |
 | `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), `stream/entropy_cut` cuts blocks where their symbol statistics change (R15), and `stream/merge` merges neighbors after the finish (R16). |

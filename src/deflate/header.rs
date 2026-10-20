@@ -21,6 +21,7 @@ use super::model::{
     token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
     MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
 };
+use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
 
 mod coupled;
@@ -169,12 +170,9 @@ impl HeaderPlanCache {
 /// benchmark sample, peak memory rose by at most 20 MiB.
 const MAX_THREAD_HEADER_PLAN_BYTES: usize = 8 << 20;
 
-/// A completed header plan priced with zero payload bits, packed into one
-/// allocation: the trimmed code lengths two per byte, then each RLE token as
-/// its symbol and extra-bits value.
-struct StoredHeaderPlan {
-    exhaustive: bool,
-    rle_mask: u8,
+/// A dynamic plan packed into one allocation: the code lengths two per byte,
+/// then each RLE token as its symbol and extra-bits value.
+pub(crate) struct PackedDynamicPlan {
     hlit: u16,
     hdist: u8,
     hclen: u8,
@@ -183,19 +181,18 @@ struct StoredHeaderPlan {
     packed: Box<[u8]>,
 }
 
-impl StoredHeaderPlan {
-    fn pack(exhaustive: bool, rle_mask: u8, kernel: &DynamicPlan) -> Option<Self> {
-        let length_count = kernel.literal_lengths.len() + kernel.distance_lengths.len();
+impl PackedDynamicPlan {
+    pub(crate) fn pack(plan: &DynamicPlan) -> Option<Self> {
+        if plan.literal_lengths.len() != plan.hlit || plan.distance_lengths.len() != plan.hdist {
+            return None;
+        }
+        let length_count = plan.hlit + plan.hdist;
         let mut packed = Vec::new();
         packed
-            .try_reserve_exact(length_count.div_ceil(2) + 2 * kernel.rle.len())
+            .try_reserve_exact(length_count.div_ceil(2) + 2 * plan.rle.len())
             .ok()?;
         let mut pending = None;
-        for &length in kernel
-            .literal_lengths
-            .iter()
-            .chain(&kernel.distance_lengths)
-        {
+        for &length in plan.literal_lengths.iter().chain(&plan.distance_lengths) {
             if length > 15 {
                 return None;
             }
@@ -205,41 +202,34 @@ impl StoredHeaderPlan {
             }
         }
         packed.extend(pending);
-        for token in &kernel.rle {
+        for token in &plan.rle {
             packed.extend([token.symbol, token.extra]);
         }
         Some(Self {
-            exhaustive,
-            rle_mask,
-            hlit: u16::try_from(kernel.hlit).ok()?,
-            hdist: u8::try_from(kernel.hdist).ok()?,
-            hclen: u8::try_from(kernel.hclen).ok()?,
-            code_length_lengths: kernel.code_length_lengths,
-            bits: kernel.bits,
+            hlit: u16::try_from(plan.hlit).ok()?,
+            hdist: u8::try_from(plan.hdist).ok()?,
+            hclen: u8::try_from(plan.hclen).ok()?,
+            code_length_lengths: plan.code_length_lengths,
+            bits: plan.bits,
             packed: packed.into_boxed_slice(),
         })
     }
 
-    /// Approximate retained bytes: a table slot with growth slack, and the
-    /// packed allocation with allocator rounding.
-    fn charge(&self) -> usize {
-        2 * std::mem::size_of::<(u64, Self)>() + (self.packed.len() + 16).next_multiple_of(16)
+    /// The packed allocation with allocator rounding.
+    pub(crate) fn heap_charge(&self) -> usize {
+        (self.packed.len() + 16).next_multiple_of(16)
     }
 
     fn length(&self, index: usize) -> u8 {
         (self.packed[index / 2] >> (4 * (index % 2))) & 15
     }
 
-    fn matches(
-        &self,
-        literal_lengths: &[u8],
-        distance_lengths: &[u8],
-        exhaustive: bool,
-        rle_mask: u8,
-    ) -> bool {
-        self.exhaustive == exhaustive
-            && self.rle_mask == rle_mask
-            && usize::from(self.hlit) == literal_lengths.len()
+    fn rle_tokens(&self) -> &[u8] {
+        &self.packed[(usize::from(self.hlit) + usize::from(self.hdist)).div_ceil(2)..]
+    }
+
+    fn lengths_match(&self, literal_lengths: &[u8], distance_lengths: &[u8]) -> bool {
+        usize::from(self.hlit) == literal_lengths.len()
             && usize::from(self.hdist) == distance_lengths.len()
             && literal_lengths
                 .iter()
@@ -248,7 +238,21 @@ impl StoredHeaderPlan {
                 .all(|(index, &length)| self.length(index) == length)
     }
 
-    fn unpack(&self) -> Option<DynamicPlan> {
+    /// Whether `plan` is the plan packed here, field for field.
+    pub(crate) fn matches(&self, plan: &DynamicPlan) -> bool {
+        let rle = self.rle_tokens();
+        self.bits == plan.bits
+            && usize::from(self.hclen) == plan.hclen
+            && self.code_length_lengths == plan.code_length_lengths
+            && rle.len() == 2 * plan.rle.len()
+            && rle
+                .chunks_exact(2)
+                .zip(&plan.rle)
+                .all(|(pair, token)| pair[0] == token.symbol && pair[1] == token.extra)
+            && self.lengths_match(&plan.literal_lengths, &plan.distance_lengths)
+    }
+
+    pub(crate) fn unpack(&self) -> Option<DynamicPlan> {
         let hlit = usize::from(self.hlit);
         let hdist = usize::from(self.hdist);
         let mut literal_lengths = Vec::new();
@@ -257,7 +261,7 @@ impl StoredHeaderPlan {
         let mut distance_lengths = Vec::new();
         distance_lengths.try_reserve_exact(hdist).ok()?;
         distance_lengths.extend((hlit..hlit + hdist).map(|index| self.length(index)));
-        let tokens = &self.packed[(hlit + hdist).div_ceil(2)..];
+        let tokens = self.rle_tokens();
         let mut rle = Vec::new();
         rle.try_reserve_exact(tokens.len() / 2).ok()?;
         rle.extend(tokens.chunks_exact(2).map(|pair| RleToken {
@@ -277,23 +281,47 @@ impl StoredHeaderPlan {
     }
 }
 
-#[derive(Default)]
-struct HeaderPlanGeneration {
-    plans: HashMap<u64, StoredHeaderPlan>,
-    bytes: usize,
+/// A completed header plan priced with zero payload bits, and its policy.
+struct StoredHeaderPlan {
+    exhaustive: bool,
+    rle_mask: u8,
+    plan: PackedDynamicPlan,
+}
+
+impl StoredHeaderPlan {
+    fn pack(exhaustive: bool, rle_mask: u8, kernel: &DynamicPlan) -> Option<Self> {
+        Some(Self {
+            exhaustive,
+            rle_mask,
+            plan: PackedDynamicPlan::pack(kernel)?,
+        })
+    }
+
+    fn matches(
+        &self,
+        literal_lengths: &[u8],
+        distance_lengths: &[u8],
+        exhaustive: bool,
+        rle_mask: u8,
+    ) -> bool {
+        self.exhaustive == exhaustive
+            && self.rle_mask == rle_mask
+            && self.plan.lengths_match(literal_lengths, distance_lengths)
+    }
+}
+
+impl Charged for StoredHeaderPlan {
+    /// A table slot with growth slack, and the packed allocation.
+    fn charge(&self) -> usize {
+        2 * std::mem::size_of::<(u64, Self)>() + self.plan.heap_charge()
+    }
 }
 
 /// Completed header plans shared by every route on one thread. Routes replan
 /// the same code lengths from different token states, and each route-local
-/// [`HeaderPlanCache`] starts empty. When the current generation reaches half
-/// the byte budget it replaces the previous one; a hit in the previous
-/// generation moves forward, so recently used plans survive. Every hash hit
-/// compares the complete code lengths and policy before reuse.
-struct HeaderPlanStore {
-    current: HeaderPlanGeneration,
-    previous: HeaderPlanGeneration,
-    max_bytes: usize,
-}
+/// [`HeaderPlanCache`] starts empty. Every hash hit compares the complete code
+/// lengths and policy before reuse.
+type HeaderPlanStore = PlanStore<StoredHeaderPlan>;
 
 impl Default for HeaderPlanStore {
     fn default() -> Self {
@@ -306,14 +334,6 @@ thread_local! {
 }
 
 impl HeaderPlanStore {
-    fn with_budget(max_bytes: usize) -> Self {
-        Self {
-            current: HeaderPlanGeneration::default(),
-            previous: HeaderPlanGeneration::default(),
-            max_bytes,
-        }
-    }
-
     fn get(
         &mut self,
         fingerprint: u64,
@@ -322,33 +342,11 @@ impl HeaderPlanStore {
         exhaustive: bool,
         rle_mask: u8,
     ) -> Option<DynamicPlan> {
-        if let Some(entry) = self.current.plans.get(&fingerprint) {
-            return entry
-                .matches(literal_lengths, distance_lengths, exhaustive, rle_mask)
-                .then(|| entry.unpack())
-                .flatten();
-        }
-        let entry = self.previous.plans.remove(&fingerprint)?;
-        self.previous.bytes -= entry.charge();
-        if !entry.matches(literal_lengths, distance_lengths, exhaustive, rle_mask) {
-            return None;
-        }
-        let plan = entry.unpack();
-        self.insert(fingerprint, entry);
-        plan
-    }
-
-    fn insert(&mut self, fingerprint: u64, entry: StoredHeaderPlan) {
-        if self.current.plans.try_reserve(1).is_err() {
-            return;
-        }
-        self.current.bytes += entry.charge();
-        if let Some(replaced) = self.current.plans.insert(fingerprint, entry) {
-            self.current.bytes -= replaced.charge();
-        }
-        if self.current.bytes >= self.max_bytes / 2 {
-            self.previous = std::mem::take(&mut self.current);
-        }
+        self.lookup(
+            fingerprint,
+            |entry| entry.matches(literal_lengths, distance_lengths, exhaustive, rle_mask),
+            |entry| entry.plan.unpack(),
+        )
     }
 }
 

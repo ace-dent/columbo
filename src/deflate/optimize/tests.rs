@@ -556,7 +556,8 @@ fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
         max_planner_is_stable: true,
     };
     assert_eq!(parent.bits, 1600);
-    let result = refine_with_terminal_header_search(
+    let mut cache = TerminalParseCache::default();
+    let result = refine_with_terminal_header_search_cached(
         TerminalHeaderSearch::PayloadTradeoff,
         &parent,
         &Options {
@@ -566,11 +567,29 @@ fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
         1 << 20,
         identity,
         &mut SearchStop::never(),
+        &mut cache,
     )
     .unwrap()
     .unwrap();
     assert_eq!((result.data.len(), result.bits), (200, 1597));
     let checked = parse_validated_rewrite(&result.data, 1 << 20, identity).unwrap();
+    // The cache keeps the validated parse of the smaller candidate, so the next
+    // method does not reparse its bytes.
+    let (bytes, kept) = cache.entry.as_ref().unwrap();
+    assert_eq!(bytes, &result.data);
+    assert_eq!(
+        (kept.consumed, kept.meaningful_bits, kept.max_distance),
+        (
+            checked.consumed,
+            checked.meaningful_bits,
+            checked.max_distance
+        )
+    );
+    assert!(kept
+        .blocks
+        .iter()
+        .zip(&checked.blocks)
+        .all(|(a, b)| a.tokens == b.tokens && a.original_dynamic == b.original_dynamic));
     assert_eq!(checked.blocks.len(), parsed.blocks.len());
     for (a, b) in checked.blocks.iter().zip(&parsed.blocks) {
         assert_eq!(a.tokens, b.tokens);

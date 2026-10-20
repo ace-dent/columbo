@@ -124,6 +124,7 @@ impl Optimization {
 pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optimization> {
     let result = format::optimize(input, format, options);
     deflate::release_thread_header_plans();
+    deflate::release_thread_block_plans();
     result
 }
 

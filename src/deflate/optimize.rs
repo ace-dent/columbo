@@ -2455,6 +2455,16 @@ impl TerminalParseCache {
         self.entry = None;
     }
 
+    /// Keep a validated parse of `data` made elsewhere.
+    fn keep(&mut self, data: &[u8], stream: ParsedStream) {
+        self.entry = None;
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(data.len()).is_ok() {
+            bytes.extend_from_slice(data);
+            self.entry = Some((bytes, stream));
+        }
+    }
+
     fn parse(
         &mut self,
         data: &[u8],
@@ -2582,10 +2592,16 @@ fn refine_with_terminal_header_search_cached(
     };
     let source = rewritten_input(candidate, &selected, decoded_limit, identity);
     // Zero replays keeps exactly the proposed tokens and tables.
-    let refined = build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, stop)?;
-    Ok(refined
-        .is_strictly_smaller_than(candidate)
-        .then(|| refined.named(search.name())))
+    let (refined, parsed) =
+        build_candidate_and_parse(source, plans, options, 0, ReplayPlanner::Full, stop, None)?;
+    if !refined.is_strictly_smaller_than(candidate) {
+        return Ok(None);
+    }
+    // The caller keeps the smaller candidate, which the next method parses.
+    if let Some(parsed) = parsed {
+        parse_cache.keep(&refined.data, parsed);
+    }
+    Ok(Some(refined.named(search.name())))
 }
 
 /// The exact Default result that a Max stream keeps before its Max routes.
@@ -4385,13 +4401,37 @@ fn build_candidate_from_plans(
 #[allow(clippy::too_many_arguments)]
 fn build_candidate_from_plans_with_progress(
     source: CandidateInput<'_>,
-    mut plans: Vec<PlannedBlock>,
+    plans: Vec<PlannedBlock>,
     options: &Options,
     replay_limit: usize,
     replay_planner: ReplayPlanner,
     expired: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
 ) -> Result<Candidate> {
+    build_candidate_and_parse(
+        source,
+        plans,
+        options,
+        replay_limit,
+        replay_planner,
+        expired,
+        progress,
+    )
+    .map(|(candidate, _)| candidate)
+}
+
+/// [`build_candidate_from_plans_with_progress`], also returning the validated
+/// parse of the candidate's bytes when one was made.
+#[allow(clippy::too_many_arguments)]
+fn build_candidate_and_parse(
+    source: CandidateInput<'_>,
+    mut plans: Vec<PlannedBlock>,
+    options: &Options,
+    replay_limit: usize,
+    replay_planner: ReplayPlanner,
+    expired: &mut SearchStop<'_>,
+    progress: Option<&RouteProgress>,
+) -> Result<(Candidate, Option<ParsedStream>)> {
     let (mut data, mut bits) = emit_plans(source.compressed, &plans, options.strict)?;
     let replay_limit = resolved_replay_limit(replay_limit, data.len());
     let initial_loses = !is_strictly_better(
@@ -4401,7 +4441,8 @@ fn build_candidate_from_plans_with_progress(
         source.meaningful_bits,
     );
 
-    let mut data_is_validated = false;
+    // The validated parse of `data`, once one is made.
+    let mut validated = None;
     let mut output_max_distance = None;
     let mut max_planner_is_stable = false;
     for round in 1..=replay_limit {
@@ -4424,7 +4465,6 @@ fn build_candidate_from_plans_with_progress(
             Instant::now()
         });
         let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
-        data_is_validated = true;
         output_max_distance = Some(replayed.max_distance);
 
         let replay_plans = match replay_planner {
@@ -4465,6 +4505,7 @@ fn build_candidate_from_plans_with_progress(
             if let Some(progress) = progress {
                 progress.stopped("Replay planner produced no complete candidate");
             }
+            validated = Some(replayed);
             break;
         };
         let (replay_data, replay_bits) = emit_plans(&data, &replay_plans, options.strict)?;
@@ -4494,6 +4535,7 @@ fn build_candidate_from_plans_with_progress(
                     );
                 }
             }
+            validated = Some(replayed);
             break;
         }
         if let (Some(progress), Some(started)) = (progress, replay_started) {
@@ -4509,19 +4551,19 @@ fn build_candidate_from_plans_with_progress(
         data = replay_data;
         bits = replay_bits;
         plans = replay_plans;
-        data_is_validated = false;
         output_max_distance = None;
     }
 
     // The loop may stop right after an accepted replay. A known-losing relaxed
     // stream is skipped, since the caller keeps the validated source bytes.
-    if (!initial_loses || options.strict) && !data_is_validated {
+    if (!initial_loses || options.strict) && validated.is_none() {
         let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
         output_max_distance = Some(replayed.max_distance);
+        validated = Some(replayed);
     }
 
     let block_report = capture_planned_block_report(&plans, reports_enabled(options));
-    Ok(Candidate {
+    let candidate = Candidate {
         data,
         bits,
         output_max_distance,
@@ -4533,7 +4575,8 @@ fn build_candidate_from_plans_with_progress(
             "Normal route"
         },
         max_planner_is_stable,
-    })
+    };
+    Ok((candidate, validated))
 }
 
 /// Retain a parsed source when the mandatory plan list cannot be allocated.

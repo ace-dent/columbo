@@ -52,8 +52,27 @@ fn xorshift(mut state: u64) -> impl FnMut() -> u64 {
 
 fn table() -> Vec<u64> {
     let mut table = Vec::new();
-    weighted_log_table(&mut table).unwrap();
+    weighted_log_table(&mut table, 0).unwrap();
     table
+}
+
+#[test]
+fn grown_weighted_log_table_matches_computed_values() {
+    let mut table = table();
+    assert_eq!(table.len(), WEIGHTED_LOG_TABLE_LEN);
+    let base = table.clone();
+    weighted_log_table(&mut table, 20_000).unwrap();
+    assert_eq!(table.len(), 20_000);
+    assert_eq!(table[..WEIGHTED_LOG_TABLE_LEN], base[..]);
+    for count in [1, 2, 4095, 4096, 4097, 12_345, 19_999] {
+        assert_eq!(table[count], count as u64 * log2_fixed(count as u64));
+        assert_eq!(
+            weighted_log(&table, count as u64),
+            weighted_log(&base, count as u64)
+        );
+    }
+    weighted_log_table(&mut table, usize::MAX).unwrap();
+    assert_eq!(table.len(), MAX_WEIGHTED_LOG_TABLE_LEN);
 }
 
 #[test]
