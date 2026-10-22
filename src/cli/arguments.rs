@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use columbo::{
+use crate::{
     Format, Options, MAX_EXPANSION_RATIO, MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES, MIN_TIMEOUT,
 };
 

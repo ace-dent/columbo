@@ -17,6 +17,7 @@
 #![forbid(unsafe_code)]
 
 mod checksum;
+mod cli;
 mod deflate;
 mod error;
 mod format;
@@ -137,6 +138,13 @@ pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optim
 /// and zlib-compressed metadata chunks.
 pub fn deflate_stream_count(input: &[u8], format: Format, options: &Options) -> Result<usize> {
     format::deflate_stream_count(input, format, options)
+}
+
+/// The command-line program's entry point, kept in the library so the program
+/// shares one copy of the code both use. Not part of the library API.
+#[doc(hidden)]
+pub fn run_cli() -> std::result::Result<(), u8> {
+    cli::run()
 }
 
 #[cfg(test)]

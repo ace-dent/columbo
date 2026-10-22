@@ -3,13 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-mod cli;
-mod terminal;
-
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match cli::run() {
+    match columbo::run_cli() {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => ExitCode::from(code),
     }

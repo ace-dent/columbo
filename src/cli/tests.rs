@@ -3,7 +3,7 @@
 
 use std::fs;
 
-use columbo::{Format, Options};
+use crate::{Format, Options};
 
 use super::test_support::unique_test_directory;
 use super::*;

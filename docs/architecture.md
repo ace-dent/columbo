@@ -9,8 +9,8 @@ remain private to the crate.
 
 | Path | Responsibility |
 | --- | --- |
-| `src/main.rs` | Start the CLI and return its exit status. |
-| `src/cli/mod.rs` | Process input files sequentially through reading, optimization, and writing. |
+| `src/main.rs` | Start the CLI through the library's hidden `run_cli` and return its exit status. |
+| `src/cli/mod.rs` | Process input files sequentially through reading, optimization, and writing. The CLI lives in the library, so it shares one copy of the terminal code with the progress reports. |
 | `src/cli/arguments.rs` | Parse OS-native arguments, validate combinations, and render help. |
 | `src/cli/files.rs` | Read within resource limits and stage atomic file replacements. |
 | `src/cli/report.rs` | Render per-file results and select the appropriate output channel. |

@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use columbo::Options;
+use crate::Options;
 
 use crate::terminal;
 use crate::terminal::formatting::{format_duration as format_elapsed, plural, plural_u64};

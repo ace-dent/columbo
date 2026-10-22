@@ -3,7 +3,6 @@
 
 //! Buffered verbose reports emitted in physical stream order.
 
-use std::collections::BTreeMap;
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
@@ -17,7 +16,7 @@ static REPORTS: OnceLock<Mutex<Reports>> = OnceLock::new();
 #[derive(Default)]
 struct Reports {
     cached_bytes: usize,
-    reports: BTreeMap<usize, Report>,
+    reports: super::IdMap<Report>,
 }
 
 pub(super) struct Report {
@@ -54,7 +53,7 @@ impl Reports {
     }
 
     fn append(&mut self, report_id: usize, arguments: fmt::Arguments<'_>) {
-        let Some(report) = self.reports.get_mut(&report_id) else {
+        let Some(report) = self.reports.get_mut(report_id) else {
             return;
         };
         if report.truncated {
@@ -72,7 +71,7 @@ impl Reports {
     }
 
     fn finish(&mut self, report_id: usize) {
-        if let Some(report) = self.reports.get_mut(&report_id) {
+        if let Some(report) = self.reports.get_mut(report_id) {
             report.finished = true;
         }
     }
@@ -88,18 +87,18 @@ impl Reports {
         let mut report_ids: Vec<_> = self
             .reports
             .iter()
-            .filter_map(|(&report_id, report)| (report.stream_id == stream_id).then_some(report_id))
+            .filter_map(|(report_id, report)| (report.stream_id == stream_id).then_some(report_id))
             .collect();
         super::sort_tiny_by(&mut report_ids, |left_id, right_id| {
-            let left = &self.reports[left_id];
-            let right = &self.reports[right_id];
+            let left = &self.reports[*left_id];
+            let right = &self.reports[*right_id];
             (left.order, left_id).cmp(&(right.order, right_id))
         });
         let mut finished = Vec::with_capacity(report_ids.len());
         for report_id in report_ids {
             let report = self
                 .reports
-                .remove(&report_id)
+                .remove(report_id)
                 .expect("a collected verbose report remains cached");
             self.cached_bytes = self.cached_bytes.saturating_sub(report.text.len());
             finished.push(report);
@@ -108,7 +107,9 @@ impl Reports {
     }
 
     fn take_finished_in_stream_order(&mut self) -> Vec<Report> {
-        let mut reports: Vec<_> = std::mem::take(&mut self.reports)
+        let mut reports: Vec<_> = self
+            .reports
+            .take()
             .into_iter()
             .filter_map(|(report_id, report)| report.finished.then_some((report_id, report)))
             .collect();

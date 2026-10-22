@@ -8,7 +8,6 @@
 //! as all its producers have finished and every earlier stream is printed.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -79,14 +78,103 @@ enum ProgressMode {
     Visual,
 }
 
+/// Report entries by report ID, sorted by ID. Callers sort what they print, so
+/// a sorted vector replaces a `BTreeMap`, whose code is compiled again for
+/// each value type.
+struct IdMap<T>(Vec<(usize, T)>);
+
+impl<T> Default for IdMap<T> {
+    fn default() -> Self {
+        Self(Vec::new())
+    }
+}
+
+impl<T> IdMap<T> {
+    fn position(&self, id: usize) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&id, |&(key, _)| key)
+    }
+
+    fn insert(&mut self, id: usize, value: T) {
+        match self.position(id) {
+            Ok(index) => self.0[index].1 = value,
+            Err(index) => self.0.insert(index, (id, value)),
+        }
+    }
+
+    fn get_mut(&mut self, id: usize) -> Option<&mut T> {
+        let index = self.position(id).ok()?;
+        Some(&mut self.0[index].1)
+    }
+
+    fn remove(&mut self, id: usize) -> Option<T> {
+        let index = self.position(id).ok()?;
+        Some(self.0.remove(index).1)
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.0.iter().map(|(id, value)| (*id, value))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.0.iter().map(|(_, value)| value)
+    }
+
+    fn take(&mut self) -> Vec<(usize, T)> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl<T> std::ops::Index<usize> for IdMap<T> {
+    type Output = T;
+
+    fn index(&self, id: usize) -> &T {
+        let index = self.position(id).expect("report ID is present");
+        &self.0[index].1
+    }
+}
+
+/// A set of report producers, one bit per `u8` tag.
+#[derive(Clone, Copy, Default)]
+struct ProducerSet([u64; 4]);
+
+impl ProducerSet {
+    fn insert(&mut self, producer: u8) {
+        self.0[usize::from(producer / 64)] |= 1 << (producer % 64);
+    }
+
+    fn contains_all(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .all(|(&mine, &theirs)| theirs & !mine == 0)
+    }
+}
+
+/// Report state of one stream: which producers have finished it, if any, and
+/// whether every expected producer has.
+#[derive(Clone, Copy, Default)]
+struct StreamState {
+    completed: Option<ProducerSet>,
+    sealed: bool,
+}
+
 struct ReportCoordinator {
     active: bool,
-    completed_producers: BTreeMap<usize, BTreeSet<u8>>,
     deadline: Option<Instant>,
-    expected_producers: BTreeSet<u8>,
+    expected_producers: ProducerSet,
     mode: ProgressMode,
     next_stream_id: usize,
-    sealed_streams: BTreeSet<usize>,
+    /// Indexed by stream ID, which runs from 1 to `total_streams`; grown on
+    /// demand.
+    streams: Vec<StreamState>,
     zip_store_changes: Vec<ZipStoreProgress>,
     total_streams: usize,
 }
@@ -95,12 +183,11 @@ impl Default for ReportCoordinator {
     fn default() -> Self {
         Self {
             active: false,
-            completed_producers: BTreeMap::new(),
             deadline: None,
-            expected_producers: BTreeSet::new(),
+            expected_producers: ProducerSet::default(),
             mode: ProgressMode::Disabled,
             next_stream_id: 1,
-            sealed_streams: BTreeSet::new(),
+            streams: Vec::new(),
             zip_store_changes: Vec::new(),
             total_streams: 0,
         }
@@ -110,23 +197,31 @@ impl Default for ReportCoordinator {
 impl ReportCoordinator {
     fn reset(&mut self, mode: ProgressMode, total_streams: usize, timeout: Duration) {
         self.active = mode.enabled();
-        self.completed_producers.clear();
         self.deadline = Instant::now().checked_add(timeout);
-        self.expected_producers.clear();
+        self.expected_producers = ProducerSet::default();
         self.expected_producers.insert(PRIMARY_STREAM_PRODUCER);
         self.mode = mode;
         self.next_stream_id = 1;
-        self.sealed_streams.clear();
+        self.streams.clear();
         self.zip_store_changes.clear();
         self.total_streams = total_streams;
     }
 
     fn set_expected_producers(&mut self, producers: &[u8]) {
-        self.expected_producers.clear();
-        self.expected_producers.extend(producers.iter().copied());
+        self.expected_producers = ProducerSet::default();
+        for &producer in producers {
+            self.expected_producers.insert(producer);
+        }
         for stream_id in self.next_stream_id..=self.total_streams {
             self.update_sealed(stream_id);
         }
+    }
+
+    fn stream_mut(&mut self, stream_id: usize) -> &mut StreamState {
+        if self.streams.len() <= stream_id {
+            self.streams.resize(stream_id + 1, StreamState::default());
+        }
+        &mut self.streams[stream_id]
     }
 
     fn complete(&mut self, stream_id: usize, duplicates: &[usize], producer: u8) {
@@ -134,9 +229,9 @@ impl ReportCoordinator {
             if stream_id < self.next_stream_id || stream_id > self.total_streams {
                 continue;
             }
-            self.completed_producers
-                .entry(stream_id)
-                .or_default()
+            self.stream_mut(stream_id)
+                .completed
+                .get_or_insert_with(ProducerSet::default)
                 .insert(producer);
             self.update_sealed(stream_id);
         }
@@ -144,47 +239,44 @@ impl ReportCoordinator {
 
     fn complete_all(&mut self, producer: u8) {
         for stream_id in self.next_stream_id..=self.total_streams {
-            self.completed_producers
-                .entry(stream_id)
-                .or_default()
+            self.stream_mut(stream_id)
+                .completed
+                .get_or_insert_with(ProducerSet::default)
                 .insert(producer);
             self.update_sealed(stream_id);
         }
     }
 
     fn update_sealed(&mut self, stream_id: usize) {
-        if self
-            .completed_producers
-            .get(&stream_id)
-            .is_some_and(|done| {
-                self.expected_producers
-                    .iter()
-                    .all(|producer| done.contains(producer))
-            })
-        {
-            self.sealed_streams.insert(stream_id);
-        } else {
-            self.sealed_streams.remove(&stream_id);
+        let expected = self.expected_producers;
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            stream.sealed = stream
+                .completed
+                .is_some_and(|done| done.contains_all(&expected));
         }
     }
 
     fn next_sealed(&self) -> Option<usize> {
         (self.next_stream_id <= self.total_streams
-            && self.sealed_streams.contains(&self.next_stream_id))
+            && self
+                .streams
+                .get(self.next_stream_id)
+                .is_some_and(|stream| stream.sealed))
         .then_some(self.next_stream_id)
     }
 
     fn advance(&mut self, stream_id: usize) {
         debug_assert_eq!(self.next_stream_id, stream_id);
-        self.sealed_streams.remove(&stream_id);
-        self.completed_producers.remove(&stream_id);
+        if let Some(stream) = self.streams.get_mut(stream_id) {
+            *stream = StreamState::default();
+        }
         self.next_stream_id = self.next_stream_id.saturating_add(1);
     }
 
     fn finish(&mut self) {
         self.active = false;
         for stream_id in self.next_stream_id..=self.total_streams {
-            self.sealed_streams.insert(stream_id);
+            self.stream_mut(stream_id).sealed = true;
         }
     }
 }

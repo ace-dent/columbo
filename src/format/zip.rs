@@ -1373,10 +1373,12 @@ fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>>
     Ok(order)
 }
 
+#[inline(never)]
 fn entry_is_optimizable(entry: &Entry) -> bool {
     entry_is_deflate_stream(entry) && entry.uncompressed_size > ALWAYS_STORE_MAX_BYTES
 }
 
+#[inline(never)]
 fn entry_is_deflate_stream(entry: &Entry) -> bool {
     entry.method == 8 && entry.flags & FLAG_ENCRYPTED == 0 && entry.compressed_size_before != 0
 }

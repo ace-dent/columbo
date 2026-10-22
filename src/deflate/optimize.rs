@@ -629,6 +629,7 @@ impl Candidate {
     }
 }
 
+#[inline(never)]
 fn candidate_progress(
     candidate: &Candidate,
     reference_bits: u64,
@@ -1506,6 +1507,17 @@ fn spawn_route<'scope, T: Send + 'scope>(
     name: &str,
     deadline: &'scope Deadline,
     route: impl FnOnce() -> Result<T> + Send + 'scope,
+) -> Option<thread::ScopedJoinHandle<'scope, Result<T>>> {
+    spawn_boxed_route(scope, name, deadline, Box::new(route))
+}
+
+/// The body of [`spawn_route`]. Boxing the route compiles the thread machinery
+/// and the cancellation guard once per result type rather than once per route.
+fn spawn_boxed_route<'scope, T: Send + 'scope>(
+    scope: &'scope thread::Scope<'scope, '_>,
+    name: &str,
+    deadline: &'scope Deadline,
+    route: Box<dyn FnOnce() -> Result<T> + Send + 'scope>,
 ) -> Option<thread::ScopedJoinHandle<'scope, Result<T>>> {
     thread::Builder::new()
         .name(name.into())
@@ -3105,21 +3117,16 @@ fn build_bounded_generic_max_candidates(
         let run_source_max = deadline.can_start_route();
         let source_worker = run_source_max
             .then(|| {
-                thread::Builder::new()
-                    .name("columbo-source-max".into())
-                    .spawn_scoped(scope, || {
-                        run_route_with_cancellation(deadline, || {
-                            build_source_max_candidate(
-                                source,
-                                options,
-                                progress,
-                                deadline,
-                                false,
-                                &mut deadline.hard_stop(),
-                            )
-                        })
-                    })
-                    .ok()
+                spawn_route(scope, "columbo-source-max", deadline, || {
+                    build_source_max_candidate(
+                        source,
+                        options,
+                        progress,
+                        deadline,
+                        false,
+                        &mut deadline.hard_stop(),
+                    )
+                })
             })
             .flatten();
 
@@ -4399,7 +4406,9 @@ fn build_candidate_from_plans(
     )
 }
 
+// Out of line: each inlined copy also dropped the unused parse.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 fn build_candidate_from_plans_with_progress(
     source: CandidateInput<'_>,
     plans: Vec<PlannedBlock>,

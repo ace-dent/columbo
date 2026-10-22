@@ -24,6 +24,87 @@ in Default with the 180-second budget and in zero-budget Max, CLI runs of the
 contributor-guide tests. Runtime is whole-file CPU over the 33 inputs, with the
 builds alternating per input.
 
+## 22 October 2026, baseline `97fda1e`
+
+| Change | `__text` bytes | Release executable bytes |
+| --- | ---: | ---: |
+| Baseline | 1,305,872 | 1,612,752 |
+| Report coordinator state in vectors | 1,292,944 | 1,596,208 |
+| Report and view maps as sorted vectors | 1,276,496 | 1,579,696 |
+| CLI in the library | 1,268,368 | 1,579,648 |
+| Candidate building, deadline and progress helpers out of line | 1,261,008 | 1,563,136 |
+| Route reports and ZIP entry checks out of line | 1,257,680 | 1,563,136 |
+| Boxed route spawns | 1,245,264 | 1,546,624 |
+| Source-max worker through `spawn_route` | 1,243,472 | 1,546,608 |
+| One Zopfli pseudo-frequency function | 1,242,192 | 1,546,608 |
+
+`__text` shrank by 63,680 bytes (4.9%) and the release executable by 66,144
+(4.1%). The `distribution` executable fell from 1,414,304 to 1,364,672 bytes
+(3.5%), its `__text` from 1,227,368 to 1,174,248, and its maximally compressed
+ZIP from 768,138 to 739,286 bytes.
+
+- **Report coordinator state in vectors.** The coordinator kept
+  `BTreeMap<usize, BTreeSet<u8>>`, `BTreeSet<u8>` and `BTreeSet<usize>`. Its
+  producers are `u8` tags, now bit sets, and its stream IDs run from 1 to the
+  file's stream count, so a vector indexed by ID holds each stream's completed
+  producers and sealed flag. A stream without a completion record stays
+  distinct from one with an empty set, as before.
+- **Report and view maps as sorted vectors.** The verbose reports and visual
+  views were `BTreeMap`s keyed by report ID. Every reader sorts by a key that
+  ends in the report ID or only tests a condition, so a vector sorted by ID,
+  searched by bisection, gives the same output. `BTreeMap` code for the five
+  Columbo key and value types took 18 KB.
+- **CLI in the library.** `main.rs` declared `cli` and `terminal` itself, so
+  the terminal module (spinner, capability checks and formatting) was compiled
+  into both the library and the program, and its nine tests ran twice. The
+  library now holds the CLI behind a hidden `run_cli`, which the program calls.
+- **Helpers out of line.** `build_candidate_from_plans_with_progress` had 19
+  inlined copies, each also dropping the unused parse;
+  `SearchDeadline::remaining` 18, `candidate_progress` 29,
+  `RouteContext::report` and `report_optional` 36, and ZIP's
+  `entry_is_deflate_stream` and `entry_is_optimizable` 53, up to 684 bytes
+  each. Each runs once per candidate, stream or member.
+- **Boxed route spawns.** Each of the 11 closures passed to `spawn_route`
+  compiled the standard library's scoped-thread machinery and the
+  cancellation guard; boxing the route leaves one copy per result type, of
+  which there are three. The source-max worker, which repeated
+  `spawn_route`'s body, now calls it.
+- **One Zopfli pseudo-frequency function.** It was compiled for 286 and 30
+  symbols; one slice-based copy now uses a 286-entry buffer for both.
+
+Measured and rejected:
+
+- `opt-level = 2`: 65,264 bytes less code, with Default and APNG times
+  unchanged, but a Max run that completes its search took 3.4% more CPU
+  (14.27 against 13.80 seconds, medians of six), and Max is deadline-bound.
+- Boxing every scoped thread's closure: 5,504 bytes larger than boxing only
+  the route spawns, since the other spawns each have their own result type.
+- Exposing `terminal` as a hidden module instead of moving the CLI: 1,344
+  bytes less saving, through a wider hidden API.
+- `plural` out of line: 64 bytes.
+
+Not addressed: the standard library's backtrace printer is about 153 KB of
+the code with `gimli`, `addr2line`, `rustc_demangle` and `object`; the default
+panic hook links it whatever the panic strategy, and removing it needs a
+nightly toolchain that rebuilds the standard library. The compiler inlines the
+drop of a `Candidate` at 217 sites (about 19 KB), and the balanced-tree move
+collectors keep a copy for each alphabet (about 5 KB).
+
+Equivalence: API comparisons on the 52 inputs, in Default with the 180-second
+budget and in zero-budget Max, matched in all 104 runs; the 33 Default inputs,
+four large APNG files and a completing Max run matched byte for byte. Rust
+tests, including the private corpus, passed in release and debug modes, with
+documentation and Python tests, a locked build, formatting and all-feature
+Clippy with warnings denied; the test names are unchanged.
+
+Runtime: 130.2 seconds of CPU for the baseline and 130.1 for the candidate on
+the 33 inputs, and 15.48 and 15.34 seconds for the completing Max run. Large
+APNG medians stayed within 1% while other work loaded the machine; on
+`bored.png` the medians of eight runs retired 37.627 and 37.634 billion
+instructions in 11.50 and 11.54 billion cycles.
+
+Artifacts: `work/binary-size-review-20261022/`.
+
 ## 20 October 2026, baseline `ef91c11`
 
 | Change | `__text` bytes | Release executable bytes |

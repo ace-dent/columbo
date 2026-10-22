@@ -48,6 +48,9 @@ impl SearchDeadline {
         call
     }
 
+    // Called once per stream or member from many places: out of line, it is
+    // one copy instead of one per call site.
+    #[inline(never)]
     pub(super) fn remaining(&self) -> Duration {
         self.timeout.saturating_sub(self.started.elapsed())
     }

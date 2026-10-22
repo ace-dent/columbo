@@ -11,7 +11,7 @@ use std::env;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use columbo::optimize;
+use crate::optimize;
 
 use crate::terminal::{self, spinner::Spinner};
 

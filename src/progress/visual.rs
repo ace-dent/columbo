@@ -6,7 +6,6 @@
 //! Workers only update cached stream views. The report coordinator prints each
 //! stream's card once, after it and all earlier streams are complete.
 
-use std::collections::BTreeMap;
 use std::env;
 #[cfg(unix)]
 use std::fs::File;
@@ -85,7 +84,7 @@ pub(super) fn begin(
 
 pub(super) fn route_started(report_id: usize, name: &str) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         view.status.clear();
@@ -99,7 +98,7 @@ pub(super) fn route_started(report_id: usize, name: &str) {
 
 pub(super) fn activity(report_id: usize, status: &str) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         view.status.clear();
@@ -110,7 +109,7 @@ pub(super) fn activity(report_id: usize, status: &str) {
 
 pub(super) fn work(report_id: usize, status: &str, completed: usize, total: usize) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         view.status.clear();
@@ -121,7 +120,7 @@ pub(super) fn work(report_id: usize, status: &str, completed: usize, total: usiz
 
 pub(super) fn checkpoint(report_id: usize, name: &str, bits: u64, blocks: usize, improved: bool) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         view.status = if improved {
@@ -138,7 +137,7 @@ pub(super) fn checkpoint(report_id: usize, name: &str, bits: u64, blocks: usize,
 
 pub(super) fn candidate(report_id: usize, name: &str, candidate: &CandidateProgress) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         let improved = is_smaller(
@@ -172,7 +171,7 @@ pub(super) fn candidate(report_id: usize, name: &str, candidate: &CandidateProgr
 
 pub(super) fn final_plan(report_id: usize, report: Option<&BlockReport>) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         if let Some(report) = report {
@@ -209,7 +208,7 @@ pub(super) fn finish(
     slice_budget: bool,
 ) {
     with_renderer(|renderer| {
-        let Some(view) = renderer.views.get_mut(&report_id) else {
+        let Some(view) = renderer.views.get_mut(report_id) else {
             return;
         };
         view.output_bytes = output_bytes;
@@ -271,7 +270,7 @@ struct Renderer {
     format: Option<&'static str>,
     header_printed: bool,
     unicode: bool,
-    views: BTreeMap<usize, StreamView>,
+    views: super::IdMap<StreamView>,
 }
 
 #[derive(Clone, Copy)]
@@ -338,11 +337,7 @@ impl Renderer {
     }
 
     fn ordered_views(&self) -> Vec<(usize, &StreamView)> {
-        let mut views: Vec<_> = self
-            .views
-            .iter()
-            .map(|(&report_id, view)| (report_id, view))
-            .collect();
+        let mut views: Vec<_> = self.views.iter().collect();
         views.sort_shared_by_key(|(report_id, view)| {
             (view.id, super::report_order(view.note), *report_id)
         });
@@ -360,11 +355,11 @@ impl Renderer {
         let mut report_ids: Vec<_> = self
             .views
             .iter()
-            .filter_map(|(&report_id, view)| (view.id == stream_id).then_some(report_id))
+            .filter_map(|(report_id, view)| (view.id == stream_id).then_some(report_id))
             .collect();
         super::sort_tiny_by(&mut report_ids, |left_id, right_id| {
-            let left = &self.views[left_id];
-            let right = &self.views[right_id];
+            let left = &self.views[*left_id];
+            let right = &self.views[*right_id];
             (super::report_order(left.note), left_id)
                 .cmp(&(super::report_order(right.note), right_id))
         });
@@ -373,7 +368,7 @@ impl Renderer {
         Some(
             report_ids
                 .into_iter()
-                .filter_map(|report_id| self.views.remove(&report_id))
+                .filter_map(|report_id| self.views.remove(report_id))
                 .map(|view| render_card(&view, self.columns, color, glyphs))
                 .collect(),
         )

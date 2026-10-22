@@ -47,8 +47,8 @@ fn one_finished_stream_can_be_removed_without_draining_later_reports() {
         .map(|report| report.text)
         .collect();
     assert_eq!(first, ["stream one first\n", "stream one second\n"]);
-    assert_eq!(reports.reports.len(), 1);
-    assert_eq!(reports.reports[&1].stream_id, 2);
+    assert_eq!(reports.reports.iter().count(), 1);
+    assert_eq!(reports.reports[1].stream_id, 2);
 }
 
 #[test]

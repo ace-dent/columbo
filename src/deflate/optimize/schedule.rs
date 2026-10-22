@@ -229,7 +229,10 @@ struct RouteContext<'a> {
     progress: Progress,
 }
 
+// The report helpers run once per candidate from dozens of call sites, so
+// they stay out of line with the report clones they make.
 impl<'a> RouteContext<'a> {
+    #[inline(never)]
     fn report(&self, candidate: &Candidate) -> CandidateProgress {
         candidate_progress(
             candidate,
@@ -238,6 +241,7 @@ impl<'a> RouteContext<'a> {
         )
     }
 
+    #[inline(never)]
     fn report_optional(&self, candidate: Option<&Candidate>) -> Option<CandidateProgress> {
         candidate.map(|candidate| self.report(candidate))
     }

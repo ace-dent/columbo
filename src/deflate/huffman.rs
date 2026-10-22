@@ -1153,12 +1153,14 @@ fn mark_rle_runs(frequencies: &[u32], protected: &mut [bool]) {
 ///
 /// Algorithm: Google Zopfli, Copyright 2011 Google Inc., Lode Vandevenne and
 /// Jyrki Alakuijala, Apache License 2.0.
-pub(crate) fn make_zopfli_rle_pseudofrequencies<const N: usize>(frequencies: &mut [u32; N]) {
+///
+/// One copy serves both alphabets; neither has more than 286 symbols.
+pub(crate) fn make_zopfli_rle_pseudofrequencies(frequencies: &mut [u32]) {
     let Some(last_nonzero) = frequencies.iter().rposition(|&frequency| frequency != 0) else {
         return;
     };
     let length = last_nonzero + 1;
-    let mut good_for_rle = [false; N];
+    let mut good_for_rle = [false; 286];
     mark_rle_runs(&frequencies[..length], &mut good_for_rle[..length]);
 
     let mut stride = 0_usize;

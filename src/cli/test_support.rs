@@ -8,7 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use columbo::{Format, Options};
+use crate::{Format, Options};
 
 use super::arguments::{parse_args, Command, ParsedCommand};
 
