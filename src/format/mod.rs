@@ -31,6 +31,8 @@ pub(super) fn try_copy_bytes(source: &[u8], message: &'static str) -> Result<Vec
 
 /// Fallibly append to a wrapper output, which can outgrow its input-sized
 /// reservation (for example in strict mode).
+// Out of line: each call copies a whole buffer.
+#[inline(never)]
 pub(super) fn try_append_bytes(
     output: &mut Vec<u8>,
     source: &[u8],

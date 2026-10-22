@@ -44,6 +44,8 @@ pub(crate) const FIXED_LITERAL_CODE_LENGTHS: [u8; 288] = make_fixed_literal_code
 pub(crate) const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
 
 /// Whether the code lengths form a complete prefix code (Kraft sum exactly 1).
+// Out of line: each call scans the lengths.
+#[inline(never)]
 pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
     let mut occupied = 0_u32;
     for &length in lengths {
@@ -70,6 +72,8 @@ pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
 /// Accept a complete code, a single one-bit code (RFC 1951 allows this for
 /// distances; zlib also accepts it for literal/length codes), or an empty code
 /// if `allow_empty` (the distance code of a literal-only block).
+// Out of line: each call scans the lengths.
+#[inline(never)]
 pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> bool {
     let populated = lengths.iter().filter(|&&length| length != 0).count();
     match populated {
@@ -782,6 +786,27 @@ fn take_generic_front(
     }
 }
 
+/// Pack a leaf's sort key: `frequency`, then `tie`. Every caller's ties are
+/// distinct, so the keys are too, and their order does not depend on the sort
+/// algorithm.
+fn leaf_key(frequency: u32, tie: u32) -> u64 {
+    u64::from(frequency) << 32 | u64::from(tie)
+}
+
+/// The tie of a key from [`leaf_key`].
+fn leaf_key_tie(key: u64) -> u32 {
+    key as u32
+}
+
+/// The overflow repair and package-merge builders sort their leaves through
+/// this one instance. The two-queue merges and Defluff's builder keep their own
+/// sorts: they build the most trees, and a key buffer for each cost more than
+/// it saved.
+#[inline(never)]
+fn sort_leaf_keys(keys: &mut [u64]) {
+    keys.sort_unstable();
+}
+
 /// Order nodes by [`node_less`]. Both two-queue merges share this one sort.
 fn sort_generic_nodes(nodes: &[Node], active: &mut [usize], variant: u32) {
     active.sort_unstable_by(|&left, &right| {
@@ -1069,16 +1094,16 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
         overflow = overflow.wrapping_sub(2);
     }
 
-    let mut leaves: Vec<(u32, usize)> = frequencies
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(symbol, frequency)| (frequency != 0).then_some((frequency, symbol)))
-        .collect();
     // Assign the shortest lengths to the most frequent symbols. Equal
     // frequencies are ordered by symbol, matching the `qsort` comparator of
-    // Columbo's C implementation.
-    leaves.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    // Columbo's C implementation; inverting the frequency sorts it descending.
+    let mut leaves: Vec<u64> = frequencies
+        .iter()
+        .enumerate()
+        .filter(|&(_, &frequency)| frequency != 0)
+        .map(|(symbol, &frequency)| leaf_key(!frequency, symbol as u32))
+        .collect();
+    sort_leaf_keys(&mut leaves);
 
     lengths.fill(0);
     let mut leaf = 0;
@@ -1087,7 +1112,7 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
             if leaf == leaves.len() {
                 return;
             }
-            lengths[leaves[leaf].1] = bits as u8;
+            lengths[leaf_key_tie(leaves[leaf]) as usize] = bits as u8;
             leaf += 1;
         }
     }
@@ -1437,7 +1462,7 @@ fn apply_package_merge(
 
     let target = 2 * leaf_count - 2;
     let mut nodes = Vec::new();
-    let mut leaves = Vec::with_capacity(leaf_count);
+    let mut keys = Vec::with_capacity(leaf_count);
 
     // Leaf node indices increase with symbol (zero counts are skipped), so
     // sorting once by (weight, index) breaks ties by symbol.
@@ -1445,14 +1470,14 @@ fn apply_package_merge(
         if frequency == 0 {
             continue;
         }
-        let index = nodes.len();
+        keys.push(leaf_key(frequency, nodes.len() as u32));
         nodes.push(PackageNode {
             weight: u64::from(frequency),
             kind: PackageKind::Leaf(symbol),
         });
-        leaves.push(index);
     }
-    leaves.sort_unstable_by_key(|&leaf| (nodes[leaf].weight, leaf));
+    sort_leaf_keys(&mut keys);
+    let leaves: Vec<usize> = keys.iter().map(|&key| leaf_key_tie(key) as usize).collect();
 
     let mut previous = Vec::with_capacity(target);
     previous.extend_from_slice(&leaves);

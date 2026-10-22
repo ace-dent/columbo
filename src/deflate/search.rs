@@ -29,9 +29,9 @@ use super::huffman::{
 };
 use super::minima::SuffixMinima;
 use super::model::{
-    canonical_length_encoding, count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan,
-    ParsedBlock, PlannedBlock, Representation, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
-    LENGTH_EXTRA_BITS,
+    canonical_length_encoding, count_frequencies, same_tokens, token_extra_bits, try_clone_slice,
+    DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token,
+    LENGTH_BASE as DEFLATE_LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -373,7 +373,7 @@ fn repack_same_distance_runs(
                 append_minimum_token_fallback(&mut output, run.first, output_matches, deficit)?;
             }
         }
-        changed |= output[output_start..] != tokens[run.start..run.end];
+        changed |= !same_tokens(&output[output_start..], &tokens[run.start..run.end]);
         index = run.end;
     }
     debug_assert_eq!(output.len(), output_count);
@@ -768,7 +768,7 @@ fn consider_proven_submatches(
         }
 
         if !options.exhaustive
-            || best.tokens.as_slice() == pass_tokens.as_slice()
+            || same_tokens(&best.tokens, &pass_tokens)
             || pass + 1 == MAX_PROVEN_SUBMATCH_PASSES
         {
             break;
@@ -1075,7 +1075,7 @@ fn consider_header_aware_proven_composition(
         };
         if priced_candidates
             .iter()
-            .any(|candidate| candidate.as_slice() == tokens.as_slice())
+            .any(|candidate| same_tokens(candidate, &tokens))
         {
             continue;
         }
@@ -1445,7 +1445,7 @@ fn price_proven_composition_state(
     let tokens = apply_proven_composition_state(source, block.plain.len(), menus, state)?;
     let duplicate = priced_candidates
         .iter()
-        .any(|candidate| candidate.as_slice() == tokens.as_slice());
+        .any(|candidate| same_tokens(candidate, &tokens));
     if duplicate && !force_price {
         return None;
     }
@@ -2397,7 +2397,7 @@ fn consider_unique_proven_submatch_tokens(
 ) {
     if priced_candidates
         .iter()
-        .any(|candidate| candidate.as_slice() == tokens.as_slice())
+        .any(|candidate| same_tokens(candidate, &tokens))
     {
         return;
     }
@@ -2570,7 +2570,7 @@ fn improve_plan_with_floor_policy(
         );
     }
     if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
-        if normalized.as_slice() != block.tokens.as_slice() {
+        if !same_tokens(&normalized, &block.tokens) {
             consider_tokens(
                 block,
                 normalized,
@@ -2583,7 +2583,7 @@ fn improve_plan_with_floor_policy(
     }
     if !options.strict {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
-            if aliased.as_slice() != block.tokens.as_slice() {
+            if !same_tokens(&aliased, &block.tokens) {
                 consider_tokens(
                     block,
                     aliased,
@@ -2661,7 +2661,7 @@ fn improve_plan_with_floor_policy(
     // Replay once from the winner, under the same limits, to carry a strict
     // intermediate expansion into a finished adjacent merge and repack its
     // header.
-    if best.tokens != block.tokens {
+    if !same_tokens(&best.tokens, &block.tokens) {
         if let Some(replay_tokens) = try_clone_token_candidate(&best.tokens, block.plain.len()) {
             if let Some(replay_block) = try_transformed_block(block, replay_tokens) {
                 let mut replay = plan_block(
@@ -3215,7 +3215,9 @@ fn consider_deft4j_trees(
     let strict = expand_matches(&block.tokens, &block.plain, &literal, &distance, false);
     let non_larger = expand_matches(&block.tokens, &block.plain, &literal, &distance, true);
     if let Some(tokens) = strict {
-        let duplicate = non_larger.as_ref().is_some_and(|other| other == &tokens);
+        let duplicate = non_larger
+            .as_ref()
+            .is_some_and(|other| same_tokens(other, &tokens));
         consider_deft4j_rebuild(block, tokens, alignment, options, stop, best);
         if !duplicate {
             if let Some(tokens) = non_larger {
@@ -3241,6 +3243,8 @@ fn consider_deft4j_trees(
 
 /// deft4j's heap code lengths for these counts, with the distance counts
 /// padded as the floor pads them.
+// Out of line: each call builds two codes.
+#[inline(never)]
 fn deft4j_heap_lengths(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
@@ -3696,14 +3700,14 @@ fn plan_block_with_search_policy(
         });
     if has_258_alias {
         if let Some(normalized) = rewrite_258_symbols(&block.tokens, block.plain.len(), false) {
-            if normalized.as_slice() != block.tokens.as_slice() {
+            if !same_tokens(&normalized, &block.tokens) {
                 consider_tokens(block, normalized, alignment, options, stop, &mut best);
             }
         }
     }
     if !options.strict && block.literal_frequencies[285] != 0 {
         if let Some(aliased) = rewrite_258_symbols(&block.tokens, block.plain.len(), true) {
-            if aliased.as_slice() != block.tokens.as_slice() {
+            if !same_tokens(&aliased, &block.tokens) {
                 consider_tokens(block, aliased, alignment, options, stop, &mut best);
             }
         }
@@ -3884,7 +3888,8 @@ fn plan_block_with_search_policy(
     }
 
     if try_ordered_queue && !stop.reached() {
-        let alternate = pre_individual.filter(|alternate| alternate.tokens != best.tokens);
+        let alternate =
+            pre_individual.filter(|alternate| !same_tokens(&alternate.tokens, &best.tokens));
         let mut seen = HashSet::new();
         // Queue edges only expand matches, so they cannot restore a match that
         // individual pruning removed. Search the intact root first, since it
@@ -3900,7 +3905,11 @@ fn plan_block_with_search_policy(
         }
     }
 
-    if policy.replay && options.exhaustive && best.tokens != block.tokens && !stop.reached() {
+    if policy.replay
+        && options.exhaustive
+        && !same_tokens(&best.tokens, &block.tokens)
+        && !stop.reached()
+    {
         // Replay winning token states through the Default search, which avoids
         // recursive route multiplication.
         let mut replay_options = options.clone();
@@ -4416,6 +4425,8 @@ fn expand_groups(tokens: &[Token], plain: &[u8], groups: &[MatchGroup]) -> Optio
     })
 }
 
+// Out of line: each call plans a whole block.
+#[inline(never)]
 fn consider_tokens(
     source: &ParsedBlock,
     tokens: Vec<Token>,
@@ -4529,6 +4540,8 @@ fn new_token_candidate(token_count: usize, decoded_bytes: usize) -> Option<Vec<T
     new_token_candidate_with_limit(token_count, decoded_bytes, MAX_TOKEN_CANDIDATE_BYTES)
 }
 
+// Out of line: each call copies a whole token list.
+#[inline(never)]
 fn try_clone_token_candidate(source: &[Token], decoded_bytes: usize) -> Option<Vec<Token>> {
     let mut tokens = new_token_candidate(source.len(), decoded_bytes)?;
     tokens.extend_from_slice(source);

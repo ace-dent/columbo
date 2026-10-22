@@ -90,6 +90,8 @@ impl<T> Default for IdMap<T> {
 }
 
 impl<T> IdMap<T> {
+    // Out of line: each call searches the map, from many report paths.
+    #[inline(never)]
     fn position(&self, id: usize) -> Result<usize, usize> {
         self.0.binary_search_by_key(&id, |&(key, _)| key)
     }
@@ -415,6 +417,8 @@ struct StreamGroup {
 struct StreamGroupGuard(Option<StreamGroup>);
 
 impl Drop for StreamGroupGuard {
+    // Out of line: report paths drop many of these guards.
+    #[inline(never)]
     fn drop(&mut self) {
         STREAM_GROUP.with(|group| {
             group.replace(self.0.take());

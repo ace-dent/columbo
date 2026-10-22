@@ -34,6 +34,8 @@ const fn make_crc32_position_tables() -> [[u32; 256]; 8] {
 }
 
 /// Extend a CRC-32 value (PNG, gzip, ZIP) with `bytes`; start from 0.
+// Out of line: each call checksums a whole buffer.
+#[inline(never)]
 pub(crate) fn crc32_update(mut crc: u32, mut bytes: &[u8]) -> u32 {
     crc = !crc;
 

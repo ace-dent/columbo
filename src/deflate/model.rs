@@ -116,6 +116,8 @@ pub(crate) struct DynamicPlan {
 }
 
 impl DynamicPlan {
+    // Out of line: each call scans the distance code.
+    #[inline(never)]
     pub(crate) fn has_two_usable_distance_codes(&self) -> bool {
         self.distance_lengths
             .iter()
@@ -128,6 +130,8 @@ impl DynamicPlan {
     /// Whether all three codes suit conservative decoders (libdeflate issue
     /// #323): each is complete, with no RFC 1951 empty or single-code exception,
     /// and at least two of distance symbols 0-29 have codes.
+    // Out of line: each call scans all three codes.
+    #[inline(never)]
     pub(crate) fn has_strictly_compatible_huffman_codes(&self) -> bool {
         huffman_tree_shape_is_complete(&self.literal_lengths)
             && huffman_tree_shape_is_complete(&self.distance_lengths)
@@ -260,6 +264,16 @@ pub(crate) struct ParsedStream {
     pub(crate) source_trailing_empty_block_count: usize,
 }
 
+/// Whether two token lists are equal. One list compares equal to itself
+/// without a scan, as `Arc` comparisons of `Eq` values do. Out of line: one
+/// copy of the scan serves every comparison of whole lists.
+#[inline(never)]
+pub(crate) fn same_tokens(left: &[Token], right: &[Token]) -> bool {
+    std::ptr::eq(left, right) || left == right
+}
+
+// Out of line: each call scans every token.
+#[inline(never)]
 pub(crate) fn count_frequencies(tokens: &[Token]) -> ([u32; 286], [u32; 30]) {
     let mut literal = [0_u32; 286];
     let mut distance = [0_u32; 30];
@@ -280,6 +294,8 @@ pub(crate) fn count_frequencies(tokens: &[Token]) -> ([u32; 286], [u32; 30]) {
     (literal, distance)
 }
 
+// Out of line: each call scans every token.
+#[inline(never)]
 pub(crate) fn token_extra_bits(tokens: &[Token]) -> u64 {
     tokens
         .iter()

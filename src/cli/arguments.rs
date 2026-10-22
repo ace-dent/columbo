@@ -309,6 +309,8 @@ pub(super) fn print_cli_error(
     Ok(())
 }
 
+// Out of line: two paths print it.
+#[inline(never)]
 pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
     writeln!(
         output,

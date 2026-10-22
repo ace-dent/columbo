@@ -518,6 +518,8 @@ pub(crate) fn token_bits(
     bits.checked_add(u64::from(end))
 }
 
+// Out of line: each call scans both alphabets.
+#[inline(never)]
 pub(crate) fn token_bits_from_frequencies(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
@@ -816,6 +818,8 @@ struct BalancedTreeMove<const N: usize> {
     family: BalancedTreeFamily,
 }
 
+// Out of line: each call scans and shifts the candidate list.
+#[inline(never)]
 fn insert_frequency_candidate(
     candidates: &mut Vec<(usize, u32)>,
     entry: (usize, u32),
@@ -1191,6 +1195,8 @@ fn arrange_equal_frequency_lengths<const N: usize>(
     }
 }
 
+// Out of line: each call scans an alphabet.
+#[inline(never)]
 fn ensure_code_symbols(frequencies: &mut [u32], strict: bool) {
     if !strict {
         return;
@@ -1756,6 +1762,8 @@ fn zopfli_rle_tree_candidate(
     plan_for_explicit_lengths_with_cost(&literal, &distance, data_bits, exhaustive)
 }
 
+// Out of line: the scan of existing candidates outweighs a call.
+#[inline(never)]
 fn push_unique<T: PartialEq>(candidates: &mut Vec<T>, candidate: T) {
     if !candidates.iter().any(|current| current == &candidate) {
         candidates.push(candidate);
@@ -1770,6 +1778,8 @@ fn trim_distance(lengths: &[u8]) -> usize {
     trim_to_last_nonzero(lengths, 1)
 }
 
+// Out of line: every header plan trims both alphabets, from many places.
+#[inline(never)]
 fn trim_to_last_nonzero(lengths: &[u8], minimum: usize) -> usize {
     lengths
         .iter()
@@ -1894,6 +1904,8 @@ fn greedy_dynamic_header_bits(
 
 /// Plan a dynamic block for given literal/length and distance code lengths,
 /// without changing the tokens.
+// Out of line: inlined, each caller also took a copy of the masked planner.
+#[inline(never)]
 pub(crate) fn plan_for_explicit_lengths(
     tokens: &[Token],
     literal_lengths: &[u8],
@@ -1925,6 +1937,8 @@ fn plan_for_explicit_lengths_masked(
     )
 }
 
+// Out of line: each call plans a whole header.
+#[inline(never)]
 pub(crate) fn plan_for_explicit_lengths_with_cost(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
@@ -2286,6 +2300,8 @@ fn deft4j_pack_code_lengths(lengths: &[u8], options: Deft4jPackOptions) -> Optio
     (output.len() <= MAX_DYNAMIC_CODE_LENGTH_COUNT).then_some(output)
 }
 
+// Out of line: each call plans a whole header.
+#[inline(never)]
 fn plan_for_trimmed_lengths(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
@@ -2914,6 +2930,9 @@ fn improve_one_tree_by_swaps(
     }
 }
 
+// Out of line: each call follows a whole header plan, and replacing the
+// best plan drops one.
+#[inline(never)]
 fn keep_better(best: &mut Option<DynamicPlan>, candidate: DynamicPlan) {
     if best
         .as_ref()
@@ -3743,6 +3762,8 @@ fn consider_dynamic_header(
     Some(bits)
 }
 
+// Out of line: each call scans the header's run-length tokens.
+#[inline(never)]
 fn dynamic_bits(data_bits: u64, plan: &DynamicPlan) -> Option<u64> {
     let mut bits = 3_u64 + 5 + 5 + 4 + u64::try_from(plan.hclen).ok()? * 3;
     for token in &plan.rle {

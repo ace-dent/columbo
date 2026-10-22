@@ -14,7 +14,8 @@ use super::header::{
     plan_rle_smoothed_tree_candidate,
 };
 use super::model::{
-    count_frequencies, token_extra_bits, ParsedBlock, PlannedBlock, Representation, Token,
+    count_frequencies, same_tokens, token_extra_bits, ParsedBlock, PlannedBlock, Representation,
+    Token,
 };
 use super::search::{solve_proven_submatch_avoiding, try_transformed_block};
 use super::stop::SearchStop;
@@ -412,7 +413,7 @@ pub(crate) fn plan_symbol_sets(
                 budget,
                 stop,
             ) {
-                if tokens.as_slice() != candidate.tokens.as_slice() {
+                if !same_tokens(&tokens, &candidate.tokens) {
                     if let Some(feedback) =
                         price_spelling(block, tokens, alignment, options, budget, stop)
                     {

@@ -1197,3 +1197,42 @@ fn frequency_only_heap_variant_ignores_the_tie_key() {
         }
     }
 }
+
+#[test]
+fn leaf_key_sorts_match_the_comparator_sorts() {
+    let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        random
+    };
+    for round in 0..2_000 {
+        let len = 2 + next() as u32 % 290;
+        // Few distinct frequencies give many ties; the last range reaches
+        // the frequency field's limit.
+        let range = [2, 3, 50, u64::from(u32::MAX)][round % 4];
+        let leaves: Vec<(u32, u32)> = (0..len)
+            .map(|symbol| ((next() % range) as u32, symbol))
+            .filter(|&(frequency, _)| frequency != 0)
+            .collect();
+        for descending in [false, true] {
+            let mut expected = leaves.clone();
+            if descending {
+                expected.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            } else {
+                expected.sort_unstable();
+            }
+            let mut keys: Vec<u64> = leaves
+                .iter()
+                .map(|&(frequency, symbol)| {
+                    leaf_key(if descending { !frequency } else { frequency }, symbol)
+                })
+                .collect();
+            sort_leaf_keys(&mut keys);
+            let actual: Vec<u32> = keys.iter().map(|&key| leaf_key_tie(key)).collect();
+            let expected: Vec<u32> = expected.iter().map(|&(_, symbol)| symbol).collect();
+            assert_eq!(actual, expected, "round {round}, descending {descending}");
+        }
+    }
+}

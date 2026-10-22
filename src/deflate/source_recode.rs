@@ -26,8 +26,8 @@ use super::huffman::{
     make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    count_frequencies, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
-    SourceBlockType, Token,
+    count_frequencies, same_tokens, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock,
+    Representation, SourceBlockType, Token,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -615,7 +615,7 @@ fn state_matches(
 ) -> bool {
     state.literal_lengths == *literal_lengths
         && state.distance_lengths == *distance_lengths
-        && (Arc::ptr_eq(&state.tokens, tokens) || state.tokens.as_slice() == tokens.as_slice())
+        && same_tokens(&state.tokens, tokens)
 }
 
 /// Build code lengths with deft4j's `HuffmanTree`/`PriorityQueue` builder.

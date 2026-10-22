@@ -21,12 +21,87 @@ symbol addresses. Duplicated inlining comes from a build with full debug
 information: the `DW_TAG_inlined_subroutine` entries in its dSYM, counted per
 inlined function with their address ranges. Hot code comes from sampled
 profiles of 33 stratified Default inputs and of 8 inputs in Max at 10 seconds.
+Since the `d5897ec` pass, these builds use the shipped configuration with only
+symbols or debug information added (the unstripped `__text` equals the
+shipped one), and each candidate is measured alone: a build adds just that
+change.
 
 Equivalence uses the efficiency review's checks: public-API runs of 52 inputs
 in Default with the 180-second budget and in zero-budget Max, CLI runs of the
 33 Default inputs and of large APNG files compared byte for byte, and the
 contributor-guide tests. Runtime is whole-file CPU over the 33 inputs, with the
-builds alternating per input.
+builds alternating per input, and instructions retired, which do not depend on
+the machine's load: medians of three runs of a Max run that completes its
+search (`036-Clefable-0.png`, 150-second budget) and of `bored.png` and
+`elephant-2.png` in Default.
+
+## 22 October 2026, baseline `d5897ec`
+
+| Change | `__text` bytes | Shipped executable bytes |
+| --- | ---: | ---: |
+| Baseline | 963,940 | 1,058,784 |
+| Alphabet, token and plan helpers out of line | 926,848 | 1,009,552 |
+| One leaf-key sort for overflow repair and package merge | 917,844 | 1,009,536 |
+| More helpers out of line, one token-list comparison | 907,836 | 993,120 |
+
+`__text` shrank by 56,104 bytes (5.8%) and the shipped executable by 65,664
+(6.2%, four 16 KiB pages); its release archive fell from 584,543 to 554,893
+bytes (5.1%).
+
+- **Helpers out of line.** 28 helpers were inlined at up to 26 call sites
+  each; each loops over an alphabet, a code, or a token or plan list, plans a
+  whole block or header, or is cold report or usage code. Among them are
+  trimming code lengths (26 copies, up to 468 bytes), counting token
+  frequencies (21), checking a code's shape (14 and 25), planning tokens and
+  headers, CRC-32, and the format wrappers' fallible appends. Each is now one
+  copy, and a call costs little beside its loop. Helpers priced per token or
+  symbol (`EntropyScoutCode::token_bits`, `slide::price`,
+  `restore::token_cost`, `code_or_unseen`) and `stored_block_bits`, which the
+  boundary search calls in its inner loop, stay inline.
+- **One token-list comparison.** The 19 comparisons of whole token lists each
+  inlined the element loop, up to 204 bytes. They now call `same_tokens`,
+  which keeps the shortcut that `Arc` comparisons of `Eq` values take: a list
+  compared with itself is equal without a scan.
+- **One leaf-key sort.** Overflow repair (`limit_generic_lengths`) and package
+  merge each compiled the standard unstable sort for their own comparator.
+  Both order leaves by frequency and then by a distinct symbol or leaf index,
+  a total order, so the result does not depend on the sort algorithm. Each now
+  packs that order into a `u64` key, and both sort through one instance. A
+  test compares the key orders with the comparator sorts on random
+  frequencies with many ties.
+
+Measured and rejected:
+
+- The same keys for the two-queue merges (6,576 bytes) and Defluff's builder
+  (3,864 bytes): each tree needs a key buffer, and allocating it added 0.7%
+  and 1.3% to the completing Max run's instructions, and zeroing one on the
+  stack 0.2% and 0.3%. That run builds many trees.
+- Out of line, these grew the code: the header's `token_bits` (4,448 bytes),
+  `Representation::try_clone` (1,156), `new_token_candidate` (240) and
+  `new_token_candidate_with_limit` (100).
+- Build options from oxipng issues #571 and #806 that Columbo does not use:
+  `-Zlocation-detail=none` is redundant with immediate abort (above); the
+  arm64 linker ignores `-no_pie`; `opt-level = "s"` or `"z"` trade speed like
+  `opt-level = 2`; profile-guided optimization would make the shipped code
+  depend on a training corpus and could slow inputs outside it.
+
+Not addressed: six hash-map types (12.5 KB of map code, each with its own
+rehash), the standard library's reservation check inlined at 252 sites (about
+55 bytes each, from 180 `try_reserve_exact` calls), and drop code.
+
+Equivalence: API comparisons on the 52 inputs, in Default with the 180-second
+budget and in zero-budget Max, matched in all 104 runs; the 33 Default inputs,
+`bored.png`, `elephant-2.png` and the completing Max run matched byte for
+byte. Rust tests, including the private corpus, passed in release and debug
+modes, with Python tests, formatting and all-feature Clippy with warnings
+denied; the only new test is the key-order test.
+
+Runtime: 127.9 seconds of CPU for the baseline and 127.0 for the candidate on
+the 33 inputs. Instructions retired fell from 155.96 to 155.81 billion on the
+completing Max run, from 35.40 to 35.28 billion on `bored.png` and from 50.28
+to 50.07 billion on `elephant-2.png`.
+
+Artifacts: `work/binary-size-review-20261022/pass3/`.
 
 ## 22 October 2026, baseline `97fda1e`
 

@@ -4274,6 +4274,8 @@ fn add_exact_eighth_cuts(
     Some(())
 }
 
+// Out of line: each call scans the existing cuts.
+#[inline(never)]
 fn add_cut(cuts: &mut Vec<Cut>, composite: &Composite, token: usize) -> Option<()> {
     if let Some(&plain) = composite.token_plain_offsets.get(token) {
         push_cut(cuts, composite, Cut { token, plain })?;
@@ -5264,6 +5266,8 @@ fn encoded_source_bytes(blocks: &[ParsedBlock]) -> u64 {
     bits.div_ceil(8)
 }
 
+// Out of line: each call sums a whole plan list.
+#[inline(never)]
 fn total_bits(plans: &[PlannedBlock]) -> u64 {
     plans.iter().map(|plan| plan.bits).sum()
 }

@@ -15,8 +15,8 @@ use super::huffman::{
     fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock, Representation,
-    SourceBlockType, Token, CODE_LENGTH_ORDER,
+    same_tokens, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock,
+    Representation, SourceBlockType, Token, CODE_LENGTH_ORDER,
 };
 use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
@@ -33,6 +33,8 @@ const MAX_THREAD_BLOCK_PLAN_BYTES: usize = 8 << 20;
 /// Return the original block's bit range if it can be copied verbatim at
 /// `alignment` (validity only, not cost). A stored block's padding depends on
 /// its alignment.
+// Out of line: called once per block plan, from many places.
+#[inline(never)]
 pub(crate) fn reusable_original_bits(
     block: &ParsedBlock,
     alignment: u8,
@@ -527,7 +529,7 @@ impl CanonicalPlanCache {
                 && entry.distance_frequencies == block.distance_frequencies
                 && entry.original_dynamic.as_ref() == block.original_dynamic.as_ref()
                 && (Arc::ptr_eq(&entry.tokens, &block.tokens)
-                    || entry.tokens.as_slice() == block.tokens.as_slice());
+                    || same_tokens(&entry.tokens, &block.tokens));
             if matches {
                 if let Some(plan) = entry.plan.try_clone() {
                     self.stats.hits = self.stats.hits.saturating_add(1);

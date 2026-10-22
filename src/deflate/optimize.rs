@@ -27,7 +27,8 @@ use super::header::{
     plan_rle_smoothed_tree_candidate,
 };
 use super::model::{
-    DynamicPlan, ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
+    same_tokens, DynamicPlan, ParsedBlock, ParsedStream, PlannedBlock, Representation,
+    SourceBlockType, Token,
 };
 use super::parse::{parse_stream, parsed_model_bytes};
 use super::restore::{
@@ -491,7 +492,7 @@ fn floor_exposes_new_search_states(source: &[ParsedBlock], floor: &[PlannedBlock
         match (source.next(), floor.next()) {
             (Some(source_block), Some(floor_block)) => {
                 if source_block.plain.len() != floor_block.plain.len()
-                    || source_block.tokens.as_slice() != floor_block.tokens.as_slice()
+                    || !same_tokens(&source_block.tokens, &floor_block.tokens)
                 {
                     return true;
                 }
@@ -2327,6 +2328,8 @@ fn plan_smoothed_tree_finish(
 
 /// Run R13 or R14. A win replaces the trees that R1c fitted its cuts to, so
 /// the result is slid once more under its new trees.
+// Out of line: each call runs a terminal header search or two.
+#[inline(never)]
 fn improve_with_tree_finish(
     search: TerminalHeaderSearch,
     source: CandidateInput<'_>,
@@ -3309,7 +3312,7 @@ fn candidate_exposes_new_parent(candidate: &Candidate, source: CandidateInput<'_
                 .any(|(plan, block)| {
                     plan.plain.len() != block.plain.len()
                         || (!std::sync::Arc::ptr_eq(&plan.tokens, &block.tokens)
-                            && plan.tokens.as_ref() != block.tokens.as_ref())
+                            && !same_tokens(&plan.tokens, &block.tokens))
                 }))
 }
 

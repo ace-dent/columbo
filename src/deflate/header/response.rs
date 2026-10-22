@@ -8,8 +8,8 @@
 use super::{plan_for_advertised_lengths, token_bits, transitions_removed};
 use crate::deflate::minima::SuffixMinima;
 use crate::deflate::model::{
-    canonical_length_encoding, ParsedBlock, PlannedBlock, Representation, Token, LENGTH_BASE,
-    LENGTH_EXTRA_BITS, MAX_DYNAMIC_CODE_LENGTH_COUNT,
+    canonical_length_encoding, same_tokens, ParsedBlock, PlannedBlock, Representation, Token,
+    LENGTH_BASE, LENGTH_EXTRA_BITS, MAX_DYNAMIC_CODE_LENGTH_COUNT,
 };
 use crate::deflate::stop::SearchStop;
 
@@ -383,7 +383,7 @@ pub(crate) fn plan_header_response(
         let tokens = response(block, &lengths[..middle], &lengths[middle..], budget, stop);
         let candidate = tokens.and_then(|tokens| {
             // Unchanged spellings belong to the existing fixed-token searches.
-            if tokens == *block.tokens {
+            if same_tokens(&tokens, &block.tokens) {
                 return None;
             }
             let payload = token_bits(&tokens, &lengths[..middle], &lengths[middle..])?;
