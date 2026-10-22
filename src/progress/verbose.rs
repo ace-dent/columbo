@@ -8,6 +8,8 @@ use std::fmt::{self, Write as _};
 use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 
+use crate::sort::SortShared;
+
 const MAX_CACHED_BYTES: usize = 64 * 1_024 * 1_024;
 
 static REPORTS: OnceLock<Mutex<Reports>> = OnceLock::new();
@@ -110,9 +112,8 @@ impl Reports {
             .into_iter()
             .filter_map(|(report_id, report)| report.finished.then_some((report_id, report)))
             .collect();
-        reports.sort_unstable_by_key(|(report_id, report)| {
-            (report.stream_id, report.order, *report_id)
-        });
+        reports
+            .sort_shared_by_key(|(report_id, report)| (report.stream_id, report.order, *report_id));
         self.cached_bytes = 0;
         reports.into_iter().map(|(_, report)| report).collect()
     }

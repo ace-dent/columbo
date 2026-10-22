@@ -12,6 +12,7 @@ use crate::deflate::{
     decoded_bytes_for_comparison, inspect_early_max_lineage, raw_stream_decodes_to, DefaultFloor,
     RawInfo,
 };
+use crate::sort::{sort_indices_unstable, SortShared};
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
 use super::{scale_duration, zlib, SearchDeadline};
@@ -886,8 +887,8 @@ fn optimize_image_streams(
         .iter()
         .try_fold(idat.len(), |total, frame| total.checked_add(frame.len()))
         .ok_or_else(|| Error::new("PNG frame data too large"))?;
-    // The source-order key breaks ties without a stable sort's merge buffer.
-    jobs.sort_unstable_by_key(|job| {
+    // The source-order key breaks every tie.
+    jobs.sort_shared_by_key(|job| {
         let source_order = match job {
             ImageJob::Idat => 0,
             ImageJob::Frame(index) => index.saturating_add(1),
@@ -1397,16 +1398,6 @@ fn parallel_image_job_timeout(
     scale_duration(soft_budget, weight as f64 / total_weight as f64)
 }
 
-/// Keeps the large unstable-sort implementation from being monomorphized for
-/// the frame comparator.
-#[inline(never)]
-fn sort_frame_indices(
-    indices: &mut [usize],
-    compare: &mut dyn FnMut(usize, usize) -> std::cmp::Ordering,
-) {
-    indices.sort_unstable_by(|&left, &right| compare(left, right));
-}
-
 /// Map each frame to the earliest frame with identical compressed bytes and
 /// decoded size. Sorting the slices, not hashing them, avoids collision attacks.
 fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Vec<usize>> {
@@ -1418,7 +1409,7 @@ fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Ve
         .try_reserve_exact(frames.len())
         .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
     order.extend(0..frames.len());
-    sort_frame_indices(&mut order, &mut |left, right| {
+    sort_indices_unstable(&mut order, &mut |left, right| {
         (frames[left].as_slice(), decoded_sizes[left])
             .cmp(&(frames[right].as_slice(), decoded_sizes[right]))
             .then_with(|| left.cmp(&right))
@@ -1528,7 +1519,7 @@ where
             summaries.push(((info.size, info.crc32, info.adler32), index));
         }
     }
-    summaries.sort_unstable();
+    summaries.sort_shared_by(Ord::cmp);
 
     let mut grouped = Vec::new();
     if grouped.try_reserve_exact(frames.len()).is_err() {

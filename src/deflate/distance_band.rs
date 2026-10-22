@@ -18,6 +18,7 @@ use super::header::estimate_boundary_block_bits;
 use super::model::{token_extra_bits, ParsedBlock, PlannedBlock, SourceBlockType, Token};
 use super::search::{expand_selected_matches, try_transformed_block};
 use super::stop::SearchStop;
+use crate::sort::SortShared;
 use crate::Options;
 
 const MAX_EXACT_RUNGS: usize = 2;
@@ -131,14 +132,16 @@ fn rungs(block: &ParsedBlock) -> Option<([u32; MAX_RUNGS], usize)> {
         total += 1;
     }
     // Stable: equal frequencies keep the shorter distance first.
-    used.sort_by_key(|&symbol| std::cmp::Reverse(block.distance_frequencies[usize::from(symbol)]));
+    used.sort_shared_by_key(|&symbol| {
+        std::cmp::Reverse(block.distance_frequencies[usize::from(symbol)])
+    });
     let mut mask = 0_u32;
     for &symbol in &used[..count - 1] {
         mask |= 1 << symbol;
         masks[total] = mask;
         total += 1;
     }
-    masks[..total].sort_unstable();
+    masks[..total].sort_shared_by(Ord::cmp);
     let mut unique = 0;
     for index in 0..total {
         if unique == 0 || masks[index] != masks[unique - 1] {

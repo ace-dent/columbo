@@ -118,7 +118,7 @@ fn support_intervals(
             }
         }
     }
-    pairs.sort_unstable();
+    pairs.sort_shared_by(Ord::cmp);
     pairs.dedup();
     pairs.retain(|&(start, end)| start != 0 || end != composite.tokens.len());
     Some(pairs)
@@ -234,7 +234,7 @@ fn price_pair(
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let mut points = [0, pair.0, pair.1, composite.tokens.len()];
-    points.sort_unstable();
+    points.sort_shared_by(Ord::cmp);
     let mut unique = [0; 4];
     let mut count = 0;
     for point in points {
@@ -323,7 +323,7 @@ fn refine(
             ranked.push((value, start, end));
         }
     }
-    ranked.sort_unstable();
+    ranked.sort_shared_by(Ord::cmp);
     ranked.truncate(MAX_PAIRS);
     let parent_bits = reusable_original_bits(block, alignment, options.strict)?.len;
     let mut best_bits = parent_bits;
@@ -370,7 +370,7 @@ fn refine(
         add_cut(&mut cuts, composite, start)?;
         add_cut(&mut cuts, composite, end)?;
     }
-    cuts.sort_unstable_by_key(|cut| cut.plain);
+    sort_cuts_by_plain(&mut cuts);
     if cuts.len() > MAX_CUTS {
         return None;
     }

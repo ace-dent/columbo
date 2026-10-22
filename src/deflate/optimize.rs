@@ -16,6 +16,7 @@ use crate::progress::{
     reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
     RouteProgress, MAX_REPORTED_BLOCKS,
 };
+use crate::sort::SortShared;
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
@@ -3544,7 +3545,7 @@ fn ordered_compact_split_seeds(seeds: [Option<&CompactSplitSeed>; 3]) -> Vec<&Co
     // first. Split pricing is not monotone, so every distinct parent still
     // runs while the deadline allows.
     let mut seeds: Vec<_> = seeds.into_iter().flatten().collect();
-    seeds.sort_by_key(|seed| (seed.data.len(), seed.bits));
+    seeds.sort_shared_by_key(|seed| (seed.data.len(), seed.bits));
     seeds
 }
 

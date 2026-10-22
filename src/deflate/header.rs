@@ -23,6 +23,7 @@ use super::model::{
 };
 use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
+use crate::sort::SortShared;
 
 mod coupled;
 mod response;
@@ -1180,7 +1181,7 @@ fn arrange_equal_frequency_lengths<const N: usize>(
             continue;
         }
 
-        assigned_lengths.sort_unstable();
+        assigned_lengths.sort_shared_by(Ord::cmp);
         if descending {
             assigned_lengths.reverse();
         }
@@ -1430,7 +1431,7 @@ fn price_exact_tree_cross_product(
         }
         // Payload bits are a lower bound on the block cost, so the smallest
         // first does the most useful work before a deadline and prunes more.
-        ordered_pairs.sort_unstable();
+        ordered_pairs.sort_shared_by(Ord::cmp);
         for (data_bits, literal_index, distance_index) in ordered_pairs {
             if !price_exact_tree_pair(
                 distance_frequencies,

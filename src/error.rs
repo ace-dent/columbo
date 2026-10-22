@@ -59,6 +59,10 @@ impl Error {
         Self::with_kind(ErrorKind::Internal, message)
     }
 
+    /// Kept cold and out of line: errors are rare, and an inlined copy of the
+    /// message conversion at each of hundreds of call sites costs code size.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn with_kind(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,

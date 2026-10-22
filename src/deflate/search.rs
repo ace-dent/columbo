@@ -14,6 +14,7 @@ use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::sort::SortShared;
 use crate::Options;
 
 use super::block::{plan_block, plan_owned_block, reusable_original_bits};
@@ -507,7 +508,7 @@ impl SameDistancePartitioner {
         if remaining != 0 {
             return None;
         }
-        lengths.sort_unstable_by(|left, right| right.cmp(left));
+        lengths.sort_shared_by(|left, right| right.cmp(left));
         Some(lengths)
     }
 }
@@ -731,7 +732,7 @@ fn consider_proven_submatches(
         {
             return;
         }
-        symbol_free_rewrites.sort_by_key(|rewrite| rewrite.token_index);
+        symbol_free_rewrites.sort_shared_by_key(|rewrite| rewrite.token_index);
         if !same_proven_submatch_rewrites(&payload_rewrites, &symbol_free_rewrites)
             && consider_proven_submatch_rewrite_family(
                 block,
@@ -864,7 +865,7 @@ fn consider_proven_submatch_rewrite_family(
         let mut order = Vec::new();
         order.try_reserve_exact(rewrites.len()).ok()?;
         order.extend(0..rewrites.len());
-        order.sort_by_key(|&index| {
+        order.sort_shared_by_key(|&index| {
             (
                 Reverse(rewrites[index].estimated_saving),
                 rewrites[index].rank.key(),
@@ -899,7 +900,7 @@ fn consider_proven_submatch_rewrite_family(
         if stop.reached() {
             return None;
         }
-        rewrites.sort_by_key(|rewrite| rewrite.token_index);
+        rewrites.sort_shared_by_key(|rewrite| rewrite.token_index);
         if let Some(tokens) = apply_proven_submatch_rewrites(source, block.plain.len(), rewrites) {
             consider_unique_proven_submatch_tokens(
                 block,
@@ -1048,7 +1049,7 @@ fn consider_header_aware_proven_composition(
         };
         let ceiling = best_delta.saturating_add(PROVEN_COMPOSITION_PAYLOAD_WINDOW);
         next.retain(|state| state.estimated_delta <= ceiling);
-        next.sort_by_key(|state| {
+        next.sort_shared_by_key(|state| {
             proven_composition_state_key(
                 state,
                 &source_literal_frequencies,
@@ -1321,7 +1322,7 @@ fn ranked_forward_proven_composition_moves(
             ranked.push(selected);
         }
     }
-    ranked.sort_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
+    ranked.sort_shared_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
     Some((
         root,
         ranked.into_iter().map(|(_, movement)| movement).collect(),
@@ -1360,7 +1361,7 @@ fn ranked_reverse_proven_composition_moves(
         );
         ranked.push((key, movement));
     }
-    ranked.sort_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
+    ranked.sort_shared_by_key(|&(key, movement)| (key, movement.menu_index, movement.choice));
     Some(ranked.into_iter().map(|(_, movement)| movement).collect())
 }
 
@@ -1466,7 +1467,7 @@ fn build_proven_composition_menus(
     let mut ranked: Vec<&ProvenSubmatchTarget> = Vec::new();
     ranked.try_reserve_exact(targets.len()).ok()?;
     ranked.extend(targets.iter());
-    ranked.sort_by_key(|target| target.rank.key());
+    ranked.sort_shared_by_key(|target| target.rank.key());
 
     let mut menus = Vec::new();
     menus
@@ -1527,7 +1528,7 @@ fn build_proven_composition_menus(
             alternatives,
         });
     }
-    menus.sort_by_key(|menu| menu.token_index);
+    menus.sort_shared_by_key(|menu| menu.token_index);
     Some(menus)
 }
 
@@ -2370,7 +2371,7 @@ fn consider_highest_length_symbol_elimination(
     if rewrites.len() != occurrence_count {
         return;
     }
-    rewrites.sort_by_key(|rewrite| rewrite.token_index);
+    rewrites.sort_shared_by_key(|rewrite| rewrite.token_index);
     if let Some(candidate) = apply_proven_submatch_rewrites(tokens, block.plain.len(), &rewrites) {
         consider_unique_proven_submatch_tokens(
             block,
@@ -4060,7 +4061,7 @@ fn ordered_state_queue(
                 }
             }
         }
-        next.sort_by_key(|state| state.bits);
+        next.sort_shared_by_key(|state| state.bits);
         next.truncate(BEAM);
         if next.is_empty() {
             break;
@@ -4397,7 +4398,7 @@ fn collect_match_groups(
             });
         }
     }
-    groups.sort_by_key(|group| (group.delta, group.count, group.symbol));
+    groups.sort_shared_by_key(|group| (group.delta, group.count, group.symbol));
     groups
 }
 

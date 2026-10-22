@@ -16,6 +16,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::sort::SortShared;
 use crate::{terminal, Options};
 
 use super::{write_format_summary, BlockEncoding, BlockReport, CandidateProgress, StreamProgress};
@@ -342,7 +343,7 @@ impl Renderer {
             .iter()
             .map(|(&report_id, view)| (report_id, view))
             .collect();
-        views.sort_unstable_by_key(|(report_id, view)| {
+        views.sort_shared_by_key(|(report_id, view)| {
             (view.id, super::report_order(view.note), *report_id)
         });
         views

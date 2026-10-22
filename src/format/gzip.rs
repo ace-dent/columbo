@@ -7,6 +7,7 @@ use crate::checksum::crc32_update;
 use crate::deflate::{
     inspect_raw_prefix, optimize_raw_prefix_with_floor, DefaultFloor, RawOptimization,
 };
+use crate::sort::sort_indices_unstable;
 use crate::{Error, Optimization, Options, Result};
 
 use super::{scale_duration, try_append_bytes, try_vec_with_capacity, SearchDeadline};
@@ -50,10 +51,11 @@ pub(super) fn optimize_preflight(
         .try_reserve_exact(members.len())
         .map_err(|_| Error::internal("could not allocate GZIP member schedule"))?;
     order.extend(0..members.len());
-    order.sort_unstable_by_key(|&index| {
+    let key = |index: usize| {
         let member = members[index];
         (member.trailer_start - member.payload_start, index)
-    });
+    };
+    sort_indices_unstable(&mut order, &mut |left, right| key(left).cmp(&key(right)));
     let total_weight = members.iter().try_fold(0_u64, |total, member| {
         total.checked_add(member.decoded_size.max(1))
     });

@@ -49,6 +49,9 @@ impl Deadline {
         self.duration.saturating_sub(self.started.elapsed())
     }
 
+    // Deadline checks read the clock, so a call costs little, while an inlined
+    // copy at each of their many call sites costs code size.
+    #[inline(never)]
     pub(crate) fn can_start_route(&self) -> bool {
         if self.soft_expired() {
             return false;
@@ -56,7 +59,7 @@ impl Deadline {
         self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELED == 0
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub(crate) fn soft_expired(&self) -> bool {
         if self.started.elapsed() < self.duration {
             return false;
@@ -66,7 +69,7 @@ impl Deadline {
     }
 
     /// Hard stop for an active route finishing a candidate.
-    #[inline(always)]
+    #[inline(never)]
     pub(crate) fn expired(&self) -> bool {
         if self.state.load(Ordering::Relaxed) & DEADLINE_ROUTES_CANCELED != 0 {
             return true;
@@ -79,7 +82,7 @@ impl Deadline {
         true
     }
 
-    #[inline(always)]
+    #[inline(never)]
     pub(crate) fn route_should_stop(&self) -> bool {
         self.expired()
     }
@@ -208,7 +211,9 @@ impl<'a> SearchStop<'a> {
         }
     }
 
-    #[inline(always)]
+    /// Kept out of line like the deadline checks: a stop is polled at hundreds
+    /// of call sites, and an inlined copy cost hundreds of bytes at each.
+    #[inline(never)]
     pub(crate) fn reached(&mut self) -> bool {
         match self {
             Self::Deadline {

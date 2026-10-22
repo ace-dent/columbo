@@ -19,6 +19,7 @@ remain private to the crate.
 | `src/format/png/chunks.rs` | Parse, validate, and encode PNG/APNG chunks; calculate decoded image sizes. |
 | `src/deflate/` | Parse, price, search, and emit structurally equivalent Deflate streams. |
 | `src/checksum.rs` | Incremental CRC-32 and Adler-32 checksums. |
+| `src/sort.rs` | Sort off the hot paths through two shared index sorts, instead of one compiled sort per element type and comparator. |
 | `src/progress/` | Coordinate physical stream order and render verbose or visual route reports. |
 | `src/terminal/` | Share terminal capability checks, text formatting, and spinner behavior between the library and CLI. |
 
@@ -60,6 +61,13 @@ allocation, work limits, exact candidate pricing, and tie order visible when
 changing a search. Similar routes can differ in these policies by design;
 [routes and methods](routes-and-methods.md) describes each route and its
 provenance.
+
+Each standard-library sort with a new element type or comparator compiles
+another 3–14 KB. Off the hot paths, sort through `src/sort.rs`:
+`sort_indices_unstable` for index slices, and `SortShared` for a stable order,
+or for an unstable one with no ties between distinct values. Stop and deadline
+checks and error constructors stay out of line, since hundreds of call sites
+use them ([code size review](research/code-size-review.md)).
 
 ## Terms
 

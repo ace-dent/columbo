@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::progress::RouteProgress;
+use crate::sort::SortShared;
 use crate::Options;
 
 use super::block::{
@@ -679,7 +680,7 @@ fn plan_global_boundary_graph(
                     break;
                 }
             }
-            cuts.sort_unstable_by_key(|cut| cut.plain);
+            sort_cuts_by_plain(&mut cuts);
         }
     }
     if cuts.len() <= 2 {
@@ -1747,7 +1748,7 @@ fn plan_compact_source_split_rescue(
                 source.plain_end,
                 include_inside_match_cuts(options.exhaustive, block.tokens.len()),
             )?;
-            cuts.sort_unstable_by_key(|cut| cut.plain);
+            sort_cuts_by_plain(&mut cuts);
             cuts.dedup_by_key(|cut| cut.plain);
 
             let mut best_probe = None;
@@ -2986,7 +2987,8 @@ fn plan_source_with_splits(
             }
         }
     }
-    cuts.sort_unstable_by_key(|&cut| {
+    // `push_cut` keeps one cut per decoded offset, so the key breaks every tie.
+    cuts.sort_shared_by_key(|&cut| {
         (
             usize::from(!composite.cut_is_token_boundary(cut)),
             cut.plain,
@@ -3024,7 +3026,7 @@ fn plan_source_with_splits(
         }
     }
 
-    ranked_splits.sort_unstable_by_key(|&(bits, split)| (bits, split.plain, split.token));
+    ranked_splits.sort_shared_by_key(|&(bits, split)| (bits, split.plain, split.token));
 
     // The adaptive probe is cheap (at most 128 histogram samples, one priced
     // cut), so it runs before the costlier searches.
@@ -3486,7 +3488,7 @@ impl<'a> Composite<'a> {
                 source_type: block.source_type,
             });
         }
-        source_plain_splits.sort_unstable();
+        source_plain_splits.sort_shared_by(Ord::cmp);
         source_plain_splits.dedup();
 
         let mut token_plain_offsets = Vec::new();
@@ -4026,10 +4028,11 @@ fn ranked_entropy_state_cuts(
             transitions.push((score, boundary));
         }
     }
+    // Each boundary scores once, so it breaks every tie.
     transitions
-        .sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        .sort_shared_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
     transitions.truncate(ENTROPY_SCOUT_MAX_CUTS);
-    transitions.sort_unstable_by_key(|&(_, boundary)| boundary);
+    transitions.sort_shared_by_key(|&(_, boundary)| boundary);
 
     let mut cuts = Vec::new();
     cuts.try_reserve_exact(transitions.len()).ok()?;
@@ -4144,7 +4147,7 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
 
     // Collect every token-boundary anchor first, so inside-match cuts cannot
     // crowd them out of the cut budget.
-    cuts.sort_unstable_by_key(|cut| cut.plain);
+    sort_cuts_by_plain(&mut cuts);
     cuts.dedup_by_key(|cut| cut.plain);
 
     // Inside-match cuts enlarge the boundary graph, so Default adds them only
@@ -4195,7 +4198,7 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
             }
         }
     }
-    inside_cuts.sort_unstable_by_key(|cut| cut.plain);
+    sort_cuts_by_plain(&mut inside_cuts);
     inside_cuts.dedup_by_key(|cut| cut.plain);
     for cut in inside_cuts {
         if cuts.len() >= MAX_BOUNDARY_DP_CUTS {
@@ -4203,7 +4206,7 @@ fn choose_cuts(composite: &Composite, exhaustive: bool, allow_regroup: bool) -> 
         }
         push_cut(&mut cuts, composite, cut)?;
     }
-    cuts.sort_unstable_by_key(|cut| cut.plain);
+    sort_cuts_by_plain(&mut cuts);
     Some(cuts)
 }
 
@@ -4296,6 +4299,12 @@ fn push_optional_cut(cuts: &mut Vec<Cut>, composite: &Composite, cut: Cut) -> Op
         return Some(());
     }
     push_cut(cuts, composite, cut)
+}
+
+/// Order cuts by decoded offset. Every caller shares this one sort.
+#[inline(never)]
+fn sort_cuts_by_plain(cuts: &mut [Cut]) {
+    cuts.sort_unstable_by_key(|cut| cut.plain);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4514,7 +4523,8 @@ where
     let best = *cache
         .iter()
         .min_by_key(|candidate| candidate_key(candidate))?;
-    cache.sort_unstable_by_key(|candidate| candidate.token);
+    // The cache holds one candidate per token.
+    cache.sort_shared_by_key(|candidate| candidate.token);
     let separation = ((end - start) / ADAPTIVE_SPLIT_INTERVALS).max(ADAPTIVE_SPLIT_FINAL_WIDTH);
     let secondary = cache
         .iter()
@@ -5201,7 +5211,7 @@ fn try_merge_parsed_blocks(left: &ParsedBlock, right: &ParsedBlock) -> Option<Pa
     for &split in &right.source_splits {
         source_splits.push(left.plain.len().checked_add(split)?);
     }
-    source_splits.sort_unstable();
+    source_splits.sort_shared_by(Ord::cmp);
     source_splits.dedup();
 
     let shared_dynamic = match (&left.original_dynamic, &right.original_dynamic) {

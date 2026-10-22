@@ -10,6 +10,7 @@ use super::{
 };
 use crate::deflate::model::{DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token};
 use crate::deflate::stop::SearchStop;
+use crate::sort::SortShared;
 
 /// With k used and 29 - k unused length symbols there are at most 14 * 15
 /// (from, to) pairs.
@@ -178,7 +179,8 @@ pub(crate) fn plan_length_exchange(
             literal.swap(from, to);
         }
     }
-    menu.sort_unstable_by_key(Proposal::key);
+    // Each literal pair is proposed once, so the key breaks every tie.
+    menu.sort_shared_by_key(Proposal::key);
     let mut best = None;
     for proposal in menu {
         if proposal.bound >= best_bits || stop.reached() || budget.work_left == 0 {

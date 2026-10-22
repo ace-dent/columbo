@@ -12,6 +12,7 @@ use crate::deflate::{
     decoded_bytes_for_storage, optimize_raw_prefix_with_floor_and_grace, DefaultFloor,
 };
 use crate::progress::ZipStoreProgress;
+use crate::sort::sort_indices_unstable;
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
 use super::{
@@ -982,7 +983,11 @@ fn preflight_local_entries(
 
     let mut physical_order = try_vec_with_capacity(entries.len(), MODEL_ALLOCATION_ERROR)?;
     physical_order.extend(0..entries.len());
-    physical_order.sort_unstable_by_key(|&index| entries[index].local_offset_before);
+    sort_indices_unstable(&mut physical_order, &mut |left, right| {
+        entries[left]
+            .local_offset_before
+            .cmp(&entries[right].local_offset_before)
+    });
 
     let mut cursor = 0_usize;
     for &index in &physical_order {
@@ -1341,7 +1346,7 @@ fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>>
         .try_reserve_exact(entries.len())
         .map_err(|_| Error::internal("could not allocate ZIP optimization order"))?;
     order.extend(0..entries.len());
-    order.sort_unstable_by(|&left_index, &right_index| {
+    sort_indices_unstable(&mut order, &mut |left_index, right_index| {
         let left = &entries[left_index];
         let right = &entries[right_index];
         let left_optimizable = entry_is_optimizable(left);

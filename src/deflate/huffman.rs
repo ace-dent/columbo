@@ -782,7 +782,8 @@ fn take_generic_front(
     }
 }
 
-fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+/// Order nodes by [`node_less`]. Both two-queue merges share this one sort.
+fn sort_generic_nodes(nodes: &[Node], active: &mut [usize], variant: u32) {
     active.sort_unstable_by(|&left, &right| {
         if node_less(nodes, left, right, variant) {
             std::cmp::Ordering::Less
@@ -792,6 +793,10 @@ fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
             std::cmp::Ordering::Equal
         }
     });
+}
+
+fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+    sort_generic_nodes(nodes, active, variant);
 
     // Two-queue construction: branch frequencies never decrease and creation
     // order increases, so for variant 0 both queues stay sorted.
@@ -882,15 +887,7 @@ fn take_reverse_front(
 /// frequency; a linked stack per run of equal frequencies gives the newest
 /// branch in constant time.
 fn merge_generic_nodes_reverse_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>) {
-    active.sort_unstable_by(|&left, &right| {
-        if node_less(nodes, left, right, 1) {
-            std::cmp::Ordering::Less
-        } else if node_less(nodes, right, left, 1) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
+    sort_generic_nodes(nodes, active, 1);
 
     let leaves = active.clone();
     let mut leaf = 0;

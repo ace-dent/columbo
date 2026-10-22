@@ -22,6 +22,7 @@ mod error;
 mod format;
 mod options;
 mod progress;
+mod sort;
 mod terminal;
 
 pub use error::{Error, ErrorKind, Result};

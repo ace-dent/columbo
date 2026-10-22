@@ -11,12 +11,18 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal};
 
+/// `env::var_os`, compiled once for every check here.
+#[inline(never)]
+fn env_value(name: &str) -> Option<OsString> {
+    env::var_os(name)
+}
+
 pub(crate) fn stdout_color_enabled() -> bool {
-    color_enabled_for(stdout_escapes_enabled(), env::var_os("NO_COLOR"))
+    color_enabled_for(stdout_escapes_enabled(), env_value("NO_COLOR"))
 }
 
 pub(crate) fn stderr_color_enabled() -> bool {
-    color_enabled_for(stderr_escapes_enabled(), env::var_os("NO_COLOR"))
+    color_enabled_for(stderr_escapes_enabled(), env_value("NO_COLOR"))
 }
 
 /// Whether stdout is a terminal that can show live, line-oriented output.
@@ -24,17 +30,17 @@ pub(crate) fn stderr_color_enabled() -> bool {
 /// This does not promise that the terminal interprets escape sequences; see
 /// [`stdout_escapes_enabled`].
 pub(crate) fn stdout_interactive() -> bool {
-    io::stdout().is_terminal() && !term_is_dumb(env::var_os("TERM").as_deref())
+    io::stdout().is_terminal() && !term_is_dumb(env_value("TERM").as_deref())
 }
 
 pub(crate) fn stderr_interactive() -> bool {
-    io::stderr().is_terminal() && !term_is_dumb(env::var_os("TERM").as_deref())
+    io::stderr().is_terminal() && !term_is_dumb(env_value("TERM").as_deref())
 }
 
 fn stdout_escapes_enabled() -> bool {
     escapes_enabled_for(
         io::stdout().is_terminal(),
-        env::var_os("TERM").as_deref(),
+        env_value("TERM").as_deref(),
         host_announces_escapes(),
     )
 }
@@ -43,7 +49,7 @@ fn stdout_escapes_enabled() -> bool {
 pub(crate) fn stderr_escapes_enabled() -> bool {
     escapes_enabled_for(
         io::stderr().is_terminal(),
-        env::var_os("TERM").as_deref(),
+        env_value("TERM").as_deref(),
         host_announces_escapes(),
     )
 }
@@ -69,9 +75,9 @@ pub(crate) fn escapes_enabled_for(
 fn host_announces_escapes() -> bool {
     !cfg!(windows)
         || windows_host_announces_escapes(
-            env::var_os("WT_SESSION").as_deref(),
-            env::var_os("ANSICON").as_deref(),
-            env::var_os("ConEmuANSI").as_deref(),
+            env_value("WT_SESSION").as_deref(),
+            env_value("ANSICON").as_deref(),
+            env_value("ConEmuANSI").as_deref(),
         )
 }
 
