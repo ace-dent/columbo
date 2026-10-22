@@ -60,7 +60,9 @@ file does not persist its directory entry. Replacement uses Rust's
 | The final directory sync fails | The error says output was installed but durability is uncertain. The CLI does not attempt a rollback. |
 | Staging cleanup fails after publication | The complete output remains installed; leftover staging data does not turn a successful publication into a failed write. |
 
-A force kill cannot run destructors or signal cleanup. An abandoned directory
+Optimized builds abort on panic, so a panic also leaves the staging directory
+in place, like a kill; debug builds unwind and remove it. A force kill cannot
+run destructors or signal cleanup. An abandoned directory
 has a name such as `.columbo-1234-0.tmp` beside the output. Remove it only after
 confirming its writer has stopped. The program does not sweep old staging names,
 which could belong to another running process.

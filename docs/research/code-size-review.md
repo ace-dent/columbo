@@ -7,8 +7,12 @@ output or speed.
 
 ## Methods
 
-Sizes are of the release executable and of the `distribution` profile's
-executable, which aborts on panic. On macOS arm64 the `__TEXT` segment grows
+Sizes are of the release executable and of the shipped executable that
+`utils/build-distribution.sh` builds: the release profile on the pinned
+nightly toolchain, which rebuilds the standard library to abort immediately on
+panic, so it carries no unwind tables, backtrace printer, panic messages or
+their source locations. (Before 22 October the script used a separate `distribution` profile
+that only set `panic = "abort"`.) On macOS arm64 the `__TEXT` segment grows
 in 16 KiB pages, so an executable's size moves in steps; the `__text` section,
 from `size -m`, gives the exact change in code.
 
@@ -39,9 +43,9 @@ builds alternating per input.
 | One Zopfli pseudo-frequency function | 1,242,192 | 1,546,608 |
 
 `__text` shrank by 63,680 bytes (4.9%) and the release executable by 66,144
-(4.1%). The `distribution` executable fell from 1,414,304 to 1,364,672 bytes
-(3.5%), its `__text` from 1,227,368 to 1,174,248, and its maximally compressed
-ZIP from 768,138 to 739,286 bytes.
+(4.1%). The shipped executable fell from 1,108,112 to 1,058,784 bytes (4.5%),
+its `__text` from 1,018,436 to 963,940, and its release archive from 613,195
+to 584,545 bytes.
 
 - **Report coordinator state in vectors.** The coordinator kept
   `BTreeMap<usize, BTreeSet<u8>>`, `BTreeSet<u8>` and `BTreeSet<usize>`. Its
@@ -83,10 +87,10 @@ Measured and rejected:
   bytes less saving, through a wider hidden API.
 - `plural` out of line: 64 bytes.
 
-Not addressed: the standard library's backtrace printer is about 153 KB of
-the code with `gimli`, `addr2line`, `rustc_demangle` and `object`; the default
-panic hook links it whatever the panic strategy, and removing it needs a
-nightly toolchain that rebuilds the standard library. The compiler inlines the
+Not addressed: the release build carries the standard library's backtrace
+printer, about 153 KB of its code with `gimli`, `addr2line`, `rustc_demangle`
+and `object`, which the default panic hook links whatever the panic strategy;
+the shipped build already drops it. The compiler inlines the
 drop of a `Candidate` at 217 sites (about 19 KB), and the balanced-tree move
 collectors keep a copy for each alphabet (about 5 KB).
 
@@ -105,6 +109,31 @@ instructions in 11.50 and 11.54 billion cycles.
 
 Artifacts: `work/binary-size-review-20261022/`.
 
+### Release builds abort on panic
+
+Release builds now set `panic = "abort"`, as distributable builds did; only
+debug builds unwind. The CLI has no panic recovery boundary, and Cargo builds
+test harnesses to unwind, so every test still runs, including the file
+safety's `catch_unwind` test. The release executable fell from 1,546,608 to
+1,364,672 bytes (11.8%): `__eh_frame` from 101,680 to 29,176 bytes,
+`__gcc_except_tab` from 36,864 to 5,736, and `__text` from 1,242,192 to
+1,174,248. Outputs were identical on the 33 Default inputs, in 130.4 seconds
+of CPU unwinding and 130.8 aborting; the completing Max run retired 1.7% fewer
+instructions.
+
+The separate `distribution` profile, which only set `panic = "abort"`, is
+gone: `utils/build-distribution.sh` builds the release profile, and its
+executable is byte-identical to the previous route's (SHA-256 `fffcf0ae…`). It
+took 128.3 seconds on the 33 inputs and retired 5.6% fewer instructions on the
+completing Max run than an ordinary release build, so benchmarks use it.
+
+The script no longer passes `-Zlocation-detail=none`: immediate abort already
+leaves out panic locations, and the shipped executable is byte-identical
+without it. Standard-library rebuilding and immediate abort still need the
+pinned nightly. On the current code, a stable release build is 1,364,672 bytes;
+rebuilding the standard library with `panic_abort` gives 1,330,960, and
+immediate abort 1,064,832, before path cleaning and re-signing.
+
 ## 20 October 2026, baseline `ef91c11`
 
 | Change | `__text` bytes | Release executable bytes |
@@ -118,9 +147,9 @@ Artifacts: `work/binary-size-review-20261022/`.
 | Deadline checks out of line | 1,305,872 | 1,612,752 |
 
 In all, `__text` shrank by 290,176 bytes (18.2%) and the release executable by
-313,856 bytes (16.3%). The `distribution` executable fell from 1,711,616 to
-1,414,304 bytes (17.4%), its `__text` from 1,508,392 to 1,227,368, and its
-maximally compressed ZIP from 905,916 to 768,138 bytes.
+313,856 bytes (16.3%). The shipped executable fell from 1,354,464 to 1,108,112
+bytes (18.2%), its `__text` from 1,269,340 to 1,018,436, and its release
+archive from 738,800 to 613,195 bytes.
 
 - **Shared sorts.** 252 standard-library sort functions took 255,916 bytes,
   16% of the code: each of about 40 call sites compiled its own copy of the
@@ -173,10 +202,9 @@ Measured and rejected:
   768 bytes larger.
 
 Not addressed: allocation and drop code the compiler inlines at each `Vec`
-(for example, 3,256 copies of `RawVecInner::deallocate`, 38 KB); the standard
-library's backtrace symbolizer (`gimli`, `addr2line`, `rustc_demangle`, about
-66 KB), which its panic hook links; and the release profile's unwind tables
-(`__eh_frame`, 108 KB), which `distribution` avoids by aborting on panic.
+(for example, 3,256 copies of `RawVecInner::deallocate`, 38 KB). The release
+build also carries the standard library's backtrace printer and its unwind
+tables (`__eh_frame`, 108 KB); the shipped build drops both.
 
 Equivalence: tests compare both shared sorts with the standard ones on random
 inputs with many ties, and the in-place fallback and permutation with the

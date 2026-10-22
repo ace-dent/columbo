@@ -101,15 +101,15 @@ PINNED_RUSTC=$(rustup which --toolchain "$TOOLCHAIN" rustc)
 RUST_SYSROOT=$(rustup run "$TOOLCHAIN" rustc --print sysroot)
 RUST_SOURCE_ROOT="$RUST_SYSROOT/lib/rustlib/src/rust"
 
-# Drop panic locations and remap build paths before they can reach an object
-# file. Cargo splits RUSTFLAGS on whitespace, so pass the flags through
+# Abort immediately on panic, which leaves out panic messages and their source
+# locations, and remap build paths before they can reach an object file. Cargo
+# splits RUSTFLAGS on whitespace, so pass the flags through
 # CARGO_ENCODED_RUSTFLAGS (separated by 0x1F) to keep paths with spaces intact.
 RUSTFLAG_SEPARATOR=$(printf '\037')
-CARGO_ENCODED_RUSTFLAGS="-Zlocation-detail=none"
+CARGO_ENCODED_RUSTFLAGS="-Zunstable-options"
 append_rustflag() {
     CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${RUSTFLAG_SEPARATOR}$1"
 }
-append_rustflag "-Zunstable-options"
 append_rustflag "-Cpanic=immediate-abort"
 append_rustflag "--remap-path-prefix=$PROJECT_ROOT=/columbo"
 append_rustflag "--remap-path-prefix=src/=/columbo/src/"
@@ -119,10 +119,10 @@ append_rustflag "--remap-path-scope=object"
 
 RUSTC="$PINNED_RUSTC" \
 CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS" \
-    rustup run "$TOOLCHAIN" cargo build --locked --profile distribution \
+    rustup run "$TOOLCHAIN" cargo build --locked --release \
         --target "$TARGET" -Z build-std
 
-BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/distribution/$BINARY_NAME"
+BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/release/$BINARY_NAME"
 python3 "$SCRIPT_DIR/sanitize-binary-paths.py" "$BINARY"
 
 # Editing a Mach-O invalidates its linker-generated ad hoc signature. Re-sign

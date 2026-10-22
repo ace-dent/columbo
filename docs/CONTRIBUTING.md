@@ -97,6 +97,14 @@ Use this script for distributable binaries; ordinary local Cargo builds can
 retain compiler or checkout paths in diagnostics. The script reports required
 toolchains, targets, and tools when they are unavailable.
 
+The script builds the release profile, which aborts on panic, with the pinned
+nightly toolchain rebuilding the standard library to abort immediately, which
+leaves out panic messages and their source locations. Its executable, `target/<target-triple>/release/columbo`, is
+smaller and slightly faster than an ordinary `cargo build --release`. Benchmark
+and time this executable, so measurements reflect what is distributed; use
+another build only when a measurement needs debug information or
+instrumentation.
+
 Each run stages its executable and archive in a private temporary directory
 under `target/dist/`, so concurrent builds cannot overwrite each other's files
 and a failed run keeps the previous release archive. The path audit also checks

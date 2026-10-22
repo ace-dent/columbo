@@ -28,16 +28,13 @@ include = [
 
 [profile.release]
 # Release builds favor runtime speed. Full LTO measured neutral to slightly
-# faster and removes unreachable code.
+# faster and removes unreachable code. The CLI has no panic recovery boundary,
+# so optimized builds abort on panic, which drops the unwind tables; debug
+# builds and test harnesses unwind. `utils/build-distribution.sh` builds the
+# distributable executables from this profile.
 opt-level = 3
 codegen-units = 1
 lto = "fat"
 overflow-checks = true
-panic = "unwind"
-strip = true
-
-# The CLI has no panic recovery boundary, so distribution builds abort instead
-# of unwinding. Development and library release builds keep unwinding.
-[profile.distribution]
-inherits = "release"
 panic = "abort"
+strip = true
