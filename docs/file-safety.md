@@ -107,10 +107,5 @@ final comparison. Dedicated child processes are forcibly killed during partial
 writing, after staging, and immediately after rename. These tests check exact
 file contents and Unix permission bits without using the private corpus.
 A simulated post-commit sync failure checks that the diagnostic describes the
-already-installed output and that no rollback occurs.
-
-The distribution path sanitizer also flushes and syncs its complete temporary
-executable before replacement, then syncs the parent directory on Unix. Its
-Python tests inject write, sync, and replace failures and check publication
-order. These tests do not simulate a machine power failure or validate every
-filesystem implementation.
+already-installed output and that no rollback occurs. These tests do not
+simulate a machine power failure or validate every filesystem implementation.

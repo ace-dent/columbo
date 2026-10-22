@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: MIT
 # SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-# Build and package a distribution executable, favoring runtime speed over
-# binary size.
+# Build and package a distribution executable for one target.
 #
-# The pinned nightly compiler rebuilds the standard library with Columbo's
-# speed-first profile, so whole-program LTO can drop unused panic formatting
-# and source paths (measured no slower than the prebuilt standard library).
-# The final path audit fails the build if build paths leak.
+# The release profile favors runtime speed. The pinned nightly toolchain does
+# what stable Rust cannot: it rebuilds the standard library with the program
+# and aborts immediately on panic, leaving out panic messages, their source
+# locations and the backtrace printer. The executable is about a fifth smaller
+# than an ordinary release build, and slightly faster. Local paths are trimmed
+# from the compiled code, and the build fails if the executable still contains
+# one.
 
 set -eu
 
@@ -97,66 +99,50 @@ if [ "$TARGET" = "x86_64-pc-windows-gnu" ] && \
     export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER
 fi
 
+# rustup's proxies can come after another Rust installation on PATH, so name
+# the pinned compiler directly.
 PINNED_RUSTC=$(rustup which --toolchain "$TOOLCHAIN" rustc)
-RUST_SYSROOT=$(rustup run "$TOOLCHAIN" rustc --print sysroot)
-RUST_SOURCE_ROOT="$RUST_SYSROOT/lib/rustlib/src/rust"
 
-# Abort immediately on panic, which leaves out panic messages and their source
-# locations, and remap build paths before they can reach an object file. Cargo
-# splits RUSTFLAGS on whitespace, so pass the flags through
-# CARGO_ENCODED_RUSTFLAGS (separated by 0x1F) to keep paths with spaces intact.
-RUSTFLAG_SEPARATOR=$(printf '\037')
-CARGO_ENCODED_RUSTFLAGS="-Zunstable-options"
-append_rustflag() {
-    CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${RUSTFLAG_SEPARATOR}$1"
-}
-append_rustflag "-Cpanic=immediate-abort"
-append_rustflag "--remap-path-prefix=$PROJECT_ROOT=/columbo"
-append_rustflag "--remap-path-prefix=src/=/columbo/src/"
-append_rustflag "--remap-path-prefix=$RUST_SYSROOT=/rust-toolchain"
-append_rustflag "--remap-path-prefix=$RUST_SOURCE_ROOT=/rust-source"
-append_rustflag "--remap-path-scope=object"
-
+# Immediate abort is unstable, hence -Zunstable-options. RUSTFLAGS replaces
+# configured flags, and Cargo would prefer CARGO_ENCODED_RUSTFLAGS, so clear
+# it. -Z trim-paths remaps checkout, registry and standard-library source
+# paths in the compiled code; compiler messages keep the real paths.
+unset CARGO_ENCODED_RUSTFLAGS
 RUSTC="$PINNED_RUSTC" \
-CARGO_ENCODED_RUSTFLAGS="$CARGO_ENCODED_RUSTFLAGS" \
+RUSTFLAGS="-Zunstable-options -Cpanic=immediate-abort" \
+CARGO_PROFILE_RELEASE_TRIM_PATHS=object \
     rustup run "$TOOLCHAIN" cargo build --locked --release \
-        --target "$TARGET" -Z build-std
+        --target "$TARGET" -Z build-std -Z trim-paths
 
 BINARY="${CARGO_TARGET_DIR:-target}/$TARGET/release/$BINARY_NAME"
-python3 "$SCRIPT_DIR/sanitize-binary-paths.py" "$BINARY"
 
-# Editing a Mach-O invalidates its linker-generated ad hoc signature. Re-sign
-# ad hoc here; release signing can still replace it afterward.
+# The linker signs ad hoc, hashing 4 KiB pages, under Cargo's intermediate
+# file name. Re-signing hashes 16 KiB pages, which saves about 6 KB, and
+# derives the identifier from the executable's UUID. Release signing can
+# replace this signature.
 case "$TARGET" in
     *-apple-darwin) codesign --force --sign - "$BINARY" ;;
 esac
 
-python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$BINARY"
+python3 "$SCRIPT_DIR/check-binary-paths.py" "$BINARY"
 
 DIST_DIR="${CARGO_TARGET_DIR:-target}/dist"
 RELEASE_STEM="columbo-v$VERSION-$PLATFORM-$CPU_ARCHITECTURE"
-# The executable keeps its plain name, so process monitors show "columbo".
-mkdir -p "$DIST_DIR"
 ARCHIVE="$DIST_DIR/$RELEASE_STEM.zip"
+mkdir -p "$DIST_DIR"
 
-# Builds for different architectures share the executable basename, so each
-# invocation stages in its own directory.
+# Write the archive in a private directory and then move it into place, so
+# concurrent runs never write the same file and a failed run keeps the
+# previous archive.
 STAGING_DIR=$(mktemp -d "$DIST_DIR/.$RELEASE_STEM.XXXXXX")
-cleanup() {
-    rm -rf "$STAGING_DIR"
-}
-trap cleanup 0
+trap 'rm -rf "$STAGING_DIR"' 0
 trap 'exit 1' HUP INT TERM
-DIST_BINARY="$STAGING_DIR/$BINARY_NAME"
 TEMP_ARCHIVE="$STAGING_DIR/$RELEASE_STEM.zip"
 
-cp "$BINARY" "$DIST_BINARY"
-python3 "$SCRIPT_DIR/sanitize-binary-paths.py" --check "$DIST_BINARY"
-
 # -9 selects maximum compression, -X omits extra file attributes such as Unix
-# owner IDs, and -j stores only base names.
-zip -9 -X -j -q "$TEMP_ARCHIVE" \
-    "$DIST_BINARY" "$PROJECT_ROOT/LICENSE"
+# owner IDs, and -j stores only base names, so the archive records no build
+# directory and the executable keeps its plain name.
+zip -9 -X -j -q "$TEMP_ARCHIVE" "$BINARY" "$PROJECT_ROOT/LICENSE"
 zip -T "$TEMP_ARCHIVE" >/dev/null
 mv "$TEMP_ARCHIVE" "$ARCHIVE"
 

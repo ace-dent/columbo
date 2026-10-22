@@ -90,25 +90,30 @@ inspect the staged diff and `cargo package --list --allow-dirty`.
 
 ### Distribution executables
 
-`utils/build-distribution.sh <target-triple>` builds with the pinned distribution
-toolchain, remaps build paths, checks the final executable with
-`utils/sanitize-binary-paths.py`, and creates an archive under `target/dist/`.
-Use this script for distributable binaries; ordinary local Cargo builds can
-retain compiler or checkout paths in diagnostics. The script reports required
-toolchains, targets, and tools when they are unavailable.
+`utils/build-distribution.sh <target-triple>` builds the release profile with
+the pinned nightly toolchain, checks the executable with
+`utils/check-binary-paths.py`, and creates an archive under `target/dist/`. Use
+this script for distributable binaries. It reports required toolchains,
+targets, and tools when they are unavailable.
 
-The script builds the release profile, which aborts on panic, with the pinned
-nightly toolchain rebuilding the standard library to abort immediately, which
-leaves out panic messages and their source locations. Its executable, `target/<target-triple>/release/columbo`, is
-smaller and slightly faster than an ordinary `cargo build --release`. Benchmark
-and time this executable, so measurements reflect what is distributed; use
-another build only when a measurement needs debug information or
-instrumentation.
+The pinned nightly rebuilds the standard library to abort immediately on panic,
+which leaves out panic messages and their source locations. The executable,
+`target/<target-triple>/release/columbo`, is smaller and slightly faster than
+an ordinary `cargo build --release`. Benchmark and time this executable, so
+measurements reflect what is distributed; use another build only when a
+measurement needs debug information or instrumentation.
 
-Each run stages its executable and archive in a private temporary directory
-under `target/dist/`, so concurrent builds cannot overwrite each other's files
-and a failed run keeps the previous release archive. The path audit also checks
-UTF-16 strings in both byte orders, such as Windows wide strings.
+Cargo's `-Z trim-paths` remaps checkout, registry and standard-library source
+paths in the compiled code; ordinary local builds can retain them. The path
+check then fails the build if the executable names a user, temporary or volume
+directory, or the checkout or home directory, in UTF-8 or in UTF-16 of either
+byte order, such as Windows wide strings. On macOS the script re-signs the
+executable ad hoc: the signature hashes 16 KiB pages rather than the linker's
+4 KiB, which saves about 6 KB.
+
+Each run writes its archive in a private temporary directory under
+`target/dist/` and then moves it into place, so concurrent builds cannot
+overwrite each other's files and a failed run keeps the previous archive.
 
 
 ## Contributor License Agreement (CLA)

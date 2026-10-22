@@ -125,11 +125,11 @@ concurrent-edit, force-kill, and sync-failure tests deterministic.
 `tests/public_api.rs` exercises the library as an external consumer.
 `tests/cli_output.rs` runs the CLI executable to check report streams and
 `--out` validation. `tests/local_corpus.rs` holds opt-in public-API regressions
-backed by local files. `tests/test_sanitize_binary_paths.py` checks path audits
-and atomic binary redaction. `tests/test_build_distribution.py` checks
+backed by local files. `tests/test_check_binary_paths.py` checks the
+distribution path audit, and `tests/test_build_distribution.py` checks
 concurrent packaging and failure cleanup with synthetic executables and a fake
-compiler. Both use temporary directories, and neither requires private
-fixtures. Build and packaging scripts live in `utils/`.
+compiler in temporary directories; neither requires private fixtures. Build and
+packaging scripts live in `utils/`.
 
 See [file safety](file-safety.md) for the write protocol, interruption behavior,
 and the limits of the portable filesystem implementation.

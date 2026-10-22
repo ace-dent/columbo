@@ -132,7 +132,28 @@ leaves out panic locations, and the shipped executable is byte-identical
 without it. Standard-library rebuilding and immediate abort still need the
 pinned nightly. On the current code, a stable release build is 1,364,672 bytes;
 rebuilding the standard library with `panic_abort` gives 1,330,960, and
-immediate abort 1,064,832, before path cleaning and re-signing.
+immediate abort 1,064,832. Re-signing ad hoc brings it to 1,058,784: the
+linker's signature hashes 4 KiB pages and `codesign` hashes 16 KiB pages.
+
+### Distribution build review
+
+The script now trims paths with Cargo's `-Z trim-paths` (the `object`
+setting) instead of five `--remap-path-prefix` flags. Those flags missed the
+registry sources of the standard library's dependencies, which `-Z build-std`
+compiles from the Cargo home; no such path reached the executable only because
+immediate abort keeps no source locations. In a build that keeps panic
+locations, the flags left 104 home-directory paths, which the path check
+rejects; trimming leaves `/rustc/<commit>/…`, `index.crates.io-…/<crate>/…`
+and `src/…`, and the check passes.
+
+The path check no longer rewrites the executable, since it found nothing to
+rewrite, so the script re-signs only to shrink the signature. Trimming changes
+Cargo's symbol hashes, so functions and constants are laid out in another
+order: the instructions and size are the same (SHA-256 `0f9cfa39…`), and
+the executable is byte-identical when built from another directory. The 33
+Default inputs matched byte for byte in 124.9 and 124.7 seconds of CPU, and
+the completing Max run matched, with medians of three retiring 156.00 and
+155.94 billion instructions.
 
 ## 20 October 2026, baseline `ef91c11`
 

@@ -756,7 +756,7 @@ passed:
 
 Tracked source and `Cargo.toml` contain no user, repository or temporary
 absolute path. Distribution binaries remain subject to the release path
-sanitizer; ordinary developer builds may retain toolchain paths.
+audit; ordinary developer builds may retain toolchain paths.
 
 Accepted routing and provenance are maintained in
 [routes and methods](routes-and-methods.md).

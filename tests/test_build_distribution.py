@@ -30,7 +30,7 @@ class BuildDistributionTests(unittest.TestCase):
             "Cargo.toml",
             "LICENSE",
             "utils/build-distribution.sh",
-            "utils/sanitize-binary-paths.py",
+            "utils/check-binary-paths.py",
         ):
             shutil.copyfile(PROJECT / name, self.project / name)
         self.target = self.root / "build with spaces"
@@ -60,10 +60,12 @@ elif args[0] == "component":
 elif args[0] == "which":
     print(sys.executable)
 elif args[0] == "run" and args[2] == "rustc":
-    print("synthetic-rustc" if args[-1] == "--version" else Path.cwd() / "sysroot")
+    print("synthetic-rustc")
 elif args[0] == "run" and args[2:4] == ["cargo", "build"]:
     if "--release" not in args:
         raise SystemExit("distribution builds use the release profile")
+    if "trim-paths" not in args or os.environ.get("CARGO_PROFILE_RELEASE_TRIM_PATHS") != "object":
+        raise SystemExit("distribution builds trim local paths")
     target = args[args.index("--target") + 1]
     binary = Path(os.environ["CARGO_TARGET_DIR"]) / target / "release" / "columbo"
     binary.parent.mkdir(parents=True, exist_ok=True)

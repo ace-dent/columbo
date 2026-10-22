@@ -18,11 +18,11 @@ include = [
     "/LICENSE",
     "/rustfmt.toml",
     "/utils/build-distribution.sh",
-    "/utils/sanitize-binary-paths.py",
+    "/utils/check-binary-paths.py",
     "/src/*.rs",
     "/src/**/*.rs",
     "/tests/*.rs",
-    "/tests/test_sanitize_binary_paths.py",
+    "/tests/test_check_binary_paths.py",
     "/tests/test_build_distribution.py",
 ]
 
