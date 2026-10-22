@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 17 October 2026 entry is the current state. Entries from 30 September keep
+The 23 October 2026 entry is the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,93 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+## DeflOpt and Defluff refresh on 23 October 2026
+
+### Benchmark state
+
+The DeflOpt and Defluff reports come from executable `54df6aab…`
+(`0d87ee8`), which adds the block-plan store (`ef91c11`), the APNG R5 move
+(`04d63bd`) and the code-size and build changes. The deft4j reports were not
+refreshed: timed deft4j is still from `f6ce13ca…` (`9d5f818`) and the APNG
+reports from `ab9a0cd7…` (`b831d49`). Against the previous DeflOpt state
+(1,693 rows from `f6ce13ca…`, 221 from `ab9a0cd7…`):
+
+| Benchmark | Result |
+| --- | --- |
+| DeflOpt Default, 957 rows | 172 smaller, none larger; net −2,804 bytes / −22,447 bits; runtime 880.3 → 738.1 s |
+| DeflOpt Max, 932 rows with unchanged allowances | 96 smaller, 779 identical, 23 larger (33 in bytes or bits); net −446 bytes / −3,538 bits; runtime 8,694.2 → 8,570.3 s |
+| Defluff, 66 pairs | Unchanged: −109 bytes and −938 bits against Defluff, no misses |
+
+Every Max row is no larger than its Default row. Other applications shared
+the machine during the DeflOpt run, so its deadline-bound rows were rerun
+serially before any loss was attributed.
+
+### Reference misses
+
+DeflOpt keeps the same four strict-policy floors (`sample-green-400x300.png`
+and `T_Grass.png`, both modes); this run's relaxed audit shows all four at
+parity. Timed deft4j's 12 misses, rerun with the current executable and the
+relaxed audit: 11 reach parity with `--strict 0`, ten of them differing only
+by 2 or 3 bits at equal bytes, and the twelfth is the preserved signed PNG
+`oxipng/c2pa-signed.png`.
+
+<a id="rows-that-grew-23-october"></a>
+
+### Rows that grew
+
+Quiet serial reruns of the 36 DeflOpt Max rows that grew in bytes or bits, at
+their earlier allowances, with builds of `9d5f818` and `0d87ee8`, net +31
+bytes; 26 tie or favor the current build (`large/nerd.png` −21). Builds of
+each commit attribute the ten that repeat:
+
+| File | At 10 s | Cause | Given time |
+| --- | ---: | --- | --- |
+| `oxipng/grayscale_alpha_8_should_be_grayscale_8.png` | +29 | Block-plan store (`ef91c11`) | 92,679 against 92,689 before the store at 20 s; 92,663 against 92,670 at 60 s |
+| `css-ig-net/test-conversion-truecoloralpha-grayscalealpha.png` | +5 | `ef91c11` | 51,861 for both builds at 20 and 60 s |
+| `css-ig-net/sample_14.png` | +5 | `ef91c11` | 7,066 for both at 30 s |
+| `css-ig-net/sample_68-fs8.png` | +10 | R18 (`6c81dfa`) | +10 at 40 and 120 s |
+| `css-ig-net/Bag.png` | +4 | R18 | 70,481 for both at 30 s |
+| `apple-fs8.png`, `Craig_Smith.png`, `butterfly.png` | +1 each | R18 | +1 each at 30 s |
+| `medium/micropython const.png` | +4 | Deadline-bound: +13 at R18, 0 at `04d63bd` (APNG only), +4 from `ef91c11` | +1 at 30 s |
+| `kensilverman-zip/pngout-20230322-mac.zip` | +1 | R18, through ZIP Max's refined Default | +1 at 30 and 60 s |
+
+The block-plan store changes no Default output and favors Max given time; it
+makes the search faster, so a 10-second deadline cuts it elsewhere. On
+`grayscale_alpha_8` both builds' main-lineage route reports are identical
+apart from timings; the difference is the PNG early lineage, whose quick
+floor is Default cut at a fifth of the allowance (2 seconds, against this
+file's 3.4-second Default) and so ends at a different parent.
+
+The R18 losses come through the same lineage. On `sample_68-fs8.png` the
+main lineage selects the same 8,891-byte stream with or without R18 (9,909
+bytes as PNG); both results come from the early lineage, whose quick floor
+now ends with R18 (Default 9,948 → 9,925 bytes) and whose refinement then
+ends 10 bytes larger. ZIP Max's refined Default shows the same effect on
+`pngout-20230322-mac.zip`: R18 shrinks the `pngout` member's Default stream
+from 118,741 to 118,706 bytes, and Max's refinement of it ends at 118,698
+bytes instead of 118,697; the direct Max branch (120,782) is not
+competitive in either build.
+
+Rejected: a seed policy for that quick floor which skips R18, since the
+refinement ends with R18 anyway and R18 there changes only the parent. It
+recovered six of these losses (`sample_68`, `Bag`, `micropython const`,
+`apple-fs8`, `Craig_Smith`, `butterfly`; −18 bytes), but on an unbiased
+sample, every eighth DeflOpt PNG by name (116 files, Max at 10 seconds,
+alternating builds), it was 0 smaller and 2 larger, net +10 bytes, with
+unchanged CPU; `css-ig-net/sample_65-fs8.png` is 9 bytes larger at 10 and 30
+seconds. As on [8 October](#early-lineage-parent-8-october), the parent does
+not predict the endpoint, so the losses are recorded, not fitted.
+
+<a id="guard-23-october"></a>
+
+### Hundred-file guard
+
+`0d87ee8` passes 91 of 100 floors. Eight failures are those of 17 October,
+with the same causes; `041-Zubat-0.png` is now 1 bit above its floor instead
+of 3. The ninth, `test-conversion-truecoloralpha-grayscalealpha.png` (floor
+51,859 bytes, now 51,861), is the deadline cut above: both builds end at
+51,861 given 20 or 60 seconds.
 
 ## APNG and Defluff refresh on 17 October 2026
 
