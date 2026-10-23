@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::terminal::formatting::{style, BOLD};
 use crate::{
     Format, Options, MAX_EXPANSION_RATIO, MAX_TIMEOUT, MIN_EXPANSION_LIMIT_BYTES, MIN_TIMEOUT,
 };
@@ -304,11 +305,10 @@ pub(super) fn print_cli_error(
 // Out of line: two paths print it.
 #[inline(never)]
 pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()> {
+    let (bold, reset) = style(color, BOLD);
     writeln!(
         output,
-        "🕵🏻‍♂️  {}{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE}{}",
-        if color { "\x1b[1m" } else { "" },
-        if color { "\x1b[0m" } else { "" },
+        "🕵🏻‍♂️  {bold}{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE}{reset}"
     )?;
     writeln!(
         output,

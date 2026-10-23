@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-use crate::cli::test_support::{parsed_command, parsed_options};
+use crate::cli::test_support::parsed_command;
 
 use super::*;
 
@@ -29,7 +29,6 @@ fn verbose_mode_prints_the_detailed_start_summary() {
     };
     print_detailed_header(
         &mut verbose_header,
-        ReportMode::Verbose,
         &verbose,
         &input,
         Duration::from_millis(2),
@@ -88,7 +87,7 @@ fn default_result_prefixes_the_quoted_input_filename() {
         bits_saved: 80,
         removed_data_bytes: 0,
     };
-    print_quiet_result(
+    print_default_result(
         &mut result,
         &input,
         &OutputAction::WrittenOptimized(PathBuf::from("output.file")),
@@ -116,7 +115,7 @@ fn default_result_describes_equal_sized_wrapper_normalization() {
         bits_saved: 0,
         removed_data_bytes: 0,
     };
-    print_quiet_result(
+    print_default_result(
         &mut result,
         &input,
         &OutputAction::WrittenOptimized(PathBuf::from("input.zip")),
@@ -188,12 +187,6 @@ fn timeout_notice_describes_the_output_action() {
 }
 
 #[test]
-fn timeout_notice_is_limited_to_verbose_mode() {
-    assert!(!ReportMode::for_options(&parsed_options(["in"])).reports_timeout());
-    assert!(ReportMode::for_options(&parsed_options(["--verbose", "in"])).reports_timeout());
-}
-
-#[test]
 fn verbose_batch_headers_report_the_file_position() {
     let command = parsed_command(["--verbose", "first", "second", "third"]);
     let mut header = Vec::new();
@@ -204,14 +197,7 @@ fn verbose_batch_headers_report_the_file_position() {
         bytes: 42,
     };
 
-    print_detailed_header(
-        &mut header,
-        ReportMode::for_options(&command.options),
-        &command,
-        &input,
-        Duration::ZERO,
-    )
-    .unwrap();
+    print_detailed_header(&mut header, &command, &input, Duration::ZERO).unwrap();
 
     let header = String::from_utf8(header).unwrap();
     assert!(header.contains("· verbose\n"));
@@ -237,7 +223,7 @@ fn relaxed_mode_caution_colors_only_its_label() {
 }
 
 #[test]
-fn report_modes_have_one_consistent_output_channel() {
+fn report_mode_follows_the_verbose_flag() {
     let strict = parsed_command(["in"]);
     let default = parsed_command(["--strict", "0", "in"]);
     let verbose = parsed_command(["--strict", "0", "--verbose", "in"]);
@@ -248,15 +234,11 @@ fn report_modes_have_one_consistent_output_channel() {
 
     let default = ReportMode::for_options(&default.options);
     assert_eq!(default, ReportMode::Default);
-    assert_eq!(default.channel(), OutputChannel::Stdout);
     assert!(!default.detailed());
-    assert!(!default.reports_timeout());
 
     let verbose = ReportMode::for_options(&verbose.options);
     assert_eq!(verbose, ReportMode::Verbose);
-    assert_eq!(verbose.channel(), OutputChannel::Stdout);
     assert!(verbose.detailed());
-    assert!(verbose.reports_timeout());
 }
 
 #[test]

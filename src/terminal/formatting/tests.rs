@@ -75,3 +75,13 @@ fn plain_spinner_overwrites_and_clears_without_escape_sequences() {
     clear_spinner_line(&mut erased, SpinnerStyle::Ansi { color: false }, width).unwrap();
     assert_eq!(String::from_utf8(erased).unwrap(), "\r\x1b[K");
 }
+
+#[test]
+fn duration_units_are_stable_at_boundaries() {
+    assert_eq!(format_duration(Duration::ZERO), "0 µs");
+    assert_eq!(format_duration(Duration::from_micros(999)), "999 µs");
+    assert_eq!(format_duration(Duration::from_millis(1)), "1.00 ms");
+    assert_eq!(format_duration(Duration::from_millis(999)), "999.00 ms");
+    assert_eq!(format_duration(Duration::from_secs(1)), "1.00 s");
+    assert_eq!(format_duration(Duration::from_secs(10)), "10.0 s");
+}

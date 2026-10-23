@@ -277,7 +277,12 @@ fn optimize_preflight_once(
         let probe = if options.verbose {
             let stream_id = metadata_stream_ids[index]
                 .expect("every supported compressed metadata chunk has a stream identifier");
-            crate::progress::with_stream_slice(stream_id, &[], Some("metadata probe"), run_probe)
+            crate::progress::with_stream_slice(
+                stream_id,
+                &[],
+                Some(crate::progress::StreamNote::MetadataProbe),
+                run_probe,
+            )
         } else {
             run_probe()
         };

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Per-file CLI summaries and output-channel selection.
+//! Per-file CLI reports: the verbose header, notices, and the result, which is
+//! one line by default and a short block in verbose mode.
 
 use std::ffi::OsStr;
 use std::io::{self, Write};
@@ -11,7 +12,9 @@ use std::time::Duration;
 use crate::Options;
 
 use crate::terminal;
-use crate::terminal::formatting::{format_duration as format_elapsed, plural, plural_u64};
+use crate::terminal::formatting::{
+    format_duration as format_elapsed, plural, plural_u64, style, YELLOW,
+};
 
 use super::arguments::Command;
 use super::{PROGRAM_NAME, PROGRAM_STAGE, PROGRAM_VERSION};
@@ -49,6 +52,7 @@ pub(super) struct OptimizationReport {
     pub(super) removed_data_bytes: u64,
 }
 
+/// Reports go to stdout; warnings, errors, and the spinner go to stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputChannel {
     Stdout,
@@ -63,18 +67,22 @@ impl OutputChannel {
         }
     }
 
+    /// Run `operation` on the locked stream, ignoring write errors such as a
+    /// closed pipe.
     pub(super) fn write(self, operation: impl FnOnce(&mut dyn Write) -> io::Result<()>) {
-        let result = match self {
+        let _ = match self {
             Self::Stdout => operation(&mut io::stdout().lock()),
             Self::Stderr => operation(&mut io::stderr().lock()),
         };
-        let _ = result;
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReportMode {
+    /// One result line per file.
     Default,
+    /// A header and result block per file, around the library's stream
+    /// reports, with the timeout notice.
     Verbose,
 }
 
@@ -87,131 +95,19 @@ impl ReportMode {
         }
     }
 
-    pub(super) fn channel(self) -> OutputChannel {
-        OutputChannel::Stdout
-    }
-
     pub(super) fn detailed(self) -> bool {
-        !matches!(self, Self::Default)
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Verbose => "verbose",
-        }
-    }
-
-    pub(super) fn reports_timeout(self) -> bool {
-        self.detailed()
-    }
-}
-
-pub(super) fn print_result(
-    output: &mut dyn Write,
-    report_mode: ReportMode,
-    input: &InputReport<'_>,
-    action: &OutputAction,
-    optimized: &OptimizationReport,
-    timings: &ExecutionTimings,
-) -> io::Result<()> {
-    match report_mode {
-        ReportMode::Default => print_quiet_result(output, input, action, optimized),
-        ReportMode::Verbose => print_detailed_result(output, input, action, optimized, timings),
-    }?;
-    if optimized.removed_data_bytes != 0 {
-        writeln!(
-            output,
-            "  Stripped {} bytes of extraneous data (separate from Deflate savings)",
-            optimized.removed_data_bytes
-        )?;
-    }
-    Ok(())
-}
-
-fn print_quiet_result(
-    output: &mut dyn Write,
-    input: &InputReport<'_>,
-    action: &OutputAction,
-    optimized: &OptimizationReport,
-) -> io::Result<()> {
-    let input_name = display_name(input.path);
-    let input_bytes = input.bytes;
-    let optimized_bytes = optimized.bytes;
-    let bits_saved = optimized.bits_saved;
-    match action {
-        OutputAction::DryRun => writeln!(
-            output,
-            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (dry run; no output written)"
-        ),
-        OutputAction::WrittenOptimized(_)
-            if input_bytes == optimized_bytes && optimized.bits_saved == 0 =>
-        {
-            writeln!(
-                output,
-                "{input_name:?} {input_bytes} -> {optimized_bytes} bytes \
-                 (representation normalized; no size saving)"
-            )
-        }
-        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => writeln!(
-            output,
-            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
-            plural_u64(bits_saved, "bit", "bits")
-        ),
-        OutputAction::WrittenOptimized(_) => writeln!(
-            output,
-            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes"
-        ),
-        OutputAction::CopiedOriginal(output_path) => writeln!(
-            output,
-            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
-             (no savings; copied original to {:?})",
-            output_path
-        ),
-        OutputAction::Preserved(output_path) => writeln!(
-            output,
-            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
-             (no savings; left {:?} unchanged)",
-            output_path
-        ),
-    }
-}
-
-pub(super) fn print_timeout_notice(
-    output: &mut dyn Write,
-    action: &OutputAction,
-    timeout: Duration,
-) -> io::Result<()> {
-    let seconds = timeout.as_secs();
-    match action {
-        OutputAction::DryRun => writeln!(
-            output,
-            "Timeout triggered after {seconds} seconds; reporting best result found so far."
-        ),
-        OutputAction::WrittenOptimized(_) => writeln!(
-            output,
-            "Timeout triggered after {seconds} seconds; wrote best output found so far."
-        ),
-        OutputAction::CopiedOriginal(_) | OutputAction::Preserved(_) => writeln!(
-            output,
-            "Timeout triggered after {seconds} seconds; no smaller output was written."
-        ),
+        self == Self::Verbose
     }
 }
 
 pub(super) fn print_detailed_header(
     output: &mut dyn Write,
-    report_mode: ReportMode,
     command: &Command,
     input: &InputReport<'_>,
     read_elapsed: Duration,
 ) -> io::Result<()> {
-    let input_name = display_name(input.path);
     writeln!(output)?;
-    let title = format!(
-        "{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · {}",
-        report_mode.label()
-    );
+    let title = format!("{PROGRAM_NAME} v{PROGRAM_VERSION} {PROGRAM_STAGE} · verbose");
     writeln!(output, "{title}")?;
     writeln!(output, "{}", "─".repeat(title.chars().count()))?;
     if input.count > 1 {
@@ -220,7 +116,7 @@ pub(super) fn print_detailed_header(
     writeln!(
         output,
         "Input    {:?} · {} {} · read {}",
-        input_name,
+        display_name(input.path),
         input.bytes,
         plural(input.bytes, "byte", "bytes"),
         format_elapsed(read_elapsed)
@@ -240,11 +136,19 @@ pub(super) fn print_detailed_header(
             output,
             "Mode     max · {strictness}{dry_run} · {} file-wide budget",
             format_elapsed(command.options.timeout),
-        )?;
+        )
     } else {
-        writeln!(output, "Mode     normal · {strictness}{dry_run}")?;
+        writeln!(output, "Mode     normal · {strictness}{dry_run}")
     }
-    Ok(())
+}
+
+pub(super) fn print_strict_mode_caution(output: &mut dyn Write, color: bool) -> io::Result<()> {
+    let (yellow, reset) = style(color, YELLOW);
+    writeln!(
+        output,
+        "{yellow}Caution:{reset} strict mode disabled; enabling compact empty/singleton \
+         Huffman alphabets and the non-standard length-258 alias"
+    )
 }
 
 pub(super) fn print_blocking_chunk_notice(
@@ -253,11 +157,7 @@ pub(super) fn print_blocking_chunk_notice(
     chunk: &str,
     color: bool,
 ) -> io::Result<()> {
-    let (yellow, reset) = if color {
-        ("\x1b[33m", "\x1b[0m")
-    } else {
-        ("", "")
-    };
+    let (yellow, reset) = style(color, YELLOW);
     writeln!(
         output,
         "{yellow}Note:{reset} {chunk} chunk in {input_path:?} prevents optimization; \
@@ -265,17 +165,89 @@ pub(super) fn print_blocking_chunk_notice(
     )
 }
 
-pub(super) fn print_strict_mode_caution(output: &mut dyn Write, color: bool) -> io::Result<()> {
-    let (yellow, reset) = if color {
-        ("\x1b[33m", "\x1b[0m")
-    } else {
-        ("", "")
+pub(super) fn print_timeout_notice(
+    output: &mut dyn Write,
+    action: &OutputAction,
+    timeout: Duration,
+) -> io::Result<()> {
+    let seconds = timeout.as_secs();
+    let outcome = match action {
+        OutputAction::DryRun => "reporting best result found so far",
+        OutputAction::WrittenOptimized(_) => "wrote best output found so far",
+        OutputAction::CopiedOriginal(_) | OutputAction::Preserved(_) => {
+            "no smaller output was written"
+        }
     };
     writeln!(
         output,
-        "{yellow}Caution:{reset} strict mode disabled; enabling compact empty/singleton \
-         Huffman alphabets and the non-standard length-258 alias"
+        "Timeout triggered after {seconds} seconds; {outcome}."
     )
+}
+
+pub(super) fn print_result(
+    output: &mut dyn Write,
+    report_mode: ReportMode,
+    input: &InputReport<'_>,
+    action: &OutputAction,
+    optimized: &OptimizationReport,
+    timings: &ExecutionTimings,
+) -> io::Result<()> {
+    match report_mode {
+        ReportMode::Default => print_default_result(output, input, action, optimized),
+        ReportMode::Verbose => print_detailed_result(output, input, action, optimized, timings),
+    }?;
+    if optimized.removed_data_bytes != 0 {
+        writeln!(
+            output,
+            "  Stripped {} bytes of extraneous data (separate from Deflate savings)",
+            optimized.removed_data_bytes
+        )?;
+    }
+    Ok(())
+}
+
+fn print_default_result(
+    output: &mut dyn Write,
+    input: &InputReport<'_>,
+    action: &OutputAction,
+    optimized: &OptimizationReport,
+) -> io::Result<()> {
+    let input_name = display_name(input.path);
+    let input_bytes = input.bytes;
+    let optimized_bytes = optimized.bytes;
+    let bits_saved = optimized.bits_saved;
+    match action {
+        OutputAction::DryRun => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (dry run; no output written)"
+        ),
+        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes && bits_saved == 0 => {
+            writeln!(
+                output,
+                "{input_name:?} {input_bytes} -> {optimized_bytes} bytes \
+                 (representation normalized; no size saving)"
+            )
+        }
+        OutputAction::WrittenOptimized(_) if input_bytes == optimized_bytes => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes (saved {bits_saved} meaningful {})",
+            plural_u64(bits_saved, "bit", "bits")
+        ),
+        OutputAction::WrittenOptimized(_) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {optimized_bytes} bytes"
+        ),
+        OutputAction::CopiedOriginal(output_path) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
+             (no savings; copied original to {output_path:?})"
+        ),
+        OutputAction::Preserved(output_path) => writeln!(
+            output,
+            "{input_name:?} {input_bytes} -> {input_bytes} bytes \
+             (no savings; left {output_path:?} unchanged)"
+        ),
+    }
 }
 
 fn print_detailed_result(
@@ -289,25 +261,18 @@ fn print_detailed_result(
     writeln!(output, "Result")?;
     match action {
         OutputAction::WrittenOptimized(path) => {
-            let output_name = display_name(path);
-            writeln!(output, "  Output  {:?}", output_name)?;
+            writeln!(output, "  Output  {:?}", display_name(path))?;
         }
-        OutputAction::CopiedOriginal(path) => {
-            let output_name = display_name(path);
-            writeln!(
-                output,
-                "  Output  {:?} · original copied · no savings",
-                output_name
-            )?;
-        }
-        OutputAction::Preserved(path) => {
-            let output_name = display_name(path);
-            writeln!(
-                output,
-                "  Output  {:?} · preserved · no savings",
-                output_name
-            )?;
-        }
+        OutputAction::CopiedOriginal(path) => writeln!(
+            output,
+            "  Output  {:?} · original copied · no savings",
+            display_name(path)
+        )?,
+        OutputAction::Preserved(path) => writeln!(
+            output,
+            "  Output  {:?} · preserved · no savings",
+            display_name(path)
+        )?,
         OutputAction::DryRun => writeln!(output, "  Output  not written · dry run")?,
     }
     writeln!(
@@ -318,24 +283,18 @@ fn print_detailed_result(
         plural(optimized.bytes, "byte", "bytes"),
         describe_optimization_change(input.bytes, optimized.bytes, optimized.bits_saved)
     )?;
-    if !action.wrote_file() {
-        writeln!(
-            output,
-            "  Time    {} total · read {} · optimize {}",
-            format_elapsed(timings.total),
-            format_elapsed(timings.read),
-            format_elapsed(timings.optimize),
-        )
+    let write = if action.wrote_file() {
+        format!(" · write {}", format_elapsed(timings.write))
     } else {
-        writeln!(
-            output,
-            "  Time    {} total · read {} · optimize {} · write {}",
-            format_elapsed(timings.total),
-            format_elapsed(timings.read),
-            format_elapsed(timings.optimize),
-            format_elapsed(timings.write)
-        )
-    }
+        String::new()
+    };
+    writeln!(
+        output,
+        "  Time    {} total · read {} · optimize {}{write}",
+        format_elapsed(timings.total),
+        format_elapsed(timings.read),
+        format_elapsed(timings.optimize),
+    )
 }
 
 fn display_name(path: &Path) -> &OsStr {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
+use super::super::context::{report_order, StreamNote};
 use super::*;
-use crate::progress::report_order;
 
 #[test]
 fn finished_reports_flush_in_physical_stream_order() {
@@ -70,14 +70,19 @@ fn lineages_have_a_stable_order_within_one_stream() {
     reports.insert(
         1,
         4,
-        report_order(Some("refined default")),
+        report_order(Some(StreamNote::RefinedDefault)),
         "refined".to_owned(),
     );
-    reports.insert(2, 4, report_order(Some("direct max")), "direct".to_owned());
+    reports.insert(
+        2,
+        4,
+        report_order(Some(StreamNote::DirectMax)),
+        "direct".to_owned(),
+    );
     reports.insert(
         3,
         4,
-        report_order(Some("default floor")),
+        report_order(Some(StreamNote::DefaultFloor)),
         "floor".to_owned(),
     );
     reports.finish(1);

@@ -11,7 +11,7 @@ use crate::checksum::crc32_update;
 use crate::deflate::{
     decoded_bytes_for_storage, optimize_raw_prefix_with_floor_and_grace, DefaultFloor,
 };
-use crate::progress::ZipStoreProgress;
+use crate::progress::{StreamNote, ZipStoreProgress};
 use crate::sort::sort_indices_unstable;
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
@@ -307,7 +307,7 @@ pub(super) fn optimize_preflight(
     } else {
         optimize_max_sequential(input, options, parsed)
     }?;
-    crate::progress::zip_store_changes(options, &optimized.store_changes);
+    crate::progress::record_zip_store_changes(options, &optimized.store_changes);
     let removed_data = if options.strip_metadata {
         let local_bytes: usize = parsed
             .entries
@@ -351,7 +351,7 @@ fn optimize_max_parallel(
         let max_worker = thread::Builder::new()
             .name("columbo-zip-direct-max".into())
             .spawn_scoped(scope, || {
-                crate::progress::with_route_lineage("direct max", || {
+                crate::progress::with_route_lineage(StreamNote::DirectMax, || {
                     let direct = optimize_once(
                         input,
                         options,
@@ -366,7 +366,7 @@ fn optimize_max_parallel(
 
         let mut floor_options = options.clone();
         floor_options.exhaustive = false;
-        let floor = crate::progress::with_route_lineage("default floor", || {
+        let floor = crate::progress::with_route_lineage(StreamNote::DefaultFloor, || {
             optimize_once(
                 input,
                 &floor_options,
@@ -384,13 +384,13 @@ fn optimize_max_parallel(
                     options,
                     &[ZIP_DEFAULT_FLOOR_PRODUCER, ZIP_REFINED_DEFAULT_PRODUCER],
                 );
-                return crate::progress::with_route_lineage("refined default", || {
+                return crate::progress::with_route_lineage(StreamNote::RefinedDefault, || {
                     refine_complete_floor(options, started, floor?)
                 });
             }
         };
         let refined_floor = floor.and_then(|floor| {
-            crate::progress::with_route_lineage("refined default", || {
+            crate::progress::with_route_lineage(StreamNote::RefinedDefault, || {
                 refine_complete_floor(options, started, floor)
             })
         });
@@ -439,7 +439,7 @@ fn optimize_max_sequential(
     // remaining time; the end of its slice is not a file timeout.
     let mut direct_options = options.clone();
     direct_options.timeout = direct_allowance;
-    let mut direct = crate::progress::with_route_lineage("direct max", || {
+    let mut direct = crate::progress::with_route_lineage(StreamNote::DirectMax, || {
         let direct = optimize_once(
             input,
             &direct_options,
@@ -451,7 +451,7 @@ fn optimize_max_sequential(
         finalize_store_fallback(direct, &direct_options)
     })?;
     direct.timed_out = started.elapsed() >= options.timeout;
-    let refined = crate::progress::with_route_lineage("refined default", || {
+    let refined = crate::progress::with_route_lineage(StreamNote::RefinedDefault, || {
         refine_complete_floor(options, started, floor)
     })?;
     Ok(best_complete_optimization(refined, direct))

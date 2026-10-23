@@ -6,6 +6,20 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
+pub(crate) const BOLD: &str = "\x1b[1m";
+pub(crate) const CYAN: &str = "\x1b[36m";
+pub(crate) const YELLOW: &str = "\x1b[33m";
+
+/// The escape sequences that start and end `style`, or two empty strings when
+/// color is disabled.
+pub(crate) fn style(color: bool, style: &'static str) -> (&'static str, &'static str) {
+    if color {
+        (style, "\x1b[0m")
+    } else {
+        ("", "")
+    }
+}
+
 pub(crate) fn format_duration(duration: Duration) -> String {
     if duration < Duration::from_millis(1) {
         format!("{} µs", duration.subsec_micros())

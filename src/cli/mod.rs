@@ -145,9 +145,8 @@ fn execute_file(
     };
 
     if detailed {
-        report_mode.channel().write(|output| {
-            print_detailed_header(output, report_mode, command, &input_report, read_elapsed)
-        });
+        OutputChannel::Stdout
+            .write(|output| print_detailed_header(output, command, &input_report, read_elapsed));
     }
 
     // Strictness applies to the whole batch, so print the caution once.
@@ -162,7 +161,7 @@ fn execute_file(
     let spinner_deadline = Instant::now()
         .checked_add(command.options.timeout)
         .unwrap_or_else(Instant::now);
-    let mut spinner = Spinner::start(report_mode == ReportMode::Default, spinner_deadline);
+    let mut spinner = Spinner::start(!detailed, spinner_deadline);
     let result = optimize(&input, command.format, &command.options);
     spinner.stop();
     let optimize_elapsed = optimize_started.map_or(Duration::ZERO, |started| started.elapsed());
@@ -243,9 +242,9 @@ fn execute_file(
             print_blocking_chunk_notice(output, input_path, chunk, channel.color_enabled())
         });
     }
-    if optimized.timed_out && report_mode.reports_timeout() {
-        report_mode
-            .channel()
+    // Default output stays one line per file.
+    if optimized.timed_out && detailed {
+        OutputChannel::Stdout
             .write(|output| print_timeout_notice(output, &output_action, command.options.timeout));
     }
     let timings = ExecutionTimings {
@@ -259,7 +258,7 @@ fn execute_file(
         bits_saved: optimized.bits_saved,
         removed_data_bytes: optimized.removed_data_bytes,
     };
-    report_mode.channel().write(|output| {
+    OutputChannel::Stdout.write(|output| {
         print_result(
             output,
             report_mode,
