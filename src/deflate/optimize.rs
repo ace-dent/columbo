@@ -639,7 +639,6 @@ fn candidate_progress(
     CandidateProgress {
         bytes: candidate.data.len(),
         bits: candidate.bits,
-        report: candidate.block_report.clone(),
         reference_bits,
         profitable,
     }
@@ -4705,7 +4704,6 @@ fn capture_planned_block_report(plans: &[PlannedBlock], enabled: bool) -> Option
     Some(BlockReport {
         blocks,
         total_blocks: plans.len(),
-        total_bits: plans.iter().map(|plan| plan.bits).sum(),
     })
 }
 
@@ -4719,9 +4717,9 @@ fn capture_source_block_report(
     if !enabled || blocks.len() != source_block_count {
         return None;
     }
-    let total_bits = blocks.iter().try_fold(0_u64, |total, block| {
-        Some(total.saturating_add(block.original?.len))
-    })?;
+    if blocks.iter().any(|block| block.original.is_none()) {
+        return None;
+    }
     let shown = blocks.len().min(MAX_REPORTED_BLOCKS);
     let mut report = Vec::new();
     report.try_reserve_exact(shown).ok()?;
@@ -4740,7 +4738,6 @@ fn capture_source_block_report(
     Some(BlockReport {
         blocks: report,
         total_blocks: source_block_count,
-        total_bits,
     })
 }
 

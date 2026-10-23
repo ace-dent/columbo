@@ -52,12 +52,9 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         ));
     }
 
-    let mut effective_options = options_with_input_expansion_limit(input.len(), options);
-    if effective_options.visual && !crate::progress::reports_enabled(&effective_options) {
-        effective_options.visual = false;
-    }
+    let effective_options = options_with_input_expansion_limit(input.len(), options);
     let options = &effective_options;
-    let reporting = options.verbose || options.visual;
+    let reporting = options.verbose;
     // Held until this call's report is finished, after `finish_file`.
     let _report_session = crate::progress::begin_report_session(options);
 

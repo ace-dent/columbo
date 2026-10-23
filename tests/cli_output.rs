@@ -122,22 +122,13 @@ fn assert_optimization_error(result: &Output) {
 fn redirected_reports_use_stdout_in_every_mode() {
     let directory = TestDirectory::new();
     fs::write(directory.0.join("input.deflate"), [0x03, 0x00]).unwrap();
-    for flags in [&[][..], &["--verbose"][..], &["--visual"][..]] {
+    for flags in [&[][..], &["--verbose"][..]] {
         let result = directory.run_report(flags, &["input.deflate"]);
         assert_eq!(result.status.code(), Some(0), "{result:?}");
         let stdout = String::from_utf8_lossy(&result.stdout);
         assert!(stdout.contains("\"input.deflate\""), "{stdout}");
         assert!(stdout.contains("dry run"), "{stdout}");
-        if flags == ["--visual"] {
-            assert!(stdout.contains("Result\n"), "{stdout}");
-            assert!(!stdout.contains("Stream 01"), "{stdout}");
-            assert_eq!(
-                String::from_utf8_lossy(&result.stderr),
-                "visual mode needs an interactive stdout terminal; continuing without stream maps\n"
-            );
-        } else {
-            assert!(result.stderr.is_empty(), "{result:?}");
-        }
+        assert!(result.stderr.is_empty(), "{result:?}");
         assert!(!result.stdout.contains(&0x1b), "{result:?}");
         assert!(!result.stderr.contains(&0x1b), "{result:?}");
         assert_eq!(
@@ -154,7 +145,7 @@ fn relaxed_mode_warns_once_on_stderr_in_every_mode() {
     for name in ["first.deflate", "second.deflate"] {
         fs::write(directory.0.join(name), [0x03, 0x00]).unwrap();
     }
-    for mode in [None, Some("--verbose"), Some("--visual")] {
+    for mode in [None, Some("--verbose")] {
         let mut flags = vec!["--strict", "0"];
         flags.extend(mode);
         let result = directory.run_report(&flags, &["first.deflate", "second.deflate"]);
@@ -175,7 +166,7 @@ fn batch_errors_stay_on_stderr_and_later_reports_use_stdout() {
     let directory = TestDirectory::new();
     fs::write(directory.0.join("bad.deflate"), [0xff]).unwrap();
     fs::write(directory.0.join("good.deflate"), [0x03, 0x00]).unwrap();
-    for flags in [&[][..], &["--verbose"][..], &["--visual"][..]] {
+    for flags in [&[][..], &["--verbose"][..]] {
         let result = directory.run_report(flags, &["bad.deflate", "good.deflate"]);
         assert_eq!(result.status.code(), Some(1), "{result:?}");
         let stdout = String::from_utf8_lossy(&result.stdout);
@@ -213,7 +204,7 @@ fn help_uses_stdout_and_argument_errors_use_stderr() {
 fn blocking_png_chunk_is_named_on_stderr_in_every_mode() {
     let directory = TestDirectory::new();
     fs::write(directory.0.join("signed.png"), SIGNED_PNG).unwrap();
-    for mode in [None, Some("--verbose"), Some("--visual")] {
+    for mode in [None, Some("--verbose")] {
         let result = Command::new(env!("CARGO_BIN_EXE_columbo"))
             .current_dir(&directory.0)
             .arg("--dry-run")

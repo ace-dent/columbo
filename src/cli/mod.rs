@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::optimize;
 
-use crate::terminal::{self, spinner::Spinner};
+use crate::terminal::spinner::Spinner;
 
 use arguments::{parse_args, print_cli_error, print_usage, Command, Destination, ParsedCommand};
 use files::{
@@ -66,11 +66,6 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
     }
 
     let report_mode = ReportMode::for_options(&command.options);
-    if command.options.visual && !terminal::stdout_interactive() {
-        eprintln!(
-            "visual mode needs an interactive stdout terminal; continuing without stream maps"
-        );
-    }
 
     let input_count = command.inputs.len();
     let mut failed = false;
@@ -163,7 +158,7 @@ fn execute_file(
     }
 
     let optimize_started = detailed.then(Instant::now);
-    // Verbose and visual reporters run their own spinner.
+    // The verbose reporter runs its own spinner.
     let spinner_deadline = Instant::now()
         .checked_add(command.options.timeout)
         .unwrap_or_else(Instant::now);

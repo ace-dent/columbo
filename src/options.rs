@@ -39,7 +39,7 @@ pub enum Format {
 /// Controls one optimization run.
 ///
 /// Options are reusable, and independent calls are thread-safe. Calls with
-/// verbose or visual reports share standard output and run one at a time;
+/// verbose reports share standard output and run one at a time;
 /// quiet calls run concurrently. Reporting never changes the optimization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -48,12 +48,6 @@ pub struct Options {
     /// Report route timings, bit gains, and final block choices to standard
     /// output.
     pub verbose: bool,
-    /// Print a two-row block map (source and output) for each Deflate stream
-    /// once it finishes.
-    ///
-    /// Takes effect only when standard output is an interactive terminal;
-    /// otherwise the call runs without visual output.
-    pub visual: bool,
     /// Remove supported metadata, credentials, signatures, and extraneous
     /// payloads while rebuilding the file. Preserve decoded content; reject
     /// ambiguous layouts and unsupported compound ZIP stripping.
@@ -94,7 +88,6 @@ impl Default for Options {
         Self {
             exhaustive: false,
             verbose: false,
-            visual: false,
             strip_metadata: false,
             strict: true,
             timeout: DEFAULT_TIMEOUT,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Verbose and visual optimization reports.
+//! Verbose optimization reports.
 //!
 //! Worker threads buffer events per stream instead of writing concurrently. A
 //! file-level coordinator prints each physical stream, in file order, as soon
@@ -20,7 +20,6 @@ use crate::terminal::spinner::Spinner;
 use crate::{Format, Options};
 
 mod verbose;
-mod visual;
 
 pub(crate) const MAX_REPORTED_BLOCKS: usize = 64;
 
@@ -75,7 +74,6 @@ fn stop_report_spinner() {
 enum ProgressMode {
     Disabled,
     Verbose,
-    Visual,
 }
 
 /// Report entries by report ID, sorted by ID. Callers sort what they print, so
@@ -115,10 +113,6 @@ impl<T> IdMap<T> {
 
     fn clear(&mut self) {
         self.0.clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
@@ -338,7 +332,6 @@ fn emit_ready_streams() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut verbose_reports = Vec::new();
-    let mut visual_cards = Vec::new();
 
     while let Some((mode, stream_id)) = with_report_coordinator(|coordinator| {
         coordinator
@@ -352,9 +345,6 @@ fn emit_ready_streams() {
                     verbose_reports.extend(reports);
                 })
             }
-            ProgressMode::Visual => visual::take_finished_stream(stream_id).map(|cards| {
-                visual_cards.extend(cards);
-            }),
             ProgressMode::Disabled => Some(()),
         };
         if ready.is_none() {
@@ -363,12 +353,11 @@ fn emit_ready_streams() {
         with_report_coordinator(|coordinator| coordinator.advance(stream_id));
     }
 
-    if verbose_reports.is_empty() && visual_cards.is_empty() {
+    if verbose_reports.is_empty() {
         return;
     }
     stop_report_spinner();
     verbose::write(verbose_reports);
-    visual::emit_cards(visual_cards);
     let restart = with_report_coordinator(|coordinator| {
         coordinator.active.then_some(coordinator.deadline).flatten()
     });
@@ -379,9 +368,7 @@ fn emit_ready_streams() {
 
 impl ProgressMode {
     fn for_options(options: &Options) -> Self {
-        if visual::enabled(options) {
-            Self::Visual
-        } else if options.verbose {
+        if options.verbose {
             Self::Verbose
         } else {
             Self::Disabled
@@ -390,14 +377,6 @@ impl ProgressMode {
 
     fn enabled(self) -> bool {
         !matches!(self, Self::Disabled)
-    }
-
-    fn verbose(self) -> bool {
-        matches!(self, Self::Verbose)
-    }
-
-    fn visual(self) -> bool {
-        matches!(self, Self::Visual)
     }
 }
 
@@ -550,14 +529,12 @@ pub(crate) struct BlockProgress {
 pub(crate) struct BlockReport {
     pub(crate) blocks: Vec<BlockProgress>,
     pub(crate) total_blocks: usize,
-    pub(crate) total_bits: u64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateProgress {
     pub(crate) bytes: usize,
     pub(crate) bits: u64,
-    pub(crate) report: Option<BlockReport>,
     pub(crate) reference_bits: u64,
     /// Whether this complete candidate is strictly smaller than its source.
     pub(crate) profitable: bool,
@@ -607,7 +584,6 @@ impl Progress {
         options: &Options,
         optimizer_started: Instant,
         stream: StreamProgress,
-        source_report: Option<BlockReport>,
     ) -> Self {
         let mode = ProgressMode::for_options(options);
         if !mode.enabled() {
@@ -626,68 +602,56 @@ impl Progress {
             || NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed),
             |group| group.id,
         );
-        let color = mode.verbose() && terminal_color_enabled();
+        let color = terminal_color_enabled();
         let report_id = NEXT_REPORT_ID.fetch_add(1, Ordering::Relaxed);
-        if mode.visual() {
-            visual::begin(
-                report_id,
-                stream_id,
-                group
-                    .as_ref()
-                    .map_or(&[][..], |group| group.duplicates.as_slice()),
-                group.as_ref().and_then(|group| group.note),
-                &stream,
-                source_report,
-            );
-        } else {
-            let duplicates = group.as_ref().map_or_else(String::new, |group| {
-                duplicate_stream_suffix(&group.duplicates)
-            });
-            let note = group
-                .as_ref()
-                .and_then(|group| group.note)
-                .map_or_else(String::new, |note| format!(" · {note}"));
-            let mut report = String::new();
-            let _ = writeln!(report);
-            let _ = writeln!(
-                report,
-                "{}Deflate stream {stream_id}{note}{duplicates}{}",
-                cyan(color),
-                reset(color)
-            );
-            let _ = writeln!(
-                report,
-                "  S{stream_id} Source · {} {} · {} meaningful {} · {} {}{}",
-                stream.compressed_bytes,
-                plural(stream.compressed_bytes, "byte", "bytes"),
-                stream.meaningful_bits,
-                plural_u64(stream.meaningful_bits, "bit", "bits"),
-                stream.blocks,
-                plural(stream.blocks, "block", "blocks"),
-                if stream.empty_blocks == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        " · {} empty {}",
-                        stream.empty_blocks,
-                        plural(stream.empty_blocks, "block", "blocks")
-                    )
-                }
-            );
-            let _ = writeln!(
-                report,
-                "  S{stream_id} Parsed · {} · {} decoded {}",
-                format_duration(stream.parse_elapsed),
-                stream.decoded_bytes,
-                plural_u64(stream.decoded_bytes, "byte", "bytes"),
-            );
-            verbose::begin(
-                report_id,
-                stream_id,
-                report_order(group.as_ref().and_then(|group| group.note)),
-                report,
-            );
-        }
+        let duplicates = group.as_ref().map_or_else(String::new, |group| {
+            duplicate_stream_suffix(&group.duplicates)
+        });
+        let note = group
+            .as_ref()
+            .and_then(|group| group.note)
+            .map_or_else(String::new, |note| format!(" · {note}"));
+        let mut report = String::new();
+        let _ = writeln!(report);
+        let _ = writeln!(
+            report,
+            "{}Deflate stream {stream_id}{note}{duplicates}{}",
+            cyan(color),
+            reset(color)
+        );
+        let _ = writeln!(
+            report,
+            "  S{stream_id} Source · {} {} · {} meaningful {} · {} {}{}",
+            stream.compressed_bytes,
+            plural(stream.compressed_bytes, "byte", "bytes"),
+            stream.meaningful_bits,
+            plural_u64(stream.meaningful_bits, "bit", "bits"),
+            stream.blocks,
+            plural(stream.blocks, "block", "blocks"),
+            if stream.empty_blocks == 0 {
+                String::new()
+            } else {
+                format!(
+                    " · {} empty {}",
+                    stream.empty_blocks,
+                    plural(stream.empty_blocks, "block", "blocks")
+                )
+            }
+        );
+        let _ = writeln!(
+            report,
+            "  S{stream_id} Parsed · {} · {} decoded {}",
+            format_duration(stream.parse_elapsed),
+            stream.decoded_bytes,
+            plural_u64(stream.decoded_bytes, "byte", "bytes"),
+        );
+        verbose::begin(
+            report_id,
+            stream_id,
+            report_order(group.as_ref().and_then(|group| group.note)),
+            report,
+        );
+
         Self {
             color,
             mode,
@@ -710,15 +674,6 @@ impl Progress {
         if !self.mode.enabled() || blocks == 0 {
             return;
         }
-        if self.mode.visual() {
-            visual::activity(
-                self.report_id,
-                &format!("Strict normalization · {blocks} blocks"),
-            );
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         self.write_verbose(format_args!(
             "  S{} {} Strict normalization · {} · canonicalized {} {}",
             self.stream_id,
@@ -731,20 +686,6 @@ impl Progress {
 
     pub(crate) fn same_distance_opportunities(self, report: SameDistanceProgress) {
         if !self.mode.enabled() {
-            return;
-        }
-        if self.mode.visual() {
-            let status = if report.runs == 0 {
-                "Source parsed · no adjacent match runs".to_owned()
-            } else {
-                format!(
-                    "Source parsed · {} match runs · up to {} removable tokens",
-                    report.runs, report.tokens_removable
-                )
-            };
-            visual::activity(self.report_id, &status);
-        }
-        if !self.mode.verbose() {
             return;
         }
         if report.runs == 0 {
@@ -776,23 +717,6 @@ impl Progress {
         if !self.mode.enabled() {
             return;
         }
-        let total_moves = report
-            .literal_pair_moves
-            .saturating_add(report.literal_quad_moves)
-            .saturating_add(report.distance_pair_moves)
-            .saturating_add(report.distance_quad_moves);
-        if self.mode.visual() {
-            visual::activity(
-                self.report_id,
-                &format!(
-                    "Source trees · {total_moves} balanced moves · up to {} paired prices",
-                    report.paired_prices
-                ),
-            );
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         self.write_verbose(format_args!(
             "  S{} Trees · {} dynamic {} · literal/length: {} pair + {} quad · distance: {} pair + {} quad · up to {} paired {}",
             self.stream_id,
@@ -808,9 +732,7 @@ impl Progress {
     }
 
     pub(crate) fn routes(self) {
-        if self.mode.visual() {
-            visual::activity(self.report_id, "Choosing optimization routes");
-        } else if self.mode.enabled() {
+        if self.mode.enabled() {
             self.write_verbose(format_args!(""));
             self.write_verbose(format_args!("  S{} Routes", self.stream_id));
         }
@@ -818,15 +740,12 @@ impl Progress {
 
     pub(crate) fn start(self, name: &'static str) -> RouteStep {
         if self.mode.enabled() {
-            if self.mode.visual() {
-                visual::route_started(self.report_id, name);
-            } else {
-                self.write_verbose(format_args!(
-                    "  S{} {} {name}…",
-                    self.stream_id,
-                    arrow(self.color)
-                ));
-            }
+            self.write_verbose(format_args!(
+                "  S{} {} {name}…",
+                self.stream_id,
+                arrow(self.color)
+            ));
+
             RouteStep {
                 name,
                 progress: self,
@@ -880,12 +799,6 @@ impl Progress {
         if !self.mode.enabled() {
             return;
         }
-        if self.mode.visual() {
-            visual::candidate(self.report_id, name, &candidate);
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         let marker = if candidate.profitable {
             success(self.color)
         } else {
@@ -904,9 +817,7 @@ impl Progress {
     }
 
     pub(crate) fn skipped(self, name: &'static str, reason: &'static str) {
-        if self.mode.visual() {
-            visual::activity(self.report_id, &format!("{name} skipped · {reason}"));
-        } else if self.mode.enabled() {
+        if self.mode.enabled() {
             self.write_verbose(format_args!(
                 "  S{}   {} {name} skipped · {reason}",
                 self.stream_id,
@@ -917,12 +828,6 @@ impl Progress {
 
     pub(crate) fn blocks(self, report: Option<BlockReport>) {
         if !self.mode.enabled() {
-            return;
-        }
-        if self.mode.visual() {
-            visual::final_plan(self.report_id, report.as_ref());
-        }
-        if !self.mode.verbose() {
             return;
         }
         self.write_verbose(format_args!(""));
@@ -974,41 +879,27 @@ impl Progress {
         if !self.mode.enabled() {
             return;
         }
-        if self.mode.visual() {
-            visual::finish(
-                self.report_id,
-                selected_route,
-                output_bytes,
-                output_bits,
-                source_bits,
-                self.optimizer_started.elapsed(),
-                timed_out,
-                self.slice_budget,
-            );
-        }
-        if self.mode.verbose() {
-            self.write_verbose(format_args!(
-                "  S{} {} Selected {selected_route} · {} {} / {} {} · {} · {}{}",
-                self.stream_id,
-                success(self.color),
-                output_bytes,
-                plural(output_bytes, "byte", "bytes"),
-                output_bits,
-                plural_u64(output_bits, "bit", "bits"),
-                describe_bit_change(source_bits, output_bits),
-                format_duration(self.optimizer_started.elapsed()),
-                if timed_out {
-                    if self.slice_budget {
-                        " · search slice reached"
-                    } else {
-                        " · deadline reached"
-                    }
+        self.write_verbose(format_args!(
+            "  S{} {} Selected {selected_route} · {} {} / {} {} · {} · {}{}",
+            self.stream_id,
+            success(self.color),
+            output_bytes,
+            plural(output_bytes, "byte", "bytes"),
+            output_bits,
+            plural_u64(output_bits, "bit", "bits"),
+            describe_bit_change(source_bits, output_bits),
+            format_duration(self.optimizer_started.elapsed()),
+            if timed_out {
+                if self.slice_budget {
+                    " · search slice reached"
                 } else {
-                    ""
+                    " · deadline reached"
                 }
-            ));
-            verbose::finish(self.report_id);
-        }
+            } else {
+                ""
+            }
+        ));
+        verbose::finish(self.report_id);
         // The scheduler may have sealed this stream before this final update
         // reached the cache, so recheck the next stream to print.
         emit_ready_streams();
@@ -1085,18 +976,6 @@ impl RouteProgress {
         if !self.mode.enabled() || self.finalizing_after_soft_deadline.replace(true) {
             return;
         }
-        if self.mode.visual() {
-            visual::activity(
-                self.report_id,
-                &format!(
-                    "Soft deadline · finalizing with {} grace",
-                    format_duration(grace)
-                ),
-            );
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         self.write_verbose(format_args!(
             "  S{}       · Soft deadline reached · finalizing active candidate · up to {} grace",
             self.stream_id,
@@ -1127,12 +1006,6 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
-        if self.mode.visual() {
-            visual::work(self.report_id, name, 0, total);
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         self.write_verbose(format_args!(
             "  S{}     {} {name} · {} {}",
             self.stream_id,
@@ -1146,14 +1019,6 @@ impl RouteProgress {
     pub(crate) fn advance(&self, completed: usize) {
         if self.mode.enabled() {
             self.completed.set(completed.min(self.total.get()));
-            if self.mode.visual() {
-                visual::work(
-                    self.report_id,
-                    self.phase.get(),
-                    self.completed.get(),
-                    self.total.get(),
-                );
-            }
         }
     }
 
@@ -1162,14 +1027,6 @@ impl RouteProgress {
         if self.mode.enabled() {
             self.completed.set(current.min(self.total.get()));
             self.current_tokens.set(Some(tokens));
-            if self.mode.visual() {
-                visual::work(
-                    self.report_id,
-                    self.phase.get(),
-                    self.completed.get(),
-                    self.total.get(),
-                );
-            }
         }
     }
 
@@ -1178,24 +1035,12 @@ impl RouteProgress {
     pub(crate) fn activity(&self, name: &'static str) {
         if self.mode.enabled() {
             self.phase.set(name);
-            if self.mode.visual() {
-                visual::work(self.report_id, name, self.completed.get(), self.total.get());
-            }
         }
     }
 
     /// Buffer a periodic status line; called from existing deadline checks.
     pub(crate) fn heartbeat(&self) {
         if !self.mode.enabled() {
-            return;
-        }
-        if self.mode.visual() {
-            visual::work(
-                self.report_id,
-                self.phase.get(),
-                self.completed.get(),
-                self.total.get(),
-            );
             return;
         }
         let now = Instant::now();
@@ -1268,13 +1113,6 @@ impl RouteProgress {
         }
         self.last_reported.set(Some(Instant::now()));
 
-        if self.mode.visual() {
-            visual::checkpoint(self.report_id, name, bits, blocks, improved);
-        }
-        if !self.mode.verbose() {
-            return;
-        }
-
         if improved {
             self.write_verbose(format_args!(
                 "  S{}       {} {name} · {} · {bits} {} in {blocks} {} · {}",
@@ -1323,17 +1161,6 @@ impl RouteProgress {
         let now = Instant::now();
         self.last_reported.set(Some(now));
         self.phase_started.set(Some(now));
-        if self.mode.visual() {
-            visual::work(
-                self.report_id,
-                "Replanning emitted stream",
-                round.saturating_sub(1),
-                limit,
-            );
-        }
-        if !self.mode.verbose() {
-            return;
-        }
         self.write_verbose(format_args!(
             "  S{}     {} Replay {round}/{limit} · reparsing {blocks} {} at {bits} {}",
             self.stream_id,
@@ -1360,12 +1187,6 @@ impl RouteProgress {
         if accepted {
             self.best_bits.set(Some(after_bits));
             self.best_blocks.set(blocks);
-            if self.mode.visual() {
-                visual::checkpoint(self.report_id, "Replay accepted", after_bits, blocks, true);
-            }
-            if !self.mode.verbose() {
-                return;
-            }
             self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · saved {} · accepted as {blocks} {}",
                 self.stream_id,
@@ -1375,12 +1196,6 @@ impl RouteProgress {
                 plural(blocks, "block", "blocks")
             ));
         } else {
-            if self.mode.visual() {
-                visual::activity(self.report_id, "Replay stable · best retained");
-            }
-            if !self.mode.verbose() {
-                return;
-            }
             self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {before_bits} → {after_bits} bits · no strict improvement; route stabilized",
                 self.stream_id,
@@ -1391,12 +1206,7 @@ impl RouteProgress {
     }
 
     pub(crate) fn replay_stopped(&self, round: usize, elapsed: Duration, reason: &'static str) {
-        if self.mode.visual() {
-            visual::activity(
-                self.report_id,
-                &format!("Replay {round} stopped · {reason}"),
-            );
-        } else if self.mode.enabled() {
+        if self.mode.enabled() {
             self.write_verbose(format_args!(
                 "  S{}       {} Replay {round} · {} · {reason}",
                 self.stream_id,
@@ -1407,9 +1217,7 @@ impl RouteProgress {
     }
 
     pub(crate) fn stopped(&self, reason: &'static str) {
-        if self.mode.visual() {
-            visual::activity(self.report_id, reason);
-        } else if self.mode.enabled() {
+        if self.mode.enabled() {
             self.write_verbose(format_args!(
                 "  S{}       {} {reason} · {} route elapsed",
                 self.stream_id,
@@ -1436,18 +1244,6 @@ impl RouteStep {
             return;
         };
         let elapsed = started.elapsed();
-        if self.progress.mode.visual() {
-            match candidate.as_ref() {
-                Some(candidate) => visual::candidate(self.progress.report_id, self.name, candidate),
-                None => visual::activity(
-                    self.progress.report_id,
-                    &format!("{} · no candidate", self.name),
-                ),
-            }
-        }
-        if !self.progress.mode.verbose() {
-            return;
-        }
         match candidate {
             Some(candidate) => {
                 let marker = if candidate.profitable {
@@ -1482,12 +1278,6 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
-        if self.progress.mode.visual() {
-            visual::activity(self.progress.report_id, &format!("{} complete", self.name));
-        }
-        if !self.progress.mode.verbose() {
-            return;
-        }
         self.progress.write_verbose(format_args!(
             "  S{} {} {} · {}",
             self.progress.stream_id,
@@ -1501,12 +1291,6 @@ impl RouteStep {
         let Some(started) = self.started else {
             return;
         };
-        if self.progress.mode.visual() {
-            visual::activity(self.progress.report_id, &format!("{} failed", self.name));
-        }
-        if !self.progress.mode.verbose() {
-            return;
-        }
         self.progress.write_verbose(format_args!(
             "  S{} {} {} · {} · failed",
             self.progress.stream_id,
@@ -1534,18 +1318,9 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
         Format::Gzip => "GZIP",
         Format::Zip => "ZIP",
     };
-    match mode {
-        ProgressMode::Visual => {
-            NEXT_STREAM_ID.store(1, Ordering::Relaxed);
-            visual::format_detected(label, deflate_streams);
-        }
-        ProgressMode::Verbose => {
-            NEXT_STREAM_ID.store(1, Ordering::Relaxed);
-            verbose::reset();
-            let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
-        }
-        ProgressMode::Disabled => {}
-    }
+    NEXT_STREAM_ID.store(1, Ordering::Relaxed);
+    verbose::reset();
+    let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
     let deadline = with_report_coordinator(|coordinator| {
         coordinator.reset(mode, deflate_streams.unwrap_or(0), options.timeout);
         coordinator.deadline
@@ -1569,17 +1344,8 @@ pub(crate) fn finish_file(options: &Options) {
     });
     stop_report_spinner();
     emit_ready_streams();
-    match mode {
-        ProgressMode::Visual => {
-            visual::finish_file();
-            let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
-        }
-        ProgressMode::Verbose => {
-            verbose::flush();
-            let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
-        }
-        ProgressMode::Disabled => {}
-    }
+    verbose::flush();
+    let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
 }
 
 fn write_zip_store_changes(output: &mut dyn Write, changes: &[ZipStoreProgress]) -> io::Result<()> {
@@ -1626,7 +1392,7 @@ fn write_format_summary(
 }
 
 /// Exclusive use of the static, per-file report state (stream IDs,
-/// coordinator, caches, renderers), so reporting calls run one at a time.
+/// coordinator, report caches), so reporting calls run one at a time.
 /// Quiet calls never touch it.
 pub(crate) struct ReportSession {
     _guard: MutexGuard<'static, ()>,
@@ -1644,7 +1410,7 @@ pub(crate) fn begin_report_session(options: &Options) -> Option<ReportSession> {
     })
 }
 
-/// Whether a progress renderer will consume block-plan snapshots.
+/// Whether the verbose reporter will consume block-plan snapshots.
 pub(crate) fn reports_enabled(options: &Options) -> bool {
     ProgressMode::for_options(options).enabled()
 }

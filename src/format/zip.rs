@@ -325,7 +325,7 @@ pub(super) fn optimize_preflight(
 }
 
 fn configure_stream_producers(options: &Options, producers: &[u8]) {
-    if options.verbose || options.visual {
+    if options.verbose {
         crate::progress::set_stream_producers(producers);
     }
 }
@@ -429,7 +429,7 @@ fn optimize_max_sequential(
     let remaining = options.timeout.saturating_sub(started.elapsed());
     let direct_allowance = remaining / 2;
     if direct_allowance.is_zero() {
-        if options.verbose || options.visual {
+        if options.verbose {
             crate::progress::complete_all_stream_producers(ZIP_DIRECT_MAX_PRODUCER);
         }
         return refine_complete_floor(options, started, floor);
@@ -467,7 +467,7 @@ fn refine_complete_floor(
     let remaining = options.timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
         floor.timed_out = true;
-        if options.verbose || options.visual {
+        if options.verbose {
             crate::progress::complete_all_stream_producers(ZIP_REFINED_DEFAULT_PRODUCER);
         }
         return finalize_store_fallback(floor, options);
@@ -826,7 +826,7 @@ fn finalize_store_fallback(
         // without --strip.
         let parsed = preflight(input, false, options.max_decoded_bytes)?;
         let mut entries = parsed.entries;
-        let report_store_changes = options.verbose || options.visual;
+        let report_store_changes = options.verbose;
         let stream_ids: Vec<Option<usize>> = if report_store_changes {
             let mut next_stream_id = 1_usize;
             entries
@@ -1078,7 +1078,8 @@ fn build_entries_parallel(
     let worker_count = optimizable.len().min(PARALLEL_ARCHIVE_MEMBER_WORKERS);
     let jobs_per_worker = optimizable.len() / worker_count;
     let workers_with_extra_job = optimizable.len() % worker_count;
-    let route_lineage = (options.verbose || options.visual)
+    let route_lineage = options
+        .verbose
         .then(crate::progress::current_route_lineage)
         .flatten();
 
@@ -1246,7 +1247,7 @@ fn build_scheduled_entry(
     } else {
         build_entry()
     }?;
-    if !timed_out && (options.verbose || options.visual) {
+    if !timed_out && options.verbose {
         if let Some(stream_id) = stream_id {
             crate::progress::complete_stream_producer(stream_id, &[], stream_producer);
         }
@@ -1332,7 +1333,7 @@ fn reclaim_timed_out_entries(
         }
         pending = still_pending;
     }
-    if options.verbose || options.visual {
+    if options.verbose {
         for stream_id in stream_ids.iter().flatten() {
             crate::progress::complete_stream_producer(*stream_id, &[], stream_producer);
         }

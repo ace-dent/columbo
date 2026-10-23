@@ -96,7 +96,6 @@ fn route_families_require_max_and_a_matching_source_topology() {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
-            None,
         );
         let context = RouteContext {
             source,

@@ -280,18 +280,12 @@ fn detailed_reporting_keeps_parallel_member_optimization_enabled() {
     };
     let quiet = optimize(&input, &quiet_options).unwrap();
 
-    let mut verbose_options = quiet_options.clone();
+    let mut verbose_options = quiet_options;
     verbose_options.verbose = true;
     let verbose = optimize(&input, &verbose_options).unwrap();
 
-    let mut visual_options = quiet_options;
-    visual_options.visual = true;
-    let visual = optimize(&input, &visual_options).unwrap();
-
     assert_eq!(verbose.data, quiet.data);
     assert_eq!(verbose.bits_saved, quiet.bits_saved);
-    assert_eq!(visual.data, quiet.data);
-    assert_eq!(visual.bits_saved, quiet.bits_saved);
 }
 
 #[test]
@@ -307,18 +301,12 @@ fn detailed_reporting_keeps_bounded_default_floor_parallelism_enabled() {
     };
     let quiet = optimize(&input, &quiet_options).unwrap();
 
-    let mut verbose_options = quiet_options.clone();
+    let mut verbose_options = quiet_options;
     verbose_options.verbose = true;
     let verbose = optimize(&input, &verbose_options).unwrap();
 
-    let mut visual_options = quiet_options;
-    visual_options.visual = true;
-    let visual = optimize(&input, &visual_options).unwrap();
-
     assert_eq!(verbose.data, quiet.data);
     assert_eq!(verbose.bits_saved, quiet.bits_saved);
-    assert_eq!(visual.data, quiet.data);
-    assert_eq!(visual.bits_saved, quiet.bits_saved);
 }
 
 #[test]

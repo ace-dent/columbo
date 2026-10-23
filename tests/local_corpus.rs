@@ -68,19 +68,16 @@ fn original_match_restoration_reaches_png_output_and_the_max_default_floor() {
     // Without restoration the output is 297 bytes. Restoring the original
     // 18-byte match at distance 34 saves one more byte.
     assert!(ordinary.data.len() <= 296);
-    for (verbose, visual) in [(true, false), (false, true)] {
-        let reported = optimize(
-            source,
-            Format::Png,
-            &Options {
-                verbose,
-                visual,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(reported, ordinary);
-    }
+    let reported = optimize(
+        source,
+        Format::Png,
+        &Options {
+            verbose: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reported, ordinary);
     let max = optimize(
         source,
         Format::Png,

@@ -99,7 +99,6 @@ fn optimize_stream(
         std::time::Duration::ZERO
     };
     let mut blocks = std::mem::take(&mut parsed.blocks);
-    let source_report = capture_source_block_report(&blocks, parsed.source_block_count, reporting);
     let progress = Progress::begin(
         options,
         started,
@@ -111,7 +110,6 @@ fn optimize_stream(
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed,
         },
-        source_report,
     );
     prepare_source_blocks(options, progress, &mut blocks)?;
     progress.routes();

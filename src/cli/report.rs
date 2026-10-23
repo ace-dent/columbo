@@ -76,14 +76,11 @@ impl OutputChannel {
 pub(super) enum ReportMode {
     Default,
     Verbose,
-    Visual,
 }
 
 impl ReportMode {
     pub(super) fn for_options(options: &Options) -> Self {
-        if options.visual {
-            Self::Visual
-        } else if options.verbose {
+        if options.verbose {
             Self::Verbose
         } else {
             Self::Default
@@ -102,7 +99,6 @@ impl ReportMode {
         match self {
             Self::Default => "default",
             Self::Verbose => "verbose",
-            Self::Visual => "visual",
         }
     }
 
@@ -121,9 +117,7 @@ pub(super) fn print_result(
 ) -> io::Result<()> {
     match report_mode {
         ReportMode::Default => print_quiet_result(output, input, action, optimized),
-        ReportMode::Verbose | ReportMode::Visual => {
-            print_detailed_result(output, input, action, optimized, timings)
-        }
+        ReportMode::Verbose => print_detailed_result(output, input, action, optimized, timings),
     }?;
     if optimized.removed_data_bytes != 0 {
         writeln!(

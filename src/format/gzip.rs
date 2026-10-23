@@ -89,14 +89,14 @@ pub(super) fn optimize_preflight(
         };
         if raw.timed_out {
             pending.push(index);
-        } else if options.verbose || options.visual {
+        } else if options.verbose {
             crate::progress::complete_stream_group(index + 1, &[]);
         }
         results[index] = Some(raw);
     }
 
     reclaim_timed_out_members(input, &members, &mut results, pending, options, &deadline)?;
-    if options.verbose || options.visual {
+    if options.verbose {
         for index in 0..members.len() {
             crate::progress::complete_stream_group(index + 1, &[]);
         }

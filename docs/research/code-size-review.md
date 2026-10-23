@@ -2,7 +2,7 @@
 
 # Code size review
 
-A dated log of changes that remove duplicated machine code without changing
+A dated log of changes that remove machine code without changing optimized
 output or speed.
 
 ## Methods
@@ -34,6 +34,50 @@ builds alternating per input, and instructions retired, which do not depend on
 the machine's load: medians of three runs of a Max run that completes its
 search (`036-Clefable-0.png`, 150-second budget) and of `bored.png` and
 `elephant-2.png` in Default.
+
+## 23 October 2026, baseline `c6f01a6`
+
+| Change | `__text` bytes | Shipped executable bytes |
+| --- | ---: | ---: |
+| Baseline | 909,776 | 993,120 |
+| Visual mode removed | 852,544 | 942,032 |
+
+`__text` shrank by 57,232 bytes (6.3%) and the shipped executable by 51,088
+(5.1%, three 16 KiB pages); its release archive fell from 556,091 to 518,648
+bytes (6.7%).
+
+- **Visual mode removed.** `--visual` drew each stream's block map with its
+  source and output rows. Its renderer (`src/progress/visual.rs`, 1,478
+  lines) is gone, with the reporter branches that built its status text and
+  the two block reports that only it read: the source stream's, taken
+  before any route runs, and a copy of the block report in every candidate
+  update. Verbose reports still print the final block plan, from the selected
+  candidate or, when the source is kept, from the source. The public
+  `Options::visual` field is removed.
+- **No process spawning.** To size its cards, the renderer ran `stty size` on
+  `/dev/tty`. It was Columbo's only `std::process::Command`, so it compiled
+  the standard library's process-spawning code: removing only that call, with
+  visual mode kept, saves 18,644 bytes of `__text` and 18,128 of executable.
+
+Equivalence: the change touches only reporting, so the public-API runs were
+not repeated. The 33 Default inputs matched byte for byte, as did `bored.png`,
+`elephant-2.png` and the completing Max run. Verbose reports of nine PNG,
+APNG, ZIP, GZIP and zlib inputs, in Default and in Max with a 10-second
+budget, matched line for line with durations masked, except two Max runs that
+reached their deadline (`Animated.png` and `Checked.playdate-pulp.zip`),
+which start different routes from run to run: the baseline build differs from
+itself in the same way. Rust tests, including the private corpus, passed in
+release mode and the ordinary suite in debug mode, with documentation and
+Python tests, a locked build, formatting and all-feature Clippy with warnings
+denied. The tests of visual mode are gone; tests it shared with verbose mode
+now cover verbose mode alone.
+
+Runtime: 99.8 seconds of CPU for the baseline and 100.2 for the candidate on
+the 33 inputs. Medians of three runs retired 105.28 and 105.35 billion
+instructions on the completing Max run, 30.77 and 30.76 billion on
+`bored.png`, and 37.45 and 37.46 billion on `elephant-2.png`.
+
+Artifacts: `work/binary-size-review-20261023/`.
 
 ## 22 October 2026, baseline `d5897ec`
 

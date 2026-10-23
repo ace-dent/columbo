@@ -172,7 +172,6 @@ pub(super) fn optimize_preflight(
         let mut floor_options = options.clone();
         floor_options.exhaustive = false;
         floor_options.verbose = false;
-        floor_options.visual = false;
         let parsed = &parsed;
 
         return thread::scope(|scope| {
@@ -275,7 +274,7 @@ fn optimize_preflight_once(
                 &mut budget,
             )
         };
-        let probe = if options.verbose || options.visual {
+        let probe = if options.verbose {
             let stream_id = metadata_stream_ids[index]
                 .expect("every supported compressed metadata chunk has a stream identifier");
             crate::progress::with_stream_slice(stream_id, &[], Some("metadata probe"), run_probe)
@@ -304,7 +303,7 @@ fn optimize_preflight_once(
             budget.remaining = remaining_before_probe;
         } else {
             budget.remaining = remaining_before_probe.saturating_sub(decoded_work);
-            if options.verbose || options.visual {
+            if options.verbose {
                 let stream_id = metadata_stream_ids[index]
                     .expect("every supported compressed metadata chunk has a stream identifier");
                 crate::progress::complete_stream_group(stream_id, &[]);
@@ -512,7 +511,7 @@ fn optimize_preflight_once(
                     }
                     .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?
                 };
-                if options.verbose || options.visual {
+                if options.verbose {
                     let stream_id = metadata_stream_ids[index].expect(
                         "every supported compressed metadata chunk has a stream identifier",
                     );
@@ -1018,7 +1017,7 @@ fn optimize_image_streams(
                     )
                 }
             };
-            let result = if options.visual || options.verbose {
+            let result = if options.verbose {
                 let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
                 if call_options.timeout < file_remaining {
                     crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?
@@ -1028,7 +1027,7 @@ fn optimize_image_streams(
             } else {
                 optimize_job()?
             };
-            if !result.timed_out && (options.verbose || options.visual) {
+            if !result.timed_out && options.verbose {
                 let (stream_id, duplicates) = image_job_stream_group(job, &representatives);
                 crate::progress::complete_stream_group(stream_id, &duplicates);
             }
@@ -1050,7 +1049,7 @@ fn optimize_image_streams(
         options,
         &budget.deadline,
     )?;
-    if options.verbose || options.visual {
+    if options.verbose {
         for (job, _) in &results {
             let (stream_id, duplicates) = image_job_stream_group(*job, &representatives);
             crate::progress::complete_stream_group(stream_id, &duplicates);
@@ -1199,7 +1198,7 @@ fn reclaim_timed_out_image_jobs(
                 image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
             let retry_job =
                 || run_png_image_zlib(stream, &retry_options, expected_decoded_size, default_floor);
-            let retry = if options.visual || options.verbose {
+            let retry = if options.verbose {
                 let (stream_id, duplicates) = image_job_stream_group(job, representatives);
                 crate::progress::with_stream_reclaim(stream_id, &duplicates, !last, retry_job)?
             } else {
@@ -1370,7 +1369,7 @@ fn optimize_image_job_slice(
         let (stream_id, duplicates) = image_job_stream_group(job, representatives);
         let optimized =
             crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?;
-        if !optimized.timed_out && (options.verbose || options.visual) {
+        if !optimized.timed_out && options.verbose {
             crate::progress::complete_stream_group(stream_id, &duplicates);
         }
         results.push((job, optimized));
@@ -1715,7 +1714,6 @@ fn optimize_single_image_max_parallel(
                 // The worker has no progress context.
                 let mut quiet_options = options.clone();
                 quiet_options.verbose = false;
-                quiet_options.visual = false;
                 thread::Builder::new()
                     .name("columbo-png-early-max".into())
                     .spawn_scoped(scope, move || {

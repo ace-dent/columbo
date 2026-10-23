@@ -111,7 +111,6 @@ pub(super) fn parse_args(
             "-h" | "--help" => return Ok(ParsedCommand::Help),
             "--raw" => format = Format::Raw,
             "-v" | "--verbose" => options.verbose = true,
-            "--visual" => options.visual = true,
             "-m" | "--max" => options.exhaustive = true,
             "-d" | "--dry-run" => dry_run = true,
             "--out" => {
@@ -157,13 +156,6 @@ pub(super) fn parse_args(
             }
         }
         index += 1;
-    }
-
-    if options.verbose && options.visual {
-        return Err(CliError::message(
-            "--visual cannot be combined with --verbose",
-            false,
-        ));
     }
 
     if positional.is_empty() {
@@ -334,10 +326,6 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     writeln!(
         output,
         "  -v, --verbose          show ordered route timings, bit gains, and block choices"
-    )?;
-    writeln!(
-        output,
-        "      --visual           show ordered Deflate block maps with aligned in/out rows"
     )?;
     writeln!(
         output,

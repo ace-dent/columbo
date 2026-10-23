@@ -75,25 +75,6 @@ fn verbose_flags_enable_progress_reporting() {
 }
 
 #[test]
-fn visual_mode_is_distinct_from_verbose_reporting() {
-    assert!(!parsed_options(["in"]).visual);
-    assert!(parsed_options(["--visual", "in"]).visual);
-
-    let error = match parse_args(
-        ["--visual", "--verbose", "in"]
-            .into_iter()
-            .map(OsString::from),
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("visual and verbose modes should not be combined"),
-    };
-    assert_eq!(
-        error.message.as_deref(),
-        Some("--visual cannot be combined with --verbose")
-    );
-}
-
-#[test]
 fn output_defaults_in_place_and_accepts_oxipng_forms_for_one_input() {
     let default = parsed_command(["in"]);
     assert_eq!(default.inputs, [PathBuf::from("in")]);
@@ -313,8 +294,6 @@ fn help_describes_only_the_merged_strict_policy() {
     assert!(help.contains("Advanced:"));
     assert!(help.contains("--raw"));
     assert!(help.contains("ordered route timings, bit gains, and block choices"));
-    assert!(help.contains("--visual"));
-    assert!(help.contains("ordered Deflate block maps with aligned in/out rows"));
     assert!(!help.contains('\x1b'));
 
     let mut colored_help = Vec::new();

@@ -604,7 +604,7 @@ fn compressed_metadata_counts_after_image_streams() {
 }
 
 #[test]
-fn duplicate_apng_frames_share_a_named_visual_group() {
+fn duplicate_apng_frames_share_a_named_report_group() {
     assert_eq!(
         image_job_stream_group(ImageJob::Idat, &[0, 0, 2]),
         (1, vec![])
@@ -1528,18 +1528,12 @@ fn metadata_probe_policy_is_identical_in_detailed_modes() {
     };
     let quiet = optimize(&input, &quiet_options).unwrap();
 
-    let mut verbose_options = quiet_options.clone();
+    let mut verbose_options = quiet_options;
     verbose_options.verbose = true;
     let verbose = optimize(&input, &verbose_options).unwrap();
 
-    let mut visual_options = quiet_options;
-    visual_options.visual = true;
-    let visual = optimize(&input, &visual_options).unwrap();
-
     assert_eq!(verbose.data, quiet.data);
     assert_eq!(verbose.bits_saved, quiet.bits_saved);
-    assert_eq!(visual.data, quiet.data);
-    assert_eq!(visual.bits_saved, quiet.bits_saved);
 }
 
 #[test]
@@ -1553,8 +1547,6 @@ fn reporting_modes_do_not_change_the_mandatory_metadata_reserve() {
         };
         let mut verbose = quiet.clone();
         verbose.verbose = true;
-        let mut visual = quiet.clone();
-        visual.visual = true;
 
         assert_eq!(
             image_work_needs_metadata_reserve(&quiet, metadata_bytes),
@@ -1562,10 +1554,6 @@ fn reporting_modes_do_not_change_the_mandatory_metadata_reserve() {
         );
         assert_eq!(
             image_work_needs_metadata_reserve(&verbose, metadata_bytes),
-            expected
-        );
-        assert_eq!(
-            image_work_needs_metadata_reserve(&visual, metadata_bytes),
             expected
         );
     }

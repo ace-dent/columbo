@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
 //! Stderr spinner with a timeout countdown, shared by the CLI and the verbose
-//! and visual reporters.
+//! reporter.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

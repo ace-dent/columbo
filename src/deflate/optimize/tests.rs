@@ -372,7 +372,6 @@ fn boundary_slide_runs_as_a_terminal_method_in_both_modes() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     for (deadline, slides) in [(&finalizing, true), (&stopped, false)] {
         let mut cache = TerminalParseCache::default();
@@ -1097,7 +1096,6 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     let ordinary_sweep = improve_with_terminal_searches(
         source,
@@ -1219,7 +1217,6 @@ fn terminal_merges_follow_the_settled_finish() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     let ordinary_sweep = improve_with_terminal_searches(
         source,
@@ -2207,7 +2204,6 @@ fn deferred_bounded_png_floor_retains_exact_default_at_zero_timeout() {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
-            None,
         ),
         None,
     )
@@ -2422,7 +2418,6 @@ fn bounded_generic_routes_preserve_complete_candidates() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     let candidates =
         build_bounded_generic_max_candidates(source, &options, &deadline, progress, None).unwrap();
@@ -2619,7 +2614,6 @@ fn complete_png_floor_reuses_the_full_default_route_sequence() {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
-            None,
         ),
         DefaultFloorWork::Timed(&deadline),
     )
@@ -2688,7 +2682,6 @@ fn strict_completion_competes_only_after_max_searches_its_parent() {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
-            None,
         ),
         DefaultFloorWork::Timed(&deadline),
     )
@@ -2765,7 +2758,6 @@ fn complete_png_floor_includes_terminal_tree_methods() {
                 meaningful_bits: parsed.meaningful_bits,
                 parse_elapsed: Duration::ZERO,
             },
-            None,
         ),
         DefaultFloorWork::Timed(&deadline),
     )
@@ -3851,7 +3843,6 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     let closed = improve_with_terminal_searches(
         source,
@@ -3973,7 +3964,6 @@ fn default_sweep_finishes_with_the_distance_ladder() {
             meaningful_bits: parsed.meaningful_bits,
             parse_elapsed: Duration::ZERO,
         },
-        None,
     );
     let only_distance_four = |candidate: &Candidate| {
         let check = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();

@@ -29,7 +29,6 @@ Input and decoded Deflate data are limited to 1 GiB per file, and decoded data t
 
 - `-h`, `--help`: Show command-line help and exit.
 - `-v`, `--verbose`: Show completed stream reports in physical order, including route timings, bit gains, and final block choices.
-- `--visual`: Show completed Deflate block maps in physical stream order. Maps are shown only when standard output is an interactive terminal; otherwise Columbo warns and continues without them. Cannot be combined with `--verbose`.
 - `-m`, `--max`: Enable slower block-boundary and token-spelling searches for potentially smaller output.
 - `-d`, `--dry-run`: Run the complete optimization for each input and report savings without writing files. With one input, `--out` is ignored; with several, it is rejected.
 - `--out <file>`: Write a single input to `file` instead of modifying it. When there is nothing to write, Columbo copies the input to a missing `file` and leaves an existing `file` unchanged.

@@ -20,7 +20,7 @@ remain private to the crate.
 | `src/deflate/` | Parse, price, search, and emit structurally equivalent Deflate streams. |
 | `src/checksum.rs` | Incremental CRC-32 and Adler-32 checksums. |
 | `src/sort.rs` | Sort off the hot paths through two shared index sorts, instead of one compiled sort per element type and comparator. |
-| `src/progress/` | Coordinate physical stream order and render verbose or visual route reports. |
+| `src/progress/` | Coordinate physical stream order and render verbose route reports. |
 | `src/terminal/` | Share terminal capability checks, text formatting, and spinner behavior between the library and CLI. |
 
 The library performs optimization, while the CLI performs filesystem changes.

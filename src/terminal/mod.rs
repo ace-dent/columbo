@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Terminal capability checks shared by the library's progress reporters and
-//! the CLI.
+//! Terminal capability checks shared by the library's verbose reporter and the
+//! CLI.
 
 pub(crate) mod formatting;
 pub(crate) mod spinner;
@@ -23,14 +23,6 @@ pub(crate) fn stdout_color_enabled() -> bool {
 
 pub(crate) fn stderr_color_enabled() -> bool {
     color_enabled_for(stderr_escapes_enabled(), env_value("NO_COLOR"))
-}
-
-/// Whether stdout is a terminal that can show live, line-oriented output.
-///
-/// This does not promise that the terminal interprets escape sequences; see
-/// [`stdout_escapes_enabled`].
-pub(crate) fn stdout_interactive() -> bool {
-    io::stdout().is_terminal() && !term_is_dumb(env_value("TERM").as_deref())
 }
 
 pub(crate) fn stderr_interactive() -> bool {

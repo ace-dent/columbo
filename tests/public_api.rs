@@ -38,7 +38,6 @@ fn explicit_raw_mode_resolves_an_ambiguous_header() {
 fn strict_mode_is_the_default() {
     assert!(Options::default().strict);
     assert!(!Options::default().verbose);
-    assert!(!Options::default().visual);
     assert_eq!(
         Options::default().max_expansion_ratio,
         Some(MAX_EXPANSION_RATIO)
@@ -58,11 +57,6 @@ fn reporting_modes_do_not_change_optimized_bytes() {
     let verbose_result = optimize(EMPTY_RAW, Format::Raw, &verbose).unwrap();
 
     assert_eq!(verbose_result, quiet_result);
-
-    let mut visual = quiet.clone();
-    visual.visual = true;
-    let visual_result = optimize(EMPTY_RAW, Format::Raw, &visual).unwrap();
-    assert_eq!(visual_result, quiet_result);
 }
 
 #[test]

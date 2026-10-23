@@ -18,10 +18,8 @@ fn percentage_reporting_handles_the_input_limit_on_32_bit_targets() {
 }
 
 #[test]
-fn visual_mode_reuses_the_detailed_start_and_end_summaries() {
-    let visual = parsed_command(["--visual", "--dry-run", "in"]);
+fn verbose_mode_prints_the_detailed_start_summary() {
     let verbose = parsed_command(["--verbose", "--dry-run", "in"]);
-    let mut visual_header = Vec::new();
     let mut verbose_header = Vec::new();
     let input = InputReport {
         path: Path::new("in"),
@@ -29,14 +27,6 @@ fn visual_mode_reuses_the_detailed_start_and_end_summaries() {
         count: 1,
         bytes: 1_024,
     };
-    print_detailed_header(
-        &mut visual_header,
-        ReportMode::Visual,
-        &visual,
-        &input,
-        Duration::from_millis(2),
-    )
-    .unwrap();
     print_detailed_header(
         &mut verbose_header,
         ReportMode::Verbose,
@@ -46,23 +36,17 @@ fn visual_mode_reuses_the_detailed_start_and_end_summaries() {
     )
     .unwrap();
 
-    let visual_header = String::from_utf8(visual_header).unwrap();
     let verbose_header = String::from_utf8(verbose_header).unwrap();
-    assert!(visual_header.contains("· visual\n"));
     assert!(verbose_header.contains("· verbose\n"));
-    assert_eq!(
-        visual_header.lines().skip(3).collect::<Vec<_>>(),
-        verbose_header.lines().skip(3).collect::<Vec<_>>()
-    );
-    let mut header_lines = visual_header.lines();
+    let mut header_lines = verbose_header.lines();
     assert_eq!(header_lines.next(), Some(""));
     let title = header_lines.next().unwrap();
     let underline = header_lines.next().unwrap();
     assert_eq!(title.chars().count(), underline.chars().count());
     assert!(underline.chars().all(|character| character == '─'));
-    assert!(visual_header.contains("Input    \"in\" · 1024 bytes · read 2.00 ms"));
-    assert!(visual_header.contains("Mode     normal · strict · dry run"));
-    assert!(visual_header.ends_with("Mode     normal · strict · dry run\n"));
+    assert!(verbose_header.contains("Input    \"in\" · 1024 bytes · read 2.00 ms"));
+    assert!(verbose_header.contains("Mode     normal · strict · dry run"));
+    assert!(verbose_header.ends_with("Mode     normal · strict · dry run\n"));
 
     let mut result = Vec::new();
     let optimized = OptimizationReport {
@@ -147,7 +131,7 @@ fn default_result_describes_equal_sized_wrapper_normalization() {
 }
 
 #[test]
-fn verbose_and_visual_share_the_detailed_result_renderer() {
+fn verbose_mode_uses_the_detailed_result_renderer() {
     let input = InputReport {
         path: Path::new("directory/abc.file"),
         index: 0,
@@ -166,7 +150,6 @@ fn verbose_and_visual_share_the_detailed_result_renderer() {
         total: Duration::from_millis(3),
     };
     let mut verbose = Vec::new();
-    let mut visual = Vec::new();
     print_result(
         &mut verbose,
         ReportMode::Verbose,
@@ -176,17 +159,7 @@ fn verbose_and_visual_share_the_detailed_result_renderer() {
         &timings,
     )
     .unwrap();
-    print_result(
-        &mut visual,
-        ReportMode::Visual,
-        &input,
-        &OutputAction::DryRun,
-        &optimized,
-        &timings,
-    )
-    .unwrap();
 
-    assert_eq!(verbose, visual);
     let detailed = String::from_utf8(verbose).unwrap();
     assert!(detailed.starts_with("\nResult\n"));
     assert!(detailed.contains("Size    100 → 90 bytes · saved 10 bytes (10.00%)"));
@@ -215,38 +188,35 @@ fn timeout_notice_describes_the_output_action() {
 }
 
 #[test]
-fn timeout_notice_is_limited_to_verbose_and_visual_modes() {
+fn timeout_notice_is_limited_to_verbose_mode() {
     assert!(!ReportMode::for_options(&parsed_options(["in"])).reports_timeout());
     assert!(ReportMode::for_options(&parsed_options(["--verbose", "in"])).reports_timeout());
-    assert!(ReportMode::for_options(&parsed_options(["--visual", "in"])).reports_timeout());
 }
 
 #[test]
-fn verbose_and_visual_batch_headers_report_the_file_position() {
-    for (flag, mode) in [("--verbose", "verbose"), ("--visual", "visual")] {
-        let command = parsed_command([flag, "first", "second", "third"]);
-        let mut header = Vec::new();
-        let input = InputReport {
-            path: Path::new("second"),
-            index: 1,
-            count: 3,
-            bytes: 42,
-        };
+fn verbose_batch_headers_report_the_file_position() {
+    let command = parsed_command(["--verbose", "first", "second", "third"]);
+    let mut header = Vec::new();
+    let input = InputReport {
+        path: Path::new("second"),
+        index: 1,
+        count: 3,
+        bytes: 42,
+    };
 
-        print_detailed_header(
-            &mut header,
-            ReportMode::for_options(&command.options),
-            &command,
-            &input,
-            Duration::ZERO,
-        )
-        .unwrap();
+    print_detailed_header(
+        &mut header,
+        ReportMode::for_options(&command.options),
+        &command,
+        &input,
+        Duration::ZERO,
+    )
+    .unwrap();
 
-        let header = String::from_utf8(header).unwrap();
-        assert!(header.contains(&format!("· {mode}\n")));
-        assert!(header.contains("File     2 of 3\n"));
-        assert!(header.contains("Input    \"second\" · 42 bytes"));
-    }
+    let header = String::from_utf8(header).unwrap();
+    assert!(header.contains("· verbose\n"));
+    assert!(header.contains("File     2 of 3\n"));
+    assert!(header.contains("Input    \"second\" · 42 bytes"));
 }
 
 #[test]
@@ -271,12 +241,10 @@ fn report_modes_have_one_consistent_output_channel() {
     let strict = parsed_command(["in"]);
     let default = parsed_command(["--strict", "0", "in"]);
     let verbose = parsed_command(["--strict", "0", "--verbose", "in"]);
-    let visual = parsed_command(["--strict", "0", "--visual", "in"]);
 
     assert!(strict.options.strict);
     assert!(!default.options.strict);
     assert!(!verbose.options.strict);
-    assert!(!visual.options.strict);
 
     let default = ReportMode::for_options(&default.options);
     assert_eq!(default, ReportMode::Default);
@@ -289,12 +257,6 @@ fn report_modes_have_one_consistent_output_channel() {
     assert_eq!(verbose.channel(), OutputChannel::Stdout);
     assert!(verbose.detailed());
     assert!(verbose.reports_timeout());
-
-    let visual = ReportMode::for_options(&visual.options);
-    assert_eq!(visual, ReportMode::Visual);
-    assert_eq!(visual.channel(), OutputChannel::Stdout);
-    assert!(visual.detailed());
-    assert!(visual.reports_timeout());
 }
 
 #[test]

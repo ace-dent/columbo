@@ -203,7 +203,7 @@ result ([reporting](#scheduling-and-observability)).
 | PNG decoded-equivalent frame reuse | After image-job optimization, frames with matching checksum and size are decoded and byte-compared; equal frames reuse the best compressed spelling. Caps: 32 MiB retained comparison data; 64 MiB comparison work. | 🟡 |
 | PNG unsafe ancillary fallback | Without `--strip`, a `caBX` or `dSIG` signature or an unknown unsafe-to-copy ancillary chunk returns the source PNG unchanged (even with invalid `tRNS`) after only the container parse; `Optimization::blocking_chunk` names the first such chunk, and the CLI reports it on stderr with a `--strip` hint. Apple's `iDOT` does not block; rewrites drop it because they invalidate its IDAT offsets. | 🟢 |
 | PNG invalid-exporter repair | Accepts and omits one `tRNS` that PNG forbids in color-type-6 (RGBA) images: non-empty, palette-sized, after a valid suggested `PLTE`, before image data. Other invalid `tRNS` shapes are errors; rewrite-sensitive unknown ancillary data blocks the repair unless stripping. Bytes after `IEND` are kept unless `--strip`. | 🟢 |
-| ZIP member scheduling | All unencrypted method-8 entries are validated. Entries >4 decoded bytes are jobs; 0–4-byte entries are always stored ([Overall pipeline](#overall-pipeline)), and if they are the only Deflate entries, Max skips its direct and refinement archive lineages. Unencrypted stored entries: validated only; encrypted: kept undecoded. Order: Default largest-first, Max small-first ([member lanes](#multithreading)). Max's 10% Store test follows a complete archive lineage and ignores header and descriptor savings. Both ZIP headers are updated; Verbose and Visual report each Deflate-to-Store change with sizes and saving, including zero-saving normalizations. Local records keep physical order, central records directory order. | 🟡–🔴 |
+| ZIP member scheduling | All unencrypted method-8 entries are validated. Entries >4 decoded bytes are jobs; 0–4-byte entries are always stored ([Overall pipeline](#overall-pipeline)), and if they are the only Deflate entries, Max skips its direct and refinement archive lineages. Unencrypted stored entries: validated only; encrypted: kept undecoded. Order: Default largest-first, Max small-first ([member lanes](#multithreading)). Max's 10% Store test follows a complete archive lineage and ignores header and descriptor savings. Both ZIP headers are updated; Verbose reports each Deflate-to-Store change with sizes and saving, including zero-saving normalizations. Local records keep physical order, central records directory order. | 🟡–🔴 |
 | ZIP max archive lineages | ≥1 optimization job; nonuniform member work; input ≤8 MiB; jobs ≤64 MiB decoded in total: race the complete Default archive (`MandatoryComplete`) against direct original-source Max from the validated source (`Established`). Larger or uniform archives: complete Default, give original-source Max half the actual remainder, then refine the completed floor with the rest. No jobs: one pass. A Max archive replaces the Default archive only when no worse in file bytes and aggregate meaningful bits and better in one. | 🔴 |
 
 ### Raw-stream route tree
@@ -830,8 +830,8 @@ scheduling can change how far a cooperative search gets, so timed runs need not
 be bit-for-bit identical.
 
 `Options` is immutable and reusable, so callers may run independent public API
-calls on their own threads; calls with verbose or visual reporting run one at a
-time because they share standard output.
+calls on their own threads; calls with verbose reporting run one at a time
+because they share standard output.
 
 ## Method catalog
 
@@ -931,22 +931,21 @@ complete safe fallback, except after the unsafe-ancillary early return. fdAT
 duplicates reuse their validated representative but charge the decoded budget
 once per occurrence.
 
-Reporting does not change optimization: quiet, Verbose, and Visual runs use the
-same route gates, deadlines, candidate ordering, memory bounds, and worker
+Reporting does not change optimization: quiet and Verbose runs use the same
+route gates, deadlines, candidate ordering, memory bounds, and worker
 parallelism. Workers buffer complete stream reports; one file-level coordinator
 writes each physical stream in source order once every earlier stream and every
 producer of that stream are final, including its reclaim passes and, in ZIP
 Max, all its archive lineages. Concurrent ZIP Default and direct-Max lineages
-are labeled separately. Visual mode keeps the final card of each optimizer
-trial and emits ordered, immutable cards without cursor rewinds.
+are labeled separately.
 
 `--verbose` reports route timings, same-distance and balanced-tree
 opportunities, candidate bit gains, the `Pricing block boundaries` phase, the
 selected route, and the final block plan, and combines with `--dry-run`
-(optimize without writing). Verbose and Visual show the CLI timeout warning,
-distinguish `search slice reached` from `deadline reached`, and label a
-follow-up card `reclaimed time`; default output is one line per file. The
-spinner is under [Multithreading](#multithreading).
+(optimize without writing). Verbose also shows the CLI timeout warning,
+distinguishes `search slice reached` from `deadline reached`, and labels a
+follow-up stream report `reclaimed time`; default output is one line per file.
+The spinner is under [Multithreading](#multithreading).
 
 ## Attribution
 

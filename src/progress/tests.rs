@@ -14,7 +14,7 @@ fn duration_units_are_stable_at_boundaries() {
 }
 
 #[test]
-fn verbose_and_visual_share_the_format_summary_rows() {
+fn verbose_reports_print_the_format_summary_rows() {
     let mut summary = Vec::new();
     write_format_summary(&mut summary, "ZIP", Some(3)).unwrap();
     assert_eq!(
@@ -24,7 +24,7 @@ fn verbose_and_visual_share_the_format_summary_rows() {
 }
 
 #[test]
-fn verbose_and_visual_share_selected_zip_store_reporting() {
+fn verbose_reports_print_selected_zip_store_changes() {
     let mut report = Vec::new();
     write_zip_store_changes(
         &mut report,
@@ -78,7 +78,7 @@ fn completed_streams_release_only_the_contiguous_physical_prefix() {
 #[test]
 fn every_registered_lineage_must_finish_before_a_stream_is_sealed() {
     let mut coordinator = ReportCoordinator::default();
-    coordinator.reset(ProgressMode::Visual, 2, Duration::from_secs(30));
+    coordinator.reset(ProgressMode::Verbose, 2, Duration::from_secs(30));
     coordinator.set_expected_producers(&[1, 2, 3]);
 
     coordinator.complete(1, &[], 2);
