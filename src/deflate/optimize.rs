@@ -259,7 +259,7 @@ pub(crate) fn optimize_raw(input: &[u8], options: &Options) -> Result<RawOptimiz
         optimized
             .data
             .try_reserve(input.len() - optimized.consumed)
-            .map_err(|_| Error::internal("could not allocate Deflate suffix"))?;
+            .map_err(|_| Error::allocation("Deflate suffix"))?;
         optimized
             .data
             .extend_from_slice(&input[optimized.consumed..]);
@@ -340,10 +340,8 @@ fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<usize> {
         }
 
         normalized_blocks += 1;
-        let tokens =
-            rewrite_258_symbols(&block.tokens, block.plain.len(), false).ok_or_else(|| {
-                Error::internal("could not allocate strict Deflate token normalization")
-            })?;
+        let tokens = rewrite_258_symbols(&block.tokens, block.plain.len(), false)
+            .ok_or_else(|| Error::allocation("strict Deflate token normalization"))?;
         block.tokens = tokens.into();
         block.recount_frequencies();
         block.original = None;
@@ -1549,7 +1547,7 @@ fn build_bounded_floor_candidate(
 fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> {
     let mut data = Vec::new();
     data.try_reserve_exact(source.compressed.len())
-        .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+        .map_err(|_| Error::allocation("Deflate output"))?;
     data.extend_from_slice(source.compressed);
     Ok(Candidate {
         data,
@@ -3436,7 +3434,7 @@ fn prepare_compact_source_split_seed_with_limits(
 
     let mut data = Vec::new();
     data.try_reserve_exact(candidate.data.len())
-        .map_err(|_| Error::internal("could not allocate compact route seed"))?;
+        .map_err(|_| Error::allocation("compact route seed"))?;
     data.extend_from_slice(&candidate.data);
     let stream = parse_validated_rewrite(&data, decoded_limit, identity)?;
     if !compact_source_split_floor_eligible_with_limits(
@@ -4596,11 +4594,11 @@ fn build_candidate_and_parse(
 /// allocation failure instead.
 fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Candidate> {
     if options.strict {
-        return Err(Error::internal("could not allocate Deflate plan"));
+        return Err(Error::allocation("Deflate plan"));
     }
     let mut data = Vec::new();
     data.try_reserve_exact(source.compressed.len())
-        .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+        .map_err(|_| Error::allocation("Deflate output"))?;
     data.extend_from_slice(source.compressed);
     Ok(Candidate {
         data,

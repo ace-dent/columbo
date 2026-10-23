@@ -239,7 +239,7 @@ pub(crate) fn normalize_padding(input: &mut [u8], decoded_limit: u64) -> Result<
                 if input[offset] & mask != 0 {
                     masks
                         .try_reserve(1)
-                        .map_err(|_| Error::internal("could not allocate padding masks"))?;
+                        .map_err(|_| Error::allocation("padding masks"))?;
                     masks.push((offset, mask));
                 }
             }
@@ -677,7 +677,7 @@ pub(crate) fn decoded_bytes_for_storage(
     let mut decoded = Vec::new();
     decoded
         .try_reserve_exact(decoded_size)
-        .map_err(|_| Error::internal("could not allocate stored Deflate payload"))?;
+        .map_err(|_| Error::allocation("stored Deflate payload"))?;
     for block in parsed.blocks {
         decoded.extend_from_slice(&block.plain);
     }

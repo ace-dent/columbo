@@ -359,22 +359,23 @@ impl RouteProgress {
         }
         self.completed.set(round);
         self.last_reported.set(Some(Instant::now()));
-        let elapsed = format_duration(elapsed);
-        if accepted {
+        let (marker, outcome) = if accepted {
             self.best_bits.set(Some(after_bits));
             self.best_blocks.set(blocks);
-            self.lines.line(format_args!(
-                "       {} Replay {round} · {elapsed} · {before_bits} → {after_bits} bits · saved {} · accepted as {blocks} {}",
-                self.lines.success(),
+            let outcome = format!(
+                "saved {} · accepted as {blocks} {}",
                 format_bit_count(before_bits.saturating_sub(after_bits)),
                 plural(blocks, "block", "blocks")
-            ));
+            );
+            (self.lines.success(), outcome)
         } else {
-            self.lines.line(format_args!(
-                "       {} Replay {round} · {elapsed} · {before_bits} → {after_bits} bits · no strict improvement; route stabilized",
-                self.lines.neutral(),
-            ));
-        }
+            let outcome = "no strict improvement; route stabilized".to_owned();
+            (self.lines.neutral(), outcome)
+        };
+        self.lines.line(format_args!(
+            "       {marker} Replay {round} · {} · {before_bits} → {after_bits} bits · {outcome}",
+            format_duration(elapsed),
+        ));
     }
 
     pub(crate) fn replay_stopped(&self, round: usize, elapsed: Duration, reason: &'static str) {

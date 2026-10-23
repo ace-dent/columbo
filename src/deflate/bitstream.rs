@@ -123,7 +123,7 @@ impl BitWriter {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(byte_len)
-            .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+            .map_err(|_| Error::allocation("Deflate output"))?;
         Ok(Self {
             bytes,
             buffer: 0,
@@ -152,7 +152,7 @@ impl BitWriter {
             let pending_bytes = usize::from(pending_bits.div_ceil(8));
             self.bytes
                 .try_reserve(pending_bytes)
-                .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+                .map_err(|_| Error::allocation("Deflate output"))?;
         }
         let mask = if bits == 32 {
             u64::from(u32::MAX)
@@ -270,7 +270,7 @@ impl BitWriter {
             let buffered_bytes = usize::from(self.buffered_bits / 8);
             self.bytes
                 .try_reserve(buffered_bytes.saturating_add(bytes.len()))
-                .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+                .map_err(|_| Error::allocation("Deflate output"))?;
         }
         self.flush_complete_bytes();
         self.bytes.extend_from_slice(bytes);

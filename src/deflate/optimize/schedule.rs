@@ -191,7 +191,7 @@ fn optimize_stream(
         candidate
             .data
             .try_reserve_exact(original.len())
-            .map_err(|_| Error::internal("could not allocate Deflate output"))?;
+            .map_err(|_| Error::allocation("Deflate output"))?;
         candidate.data.extend_from_slice(original);
     }
     let mut data = candidate.data;

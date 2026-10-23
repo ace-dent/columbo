@@ -71,3 +71,10 @@ fn deterministic_malformed_corpus_never_panics_or_grows_output() {
         }
     }
 }
+
+#[test]
+fn allocation_errors_name_what_could_not_be_allocated() {
+    let error = Error::allocation("PNG output");
+    assert_eq!(error.kind(), ErrorKind::Internal);
+    assert_eq!(error.message(), "could not allocate PNG output");
+}

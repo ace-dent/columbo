@@ -118,7 +118,7 @@ fn empty_chunk_replacements(chunk_count: usize) -> Result<Vec<Option<CompressedB
     let mut replacements = Vec::new();
     replacements
         .try_reserve_exact(chunk_count)
-        .map_err(|_| Error::internal("could not allocate PNG chunk model"))?;
+        .map_err(|_| Error::allocation("PNG chunk model"))?;
     replacements.resize_with(chunk_count, || None);
     Ok(replacements)
 }
@@ -155,8 +155,7 @@ pub(super) fn optimize_preflight(
         .rewrite_sensitive_chunk
         .filter(|_| !options.strip_metadata)
     {
-        let data = try_clone_bytes(input)
-            .ok_or_else(|| Error::internal("could not allocate PNG output"))?;
+        let data = try_clone_bytes(input).ok_or_else(|| Error::allocation("PNG output"))?;
         return Ok(Optimization::from_metrics(input.len(), data, 0, 0, false).blocked_by(kind));
     }
     // Per-stream floors cannot guarantee the Default result when Max splits its
@@ -439,7 +438,7 @@ fn optimize_preflight_once(
     let mut output = Vec::new();
     output
         .try_reserve_exact(datastream_len)
-        .map_err(|_| Error::internal("could not allocate PNG output"))?;
+        .map_err(|_| Error::allocation("PNG output"))?;
     output.extend_from_slice(SIGNATURE);
     let mut idat_written = false;
     let mut frame_index = 0_usize;
@@ -463,7 +462,7 @@ fn optimize_preflight_once(
             b"fcTL" => {
                 frame_written = false;
                 let mut body = try_clone_bytes(chunk.data)
-                    .ok_or_else(|| Error::internal("could not allocate APNG control chunk"))?;
+                    .ok_or_else(|| Error::allocation("APNG control chunk"))?;
                 body[..4].copy_from_slice(&animation_sequence.to_be_bytes());
                 animation_sequence += 1;
                 append_chunk(&mut output, *b"fcTL", &body)?;
@@ -537,7 +536,7 @@ fn optimize_preflight_once(
             _ => {
                 output
                     .try_reserve(chunk.encoded.len())
-                    .map_err(|_| Error::internal("could not allocate PNG output"))?;
+                    .map_err(|_| Error::allocation("PNG output"))?;
                 output.extend_from_slice(chunk.encoded);
             }
         }
@@ -551,7 +550,7 @@ fn optimize_preflight_once(
                 if !chunk.discard_on_output {
                     output
                         .try_reserve(chunk.encoded.len())
-                        .map_err(|_| Error::internal("could not allocate PNG output"))?;
+                        .map_err(|_| Error::allocation("PNG output"))?;
                     output.extend_from_slice(chunk.encoded);
                 }
             }
@@ -571,11 +570,7 @@ fn optimize_preflight_once(
                 source.len() - (frame_source_bits(frame)?.div_ceil(8) as usize + 6);
         }
     } else {
-        super::try_append_bytes(
-            &mut output,
-            &input[datastream_len..],
-            "could not allocate PNG suffix",
-        )?;
+        super::try_append_bytes(&mut output, &input[datastream_len..], "PNG suffix")?;
     }
 
     Ok(PngOptimization {
@@ -676,18 +671,18 @@ fn refine_cached_compressed_body(
 ) -> Result<CompressedBodyOptimization> {
     let Some(decoded_size) = floor.decoded_size else {
         return try_clone_compressed_body(floor)
-            .ok_or_else(|| Error::internal("could not allocate PNG metadata result"));
+            .ok_or_else(|| Error::allocation("PNG metadata result"));
     };
     if !options.exhaustive || budget.deadline.remaining().is_zero() {
         return try_clone_compressed_body(floor)
-            .ok_or_else(|| Error::internal("could not allocate PNG metadata result"));
+            .ok_or_else(|| Error::allocation("PNG metadata result"));
     }
 
     let floor_data = floor.replacement.as_deref().unwrap_or(source_data);
     let remaining = budget.deadline.remaining();
     let direct_allowance = remaining / 2;
-    let mut best = try_clone_compressed_body(floor)
-        .ok_or_else(|| Error::internal("could not allocate PNG metadata result"))?;
+    let mut best =
+        try_clone_compressed_body(floor).ok_or_else(|| Error::allocation("PNG metadata result"))?;
 
     // The floor may have changed the source tokens, so first search from the
     // original stream (deft4j's starting point) for half the remaining time.
@@ -744,7 +739,7 @@ fn optimize_cached_compressed_parent(
 
     let mut body = Vec::new();
     body.try_reserve_exact(body_len)
-        .map_err(|_| Error::internal("could not allocate PNG compressed metadata"))?;
+        .map_err(|_| Error::allocation("PNG compressed metadata"))?;
     body.extend_from_slice(&parent_data[..zlib_offset]);
     body.extend_from_slice(&optimized.data);
     Ok(CompressedBodyOptimization {
@@ -771,7 +766,7 @@ fn metadata_stream_ids(parsed: &ParsedPng<'_>) -> Result<Vec<Option<usize>>> {
         .ok_or_else(|| Error::resource_limit("too many PNG Deflate streams"))?;
     let mut ids = Vec::new();
     ids.try_reserve_exact(parsed.chunks.len())
-        .map_err(|_| Error::internal("could not allocate PNG stream identifiers"))?;
+        .map_err(|_| Error::allocation("PNG stream identifiers"))?;
     for chunk in &parsed.chunks {
         if supported_compressed_metadata(chunk) {
             ids.push(Some(next_id));
@@ -861,7 +856,7 @@ fn optimize_image_streams(
     let mut representative_weights = Vec::new();
     representative_weights
         .try_reserve_exact(frames.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
+        .map_err(|_| Error::allocation("PNG frame model"))?;
     representative_weights.resize(frames.len(), 0_usize);
     for (index, &representative) in representatives.iter().enumerate() {
         representative_weights[representative] = representative_weights[representative]
@@ -876,7 +871,7 @@ fn optimize_image_streams(
             .checked_add(1)
             .ok_or_else(|| Error::resource_limit("too many PNG frames"))?,
     )
-    .map_err(|_| Error::internal("could not allocate PNG frame jobs"))?;
+    .map_err(|_| Error::allocation("PNG frame jobs"))?;
     jobs.push(ImageJob::Idat);
     jobs.extend(
         representatives
@@ -912,7 +907,7 @@ fn optimize_image_streams(
     let mut optimized = Vec::<Option<FrameOptimization>>::new();
     optimized
         .try_reserve_exact(frames.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
+        .map_err(|_| Error::allocation("PNG frame results"))?;
     optimized.resize_with(frames.len(), || None);
     let image_floor = image_default_floor(single_image, options.exhaustive);
     let parallel_multi_image = !single_image
@@ -928,7 +923,7 @@ fn optimize_image_streams(
         if !options.exhaustive {
             default_timeouts
                 .try_reserve_exact(jobs.len())
-                .map_err(|_| Error::internal("could not allocate PNG image schedule"))?;
+                .map_err(|_| Error::allocation("PNG image schedule"))?;
             let remaining = budget.deadline.remaining();
             let image_remaining = if has_later_streams {
                 scale_duration(remaining, NON_LARGEST_IMAGE_SEARCH_FRACTION)
@@ -975,7 +970,7 @@ fn optimize_image_streams(
         let mut results = Vec::new();
         results
             .try_reserve_exact(jobs.len())
-            .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
+            .map_err(|_| Error::allocation("PNG frame results"))?;
         for job in jobs {
             let weight = match job {
                 ImageJob::Idat => idat.len(),
@@ -1079,16 +1074,16 @@ fn optimize_image_streams(
                     .size;
                 budget.remaining -= decoded_size;
             }
-            optimized[index] =
-                Some(try_clone_frame(frame).ok_or_else(|| {
-                    Error::internal("could not allocate duplicate PNG frame result")
-                })?);
+            optimized[index] = Some(
+                try_clone_frame(frame)
+                    .ok_or_else(|| Error::allocation("duplicate PNG frame result"))?,
+            );
         }
     }
     let mut complete = Vec::new();
     complete
         .try_reserve_exact(optimized.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
+        .map_err(|_| Error::allocation("PNG frame results"))?;
     for frame in optimized {
         complete.push(frame.expect("every APNG frame has a representative result"));
     }
@@ -1172,7 +1167,7 @@ fn reclaim_timed_out_image_jobs(
         let mut still_pending = Vec::new();
         still_pending
             .try_reserve_exact(pending.len())
-            .map_err(|_| Error::internal("could not allocate PNG frame schedule"))?;
+            .map_err(|_| Error::allocation("PNG frame schedule"))?;
 
         for (position, &result_index) in pending.iter().enumerate() {
             let file_remaining = reclaim_allowance
@@ -1281,7 +1276,7 @@ fn optimize_image_jobs_parallel(
         let mut workers = Vec::new();
         workers
             .try_reserve_exact(worker_count)
-            .map_err(|_| Error::internal("could not allocate PNG image workers"))?;
+            .map_err(|_| Error::allocation("PNG image workers"))?;
         let mut fallback_results = Vec::new();
         let mut start = 0_usize;
         for worker_index in 0..worker_count {
@@ -1359,7 +1354,7 @@ fn optimize_image_job_slice(
     let mut results = Vec::new();
     results
         .try_reserve_exact(jobs.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame results"))?;
+        .map_err(|_| Error::allocation("PNG frame results"))?;
     for (index, &job) in jobs.iter().enumerate() {
         let weight = image_job_weight(job, idat, representative_weights);
         let mut call_options = options.clone();
@@ -1411,7 +1406,7 @@ fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Ve
     let mut order = Vec::new();
     order
         .try_reserve_exact(frames.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
+        .map_err(|_| Error::allocation("PNG frame model"))?;
     order.extend(0..frames.len());
     sort_indices_unstable(&mut order, &mut |left, right| {
         (frames[left].as_slice(), decoded_sizes[left])
@@ -1422,7 +1417,7 @@ fn frame_representatives(frames: &[Vec<u8>], decoded_sizes: &[u64]) -> Result<Ve
     let mut representatives = Vec::new();
     representatives
         .try_reserve_exact(frames.len())
-        .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
+        .map_err(|_| Error::allocation("PNG frame model"))?;
     representatives.extend(0..frames.len());
     let mut group_start = 0;
     while group_start < order.len() {
@@ -1974,7 +1969,7 @@ fn optimize_compressed_body(
     }
     let mut body = Vec::new();
     body.try_reserve_exact(body_len)
-        .map_err(|_| Error::internal("could not allocate PNG compressed metadata"))?;
+        .map_err(|_| Error::allocation("PNG compressed metadata"))?;
     body.extend_from_slice(&data[..zlib_offset]);
     body.extend_from_slice(&optimized.data);
     Ok(Some(CompressedBodyOptimization {

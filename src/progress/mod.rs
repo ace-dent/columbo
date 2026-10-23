@@ -313,23 +313,12 @@ fn describe_size(bytes: usize, bits: u64, reference_bits: u64) -> String {
 }
 
 fn describe_bit_change(reference_bits: u64, candidate_bits: u64) -> String {
-    match reference_bits.cmp(&candidate_bits) {
-        std::cmp::Ordering::Greater => {
-            let saved = reference_bits - candidate_bits;
-            format!(
-                "saved {saved} {} vs source",
-                plural_u64(saved, "bit", "bits")
-            )
-        }
-        std::cmp::Ordering::Less => {
-            let added = candidate_bits - reference_bits;
-            format!(
-                "added {added} {} vs source",
-                plural_u64(added, "bit", "bits")
-            )
-        }
-        std::cmp::Ordering::Equal => "same bit length as source".to_owned(),
-    }
+    let (change, bits) = match reference_bits.cmp(&candidate_bits) {
+        std::cmp::Ordering::Greater => ("saved", reference_bits - candidate_bits),
+        std::cmp::Ordering::Less => ("added", candidate_bits - reference_bits),
+        std::cmp::Ordering::Equal => return "same bit length as source".to_owned(),
+    };
+    format!("{change} {} vs source", format_bit_count(bits))
 }
 
 fn format_bit_count(bits: u64) -> String {

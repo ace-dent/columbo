@@ -14,17 +14,18 @@ use deadline::{scale_duration, SearchDeadline};
 use crate::{Error, ErrorKind, Format, Optimization, Options, Result};
 
 /// Allocate a vector fallibly, so a capacity taken from untrusted input yields
-/// a wrapper error instead of an allocation panic or abort.
-pub(super) fn try_vec_with_capacity<T>(capacity: usize, message: &'static str) -> Result<Vec<T>> {
+/// a wrapper error instead of an allocation panic or abort. `what` names the
+/// buffer in the error (see [`Error::allocation`]), as in the helpers below.
+pub(super) fn try_vec_with_capacity<T>(capacity: usize, what: &'static str) -> Result<Vec<T>> {
     let mut output = Vec::new();
     output
         .try_reserve_exact(capacity)
-        .map_err(|_| Error::internal(message))?;
+        .map_err(|_| Error::allocation(what))?;
     Ok(output)
 }
 
-pub(super) fn try_copy_bytes(source: &[u8], message: &'static str) -> Result<Vec<u8>> {
-    let mut output = try_vec_with_capacity(source.len(), message)?;
+pub(super) fn try_copy_bytes(source: &[u8], what: &'static str) -> Result<Vec<u8>> {
+    let mut output = try_vec_with_capacity(source.len(), what)?;
     output.extend_from_slice(source);
     Ok(output)
 }
@@ -36,11 +37,11 @@ pub(super) fn try_copy_bytes(source: &[u8], message: &'static str) -> Result<Vec
 pub(super) fn try_append_bytes(
     output: &mut Vec<u8>,
     source: &[u8],
-    message: &'static str,
+    what: &'static str,
 ) -> Result<()> {
     output
         .try_reserve(source.len())
-        .map_err(|_| Error::internal(message))?;
+        .map_err(|_| Error::allocation(what))?;
     output.extend_from_slice(source);
     Ok(())
 }

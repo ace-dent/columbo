@@ -27,9 +27,9 @@ const ZIP64_END_OF_CENTRAL_DIRECTORY: u32 = 0x0606_4b50;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
-const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate ZIP output";
-const MODEL_ALLOCATION_ERROR: &str = "could not allocate ZIP entry model";
-const LOCAL_ALLOCATION_ERROR: &str = "could not allocate ZIP local entry";
+const OUTPUT_ALLOCATION: &str = "ZIP output";
+const MODEL_ALLOCATION: &str = "ZIP entry model";
+const LOCAL_ALLOCATION: &str = "ZIP local entry";
 const STORE_MIN_SAVINGS_PERCENT: u64 = 10;
 const ALWAYS_STORE_MAX_BYTES: u32 = 4;
 
@@ -678,7 +678,7 @@ fn optimize_once(
 
     if output.len() > input.len() && !options.strict && !options.strip_metadata {
         output.clear();
-        try_append_bytes(&mut output, input, OUTPUT_ALLOCATION_ERROR)?;
+        try_append_bytes(&mut output, input, OUTPUT_ALLOCATION)?;
         output_deflate_bits = source_deflate_bits;
     }
 
@@ -709,7 +709,7 @@ fn rebuild_archive(
     // Local records need not follow central directory order, so write them by
     // physical offset. Unreferenced bytes between them are kept, or dropped
     // uninterpreted with --strip.
-    let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION_ERROR)?;
+    let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION)?;
     let mut cursor = 0_usize;
     for &index in physical_order {
         let entry = &mut entries[index];
@@ -720,12 +720,12 @@ fn rebuild_archive(
             try_append_bytes(
                 &mut output,
                 &input[cursor..entry.local_offset_before],
-                OUTPUT_ALLOCATION_ERROR,
+                OUTPUT_ALLOCATION,
             )?;
         }
         entry.local_offset_after = output.len();
         if !entry.skip {
-            try_append_bytes(&mut output, &entry.local, OUTPUT_ALLOCATION_ERROR)?;
+            try_append_bytes(&mut output, &entry.local, OUTPUT_ALLOCATION)?;
         }
         cursor = entry
             .local_offset_before
@@ -741,7 +741,7 @@ fn rebuild_archive(
         try_append_bytes(
             &mut output,
             &input[cursor..central_offset],
-            OUTPUT_ALLOCATION_ERROR,
+            OUTPUT_ALLOCATION,
         )?;
     }
 
@@ -754,7 +754,7 @@ fn rebuild_archive(
         let local_offset = u32::try_from(entry.local_offset_after)
             .map_err(|_| Error::new("ZIP central directory points to unknown entry"))?;
         let source = &input[entry.central_offset..entry.central_offset + entry.central_size];
-        let mut record = try_copy_bytes(source, OUTPUT_ALLOCATION_ERROR)?;
+        let mut record = try_copy_bytes(source, OUTPUT_ALLOCATION)?;
         put_le16(&mut record, 8, output_flags(entry));
         put_le16(&mut record, 10, entry.method);
         put_le32(&mut record, 20, entry.compressed_size_after);
@@ -773,7 +773,7 @@ fn rebuild_archive(
         } else {
             record.len()
         };
-        try_append_bytes(&mut output, &record[..record_size], OUTPUT_ALLOCATION_ERROR)?;
+        try_append_bytes(&mut output, &record[..record_size], OUTPUT_ALLOCATION)?;
         written_entries = written_entries
             .checked_add(1)
             .ok_or_else(|| Error::new("optimized ZIP requires ZIP64"))?;
@@ -793,7 +793,7 @@ fn rebuild_archive(
     };
     let mut new_eocd = try_copy_bytes(
         &input[eocd_offset..eocd_offset + eocd_length],
-        OUTPUT_ALLOCATION_ERROR,
+        OUTPUT_ALLOCATION,
     )?;
     put_le16(&mut new_eocd, 8, written_entries);
     put_le16(&mut new_eocd, 10, written_entries);
@@ -802,12 +802,12 @@ fn rebuild_archive(
     if options.strip_metadata {
         put_le16(&mut new_eocd, 20, 0);
     }
-    try_append_bytes(&mut output, &new_eocd, OUTPUT_ALLOCATION_ERROR)?;
+    try_append_bytes(&mut output, &new_eocd, OUTPUT_ALLOCATION)?;
     if !options.strip_metadata {
         try_append_bytes(
             &mut output,
             &input[eocd_offset + 22 + comment_length..],
-            OUTPUT_ALLOCATION_ERROR,
+            OUTPUT_ALLOCATION,
         )?;
     }
     Ok(output)
@@ -845,7 +845,7 @@ fn finalize_store_fallback(
             Vec::new()
         };
         let mut store_changes = if report_store_changes {
-            try_vec_with_capacity(entries.len(), "could not allocate ZIP Store report")?
+            try_vec_with_capacity(entries.len(), "ZIP Store report")?
         } else {
             Vec::new()
         };
@@ -889,7 +889,7 @@ fn finalize_store_fallback(
                 .prefix_size
                 .checked_add(decoded.len())
                 .ok_or_else(|| Error::new("ZIP local entry too large"))?;
-            let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION_ERROR)?;
+            let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION)?;
             local.extend_from_slice(&input[position..position + layout.prefix_size]);
             put_le16(&mut local, 6, entry.flags & !FLAG_DATA_DESCRIPTOR);
             put_le16(&mut local, 8, 0);
@@ -926,7 +926,7 @@ fn finalize_store_fallback(
                     let start = entry.local_offset_before;
                     entry.local = try_copy_bytes(
                         &input[start..start + entry.local_size_before],
-                        LOCAL_ALLOCATION_ERROR,
+                        LOCAL_ALLOCATION,
                     )?;
                 }
             }
@@ -981,7 +981,7 @@ fn preflight_local_entries(
         entry.local_size_before = local_entry_layout(input, central_offset, entry)?.total_size;
     }
 
-    let mut physical_order = try_vec_with_capacity(entries.len(), MODEL_ALLOCATION_ERROR)?;
+    let mut physical_order = try_vec_with_capacity(entries.len(), MODEL_ALLOCATION)?;
     physical_order.extend(0..entries.len());
     sort_indices_unstable(&mut physical_order, &mut |left, right| {
         entries[left]
@@ -1020,7 +1020,7 @@ fn build_entries_serial(
     let mut timed_out = Vec::new();
     timed_out
         .try_reserve_exact(build_order.len())
-        .map_err(|_| Error::internal("could not allocate ZIP member schedule"))?;
+        .map_err(|_| Error::allocation("ZIP member schedule"))?;
     for &index in build_order {
         if build_scheduled_entry(
             input,
@@ -1087,11 +1087,11 @@ fn build_entries_parallel(
         let mut workers = Vec::new();
         workers
             .try_reserve_exact(worker_count)
-            .map_err(|_| Error::internal("could not allocate ZIP member workers"))?;
+            .map_err(|_| Error::allocation("ZIP member workers"))?;
         let mut completed = Vec::new();
         completed
             .try_reserve_exact(optimizable.len())
-            .map_err(|_| Error::internal("could not allocate ZIP member results"))?;
+            .map_err(|_| Error::allocation("ZIP member results"))?;
 
         let mut start = 0_usize;
         for worker_index in 0..worker_count {
@@ -1146,7 +1146,7 @@ fn build_entries_parallel(
     let mut timed_out = Vec::new();
     timed_out
         .try_reserve_exact(build_order.len())
-        .map_err(|_| Error::internal("could not allocate ZIP member schedule"))?;
+        .map_err(|_| Error::allocation("ZIP member schedule"))?;
     for (index, entry, entry_timed_out) in completed {
         entries[index] = entry;
         if entry_timed_out {
@@ -1190,7 +1190,7 @@ fn build_entry_batch(
     let mut completed = Vec::new();
     completed
         .try_reserve_exact(jobs.len())
-        .map_err(|_| Error::internal("could not allocate ZIP member results"))?;
+        .map_err(|_| Error::allocation("ZIP member results"))?;
     for &index in jobs {
         let mut entry = entries[index].clone();
         let timed_out = build_scheduled_entry(
@@ -1280,7 +1280,7 @@ fn reclaim_timed_out_entries(
         let mut still_pending = Vec::new();
         still_pending
             .try_reserve_exact(pending.len())
-            .map_err(|_| Error::internal("could not allocate ZIP member schedule"))?;
+            .map_err(|_| Error::allocation("ZIP member schedule"))?;
 
         for (position, &index) in pending.iter().enumerate() {
             let file_remaining = deadline.remaining();
@@ -1345,7 +1345,7 @@ fn optimization_order(entries: &[Entry], exhaustive: bool) -> Result<Vec<usize>>
     let mut order = Vec::new();
     order
         .try_reserve_exact(entries.len())
-        .map_err(|_| Error::internal("could not allocate ZIP optimization order"))?;
+        .map_err(|_| Error::allocation("ZIP optimization order"))?;
     order.extend(0..entries.len());
     sort_indices_unstable(&mut order, &mut |left_index, right_index| {
         let left = &entries[left_index];
@@ -1534,7 +1534,7 @@ fn parse_central_entries(
     count: u16,
     strip_metadata: bool,
 ) -> Result<Vec<Entry>> {
-    let mut entries = try_vec_with_capacity(count as usize, MODEL_ALLOCATION_ERROR)?;
+    let mut entries = try_vec_with_capacity(count as usize, MODEL_ALLOCATION)?;
     let mut position = central_offset;
 
     for _ in 0..count {
@@ -1627,7 +1627,7 @@ fn build_local_entry(
     if entry.flags & FLAG_ENCRYPTED != 0 {
         entry.local = try_copy_bytes(
             &input[position..position + old_local_size],
-            LOCAL_ALLOCATION_ERROR,
+            LOCAL_ALLOCATION,
         )?;
         return Ok(false);
     }
@@ -1707,7 +1707,7 @@ fn build_local_entry(
     let local_size = new_prefix_size
         .checked_add(payload.len())
         .ok_or_else(|| Error::new("ZIP local entry too large"))?;
-    let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION_ERROR)?;
+    let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION)?;
     local.extend_from_slice(&input[position..position + new_prefix_size]);
     put_le16(&mut local, 6, entry.flags & !FLAG_DATA_DESCRIPTOR);
     if entry.strip_extra {

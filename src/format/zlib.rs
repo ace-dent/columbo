@@ -8,7 +8,7 @@ use crate::{Error, Optimization, Options, Result};
 
 use super::{try_append_bytes, try_copy_bytes, try_vec_with_capacity};
 
-const OUTPUT_ALLOCATION_ERROR: &str = "could not allocate zlib output";
+const OUTPUT_ALLOCATION: &str = "zlib output";
 
 /// Result of optimizing a zlib stream embedded in a container.
 #[derive(Debug)]
@@ -60,7 +60,7 @@ pub(super) fn optimize_embedded(
     if input.len() < 6 || !has_rfc1950_header(input) || unsupported_dictionary {
         if lenient_header {
             return Ok(StreamOptimization {
-                data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
+                data: try_copy_bytes(input, OUTPUT_ALLOCATION)?,
                 info: None,
                 timed_out: false,
                 removed_data_bytes: 0,
@@ -87,7 +87,7 @@ pub(super) fn optimize_embedded(
     if lenient_header && stream_end != input.len() {
         raw.info.deflate_bits = raw.info.source_deflate_bits;
         return Ok(StreamOptimization {
-            data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
+            data: try_copy_bytes(input, OUTPUT_ALLOCATION)?,
             info: Some(raw.info),
             timed_out: raw.timed_out,
             removed_data_bytes: 0,
@@ -99,7 +99,7 @@ pub(super) fn optimize_embedded(
         if lenient_header {
             raw.info.deflate_bits = raw.info.source_deflate_bits;
             return Ok(StreamOptimization {
-                data: try_copy_bytes(input, OUTPUT_ALLOCATION_ERROR)?,
+                data: try_copy_bytes(input, OUTPUT_ALLOCATION)?,
                 info: Some(raw.info),
                 timed_out: raw.timed_out,
                 removed_data_bytes: 0,
@@ -120,7 +120,7 @@ pub(super) fn optimize_embedded(
         .len()
         .checked_add(6)
         .ok_or_else(|| Error::new("zlib output is too large"))?;
-    let mut data = try_vec_with_capacity(output_size, OUTPUT_ALLOCATION_ERROR)?;
+    let mut data = try_vec_with_capacity(output_size, OUTPUT_ALLOCATION)?;
     data.extend_from_slice(&optimized_header(input[0], raw.output_max_distance));
     data.extend_from_slice(&raw.data);
     data.extend_from_slice(&input[checksum_start..stream_end]);
@@ -130,14 +130,14 @@ pub(super) fn optimize_embedded(
     // source stream.
     if data.len() > stream_end && !options.strict && !options.strip_metadata {
         data.clear();
-        try_append_bytes(&mut data, &input[..stream_end], OUTPUT_ALLOCATION_ERROR)?;
+        try_append_bytes(&mut data, &input[..stream_end], OUTPUT_ALLOCATION)?;
         raw.output_max_distance = raw.info.max_distance;
         data[..2].copy_from_slice(&optimized_header(input[0], raw.output_max_distance));
         raw.info.deflate_bits = raw.info.source_deflate_bits;
     }
 
     if !options.strip_metadata {
-        try_append_bytes(&mut data, &input[stream_end..], OUTPUT_ALLOCATION_ERROR)?;
+        try_append_bytes(&mut data, &input[stream_end..], OUTPUT_ALLOCATION)?;
     }
 
     Ok(StreamOptimization {

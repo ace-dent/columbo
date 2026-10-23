@@ -59,6 +59,14 @@ impl Error {
         Self::with_kind(ErrorKind::Internal, message)
     }
 
+    /// An allocation failure, `could not allocate {what}`. Composing the
+    /// message here keeps one copy of its shared phrase in the executable.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn allocation(what: &str) -> Self {
+        Self::internal(format!("could not allocate {what}"))
+    }
+
     /// Kept cold and out of line: errors are rare, and an inlined copy of the
     /// message conversion at each of hundreds of call sites costs code size.
     #[cold]

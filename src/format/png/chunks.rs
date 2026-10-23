@@ -157,10 +157,10 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
         if matches!(&kind, b"fcTL" | b"IEND") && !fdat.is_empty() {
             fdat_frames
                 .try_reserve(1)
-                .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
+                .map_err(|_| Error::allocation("PNG frame model"))?;
             fdat_decoded_sizes
                 .try_reserve(1)
-                .map_err(|_| Error::internal("could not allocate PNG frame model"))?;
+                .map_err(|_| Error::allocation("PNG frame model"))?;
             fdat_frames.push(std::mem::take(&mut fdat));
             fdat_decoded_sizes.push(
                 state
@@ -189,7 +189,7 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
             }
             state.saw_idat = true;
             idat.try_reserve(data.len())
-                .map_err(|_| Error::internal("could not allocate PNG image stream"))?;
+                .map_err(|_| Error::allocation("PNG image stream"))?;
             idat.extend_from_slice(data);
         } else if kind == *b"fdAT" {
             if !state.saw_actl
@@ -205,7 +205,7 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
             // it does not count as frame data.
             state.frame_has_data |= data.len() > 4;
             fdat.try_reserve(data.len() - 4)
-                .map_err(|_| Error::internal("could not allocate PNG frame stream"))?;
+                .map_err(|_| Error::allocation("PNG frame stream"))?;
             fdat.extend_from_slice(&data[4..]);
         } else if state.saw_idat && !strip_chunk {
             state.after_idat_run = true;
@@ -213,7 +213,7 @@ pub(super) fn parse(input: &[u8], strip_metadata: bool) -> Result<ParsedPng<'_>>
 
         chunks
             .try_reserve(1)
-            .map_err(|_| Error::internal("could not allocate PNG chunk model"))?;
+            .map_err(|_| Error::allocation("PNG chunk model"))?;
         chunks.push(Chunk {
             kind,
             data,
@@ -354,6 +354,15 @@ fn png_decoded_size(
         .ok_or_else(|| Error::resource_limit("PNG image dimensions are too large"))
 }
 
+/// `invalid PNG tRNS` and so on, for the chunk being validated. Chunk kinds
+/// are ASCII letters, checked before validation.
+#[cold]
+#[inline(never)]
+fn invalid_chunk(kind: [u8; 4]) -> Error {
+    let name = std::str::from_utf8(&kind).unwrap_or_default();
+    Error::new(format!("invalid PNG {name}"))
+}
+
 fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<()> {
     if kind != *b"PLTE" {
         return Ok(());
@@ -365,11 +374,11 @@ fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Resul
         || data.len() % 3 != 0
         || matches!(state.color_type, 0 | 4)
     {
-        return Err(Error::new("invalid PNG PLTE"));
+        return Err(invalid_chunk(kind));
     }
     state.palette_entries = (data.len() / 3) as u32;
     if state.color_type == 3 && state.palette_entries > (1_u32 << state.bit_depth) {
-        return Err(Error::new("invalid PNG PLTE"));
+        return Err(invalid_chunk(kind));
     }
     state.saw_plte = true;
     Ok(())
@@ -384,21 +393,21 @@ fn validate_palette(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Resul
 fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Result<bool> {
     let mut discard_on_output = false;
     macro_rules! once_before_image {
-        ($kind:literal, $seen:ident, $length:expr, $message:literal) => {
+        ($kind:literal, $seen:ident, $length:expr) => {
             if kind == *$kind {
                 if state.$seen || state.saw_plte || state.saw_idat || data.len() != $length {
-                    return Err(Error::new($message));
+                    return Err(invalid_chunk(kind));
                 }
                 state.$seen = true;
             }
         };
     }
 
-    once_before_image!(b"cHRM", saw_chrm, 32, "invalid PNG cHRM");
-    once_before_image!(b"gAMA", saw_gama, 4, "invalid PNG gAMA");
-    once_before_image!(b"cICP", saw_cicp, 4, "invalid PNG cICP");
-    once_before_image!(b"mDCV", saw_mdcv, 24, "invalid PNG mDCV");
-    once_before_image!(b"cLLI", saw_clli, 8, "invalid PNG cLLI");
+    once_before_image!(b"cHRM", saw_chrm, 32);
+    once_before_image!(b"gAMA", saw_gama, 4);
+    once_before_image!(b"cICP", saw_cicp, 4);
+    once_before_image!(b"mDCV", saw_mdcv, 24);
+    once_before_image!(b"cLLI", saw_clli, 8);
 
     if kind == *b"iCCP" {
         let name_end = find_nul(data, 0);
@@ -410,7 +419,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             || name_end.is_some_and(|end| end > 79)
             || name_end.map_or(true, |end| end + 2 > data.len() || data[end + 1] != 0)
         {
-            return Err(Error::new("invalid PNG iCCP"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_iccp = true;
     }
@@ -423,13 +432,13 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             _ => 4,
         };
         if state.saw_sbit || state.saw_plte || state.saw_idat || data.len() != expected {
-            return Err(Error::new("invalid PNG sBIT"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_sbit = true;
     }
     if kind == *b"sRGB" {
         if state.saw_srgb || state.saw_plte || state.saw_idat || data.len() != 1 || data[0] > 3 {
-            return Err(Error::new("invalid PNG sRGB"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_srgb = true;
     }
@@ -448,7 +457,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             _ => false,
         };
         if state.saw_trns || state.saw_idat || !valid_for_color_type {
-            return Err(Error::new("invalid PNG tRNS"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_trns = true;
     }
@@ -463,7 +472,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             || (state.color_type == 3 && !state.saw_plte)
             || data.len() != expected
         {
-            return Err(Error::new("invalid PNG bKGD"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_bkgd = true;
     }
@@ -473,13 +482,13 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             || !state.saw_plte
             || data.len() != state.palette_entries as usize * 2
         {
-            return Err(Error::new("invalid PNG hIST"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_hist = true;
     }
     if kind == *b"pHYs" {
         if state.saw_phys || state.saw_idat || data.len() != 9 || data[8] > 1 {
-            return Err(Error::new("invalid PNG pHYs"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_phys = true;
     }
@@ -497,13 +506,13 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
                     || !valid_positive_png_float(&data[offset + 1..])
             })
         {
-            return Err(Error::new("invalid PNG sCAL"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_scal = true;
     }
     if kind == *b"eXIf" {
         if state.saw_exif || state.saw_idat {
-            return Err(Error::new("invalid PNG eXIf"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_exif = true;
     }
@@ -524,7 +533,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
             || data[5] > 59
             || data[6] > 60
         {
-            return Err(Error::new("invalid PNG tIME"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_time = true;
     }
@@ -532,7 +541,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
         // caBX holds Content Credentials (C2PA). Only one is allowed, and it
         // must precede IDAT.
         if state.saw_cabx || state.saw_idat {
-            return Err(Error::new("invalid PNG caBX"));
+            return Err(invalid_chunk(kind));
         }
         state.saw_cabx = true;
     }
@@ -540,7 +549,7 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
 
     if kind == *b"sPLT" {
         if state.saw_idat || data.len() < 3 {
-            return Err(Error::new("invalid PNG sPLT"));
+            return Err(invalid_chunk(kind));
         }
         let name_end = find_nul(data, 0);
         if name_end.is_none()
@@ -549,12 +558,12 @@ fn validate_ancillary(kind: [u8; 4], data: &[u8], state: &mut ParseState) -> Res
                 end + 2 > data.len() || !matches!(data[end + 1], 8 | 16)
             })
         {
-            return Err(Error::new("invalid PNG sPLT"));
+            return Err(invalid_chunk(kind));
         }
         let name_end = name_end.unwrap();
         let entry_size = if data[name_end + 1] == 8 { 6 } else { 10 };
         if (data.len() - name_end - 2) % entry_size != 0 {
-            return Err(Error::new("invalid PNG sPLT"));
+            return Err(invalid_chunk(kind));
         }
     }
     Ok(discard_on_output)
@@ -621,13 +630,13 @@ fn validate_compressed_metadata(kind: [u8; 4], data: &[u8]) -> Result<()> {
             || keyword_end.is_some_and(|end| end > 79)
             || keyword_end.map_or(true, |end| end + 2 > data.len() || data[end + 1] != 0)
         {
-            return Err(Error::new("invalid PNG zTXt"));
+            return Err(invalid_chunk(kind));
         }
     }
     if kind == *b"iTXt" {
         let keyword_end = find_nul(data, 0);
         let Some(keyword_end) = keyword_end else {
-            return Err(Error::new("invalid PNG iTXt"));
+            return Err(invalid_chunk(kind));
         };
         if keyword_end == 0
             || keyword_end > 79
@@ -635,13 +644,13 @@ fn validate_compressed_metadata(kind: [u8; 4], data: &[u8]) -> Result<()> {
             || data[keyword_end + 1] > 1
             || (data[keyword_end + 1] == 1 && data[keyword_end + 2] != 0)
         {
-            return Err(Error::new("invalid PNG iTXt"));
+            return Err(invalid_chunk(kind));
         }
         let Some(language_end) = find_nul(data, keyword_end + 3) else {
-            return Err(Error::new("invalid PNG iTXt"));
+            return Err(invalid_chunk(kind));
         };
         if find_nul(data, language_end + 1).is_none() {
-            return Err(Error::new("invalid PNG iTXt"));
+            return Err(invalid_chunk(kind));
         }
     }
     Ok(())
@@ -766,7 +775,7 @@ pub(super) fn append_chunk_parts(
         .ok_or_else(|| Error::new("PNG chunk too large"))?;
     output
         .try_reserve(encoded_len)
-        .map_err(|_| Error::internal("could not allocate PNG output"))?;
+        .map_err(|_| Error::allocation("PNG output"))?;
     output.extend_from_slice(&length.to_be_bytes());
     output.extend_from_slice(&kind);
     let mut crc = crc32_update(0, &kind);
