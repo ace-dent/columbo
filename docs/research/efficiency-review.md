@@ -70,6 +70,7 @@ gains where established.
 | 13 Oct 2026 | [`9ffa010`](#9ffa010-13-october-2026) | Code-length tree building (`huffman.rs`, `header.rs`) | 12-byte heap entries with child indices replace 88-byte linked nodes; code-length reordering returns early when lengths already follow frequencies; the order-key tree that duplicates DeflOpt variant 3 is no longer built | Default CPU 1.13× (33 inputs) | 104 API (52 inputs; 4 Default runs reached the deadline, 3 rerun to completion); 33 Default inputs; 640,000 heap-builder, 200,000 reorder; 659 Rust, 13 Python tests |
 | 13 Oct 2026 | [`dc68b5f`](#dc68b5f-13-october-2026) | Header-plan reuse across routes (`header.rs`) | Route-local header-cache misses fall through to a per-thread store of packed completed plans, two generations within an 8 MiB charge | Default CPU 1.38× (33 inputs); peak memory +3.8 MiB median, +20.0 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 662 Rust, 13 Python tests |
 | 20 Oct 2026 | [`04d63bd`](#04d63bd-20-october-2026) | Repeated block plans, terminal reparses, entropy-cut logarithms (`block.rs`, `optimize.rs`, `stream/entropy_cut.rs`) | A per-thread store of completed block plans keyed by symbol counts, extra bits, source header and policy; an accepted terminal candidate's validated parse handed to the next method; the `c log2 c` table grown to the block's counts | Default CPU 1.29× (33 inputs); Partnership card 1.52× with 100 MiB less peak memory; peak memory +1.9 MiB median, +11.9 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 APNG inputs; 685 Rust, 13 Python tests |
+| 23 Oct 2026 | [`c94eb07`](#c94eb07-23-october-2026) | Code-length trees and DeflOpt local rewrites (`header.rs`, `huffman.rs`) | A per-thread cache of code-length trees by builder and RLE histogram; one record of local-rewrite steps shared by the four heap variants; rewrites count their symbols as they are built; packed heap keys | Default CPU 1.25× (33 inputs); large APNG files 1.22–1.39×; a completing Max run 1.56×; peak memory +0.2 MiB median, +3.1 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs, 7 large PNG/APNG files and a completing Max run; 20,000 rewrite comparisons; 681 Rust, 13 Python tests |
 
 ## Entries
 
@@ -466,6 +467,91 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `c94eb07`, 23 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the 33 stratified Default inputs, once per build in alternating order, while
+other applications loaded the machine.
+
+| Candidate | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| Code-length tree cache, 4,096 slots | 125.3 s | 115.5 s | 1.08× | +0.5 / +3.2 MiB |
+| Plus counted rewrites and packed heap keys | 124.7 s | 106.1 s | 1.18× | +0.1 / +2.8 MiB |
+| Plus shared local-rewrite steps | 129.0 s | 102.1 s | 1.26× | +0.4 / +4.4 MiB |
+| Retained | 126.4 s | 100.9 s | 1.25× | +0.2 / +3.1 MiB |
+
+A sampled Default profile of the same inputs put 60% of CPU under
+`plan_for_trimmed_lengths_uncached`, the uncached header planner, and 28% in
+`make_lengths_variant_heap_inner`, the DeflOpt and order-key heap builders,
+16% in its sift-down alone. Counters in a test build found 777,383 header plans
+building 73.9 million code-length codes (19 symbols, at most 7 bits). Only
+about 5% repeated within one header plan, but 56% repeated a builder and RLE
+histogram already built on the same thread. The DeflOpt local rewrite ran
+34.3 million times on RLEs of 223 tokens on average, and 68% of those calls
+repeated an earlier one from the same RLE seed, with the same RLE and tree.
+
+- **Code-length tree cache.** Each code-length builder (the DeflOpt and
+  order-key heaps by variant, deft4j's Java heap, Defluff's limited and exact
+  builders, and Columbo's own) is a pure function of the RLE histogram, and
+  header plans for different code lengths often share one. A per-thread
+  direct-mapped cache of 4,096 slots, about 0.4 MiB, keyed by builder and
+  histogram, returned 46% of all code-length codes, against 49% at 16,384
+  slots, 51% at 262,144 and 56% unbounded. Each hit compares the complete key,
+  and the cache is emptied with the header-plan store.
+- **Shared local-rewrite steps.** The four heap variants each run the DeflOpt
+  local rewrite from the same RLE seed, and a step depends only on the current
+  RLE and the tree the variant builds there: the prices it offers, whether the
+  loop goes on, and the next RLE. A variant that builds an explored step's tree
+  at the same RLE would offer the same prices again, which cannot change the
+  best plan, since a plan replaces it only when strictly smaller; it moves to
+  the recorded outcome instead.
+- **Counted rewrites.** The local rewrite counts its output's symbols as it
+  builds it instead of in a second pass, starts its output only at the first
+  change, since a search's last rewrite usually changes nothing, and the loop
+  takes its repeat rank from those counts instead of another pass.
+- **Packed heap keys.** The heap sift-down compares one 64-bit key per entry,
+  the frequency above the tie field, instead of matching the tie rule at each
+  comparison.
+
+On larger inputs, alternating builds once each:
+
+| Input | CPU before | CPU after | Speedup |
+| --- | ---: | ---: | ---: |
+| `976310_99309…` (APNG) | 46.9 s | 38.3 s | 1.22× |
+| `703080_80061…` (APNG) | 23.1 s | 18.2 s | 1.27× |
+| `1172470_101529…` (APNG) | 40.1 s | 32.0 s | 1.25× |
+| `1172470_101537…` (APNG) | 23.8 s | 19.3 s | 1.23× |
+| `1328670_115967…` (APNG) | 73.0 s | 52.7 s | 1.39× |
+| `bored.png` | 4.3 s | 3.7 s | 1.16× |
+| `elephant-2.png` | 7.1 s | 5.3 s | 1.34× |
+| `036-Clefable-0.png`, Max at 150 s, completing its search | 13.3 s | 8.5 s | 1.56× |
+
+APNG peak memory varies by up to 60 MiB between runs of one build; medians of
+three runs rose 3.5 MiB on `1328670_115967…` and 3.1 MiB on `976310_99309…`,
+about one 0.4 MiB cache per APNG worker lane.
+
+Equivalence: a new test compares the rewrite with the previous implementation
+on 20,000 random RLEs and trees, including its counted frequencies, and the
+existing swapping-sift test checks the packed keys under all three tie rules.
+API comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs. Every CLI timing run, the eight
+larger inputs above and the completing Max run matched byte for byte. Rust
+tests, including the private corpus, passed in release and debug modes, with
+documentation and Python tests, a locked build, formatting, all-feature Clippy
+with warnings denied and a package list without private fixtures or scratch
+artifacts. `__text` grew from 907,836 to 909,776 bytes; the shipped
+executable keeps its 993,120 bytes.
+
+Measured and rejected in the same review:
+
+- A larger cache: 16,384 slots returned 49% of codes instead of 46%, about 1%
+  of CPU, for 1.7 MiB per thread.
+- One tree for all eight heap variants when a build compares no equal
+  frequencies, since every variant then makes the same comparisons: only 2.5%
+  of code-length builds were tie-free.
+
+Artifacts: `work/efficiency-review-code-length-trees/`.
 
 ### `04d63bd`, 20 October 2026
 

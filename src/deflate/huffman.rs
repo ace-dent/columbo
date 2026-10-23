@@ -1600,7 +1600,8 @@ pub(crate) struct DefloptHeapScratch {
     leaf_order: Vec<u32>,
 }
 
-#[inline]
+/// The tie rule's order; tests check `heap_sift_down`'s packed keys against it.
+#[cfg(test)]
 fn heap_entry_less(a: HeapEntry, b: HeapEntry, tie: HeapTie) -> bool {
     if a.frequency != b.frequency {
         return a.frequency < b.frequency;
@@ -1613,17 +1614,41 @@ fn heap_entry_less(a: HeapEntry, b: HeapEntry, tie: HeapTie) -> bool {
 }
 
 fn heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
+    // One loop per tie rule. The frequency in the high half and the tie field
+    // in the low half order entries by frequency, then by the tie rule, in one
+    // comparison.
+    match tie {
+        HeapTie::FrequencyOnly => {
+            heap_sift_down_by(heap, start, |entry| u64::from(entry.frequency) << 32);
+        }
+        HeapTie::Height => heap_sift_down_by(heap, start, |entry| {
+            u64::from(entry.frequency) << 32 | u64::from(entry.height)
+        }),
+        HeapTie::Order => heap_sift_down_by(heap, start, |entry| {
+            u64::from(entry.frequency) << 32 | u64::from(entry.index)
+        }),
+    }
+}
+
+#[inline(always)]
+fn heap_sift_down_by(heap: &mut [HeapEntry], start: usize, key: impl Fn(HeapEntry) -> u64) {
     let entry = heap[start];
+    let entry_key = key(entry);
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             break;
         }
-        if child + 1 < heap.len() && heap_entry_less(heap[child + 1], heap[child], tie) {
-            child += 1;
+        let mut child_key = key(heap[child]);
+        if child + 1 < heap.len() {
+            let right_key = key(heap[child + 1]);
+            if right_key < child_key {
+                child += 1;
+                child_key = right_key;
+            }
         }
-        if !heap_entry_less(heap[child], entry, tie) {
+        if child_key >= entry_key {
             break;
         }
         heap[root] = heap[child];

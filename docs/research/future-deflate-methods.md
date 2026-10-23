@@ -51,6 +51,15 @@ main planner re-spelling R15/R16 blocks, which R17
 class in the same review saved 90 bytes on 33 files for 6.7% more CPU and grew
 two outputs, so the class stays.
 
+Follow-up, 23 October 2026: on 149 current Default PNG outputs (`0d87ee8`,
+36.2 Mbit), headers take 0.71% of all bits, match extra bits 19.3%, and payload
+codes sit 0.61% above the entropy of each block's own counts. Entropy-plus-header
+estimates put further partition changes at 0.03–0.05% each (one more cut, two
+cuts, or a merge), and a planner-priced respelling probe found 0.008%, so no
+token, tree or partition method was taken forward; see
+[rejected or deferred experiments](#rejected-or-deferred-experiments). Probe
+and data: `work/new-method-probes-20261023/`.
+
 ## Decision
 
 The Zopfli fork-network review produced one retained method: re-run Columbo's
@@ -305,6 +314,7 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | Header fit both early and late for compact streams | Keeping the in-sweep fit for streams of ≤8 KiB compressed and ≤128 KiB decoded beside the late one: 6,580 bytes on 81 of 120 APNG-heavy PNGs, none larger, but +33% CPU, since most APNG frames are compact and ran R2–R4 twice; its size limits came from the compact tree floor, not from this effect. Repeating R18 and R2–R4 after a win recovered only part of the small-stream losses | A size class derived from where the early fit pays |
 | R2–R4 after R18 with R5 left in the sweep (`b831d49`) | Under `ApngDefault`, R5 then ran before the fit, kept token rewrites that beat only the unfitted header, and left the late R4 less to gain: in the full sticker benchmark 103 Default rows grew by 1,315 bytes against `6c81dfa`; on all 2,431 stickers 216 files grew by 3,072 bytes, against 58 by 1,059 bytes once R5 moved with the fit, which saved 67,715 bytes more | None: R5 compares against its parent, so it follows the fit |
 | R2–R4 again after a late R5 win (`ApngDefault`) | Refit the header after R5's late rewrite: never larger; on 178 APNG-heavy files 599 bytes on 60 (0.0025%), for 1.7% more median and 4% more total CPU; `apng-medium/ball.png` recovered 12 of the 78 bytes it lost when R5 moved | A cheaper refit, or a frame class where R5's rewrites are common |
+| Fractional-cost respelling | Zopfli's statistical cost model: price each symbol at −log2 p of the block's current counts, the exact marginal of its entropy bound, instead of its integer code length; iterate four passes of a per-match shortest path over literals and same-distance submatches, recounting each pass, every candidate priced by the planner. On 1,042 Huffman blocks of 150 Default outputs at `0d87ee8` (31.95 Mbit): the integer-cost control found 1,609 bits, fractional costs 1,615, the better of the two 2,536 (0.008%); re-planning the unchanged tokens found nothing | A block class whose spelling needs counts far from its current ones, where the integer iteration stalls |
 
 ### Execution
 

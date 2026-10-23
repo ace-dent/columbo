@@ -392,15 +392,150 @@ fn stored_header_plan_kernel(
     Some(plan)
 }
 
-/// Drop this thread's stored header plans. A top-level optimization calls this
-/// on return, so library callers keep no plans between inputs; worker threads
-/// free theirs when they exit.
+/// Drop this thread's stored header plans and code-length trees. A top-level
+/// optimization calls this on return, so library callers keep no plans between
+/// inputs; worker threads free theirs when they exit.
 pub(crate) fn release_thread_header_plans() {
     let _ = HEADER_PLAN_STORE.try_with(|store| {
         if let Ok(mut store) = store.try_borrow_mut() {
             *store = HeaderPlanStore::default();
         }
     });
+    let _ = CODE_LENGTH_TREES.try_with(|cache| {
+        if let Ok(mut cache) = cache.try_borrow_mut() {
+            *cache = None;
+        }
+    });
+}
+
+/// A builder of code-length codes: 19 symbols, at most 7 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeLengthBuilder {
+    DefloptHeap(u32),
+    OrderHeap(u32),
+    Deft4jJavaHeap,
+    DefluffLimited,
+    Columbo(u32),
+    DefluffExact,
+}
+
+impl CodeLengthBuilder {
+    fn key(self) -> u64 {
+        match self {
+            Self::DefloptHeap(variant) => u64::from(variant),
+            Self::OrderHeap(variant) => 4 + u64::from(variant),
+            Self::Deft4jJavaHeap => 8,
+            Self::DefluffLimited => 9,
+            Self::Columbo(variant) => 10 + u64::from(variant),
+            Self::DefluffExact => 14,
+        }
+    }
+
+    fn build(self, frequencies: &[u32; 19], heap_scratch: &mut DefloptHeapScratch) -> [u8; 19] {
+        let mut lengths = [0_u8; 19];
+        match self {
+            Self::DefloptHeap(variant) => make_lengths_deflopt_heap_into_with_scratch(
+                frequencies,
+                &mut lengths,
+                7,
+                variant,
+                heap_scratch,
+            ),
+            Self::OrderHeap(variant) => make_lengths_order_heap_into_with_scratch(
+                frequencies,
+                &mut lengths,
+                7,
+                variant,
+                heap_scratch,
+            ),
+            Self::Deft4jJavaHeap => {
+                make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7)
+            }
+            Self::DefluffLimited => {
+                make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, 7, 0);
+            }
+            Self::Columbo(variant) => make_lengths_into(frequencies, &mut lengths, 7, variant),
+            Self::DefluffExact => make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0),
+        }
+        lengths
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CodeLengthTreeEntry {
+    builder: CodeLengthBuilder,
+    frequencies: [u32; 19],
+    lengths: [u8; 19],
+}
+
+/// Slots in each thread's code-length tree cache, about 0.4 MiB. Header plans
+/// for different code lengths often share an RLE histogram, and repeats come
+/// close together: on 33 stratified Default inputs this size returned 46% of
+/// all code-length trees, against 56% for an unbounded cache.
+const CODE_LENGTH_TREE_CACHE_BITS: u32 = 12;
+
+thread_local! {
+    /// Code-length trees built on this thread, direct-mapped by builder and
+    /// RLE histogram. Each builder is a pure function of the histogram, so a
+    /// hit, which compares the complete key, returns the tree it would build.
+    static CODE_LENGTH_TREES: RefCell<Option<Box<[Option<CodeLengthTreeEntry>]>>> =
+        const { RefCell::new(None) };
+}
+
+fn code_length_tree_slot(builder: CodeLengthBuilder, frequencies: &[u32; 19]) -> usize {
+    const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut hash = (builder.key() + 1).wrapping_mul(MULTIPLIER);
+    for &frequency in frequencies {
+        hash = (hash ^ u64::from(frequency)).wrapping_mul(MULTIPLIER);
+    }
+    (hash >> (u64::BITS - CODE_LENGTH_TREE_CACHE_BITS)) as usize
+}
+
+/// Build the code-length code `builder` gives `frequencies`, or return the one
+/// this thread last built for the same builder and histogram.
+fn code_length_tree(
+    builder: CodeLengthBuilder,
+    frequencies: &[u32; 19],
+    heap_scratch: &mut DefloptHeapScratch,
+) -> [u8; 19] {
+    let slot = code_length_tree_slot(builder, frequencies);
+    let cached = CODE_LENGTH_TREES
+        .try_with(|cache| {
+            let cache = cache.try_borrow().ok()?;
+            let entry = (*cache.as_ref()?.get(slot)?)?;
+            (entry.builder == builder && entry.frequencies == *frequencies).then_some(entry.lengths)
+        })
+        .ok()
+        .flatten();
+    if let Some(lengths) = cached {
+        return lengths;
+    }
+
+    let lengths = builder.build(frequencies, heap_scratch);
+    let _ = CODE_LENGTH_TREES.try_with(|cache| {
+        let Ok(mut cache) = cache.try_borrow_mut() else {
+            return;
+        };
+        if cache.is_none() {
+            let mut entries = Vec::new();
+            if entries
+                .try_reserve_exact(1 << CODE_LENGTH_TREE_CACHE_BITS)
+                .is_err()
+            {
+                return;
+            }
+            entries.resize(1 << CODE_LENGTH_TREE_CACHE_BITS, None);
+            *cache = Some(entries.into_boxed_slice());
+        }
+        if let Some(entry) = cache.as_mut().and_then(|entries| entries.get_mut(slot)) {
+            *entry = Some(CodeLengthTreeEntry {
+                builder,
+                frequencies: *frequencies,
+                lengths,
+            });
+        }
+    });
+    lengths
 }
 
 fn header_plan_fingerprint(
@@ -1871,12 +2006,9 @@ fn greedy_dynamic_header_bits(
 
     let rle = greedy_rle(&concatenated[..concatenated_len], false, false, false);
     let code_length_frequencies = rle_frequencies(&rle);
-    let mut code_length_lengths = [0_u8; 19];
-    make_lengths_deflopt_heap_into_with_scratch(
+    let code_length_lengths = code_length_tree(
+        CodeLengthBuilder::DefloptHeap(0),
         &code_length_frequencies,
-        &mut code_length_lengths,
-        7,
-        0,
         heap_scratch,
     );
     huffman_code_lengths_are_valid(&code_length_lengths).then_some(())?;
@@ -2176,8 +2308,11 @@ fn build_deft4j_header(
 
 fn deft4j_code_length_tree(rle: &[RleToken]) -> Option<[u8; 19]> {
     let frequencies = rle_frequencies(rle);
-    let mut lengths = [0_u8; 19];
-    make_lengths_deft4j_java_heap_into(&frequencies, &mut lengths, 7);
+    let lengths = code_length_tree(
+        CodeLengthBuilder::Deft4jJavaHeap,
+        &frequencies,
+        &mut DefloptHeapScratch::default(),
+    );
     if !code_length_tree_shape_is_valid(&lengths) {
         return None;
     }
@@ -2955,6 +3090,7 @@ fn consider_rle(
 
     let mut frequencies = rle_frequencies(&rle);
     let mut prescored_deflopt_trees = [None; 4];
+    let mut local_rewrite_steps = LocalRewriteSteps::default();
     for (variant, tree) in prescored_deflopt_trees.iter_mut().enumerate() {
         *tree = consider_columbo_deflopt_local_rewrite(
             data_bits,
@@ -2963,6 +3099,7 @@ fn consider_rle(
             &rle,
             &frequencies,
             variant as u32,
+            &mut local_rewrite_steps,
             search,
         );
     }
@@ -2984,37 +3121,35 @@ fn consider_rle(
                 .then_some(prescored_deflopt_trees[variant as usize])
                 .flatten();
             let order_lengths = prescored_order_tree.unwrap_or_else(|| {
-                let mut order_lengths = [0_u8; 19];
-                make_lengths_order_heap_into_with_scratch(
+                code_length_tree(
+                    CodeLengthBuilder::OrderHeap(variant),
                     &frequencies,
-                    &mut order_lengths,
-                    7,
-                    variant,
                     &mut search.heap_scratch,
-                );
-                order_lengths
+                )
             });
             push_unique(&mut code_length_candidates, order_lengths);
             // deft4j's tree builder is slow on the data alphabets but cheap
             // on the code-length alphabet, so every header search includes it.
             if variant == 0 {
-                let mut deft4j_lengths = [0_u8; 19];
-                make_lengths_deft4j_java_heap_into(&frequencies, &mut deft4j_lengths, 7);
+                let deft4j_lengths = code_length_tree(
+                    CodeLengthBuilder::Deft4jJavaHeap,
+                    &frequencies,
+                    &mut search.heap_scratch,
+                );
                 consider_deft4j_pruned_header(
                     data_bits,
                     literal_lengths,
                     distance_lengths,
                     &rle,
                     &deft4j_lengths,
+                    &mut search.heap_scratch,
                     &mut search.best,
                 );
                 push_unique(&mut code_length_candidates, deft4j_lengths);
-                let mut defluff_limited_lengths = [0_u8; 19];
-                make_lengths_columbo_defluff_limited_into(
+                let defluff_limited_lengths = code_length_tree(
+                    CodeLengthBuilder::DefluffLimited,
                     &frequencies,
-                    &mut defluff_limited_lengths,
-                    7,
-                    0,
+                    &mut search.heap_scratch,
                 );
                 push_unique(&mut code_length_candidates, defluff_limited_lengths);
             }
@@ -3027,23 +3162,26 @@ fn consider_rle(
                     }
                 } else if variant != FREQUENCY_ONLY_HEAP_VARIANT {
                     // Variant 3's DeflOpt tree is the order-key tree above.
-                    let mut deflopt_lengths = [0_u8; 19];
-                    make_lengths_deflopt_heap_into_with_scratch(
+                    let deflopt_lengths = code_length_tree(
+                        CodeLengthBuilder::DefloptHeap(variant),
                         &frequencies,
-                        &mut deflopt_lengths,
-                        7,
-                        variant,
                         &mut search.heap_scratch,
                     );
                     push_unique(&mut code_length_candidates, deflopt_lengths);
                 }
-                let mut columbo_lengths = [0_u8; 19];
-                make_lengths_into(&frequencies, &mut columbo_lengths, 7, variant);
+                let columbo_lengths = code_length_tree(
+                    CodeLengthBuilder::Columbo(variant),
+                    &frequencies,
+                    &mut search.heap_scratch,
+                );
                 push_unique(&mut code_length_candidates, columbo_lengths);
 
                 if variant == 0 {
-                    let mut defluff_lengths = [0_u8; 19];
-                    make_lengths_defluff_exact_into(&frequencies, &mut defluff_lengths, 7, 0);
+                    let defluff_lengths = code_length_tree(
+                        CodeLengthBuilder::DefluffExact,
+                        &frequencies,
+                        &mut search.heap_scratch,
+                    );
                     push_unique(&mut code_length_candidates, defluff_lengths);
                 }
             }
@@ -3107,21 +3245,22 @@ fn consider_rle(
         let mut rewritten = rewrite_rle_deflopt_local(&rle, &tree);
         if exhaustive {
             if let Some(shortest) = shortest_rle(decoded_lengths, &tree) {
-                if rewritten.as_ref().map_or(true, |local| {
+                if rewritten.as_ref().map_or(true, |(local, _)| {
                     rle_cost(&shortest, &tree) < rle_cost(local, &tree)
                 }) {
-                    rewritten = Some(shortest);
+                    let shortest_frequencies = rle_frequencies(&shortest);
+                    rewritten = Some((shortest, shortest_frequencies));
                 }
             }
         }
-        let Some(rewritten) = rewritten else {
+        let Some((rewritten, rewritten_frequencies)) = rewritten else {
             break;
         };
         if rewritten == rle {
             break;
         }
         rle = rewritten;
-        frequencies = rle_frequencies(&rle);
+        frequencies = rewritten_frequencies;
     }
 }
 
@@ -3134,6 +3273,7 @@ fn consider_deft4j_pruned_header(
     distance_lengths: &[u8],
     rle: &[RleToken],
     deft4j_lengths: &[u8],
+    heap_scratch: &mut DefloptHeapScratch,
     best: &mut Option<DynamicPlan>,
 ) {
     if deft4j_lengths.len() != 19 || !code_length_tree_shape_is_valid(deft4j_lengths) {
@@ -3152,8 +3292,11 @@ fn consider_deft4j_pruned_header(
         return;
     };
     let frequencies = rle_frequencies(&pruned);
-    let mut code_length_lengths = [0_u8; 19];
-    make_lengths_deft4j_java_heap_into(&frequencies, &mut code_length_lengths, 7);
+    let code_length_lengths = code_length_tree(
+        CodeLengthBuilder::Deft4jJavaHeap,
+        &frequencies,
+        heap_scratch,
+    );
     if !code_length_tree_shape_is_valid(&code_length_lengths) {
         return;
     }
@@ -3190,9 +3333,39 @@ fn consider_deft4j_pruned_header(
     }
 }
 
+/// Steps the DeflOpt local rewrite has taken from one RLE seed. Each heap
+/// variant starts from the seed, and a step depends only on the current RLE
+/// and the tree the variant builds there: the prices it offers, whether the
+/// loop goes on, and the next RLE. A variant that builds an explored step's
+/// tree at the same RLE would offer the same prices again, which cannot
+/// change the best plan, so it moves straight to the recorded outcome.
+#[derive(Default)]
+struct LocalRewriteSteps {
+    /// RLEs reached from the seed and their symbol frequencies; state 0, the
+    /// seed itself, is not stored.
+    states: Vec<(Vec<RleToken>, [u32; 19])>,
+    steps: Vec<(usize, [u8; 19], LocalRewriteOutcome)>,
+}
+
+#[derive(Clone, Copy)]
+enum LocalRewriteOutcome {
+    /// The tree gives no valid header.
+    Invalid,
+    Stop,
+    Next(usize),
+}
+
+/// One step's result, before the next RLE is stored.
+enum LocalRewriteStep {
+    Invalid,
+    Stop,
+    Next(Vec<RleToken>, [u32; 19]),
+}
+
 /// Price DeflOpt-style local rewrite/rebuild candidates from one RLE seed.
 /// Each rewrite must strictly lower `repeat_rank`, which bounds the loop.
 /// Returns the first tree that gave a valid header, for reuse by the caller.
+#[allow(clippy::too_many_arguments)]
 fn consider_columbo_deflopt_local_rewrite(
     data_bits: u64,
     literal_lengths: &[u8],
@@ -3200,174 +3373,228 @@ fn consider_columbo_deflopt_local_rewrite(
     initial_rle: &[RleToken],
     initial_frequencies: &[u32; 19],
     variant: u32,
+    steps: &mut LocalRewriteSteps,
     search: &mut HeaderPlanSearch,
 ) -> Option<[u8; 19]> {
-    let mut rewritten_rle: Option<Vec<RleToken>> = None;
-    let mut frequencies = *initial_frequencies;
-    let mut rank = repeat_rank(initial_rle);
+    let mut state = 0;
     let mut initial_tree = None;
 
     loop {
-        let rle = rewritten_rle.as_deref().unwrap_or(initial_rle);
-        let mut code_length_lengths = [0_u8; 19];
-        make_lengths_deflopt_heap_into_with_scratch(
+        let frequencies = match state {
+            0 => *initial_frequencies,
+            _ => steps.states[state - 1].1,
+        };
+        let code_length_lengths = code_length_tree(
+            CodeLengthBuilder::DefloptHeap(variant),
             &frequencies,
-            &mut code_length_lengths,
-            7,
-            variant,
             &mut search.heap_scratch,
         );
         if !code_length_tree_shape_is_valid(&code_length_lengths) {
             return initial_tree;
         }
 
-        let Some(_) = consider_dynamic_header(
-            data_bits,
-            literal_lengths,
-            distance_lengths,
-            rle,
-            &frequencies,
-            code_length_lengths,
-            &mut search.best,
-        ) else {
-            return initial_tree;
+        let explored = steps
+            .steps
+            .iter()
+            .find(|(explored_state, tree, _)| {
+                *explored_state == state && *tree == code_length_lengths
+            })
+            .map(|&(_, _, outcome)| outcome);
+        let outcome = match explored {
+            Some(outcome) => outcome,
+            None => {
+                let rle = match state {
+                    0 => initial_rle,
+                    _ => &steps.states[state - 1].0,
+                };
+                let outcome = match local_rewrite_step(
+                    data_bits,
+                    literal_lengths,
+                    distance_lengths,
+                    rle,
+                    &frequencies,
+                    code_length_lengths,
+                    search,
+                ) {
+                    LocalRewriteStep::Invalid => LocalRewriteOutcome::Invalid,
+                    LocalRewriteStep::Stop => LocalRewriteOutcome::Stop,
+                    LocalRewriteStep::Next(rle, frequencies) => {
+                        steps.states.push((rle, frequencies));
+                        LocalRewriteOutcome::Next(steps.states.len())
+                    }
+                };
+                steps.steps.push((state, code_length_lengths, outcome));
+                outcome
+            }
         };
-        initial_tree.get_or_insert(code_length_lengths);
-
-        // The rewrite loop follows the unmodified DeflOpt tree, which keeps
-        // tie behavior deterministic.
-        let mut reordered = code_length_lengths;
-        if reorder_code_length_lengths(&mut reordered, &frequencies) {
-            consider_dynamic_header(
-                data_bits,
-                literal_lengths,
-                distance_lengths,
-                rle,
-                &frequencies,
-                reordered,
-                &mut search.best,
-            );
+        match outcome {
+            LocalRewriteOutcome::Invalid => return initial_tree,
+            LocalRewriteOutcome::Stop => {
+                initial_tree.get_or_insert(code_length_lengths);
+                return initial_tree;
+            }
+            LocalRewriteOutcome::Next(next) => {
+                initial_tree.get_or_insert(code_length_lengths);
+                state = next;
+            }
         }
+    }
+}
 
-        if rank == 0 {
-            break;
-        }
-        let Some(rewritten) = rewrite_rle_deflopt_local(rle, &code_length_lengths) else {
-            break;
-        };
-        let next_rank = repeat_rank(&rewritten);
-        if next_rank >= rank {
-            break;
-        }
+/// One step of the DeflOpt local rewrite: price the RLE under the tree (and its
+/// frequency-ordered form), then rewrite the RLE under the tree and price the
+/// rewrite if it lowers `repeat_rank`. Returns the rewrite to continue from.
+fn local_rewrite_step(
+    data_bits: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    rle: &[RleToken],
+    frequencies: &[u32; 19],
+    code_length_lengths: [u8; 19],
+    search: &mut HeaderPlanSearch,
+) -> LocalRewriteStep {
+    if consider_dynamic_header(
+        data_bits,
+        literal_lengths,
+        distance_lengths,
+        rle,
+        frequencies,
+        code_length_lengths,
+        &mut search.best,
+    )
+    .is_none()
+    {
+        return LocalRewriteStep::Invalid;
+    }
 
-        // Price the rewrite under the existing tree too: it is a distinct
-        // legal header.
-        let rewritten_frequencies = rle_frequencies(&rewritten);
+    // The rewrite loop follows the unmodified DeflOpt tree, which keeps tie
+    // behavior deterministic.
+    let mut reordered = code_length_lengths;
+    if reorder_code_length_lengths(&mut reordered, frequencies) {
         consider_dynamic_header(
             data_bits,
             literal_lengths,
             distance_lengths,
-            &rewritten,
-            &rewritten_frequencies,
-            code_length_lengths,
+            rle,
+            frequencies,
+            reordered,
             &mut search.best,
         );
-
-        rewritten_rle = Some(rewritten);
-        frequencies = rewritten_frequencies;
-        rank = next_rank;
     }
-    initial_tree
+
+    let rank = repeat_rank(frequencies);
+    if rank == 0 {
+        return LocalRewriteStep::Stop;
+    }
+    let Some((rewritten, rewritten_frequencies)) =
+        rewrite_rle_deflopt_local(rle, &code_length_lengths)
+    else {
+        return LocalRewriteStep::Stop;
+    };
+    if repeat_rank(&rewritten_frequencies) >= rank {
+        return LocalRewriteStep::Stop;
+    }
+
+    // Price the rewrite under the existing tree too: it is a distinct legal
+    // header.
+    consider_dynamic_header(
+        data_bits,
+        literal_lengths,
+        distance_lengths,
+        &rewritten,
+        &rewritten_frequencies,
+        code_length_lengths,
+        &mut search.best,
+    );
+    LocalRewriteStep::Next(rewritten, rewritten_frequencies)
 }
 
 /// Expand a repeat code only when its explicit spelling is strictly cheaper
 /// under the given tree. A code 17 of 3 to 6 zeros after a zero becomes code
-/// 16 when code 16's length is no longer. Returns `None` if nothing changes.
+/// 16 when code 16's length is no longer. Returns `None` if nothing changes;
+/// otherwise the rewrite and its symbol frequencies, counted as it is built.
 fn rewrite_rle_deflopt_local(
     input: &[RleToken],
     code_length_lengths: &[u8; 19],
-) -> Option<Vec<RleToken>> {
-    let mut output = Vec::new();
-    output.try_reserve(input.len()).ok()?;
+) -> Option<(Vec<RleToken>, [u32; 19])> {
+    // Built from the first change on: the last rewrite of a search usually
+    // changes nothing.
+    let mut output: Option<Vec<RleToken>> = None;
+    let mut frequencies = [0_u32; 19];
     let mut previous = None;
-    let mut changed = false;
 
-    for &token in input {
-        match token.symbol {
+    for (index, &token) in input.iter().enumerate() {
+        // The replacement: one token, or `count` explicit copies of a value.
+        let (replacement, repeated) = match token.symbol {
             value @ 0..=15 => {
-                output.push(token);
                 previous = Some(value);
+                (None, None)
             }
             18 => {
                 let count = usize::from(token.extra) + 11;
-                if explicit_rle_cost(code_length_lengths, 0, count)
-                    < rle_symbol_cost(code_length_lengths, 18)
-                {
-                    output.extend(
-                        std::iter::repeat(RleToken {
-                            symbol: 0,
-                            extra: 0,
-                        })
-                        .take(count),
-                    );
-                    changed = true;
-                } else {
-                    output.push(token);
-                }
                 previous = Some(0);
+                let expand = explicit_rle_cost(code_length_lengths, 0, count)
+                    < rle_symbol_cost(code_length_lengths, 18);
+                (None, expand.then_some((0, count)))
             }
             17 => {
                 let count = usize::from(token.extra) + 3;
-                if previous == Some(0)
+                let follows_zero = previous == Some(0);
+                previous = Some(0);
+                if follows_zero
                     && token.extra <= 3
                     && code_length_lengths[16] != 0
                     && code_length_lengths[17] != 0
                     && code_length_lengths[16] <= code_length_lengths[17]
                 {
-                    output.push(RleToken {
+                    let repeat = RleToken {
                         symbol: 16,
                         extra: token.extra,
-                    });
-                    changed = true;
-                } else if explicit_rle_cost(code_length_lengths, 0, count)
-                    < rle_symbol_cost(code_length_lengths, 17)
-                {
-                    output.extend(
-                        std::iter::repeat(RleToken {
-                            symbol: 0,
-                            extra: 0,
-                        })
-                        .take(count),
-                    );
-                    changed = true;
+                    };
+                    (Some(repeat), None)
                 } else {
-                    output.push(token);
+                    let expand = explicit_rle_cost(code_length_lengths, 0, count)
+                        < rle_symbol_cost(code_length_lengths, 17);
+                    (None, expand.then_some((0, count)))
                 }
-                previous = Some(0);
             }
             16 => {
                 let previous = previous?;
                 let count = usize::from(token.extra) + 3;
-                if explicit_rle_cost(code_length_lengths, previous, count)
-                    < rle_symbol_cost(code_length_lengths, 16)
-                {
-                    output.extend(
-                        std::iter::repeat(RleToken {
-                            symbol: previous,
-                            extra: 0,
-                        })
-                        .take(count),
-                    );
-                    changed = true;
-                } else {
-                    output.push(token);
-                }
+                let expand = explicit_rle_cost(code_length_lengths, previous, count)
+                    < rle_symbol_cost(code_length_lengths, 16);
+                (None, expand.then_some((previous, count)))
             }
             _ => return None,
+        };
+
+        if (replacement.is_some() || repeated.is_some()) && output.is_none() {
+            let mut started = Vec::new();
+            started.try_reserve(input.len()).ok()?;
+            started.extend_from_slice(&input[..index]);
+            output = Some(started);
+        }
+        if let Some((value, count)) = repeated {
+            if let Some(output) = output.as_mut() {
+                output.extend(
+                    std::iter::repeat(RleToken {
+                        symbol: value,
+                        extra: 0,
+                    })
+                    .take(count),
+                );
+            }
+            frequencies[usize::from(value)] += count as u32;
+        } else {
+            let token = replacement.unwrap_or(token);
+            if let Some(output) = output.as_mut() {
+                output.push(token);
+            }
+            frequencies[usize::from(token.symbol)] += 1;
         }
     }
 
-    changed.then_some(output)
+    output.map(|output| (output, frequencies))
 }
 
 /// Expand repeat codes that cost more than (or, with `include_equal`, the same
@@ -3439,14 +3666,10 @@ fn rle_symbol_cost(lengths: &[u8; 19], symbol: u8) -> u64 {
     }
 }
 
-fn repeat_rank(rle: &[RleToken]) -> usize {
-    rle.iter()
-        .map(|token| match token.symbol {
-            17 => 2,
-            16 | 18 => 1,
-            _ => 0,
-        })
-        .sum()
+/// Two for each code 17 and one for each code 16 or 18, from the RLE's symbol
+/// frequencies.
+fn repeat_rank(frequencies: &[u32; 19]) -> u64 {
+    2 * u64::from(frequencies[17]) + u64::from(frequencies[16]) + u64::from(frequencies[18])
 }
 
 /// Whether no two coded symbols have a longer code for a strictly larger
