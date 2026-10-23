@@ -420,19 +420,37 @@ enum CodeLengthBuilder {
 }
 
 impl CodeLengthBuilder {
-    fn key(self) -> u64 {
-        match self {
-            Self::DefloptHeap(variant) => u64::from(variant),
-            Self::OrderHeap(variant) => 4 + u64::from(variant),
-            Self::Deft4jJavaHeap => 8,
-            Self::DefluffLimited => 9,
-            Self::Columbo(variant) => 10 + u64::from(variant),
-            Self::DefluffExact => 14,
-        }
+    /// Trees in each [`CodeLengthTreeEntry`].
+    const COUNT: usize = 14;
+
+    /// This builder's tree in a [`CodeLengthTreeEntry`], or `None` for a
+    /// variant no header search asks for. Variant 3 of both heap builders
+    /// breaks every tie by frequency alone, so the two build the same tree.
+    fn index(self) -> Option<usize> {
+        let index = match self {
+            Self::DefloptHeap(FREQUENCY_ONLY_HEAP_VARIANT)
+            | Self::OrderHeap(FREQUENCY_ONLY_HEAP_VARIANT) => 3,
+            Self::DefloptHeap(variant @ 0..=2) => variant,
+            Self::OrderHeap(variant @ 0..=2) => 4 + variant,
+            Self::Deft4jJavaHeap => 7,
+            Self::DefluffLimited => 8,
+            Self::Columbo(variant @ 0..=3) => 9 + variant,
+            Self::DefluffExact => 13,
+            Self::DefloptHeap(_) | Self::OrderHeap(_) | Self::Columbo(_) => return None,
+        };
+        Some(index as usize)
     }
 
-    fn build(self, frequencies: &[u32; 19], heap_scratch: &mut DefloptHeapScratch) -> [u8; 19] {
+    /// Build this builder's tree, and say whether it is also the tree of both
+    /// `DefluffLimited` and `Columbo(0)`: they start from the same variant-0
+    /// Huffman tree and differ only in how they limit one deeper than 7 bits.
+    fn build(
+        self,
+        frequencies: &[u32; 19],
+        heap_scratch: &mut DefloptHeapScratch,
+    ) -> ([u8; 19], bool) {
         let mut lengths = [0_u8; 19];
+        let mut unlimited = false;
         match self {
             Self::DefloptHeap(variant) => make_lengths_deflopt_heap_into_with_scratch(
                 frequencies,
@@ -452,41 +470,53 @@ impl CodeLengthBuilder {
                 make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7)
             }
             Self::DefluffLimited => {
-                make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, 7, 0);
+                unlimited =
+                    !make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, 7, 0);
             }
-            Self::Columbo(variant) => make_lengths_into(frequencies, &mut lengths, 7, variant),
+            Self::Columbo(variant) => {
+                let repaired = make_lengths_into(frequencies, &mut lengths, 7, variant);
+                unlimited = variant == 0 && !repaired;
+            }
             Self::DefluffExact => make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0),
         }
-        lengths
+        (lengths, unlimited)
     }
 }
 
+/// One RLE histogram's code-length trees, by [`CodeLengthBuilder::index`].
 #[derive(Clone, Copy)]
 struct CodeLengthTreeEntry {
-    builder: CodeLengthBuilder,
     frequencies: [u32; 19],
-    lengths: [u8; 19],
+    /// Bit `index` is set once `lengths[index]` holds that builder's tree.
+    built: u16,
+    lengths: [[u8; 19]; CodeLengthBuilder::COUNT],
 }
 
-/// Slots in each thread's code-length tree cache, about 1.7 MiB. Header plans
-/// for different code lengths often share an RLE histogram, and repeats come
-/// close together: this size returned 49% of all code-length trees on 33
-/// stratified Default inputs (46% at 4,096 slots, 56% unbounded) and 75% in
-/// Max, whose exhaustive search asks more builders per histogram (71% at
-/// 4,096 slots, 77% at 65,536).
-const CODE_LENGTH_TREE_CACHE_BITS: u32 = 14;
+const EMPTY_CODE_LENGTH_TREE_ENTRY: CodeLengthTreeEntry = CodeLengthTreeEntry {
+    frequencies: [0; 19],
+    built: 0,
+    lengths: [[0; 19]; CodeLengthBuilder::COUNT],
+};
+
+/// Entries in each thread's code-length tree cache, about 1.3 MiB. Header
+/// plans for different code lengths often share an RLE histogram, and repeats
+/// come close together. Storing each histogram once, with all its builders'
+/// trees, holds more trees in less memory than one slot per builder and
+/// histogram: in a completing Max run, this size built 10% fewer trees than
+/// 16,384 such slots (1.7 MiB), and twice the entries 5% fewer again.
+const CODE_LENGTH_TREE_CACHE_BITS: u32 = 12;
 
 thread_local! {
-    /// Code-length trees built on this thread, direct-mapped by builder and
-    /// RLE histogram. Each builder is a pure function of the histogram, so a
-    /// hit, which compares the complete key, returns the tree it would build.
-    static CODE_LENGTH_TREES: RefCell<Option<Box<[Option<CodeLengthTreeEntry>]>>> =
+    /// Code-length trees built on this thread, direct-mapped by RLE histogram.
+    /// Each builder is a pure function of the histogram, so a hit, which
+    /// compares the complete histogram, returns the tree it would build.
+    static CODE_LENGTH_TREES: RefCell<Option<Box<[CodeLengthTreeEntry]>>> =
         const { RefCell::new(None) };
 }
 
-fn code_length_tree_slot(builder: CodeLengthBuilder, frequencies: &[u32; 19]) -> usize {
+fn code_length_tree_slot(frequencies: &[u32; 19]) -> usize {
     const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut hash = (builder.key() + 1).wrapping_mul(MULTIPLIER);
+    let mut hash = 0_u64;
     for &frequency in frequencies {
         hash = (hash ^ u64::from(frequency)).wrapping_mul(MULTIPLIER);
     }
@@ -500,12 +530,16 @@ fn code_length_tree(
     frequencies: &[u32; 19],
     heap_scratch: &mut DefloptHeapScratch,
 ) -> [u8; 19] {
-    let slot = code_length_tree_slot(builder, frequencies);
+    let Some(index) = builder.index() else {
+        return builder.build(frequencies, heap_scratch).0;
+    };
+    let slot = code_length_tree_slot(frequencies);
     let cached = CODE_LENGTH_TREES
         .try_with(|cache| {
             let cache = cache.try_borrow().ok()?;
-            let entry = (*cache.as_ref()?.get(slot)?)?;
-            (entry.builder == builder && entry.frequencies == *frequencies).then_some(entry.lengths)
+            let entry = cache.as_ref()?.get(slot)?;
+            (entry.built & (1 << index) != 0 && entry.frequencies == *frequencies)
+                .then_some(entry.lengths[index])
         })
         .ok()
         .flatten();
@@ -513,7 +547,7 @@ fn code_length_tree(
         return lengths;
     }
 
-    let lengths = builder.build(frequencies, heap_scratch);
+    let (lengths, unlimited) = builder.build(frequencies, heap_scratch);
     let _ = CODE_LENGTH_TREES.try_with(|cache| {
         let Ok(mut cache) = cache.try_borrow_mut() else {
             return;
@@ -526,15 +560,30 @@ fn code_length_tree(
             {
                 return;
             }
-            entries.resize(1 << CODE_LENGTH_TREE_CACHE_BITS, None);
+            entries.resize(
+                1 << CODE_LENGTH_TREE_CACHE_BITS,
+                EMPTY_CODE_LENGTH_TREE_ENTRY,
+            );
             *cache = Some(entries.into_boxed_slice());
         }
-        if let Some(entry) = cache.as_mut().and_then(|entries| entries.get_mut(slot)) {
-            *entry = Some(CodeLengthTreeEntry {
-                builder,
-                frequencies: *frequencies,
-                lengths,
-            });
+        let Some(entry) = cache.as_mut().and_then(|entries| entries.get_mut(slot)) else {
+            return;
+        };
+        if entry.frequencies != *frequencies {
+            entry.frequencies = *frequencies;
+            entry.built = 0;
+        }
+        let shared: &[CodeLengthBuilder] = if unlimited {
+            &[
+                CodeLengthBuilder::DefluffLimited,
+                CodeLengthBuilder::Columbo(0),
+            ]
+        } else {
+            &[builder]
+        };
+        for index in shared.iter().filter_map(|builder| builder.index()) {
+            entry.lengths[index] = lengths;
+            entry.built |= 1 << index;
         }
     });
     lengths
@@ -2275,7 +2324,9 @@ fn build_deft4j_header(
     let mut code_length_lengths = deft4j_code_length_tree(&rle)?;
 
     if options.prune {
-        if let Some(pruned) = rewrite_rle_deft4j_literals(&rle, &code_length_lengths, true) {
+        if let Some((pruned, _)) =
+            rewrite_rle_deft4j_literals(&rle, &rle_frequencies(&rle), &code_length_lengths, true)
+        {
             rle = pruned;
             code_length_lengths = deft4j_code_length_tree(&rle)?;
         }
@@ -2289,9 +2340,12 @@ fn build_deft4j_header(
         code_length_lengths,
     )?;
     if options.optimize_header {
-        if let Some(optimized) =
-            rewrite_rle_deft4j_literals(&plan.rle, &plan.code_length_lengths, false)
-        {
+        if let Some((optimized, _)) = rewrite_rle_deft4j_literals(
+            &plan.rle,
+            &rle_frequencies(&plan.rle),
+            &plan.code_length_lengths,
+            false,
+        ) {
             if let Some(candidate) = deft4j_dynamic_plan(
                 data_bits,
                 literal_lengths,
@@ -2470,6 +2524,7 @@ struct HeaderPlanSearch {
     /// frequencies, by code-length code: RLE seeds often reach the same
     /// feedback tree.
     shortest_rles: Vec<([u8; 19], Option<CountedRle>)>,
+    shortest_rle_scratch: ShortestRleScratch,
 }
 
 impl HeaderPlanSearch {
@@ -2477,7 +2532,8 @@ impl HeaderPlanSearch {
         if let Some((_, rle)) = self.shortest_rles.iter().find(|(seen, _)| seen == tree) {
             return rle.clone();
         }
-        let rle = shortest_rle_with_frequencies(decoded_lengths, tree);
+        let rle =
+            shortest_rle_with_frequencies(decoded_lengths, tree, &mut self.shortest_rle_scratch);
         self.shortest_rles.push((*tree, rle.clone()));
         rle
     }
@@ -3161,6 +3217,7 @@ fn consider_rle(
                     literal_lengths,
                     distance_lengths,
                     &rle,
+                    &frequencies,
                     &deft4j_lengths,
                     &mut search.heap_scratch,
                     &mut search.best,
@@ -3262,7 +3319,7 @@ fn consider_rle(
         let Some(tree) = feedback_tree else {
             break;
         };
-        let mut rewritten = rewrite_rle_deflopt_local(&rle, &tree);
+        let mut rewritten = rewrite_rle_deflopt_local(&rle, &frequencies, &tree);
         if exhaustive {
             if let Some(shortest) = search.shortest_rle(decoded_lengths, &tree) {
                 if rewritten.as_ref().map_or(true, |(local, _)| {
@@ -3286,11 +3343,13 @@ fn consider_rle(
 /// Price a header using deft4j's code-length tree and equal-cost RLE prune,
 /// then rebuild the code-length code. A tied rewrite can still shorten the
 /// rebuilt header.
+#[allow(clippy::too_many_arguments)]
 fn consider_deft4j_pruned_header(
     data_bits: u64,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     rle: &[RleToken],
+    frequencies: &[u32; 19],
     deft4j_lengths: &[u8],
     heap_scratch: &mut DefloptHeapScratch,
     best: &mut Option<DynamicPlan>,
@@ -3300,17 +3359,19 @@ fn consider_deft4j_pruned_header(
     }
     let mut code_length_lengths = [0_u8; 19];
     code_length_lengths.copy_from_slice(deft4j_lengths);
-    if rle
+    if frequencies
         .iter()
-        .any(|token| code_length_lengths[usize::from(token.symbol)] == 0)
+        .zip(code_length_lengths)
+        .any(|(&frequency, length)| frequency != 0 && length == 0)
     {
         return;
     }
 
-    let Some(pruned) = rewrite_rle_deft4j_literals(rle, &code_length_lengths, true) else {
+    let Some((pruned, frequencies)) =
+        rewrite_rle_deft4j_literals(rle, frequencies, &code_length_lengths, true)
+    else {
         return;
     };
-    let frequencies = rle_frequencies(&pruned);
     let code_length_lengths = code_length_tree(
         CodeLengthBuilder::Deft4jJavaHeap,
         &frequencies,
@@ -3319,9 +3380,10 @@ fn consider_deft4j_pruned_header(
     if !code_length_tree_shape_is_valid(&code_length_lengths) {
         return;
     }
-    if pruned
+    if frequencies
         .iter()
-        .any(|token| code_length_lengths[usize::from(token.symbol)] == 0)
+        .zip(code_length_lengths)
+        .any(|(&frequency, length)| frequency != 0 && length == 0)
     {
         return;
     }
@@ -3338,8 +3400,9 @@ fn consider_deft4j_pruned_header(
 
     // deft4j's final `optimiseHeader` step expands only strictly dearer
     // repeats under the rebuilt tree and keeps that tree unchanged.
-    if let Some(optimized) = rewrite_rle_deft4j_literals(&pruned, &code_length_lengths, false) {
-        let optimized_frequencies = rle_frequencies(&optimized);
+    if let Some((optimized, optimized_frequencies)) =
+        rewrite_rle_deft4j_literals(&pruned, &frequencies, &code_length_lengths, false)
+    {
         consider_dynamic_header(
             data_bits,
             literal_lengths,
@@ -3506,7 +3569,7 @@ fn local_rewrite_step(
         return LocalRewriteStep::Stop;
     }
     let Some((rewritten, rewritten_frequencies)) =
-        rewrite_rle_deflopt_local(rle, &code_length_lengths)
+        rewrite_rle_deflopt_local(rle, frequencies, &code_length_lengths)
     else {
         return LocalRewriteStep::Stop;
     };
@@ -3530,14 +3593,24 @@ fn local_rewrite_step(
 
 /// Expand a repeat code only when its explicit spelling is strictly cheaper
 /// under the given tree. A code 17 of 3 to 6 zeros after a zero becomes code
-/// 16 when code 16's length is no longer. Returns `None` if nothing changes;
-/// otherwise the rewrite and its symbol frequencies, counted as it is built.
+/// 16 when code 16's length is no longer. `frequencies` are the input's symbol
+/// frequencies. Returns `None` if nothing changes; otherwise the rewrite and
+/// its symbol frequencies, counted as it is built.
 fn rewrite_rle_deflopt_local(
     input: &[RleToken],
+    frequencies: &[u32; 19],
     code_length_lengths: &[u8; 19],
 ) -> Option<CountedRle> {
-    // Built from the first change on: the last rewrite of a search usually
-    // changes nothing.
+    debug_assert_eq!(*frequencies, rle_frequencies(input));
+    // The last rewrite of a search usually changes nothing; this finds most
+    // such rewrites without reading the RLE.
+    if !some_repeat_expands(frequencies, code_length_lengths, false)
+        && !(frequencies[17] != 0 && zero_repeat_takes_code_16(code_length_lengths))
+    {
+        return None;
+    }
+    // Built from the first change on: a rewrite that passes the check above
+    // can still change nothing.
     let mut output: Option<Vec<RleToken>> = None;
     let mut frequencies = [0_u32; 19];
     let mut previous = None;
@@ -3562,9 +3635,7 @@ fn rewrite_rle_deflopt_local(
                 previous = Some(0);
                 if follows_zero
                     && token.extra <= 3
-                    && code_length_lengths[16] != 0
-                    && code_length_lengths[17] != 0
-                    && code_length_lengths[16] <= code_length_lengths[17]
+                    && zero_repeat_takes_code_16(code_length_lengths)
                 {
                     let repeat = RleToken {
                         symbol: 16,
@@ -3589,7 +3660,10 @@ fn rewrite_rle_deflopt_local(
 
         if (replacement.is_some() || repeated.is_some()) && output.is_none() {
             let mut started = Vec::new();
-            started.try_reserve(input.len()).ok()?;
+            // Expansions can outgrow the input, but not a header's lengths.
+            started
+                .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
+                .ok()?;
             started.extend_from_slice(&input[..index]);
             output = Some(started);
         }
@@ -3616,16 +3690,57 @@ fn rewrite_rle_deflopt_local(
     output.map(|output| (output, frequencies))
 }
 
+/// Whether spelling out some repeat code of an RLE with these symbol
+/// frequencies costs less than the code under the tree, or with
+/// `include_equal` no more; if not, a rewrite need not read the RLE. A repeat
+/// spelled out costs more the longer it is, so each repeat code is checked at
+/// its shortest count, and code 16 after every value it can follow.
+fn some_repeat_expands(
+    frequencies: &[u32; 19],
+    code_length_lengths: &[u8; 19],
+    include_equal: bool,
+) -> bool {
+    let expands = |value: u8, symbol: u8, shortest: usize| {
+        let explicit = explicit_rle_cost(code_length_lengths, value, shortest);
+        let repeat = rle_symbol_cost(code_length_lengths, symbol);
+        explicit < repeat || (include_equal && explicit == repeat)
+    };
+    let zero_repeats = frequencies[17] != 0 || frequencies[18] != 0;
+    (frequencies[18] != 0 && expands(0, 18, 11))
+        || (frequencies[17] != 0 && expands(0, 17, 3))
+        || (frequencies[16] != 0
+            && (0..16).any(|value| {
+                (frequencies[usize::from(value)] != 0 || (value == 0 && zero_repeats))
+                    && expands(value, 16, 3)
+            }))
+}
+
+/// Whether a code 17 of 3 to 6 zeros after a zero becomes code 16 in
+/// [`rewrite_rle_deflopt_local`].
+fn zero_repeat_takes_code_16(code_length_lengths: &[u8; 19]) -> bool {
+    code_length_lengths[16] != 0
+        && code_length_lengths[17] != 0
+        && code_length_lengths[16] <= code_length_lengths[17]
+}
+
 /// Expand repeat codes that cost more than (or, with `include_equal`, the same
-/// as) their explicit spelling under a fixed tree.
+/// as) their explicit spelling under a fixed tree. `frequencies` are the
+/// input's symbol frequencies. Returns `None` if nothing changes; otherwise
+/// the rewrite and its symbol frequencies.
 ///
 /// This mirrors deft4j's header-only prune: `include_equal` is used before a
 /// tree rebuild, since a tied rewrite can change the next tree.
 fn rewrite_rle_deft4j_literals(
     input: &[RleToken],
+    frequencies: &[u32; 19],
     code_length_lengths: &[u8; 19],
     include_equal: bool,
-) -> Option<Vec<RleToken>> {
+) -> Option<CountedRle> {
+    debug_assert_eq!(*frequencies, rle_frequencies(input));
+    if !some_repeat_expands(frequencies, code_length_lengths, include_equal) {
+        return None;
+    }
+    let mut rewritten_frequencies = *frequencies;
     let mut output = Vec::new();
     output.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
     let mut previous = None;
@@ -3656,13 +3771,15 @@ fn rewrite_rle_deft4j_literals(
                 })
                 .take(count),
             );
+            rewritten_frequencies[usize::from(token.symbol)] -= 1;
+            rewritten_frequencies[usize::from(value)] += count as u32;
             changed = true;
         } else {
             output.push(token);
         }
         previous = Some(value);
     }
-    changed.then_some(output)
+    changed.then_some((output, rewritten_frequencies))
 }
 
 fn explicit_rle_cost(lengths: &[u8; 19], symbol: u8, count: usize) -> u64 {
@@ -3751,7 +3868,8 @@ fn reorder_code_length_lengths(lengths: &mut [u8; 19], frequencies: &[u32; 19]) 
 }
 
 fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
-    let mut output = Vec::new();
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -3808,7 +3926,8 @@ fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleT
 /// eight repeats) to every run where greedy six-repeat codes would leave one or
 /// two explicit values.
 fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
-    let mut output = Vec::new();
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -3869,7 +3988,8 @@ fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken
 /// codes 18 and 17 are spelled as one explicit zero followed by code 16, as
 /// deft4j allows.
 fn columbo_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
-    let mut output = Vec::new();
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -4035,25 +4155,8 @@ fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
 
 /// Find the cheapest RLE spelling of `lengths` under a fixed code-length code.
 pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
-    shortest_rle_with_frequencies(lengths, costs).map(|(rle, _)| rle)
-}
-
-/// [`shortest_rle`] with the RLE's symbol frequencies, counted as it is
-/// assembled.
-fn shortest_rle_with_frequencies(lengths: &[u8], costs: &[u8; 19]) -> Option<CountedRle> {
-    // A header's code lengths fit fixed buffers on the stack; longer input
-    // takes the same search with buffers from the heap.
-    if lengths.len() <= MAX_DYNAMIC_CODE_LENGTH_COUNT {
-        let mut best = [INF; MAX_DYNAMIC_CODE_LENGTH_COUNT + 1];
-        let mut step = [None; MAX_DYNAMIC_CODE_LENGTH_COUNT];
-        let mut zero_repeats = [0; MAX_DYNAMIC_CODE_LENGTH_COUNT];
-        shortest_rle_in(lengths, costs, &mut best, &mut step, &mut zero_repeats)
-    } else {
-        let mut best = vec![INF; lengths.len() + 1];
-        let mut step = vec![None; lengths.len()];
-        let mut zero_repeats = vec![0; lengths.len()];
-        shortest_rle_in(lengths, costs, &mut best, &mut step, &mut zero_repeats)
-    }
+    shortest_rle_with_frequencies(lengths, costs, &mut ShortestRleScratch::default())
+        .map(|(rle, _)| rle)
 }
 
 #[derive(Clone, Copy)]
@@ -4062,25 +4165,54 @@ struct RleStep {
     token: RleToken,
 }
 
-/// [`shortest_rle`] in caller-provided buffers of at least `lengths.len() + 1`,
-/// `lengths.len()` and `lengths.len()` entries; `best` must hold `INF` and
-/// `step` `None`.
-fn shortest_rle_in(
+/// Buffers for [`shortest_rle_with_frequencies`], reused between searches. A
+/// search writes every entry it reads first, so they are never cleared.
+#[derive(Default)]
+struct ShortestRleScratch {
+    best: Vec<u64>,
+    step: Vec<Option<RleStep>>,
+    zero_repeats: Vec<usize>,
+}
+
+/// [`shortest_rle`] with the RLE's symbol frequencies, counted as it is
+/// assembled. `None` also when the buffers cannot grow.
+fn shortest_rle_with_frequencies(
     lengths: &[u8],
     costs: &[u8; 19],
-    best: &mut [u64],
-    step: &mut [Option<RleStep>],
-    zero_repeats: &mut [usize],
+    scratch: &mut ShortestRleScratch,
 ) -> Option<CountedRle> {
-    let best = &mut best[..=lengths.len()];
-    let step = &mut step[..lengths.len()];
+    let len = lengths.len();
+    if scratch.best.len() <= len {
+        scratch
+            .best
+            .try_reserve_exact(len + 1 - scratch.best.len())
+            .ok()?;
+        scratch
+            .step
+            .try_reserve_exact(len - scratch.step.len())
+            .ok()?;
+        scratch
+            .zero_repeats
+            .try_reserve_exact(len - scratch.zero_repeats.len())
+            .ok()?;
+        scratch.best.resize(len + 1, INF);
+        scratch.step.resize(len, None);
+        scratch.zero_repeats.resize(len, 0);
+    }
+    let best = &mut scratch.best[..=len];
+    let step = &mut scratch.step[..len];
+    let zero_repeats = &mut scratch.zero_repeats[..len];
     let mut run = 0;
     // A monotonic deque of repeat ends in `zero_repeats[front..back]`; each
     // run of equal lengths restarts it, so `back` never passes the run length.
     let (mut front, mut back) = (0, 0);
-    best[lengths.len()] = 0;
-    for index in (0..lengths.len()).rev() {
-        if index + 1 < lengths.len() && lengths[index] == lengths[index + 1] {
+    // Positions are solved from the end, each before any earlier position
+    // reads it. `step` is read only along a path of finite costs, each step of
+    // which this search wrote.
+    best[len] = 0;
+    for index in (0..len).rev() {
+        best[index] = INF;
+        if index + 1 < len && lengths[index] == lengths[index + 1] {
             run += 1;
         } else {
             run = 1;
@@ -4107,16 +4239,16 @@ fn shortest_rle_in(
             None
         };
 
-        let mut consider = |count: usize, symbol: u8, extra: u8| {
-            let code = costs[usize::from(symbol)];
-            if code == 0 || index + count > lengths.len() {
-                return;
-            }
-            let cost = u64::from(code)
-                .saturating_add(rle_extra_bits(symbol))
-                .saturating_add(best[index + count]);
-            // Replace only on a strict improvement, so a tie keeps the option
-            // considered first: an explicit length, then codes 16, 17 and 18.
+        // Replace only on a strict improvement, so a tie keeps the option
+        // considered first: an explicit length, then codes 16, 17 and 18, each
+        // with its shortest repeat. Costs stay below `INF` plus a few bits, so
+        // plain sums cannot overflow, and a sum through an unreachable `INF`
+        // never wins.
+        let value = lengths[index];
+        let mut choose = |best: &mut [u64], count: usize, symbol: u8, extra: u8| {
+            let cost = u64::from(costs[usize::from(symbol)])
+                + rle_extra_bits(symbol)
+                + best[index + count];
             if cost < best[index] {
                 best[index] = cost;
                 step[index] = Some(RleStep {
@@ -4125,26 +4257,31 @@ fn shortest_rle_in(
                 });
             }
         };
-
-        consider(1, lengths[index], 0);
-        if index > 0 && lengths[index] == lengths[index - 1] {
-            for count in 3..=run.min(6) {
-                consider(count, 16, (count - 3) as u8);
-            }
+        if costs[usize::from(value)] != 0 {
+            choose(best, 1, value, 0);
         }
-        if lengths[index] == 0 {
-            for count in 3..=run.min(10) {
-                consider(count, 17, (count - 3) as u8);
+        // Every repeat of a code costs the same bits, so the shortest repeat
+        // with the cheapest remainder is the one a count-by-count scan keeps.
+        if index > 0 && value == lengths[index - 1] && costs[16] != 0 && run >= 3 {
+            let count = 3 + earliest_minimum(&best[index + 3..=index + run.min(6)]);
+            choose(best, count, 16, (count - 3) as u8);
+        }
+        if value == 0 {
+            if costs[17] != 0 && run >= 3 {
+                let count = 3 + earliest_minimum(&best[index + 3..=index + run.min(10)]);
+                choose(best, count, 17, (count - 3) as u8);
             }
             if let Some(count) = zero_repeat {
-                consider(count, 18, (count - 11) as u8);
+                choose(best, count, 18, (count - 11) as u8);
             }
         }
     }
     if best[0] == INF {
         return None;
     }
+    // Each token spells at least one length.
     let mut output = Vec::new();
+    output.try_reserve_exact(len).ok()?;
     let mut frequencies = [0_u32; 19];
     let mut index = 0;
     while index < lengths.len() {
@@ -4154,6 +4291,17 @@ fn shortest_rle_in(
         index = selected.next;
     }
     Some((output, frequencies))
+}
+
+/// The position of the first smallest value in a nonempty slice.
+fn earliest_minimum(values: &[u64]) -> usize {
+    let mut position = 0;
+    for (index, &value) in values.iter().enumerate().skip(1) {
+        if value < values[position] {
+            position = index;
+        }
+    }
+    position
 }
 
 #[cfg(test)]

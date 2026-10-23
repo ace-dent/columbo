@@ -47,20 +47,23 @@ pub(crate) const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
 // Out of line: each call scans the lengths.
 #[inline(never)]
 pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
-    let mut occupied = 0_u32;
-    for &length in lengths {
-        if length == 0 {
-            continue;
+    // Branch-free, so the loop vectorizes: a zero length adds nothing, and a
+    // length over the limit fails the final test whatever it adds. A `u32`
+    // sum of 2^16 lengths of at most 2^15 each cannot overflow, and wrapping
+    // additions keep release overflow checks out of the loop.
+    let mut occupied = 0_u64;
+    let mut longest = 0_u8;
+    for chunk in lengths.chunks(1 << 16) {
+        let mut chunk_occupied = 0_u32;
+        for &length in chunk {
+            longest = longest.max(length);
+            chunk_occupied = chunk_occupied.wrapping_add(
+                (u32::from(length != 0) << MAX_CODE_BITS) >> length.min(MAX_CODE_BITS as u8),
+            );
         }
-        let Some(shift) = MAX_CODE_BITS.checked_sub(usize::from(length)) else {
-            return false;
-        };
-        let Some(updated) = occupied.checked_add(1_u32 << shift) else {
-            return false;
-        };
-        occupied = updated;
+        occupied = occupied.wrapping_add(u64::from(chunk_occupied));
     }
-    occupied == COMPLETE_HUFFMAN_CODE_SPACE
+    usize::from(longest) <= MAX_CODE_BITS && occupied == u64::from(COMPLETE_HUFFMAN_CODE_SPACE)
 }
 
 /// The code-length code must be complete; there is no empty or single-code
@@ -637,6 +640,16 @@ impl Node {
     }
 }
 
+/// [`node_less`] as one integer: the frequency, then the order, ascending for
+/// even variants and descending for odd ones. Orders are symbol or node
+/// indices, so they fit 32 bits.
+fn node_key(node: &Node, variant: u32) -> u64 {
+    debug_assert!(u32::try_from(node.order).is_ok());
+    let order = node.order as u32;
+    let order = if variant & 1 != 0 { !order } else { order };
+    u64::from(node.frequency) << 32 | u64::from(order)
+}
+
 fn node_less(nodes: &[Node], a: usize, b: usize, variant: u32) -> bool {
     if nodes[a].frequency != nodes[b].frequency {
         return nodes[a].frequency < nodes[b].frequency;
@@ -648,16 +661,32 @@ fn node_less(nodes: &[Node], a: usize, b: usize, variant: u32) -> bool {
     }
 }
 
-fn generic_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut root: usize, variant: u32) {
+/// A heap entry: a node and its [`node_key`], so comparisons need not read the
+/// node. Equal keys compare as [`node_less`] does, so the heap moves exactly as
+/// one of node indices would.
+type KeyedNode = (u64, usize);
+
+fn keyed_heap(nodes: &[Node], members: &[usize], variant: u32) -> Vec<KeyedNode> {
+    let mut heap: Vec<KeyedNode> = members
+        .iter()
+        .map(|&node| (node_key(&nodes[node], variant), node))
+        .collect();
+    for start in (0..heap.len() / 2).rev() {
+        keyed_heap_sift_down(&mut heap, start);
+    }
+    heap
+}
+
+fn keyed_heap_sift_down(heap: &mut [KeyedNode], mut root: usize) {
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             return;
         }
-        if child + 1 < heap.len() && node_less(nodes, heap[child + 1], heap[child], variant) {
+        if child + 1 < heap.len() && heap[child + 1].0 < heap[child].0 {
             child += 1;
         }
-        if !node_less(nodes, heap[child], heap[root], variant) {
+        if heap[child].0 >= heap[root].0 {
             return;
         }
         heap.swap(root, child);
@@ -665,22 +694,22 @@ fn generic_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut root: usize, v
     }
 }
 
-fn generic_heap_pop(nodes: &[Node], heap: &mut Vec<usize>, variant: u32) -> Option<usize> {
-    let result = *heap.first()?;
+fn keyed_heap_pop(heap: &mut Vec<KeyedNode>) -> Option<usize> {
+    let result = heap.first()?.1;
     let last = heap.pop().expect("the heap is non-empty");
     if !heap.is_empty() {
         heap[0] = last;
-        generic_heap_sift_down(nodes, heap, 0, variant);
+        keyed_heap_sift_down(heap, 0);
     }
     Some(result)
 }
 
-fn generic_heap_push(nodes: &[Node], heap: &mut Vec<usize>, node: usize, variant: u32) {
+fn keyed_heap_push(heap: &mut Vec<KeyedNode>, entry: KeyedNode) {
     let mut position = heap.len();
-    heap.push(node);
+    heap.push(entry);
     while position != 0 {
         let parent = (position - 1) / 2;
-        if !node_less(nodes, heap[position], heap[parent], variant) {
+        if heap[position].0 >= heap[parent].0 {
             break;
         }
         heap.swap(position, parent);
@@ -689,27 +718,22 @@ fn generic_heap_push(nodes: &[Node], heap: &mut Vec<usize>, node: usize, variant
 }
 
 fn merge_generic_nodes_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
-    for start in (0..active.len() / 2).rev() {
-        generic_heap_sift_down(nodes, active, start, variant);
-    }
-    while active.len() > 1 {
-        let left = generic_heap_pop(nodes, active, variant).expect("two nodes remain");
-        let right = generic_heap_pop(nodes, active, variant).expect("one node remains");
+    let mut heap = keyed_heap(nodes, active, variant);
+    while heap.len() > 1 {
+        let left = keyed_heap_pop(&mut heap).expect("two nodes remain");
+        let right = keyed_heap_pop(&mut heap).expect("one node remains");
         let index = nodes.len();
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
-        generic_heap_push(nodes, active, index, variant);
+        keyed_heap_push(&mut heap, (node_key(&nodes[index], variant), index));
     }
+    active.clear();
+    active.extend(heap.first().map(|&(_, root)| root));
 }
 
-fn generic_heap_pop_active(
-    nodes: &[Node],
-    heap: &mut Vec<usize>,
-    active: &[bool],
-    variant: u32,
-) -> Option<usize> {
+fn keyed_heap_pop_active(heap: &mut Vec<KeyedNode>, active: &[bool]) -> Option<usize> {
     loop {
-        let node = generic_heap_pop(nodes, heap, variant)?;
+        let node = keyed_heap_pop(heap)?;
         if active[node] {
             return Some(node);
         }
@@ -721,12 +745,8 @@ fn generic_heap_pop_active(
 /// skipped by the other.
 fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
     debug_assert_ne!(variant & 2, 0);
-    let mut increasing_order = active.clone();
-    let mut decreasing_order = active.clone();
-    for start in (0..increasing_order.len() / 2).rev() {
-        generic_heap_sift_down(nodes, &mut increasing_order, start, 0);
-        generic_heap_sift_down(nodes, &mut decreasing_order, start, 1);
-    }
+    let mut increasing_order = keyed_heap(nodes, active, 0);
+    let mut decreasing_order = keyed_heap(nodes, active, 1);
 
     let leaf_count = active.len();
     let mut is_active = Vec::with_capacity(leaf_count.saturating_mul(2));
@@ -735,17 +755,17 @@ fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
     while remaining > 1 {
         let reverse_first = variant & 1 != 0;
         let left = if reverse_first {
-            generic_heap_pop_active(nodes, &mut decreasing_order, &is_active, 1)
+            keyed_heap_pop_active(&mut decreasing_order, &is_active)
         } else {
-            generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+            keyed_heap_pop_active(&mut increasing_order, &is_active)
         }
         .expect("two nodes remain");
         is_active[left] = false;
 
         let right = if reverse_first {
-            generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+            keyed_heap_pop_active(&mut increasing_order, &is_active)
         } else {
-            generic_heap_pop_active(nodes, &mut decreasing_order, &is_active, 1)
+            keyed_heap_pop_active(&mut decreasing_order, &is_active)
         }
         .expect("one node remains");
         is_active[right] = false;
@@ -754,13 +774,12 @@ fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
         is_active.push(true);
-        generic_heap_push(nodes, &mut increasing_order, index, 0);
-        generic_heap_push(nodes, &mut decreasing_order, index, 1);
+        keyed_heap_push(&mut increasing_order, (node_key(&nodes[index], 0), index));
+        keyed_heap_push(&mut decreasing_order, (node_key(&nodes[index], 1), index));
         remaining -= 1;
     }
 
-    let root = generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
-        .expect("one root remains");
+    let root = keyed_heap_pop_active(&mut increasing_order, &is_active).expect("one root remains");
     active.clear();
     active.push(root);
 }
@@ -809,15 +828,7 @@ fn sort_leaf_keys(keys: &mut [u64]) {
 
 /// Order nodes by [`node_less`]. Both two-queue merges share this one sort.
 fn sort_generic_nodes(nodes: &[Node], active: &mut [usize], variant: u32) {
-    active.sort_unstable_by(|&left, &right| {
-        if node_less(nodes, left, right, variant) {
-            std::cmp::Ordering::Less
-        } else if node_less(nodes, right, left, variant) {
-            std::cmp::Ordering::Greater
-        } else {
-            std::cmp::Ordering::Equal
-        }
-    });
+    active.sort_unstable_by_key(|&node| node_key(&nodes[node], variant));
 }
 
 fn merge_generic_nodes_two_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
@@ -917,7 +928,9 @@ fn merge_generic_nodes_reverse_front(nodes: &mut Vec<Node>, active: &mut Vec<usi
     let leaves = active.clone();
     let mut leaf = 0;
     let mut runs = VecDeque::with_capacity(leaves.len());
-    let mut previous = vec![None; nodes.len()];
+    // One entry per node, branches included.
+    let mut previous = Vec::with_capacity(nodes.len().saturating_mul(2));
+    previous.resize(nodes.len(), None);
     let mut remaining = leaves.len();
     while remaining > 1 {
         let left = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
@@ -993,13 +1006,15 @@ pub(crate) fn make_lengths(frequencies: &[u32], max_bits: u8, variant: u32) -> V
     lengths
 }
 
+/// Return whether the unlimited tree was deeper than `max_bits` and needed
+/// repair.
 pub(crate) fn make_lengths_into(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
-) {
-    make_lengths_inner(frequencies, lengths, max_bits, variant);
+) -> bool {
+    make_lengths_inner(frequencies, lengths, max_bits, variant)
 }
 
 /// Return whether the unlimited tree was deeper than `max_bits` and needed
@@ -1009,7 +1024,8 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
     lengths.fill(0);
 
     let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
-    let mut active = Vec::with_capacity(frequencies.len());
+    // The two-queue merge appends each branch to the leaves.
+    let mut active = Vec::with_capacity(frequencies.len().saturating_mul(2));
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency == 0 {
             continue;
@@ -1310,16 +1326,19 @@ pub(crate) fn make_lengths_columbo_defluff_limited(
     lengths
 }
 
+/// Return whether the unlimited tree was deeper than `max_bits` and needed
+/// package-merge.
 pub(crate) fn make_lengths_columbo_defluff_limited_into(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     _variant: u32,
-) {
+) -> bool {
     if !make_lengths_inner(frequencies, lengths, max_bits, 0) {
-        return;
+        return false;
     }
     apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
+    true
 }
 
 /// Build Defluff's code lengths exactly, including its leaf-before-branch tie
@@ -1461,7 +1480,8 @@ fn apply_package_merge(
     }
 
     let target = 2 * leaf_count - 2;
-    let mut nodes = Vec::new();
+    // The leaves, then fewer than `leaf_count` packages at each further level.
+    let mut nodes = Vec::with_capacity(leaf_count.saturating_mul(usize::from(max_bits)));
     let mut keys = Vec::with_capacity(leaf_count);
 
     // Leaf node indices increase with symbol (zero counts are skipped), so
@@ -1715,6 +1735,10 @@ fn make_lengths_variant_heap_inner(
     symbols.clear();
     children.clear();
     leaf_order.clear();
+    // Grow fresh buffers once rather than by doubling.
+    heap.reserve(frequencies.len());
+    symbols.reserve(frequencies.len());
+    children.reserve(frequencies.len());
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
             let index = u32::try_from(symbols.len()).expect("alphabet fits u32");

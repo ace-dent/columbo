@@ -700,6 +700,194 @@ fn optimized_generic_variants_match_the_scanning_topology() {
     }
 }
 
+/// The node-index heap the keyed heaps replaced.
+fn reference_generic_heap_sift_down(
+    nodes: &[Node],
+    heap: &mut [usize],
+    mut root: usize,
+    variant: u32,
+) {
+    loop {
+        let mut child = root * 2 + 1;
+        if child >= heap.len() {
+            return;
+        }
+        if child + 1 < heap.len() && node_less(nodes, heap[child + 1], heap[child], variant) {
+            child += 1;
+        }
+        if !node_less(nodes, heap[child], heap[root], variant) {
+            return;
+        }
+        heap.swap(root, child);
+        root = child;
+    }
+}
+
+fn reference_generic_heap_pop(
+    nodes: &[Node],
+    heap: &mut Vec<usize>,
+    variant: u32,
+) -> Option<usize> {
+    let result = *heap.first()?;
+    let last = heap.pop().expect("the heap is non-empty");
+    if !heap.is_empty() {
+        heap[0] = last;
+        reference_generic_heap_sift_down(nodes, heap, 0, variant);
+    }
+    Some(result)
+}
+
+fn reference_generic_heap_push(nodes: &[Node], heap: &mut Vec<usize>, node: usize, variant: u32) {
+    let mut position = heap.len();
+    heap.push(node);
+    while position != 0 {
+        let parent = (position - 1) / 2;
+        if !node_less(nodes, heap[position], heap[parent], variant) {
+            break;
+        }
+        heap.swap(position, parent);
+        position = parent;
+    }
+}
+
+fn reference_merge_generic_nodes_heap(
+    nodes: &mut Vec<Node>,
+    active: &mut Vec<usize>,
+    variant: u32,
+) {
+    for start in (0..active.len() / 2).rev() {
+        reference_generic_heap_sift_down(nodes, active, start, variant);
+    }
+    while active.len() > 1 {
+        let left = reference_generic_heap_pop(nodes, active, variant).expect("two nodes remain");
+        let right = reference_generic_heap_pop(nodes, active, variant).expect("one node remains");
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        reference_generic_heap_push(nodes, active, index, variant);
+    }
+}
+
+fn reference_generic_heap_pop_active(
+    nodes: &[Node],
+    heap: &mut Vec<usize>,
+    active: &[bool],
+    variant: u32,
+) -> Option<usize> {
+    loop {
+        let node = reference_generic_heap_pop(nodes, heap, variant)?;
+        if active[node] {
+            return Some(node);
+        }
+    }
+}
+
+fn reference_merge_generic_nodes_dual_heap(
+    nodes: &mut Vec<Node>,
+    active: &mut Vec<usize>,
+    variant: u32,
+) {
+    let mut increasing_order = active.clone();
+    let mut decreasing_order = active.clone();
+    for start in (0..increasing_order.len() / 2).rev() {
+        reference_generic_heap_sift_down(nodes, &mut increasing_order, start, 0);
+        reference_generic_heap_sift_down(nodes, &mut decreasing_order, start, 1);
+    }
+    let mut is_active = vec![true; nodes.len()];
+    let mut remaining = active.len();
+    while remaining > 1 {
+        let (first, second) = if variant & 1 != 0 { (1, 0) } else { (0, 1) };
+        let mut pop = |order: u32, is_active: &[bool]| {
+            let heap = if order == 0 {
+                &mut increasing_order
+            } else {
+                &mut decreasing_order
+            };
+            reference_generic_heap_pop_active(nodes, heap, is_active, order)
+        };
+        let left = pop(first, &is_active).expect("two nodes remain");
+        is_active[left] = false;
+        let right = pop(second, &is_active).expect("one node remains");
+        is_active[right] = false;
+        let index = nodes.len();
+        let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
+        nodes.push(Node::branch(frequency, left, right, index));
+        is_active.push(true);
+        reference_generic_heap_push(nodes, &mut increasing_order, index, 0);
+        reference_generic_heap_push(nodes, &mut decreasing_order, index, 1);
+        remaining -= 1;
+    }
+    let root = reference_generic_heap_pop_active(nodes, &mut increasing_order, &is_active, 0)
+        .expect("one root remains");
+    active.clear();
+    active.push(root);
+}
+
+#[test]
+fn keyed_heap_merges_match_the_node_heap_reference() {
+    let topology = |nodes: &[Node]| -> Vec<_> {
+        nodes
+            .iter()
+            .map(|node| {
+                (
+                    node.frequency,
+                    node.symbol,
+                    node.left,
+                    node.right,
+                    node.order,
+                )
+            })
+            .collect()
+    };
+    let mut state = 0x2545_f491_u32;
+    for alphabet_len in [19, 30, 286] {
+        for sample in 0..256 {
+            // Small frequencies give many ties, and a leaf's order (its
+            // symbol) can equal a branch's (its index).
+            let mut nodes = Vec::new();
+            let mut active = Vec::new();
+            for symbol in 0..alphabet_len {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let frequency = (state ^ sample) % 5;
+                if frequency != 0 {
+                    active.push(nodes.len());
+                    nodes.push(Node::leaf(frequency, symbol, symbol));
+                }
+            }
+            if active.len() < 2 {
+                continue;
+            }
+            for variant in 0..4 {
+                let (mut keyed_nodes, mut keyed_active) = (nodes.clone(), active.clone());
+                let (mut reference_nodes, mut reference_active) = (nodes.clone(), active.clone());
+                if variant & 2 == 0 {
+                    merge_generic_nodes_heap(&mut keyed_nodes, &mut keyed_active, variant);
+                    reference_merge_generic_nodes_heap(
+                        &mut reference_nodes,
+                        &mut reference_active,
+                        variant,
+                    );
+                } else {
+                    merge_generic_nodes_dual_heap(&mut keyed_nodes, &mut keyed_active, variant);
+                    reference_merge_generic_nodes_dual_heap(
+                        &mut reference_nodes,
+                        &mut reference_active,
+                        variant,
+                    );
+                }
+                assert_eq!(
+                    topology(&keyed_nodes),
+                    topology(&reference_nodes),
+                    "alphabet={alphabet_len} sample={sample} variant={variant}",
+                );
+                assert_eq!(keyed_active, reference_active);
+            }
+        }
+    }
+}
+
 #[test]
 fn deft4j_adds_a_dummy_leaf_for_a_single_symbol() {
     let frequencies = [0, 7, 0, 0];

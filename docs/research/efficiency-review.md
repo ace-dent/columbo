@@ -72,6 +72,7 @@ gains where established.
 | 20 Oct 2026 | [`04d63bd`](#04d63bd-20-october-2026) | Repeated block plans, terminal reparses, entropy-cut logarithms (`block.rs`, `optimize.rs`, `stream/entropy_cut.rs`) | A per-thread store of completed block plans keyed by symbol counts, extra bits, source header and policy; an accepted terminal candidate's validated parse handed to the next method; the `c log2 c` table grown to the block's counts | Default CPU 1.29× (33 inputs); Partnership card 1.52× with 100 MiB less peak memory; peak memory +1.9 MiB median, +11.9 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 APNG inputs; 685 Rust, 13 Python tests |
 | 23 Oct 2026 | [`c94eb07`](#c94eb07-23-october-2026) | Code-length trees and DeflOpt local rewrites (`header.rs`, `huffman.rs`) | A per-thread cache of code-length trees by builder and RLE histogram; one record of local-rewrite steps shared by the four heap variants; rewrites count their symbols as they are built; packed heap keys | Default CPU 1.25× (33 inputs); large APNG files 1.22–1.39×; a completing Max run 1.56×; peak memory +0.2 MiB median, +3.1 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs, 7 large PNG/APNG files and a completing Max run; 20,000 rewrite comparisons; 681 Rust, 13 Python tests |
 | 23 Oct 2026 | [`0141972`](#0141972-23-october-2026) | Max header planning (`header.rs`) | Shortest RLEs found once per header plan and tree, in stack buffers, with their symbol counts; the code-length tree cache grown to 16,384 slots | Captured Max header plans 1.14×; completing Max runs 1.30× and 1.11×; Default CPU 1.01× (33 inputs); peak memory +1.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 20,000 shortest-RLE comparisons; 666 Rust, 13 Python tests |
+| 23 Oct 2026 | [`d72c937`](#d72c937-23-october-2026) | Max header planning (`header.rs`, `huffman.rs`) | Code-length trees cached by RLE histogram, builders that must agree sharing one tree; repeat rewrites skipped when the RLE's symbol counts show nothing can change; one scan per shortest-RLE repeat window, in buffers kept for the header plan; RLE and tree buffers sized once; a branch-free Kraft sum; packed keys in Columbo's heaps | Captured Max header plans 1.26×; completing Max runs 1.29× and 1.12×; Default CPU 1.14× (33 inputs); peak memory −0.1 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 403,865 captured shortest-RLE calls; 20,000 rewrite and 768 heap-merge comparisons; 668 Rust, 7 Python tests |
 
 ## Entries
 
@@ -468,6 +469,108 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `d72c937`, 23 October 2026
+
+Batches: whole-file CPU over the 33 stratified Default inputs once per build in
+alternating order; three alternating runs of each completing Max run; two
+alternating runs of the header-plan replay.
+
+A sampled profile of ten inputs in Max at 20 seconds (239,122 CPU samples) put
+70% under `plan_for_trimmed_lengths_uncached`: 28% in code-length trees despite
+their cache, 14% in `shortest_rle`, 10% in the DeflOpt and deft4j repeat
+rewrites and 3% in the Kraft-sum check of payload code lengths. Memory
+allocation took about 8%.
+
+- **Code-length trees by histogram.** One cache entry per RLE histogram holds
+  every builder's tree, so each histogram is hashed, compared and stored once
+  instead of once per builder. Simulated on the completing Clefable run's
+  requests, 4,096 entries (1.3 MiB per thread) built 2.42 million trees where
+  the previous 16,384 slots (1.7 MiB) built 2.69 million, before the sharing
+  below. Two pairs of builders always build the same tree and share one: the
+  DeflOpt and order-key heaps' variant 3, which breaks every tie by frequency
+  alone, and Defluff's limited builder with Columbo's variant 0, which start
+  from the same Huffman tree and differ only in how they limit one deeper than
+  7 bits; that pair agreed on every histogram counted.
+- **Rewrites that cannot change.** The DeflOpt local rewrite and deft4j's prune
+  spell out a repeat code only when that is cheaper (deft4j's pre-rebuild
+  prune also when it ties), and DeflOpt makes code 17 into code 16 when 16 is
+  no longer. A repeat spelled out costs more the longer it is, so the RLE's
+  symbol counts and the tree show whether any token could change, without
+  reading the RLE. In the Clefable run, 86% of DeflOpt rewrites changed
+  nothing, and the check answered 78% of all calls; it answered 51% of
+  deft4j's pre-rebuild prunes and 54% of its final ones. The deft4j path also
+  counts the pruned RLE's symbols as it builds it and checks for missing codes
+  from the counts.
+- **Shortest RLE.** Each repeat code's window is scanned once for its shortest
+  cheapest repeat instead of pricing every count, and the costs, steps and
+  deque live in buffers kept for the header plan and written before they are
+  read, instead of stack arrays filled on every call.
+- **Allocation.** The RLE spellings, the shortest RLE and the DeflOpt rewrite
+  reserve one token per code length; heap-builder, package-merge and Columbo
+  merge buffers are sized once instead of growing. RLE capacity alone retired
+  7% fewer instructions in the Clefable run.
+- **Branch-free Kraft sum.** The completeness check of code lengths
+  vectorizes, with wrapping additions that cannot overflow keeping release
+  overflow checks out of the loop: 52 instead of 345 ns on 316 lengths.
+- **Packed keys in Columbo's heaps.** Its single- and two-heap merges compare a
+  64-bit key, frequency above order, instead of reading the nodes. Equal keys
+  compare as before, so each heap moves exactly as it did; variants 2 and 3
+  took 987 and 920 instead of 1,220 and 1,197 ns per code-length tree.
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed | 5.95 s | 4.74 s | 1.26× |
+| `036-Clefable-0.png`, Max completing its search | 3.58 s | 2.78 s | 1.29× |
+| `114-Tangela-1.png`, Max completing its search | 0.29 s | 0.26 s | 1.12× |
+| 33 Default inputs | 99.8 s | 87.2 s | 1.14× |
+
+The Clefable run retired 63.7 instead of 78.2 billion instructions: the
+shortest RLE saved 1.2%, the tree cache 2.6%, the rewrite checks and Kraft sum
+8.1%, RLE capacity 7.1% and the remaining buffers and keys 0.9%, each against
+the build before it. Default peak memory fell 0.1 MiB at the median and rose
+2.1 MiB at most.
+
+Deadline-bound Max cannot show equivalence. On every sixteenth DeflOpt PNG by
+name (58 files, Max at 10 seconds, alternating builds), 56 outputs were
+identical, and `4.2.03.png` and
+`interlaced_rgba_8_should_be_grayscale_alpha_8.png` were 4 bytes and 1 byte
+smaller; none grew.
+
+Equivalence: new tests compare deft4j's prune with the previous implementation
+on 20,000 random RLEs and trees under both tie rules, including its counted
+frequencies, and Columbo's keyed heap merges with the previous heaps on 768
+random alphabets of small counts, where leaves and branches tie; the existing
+DeflOpt-rewrite and shortest-RLE comparisons still pass. On 403,865 shortest-RLE
+calls captured from four Max runs, the search matched the baseline's. The
+89,255 replayed header plans matched plan for plan. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every CLI timing run and both completing Max runs matched
+byte for byte. Rust tests, including the private corpus, passed in release and
+debug modes, with documentation and Python tests, a locked build, formatting,
+all-feature Clippy with warnings denied and a package list without private
+fixtures or scratch artifacts. `__text` grew from 840,184 to 841,128 bytes and
+the shipped executable from 925,616 to 925,632.
+
+Measured and rejected in the same review:
+
+- Spelling each run of equal code lengths from per-value tables, since no code
+  crosses a run and a run's cheapest spelling depends only on its value and
+  length: 1.33× on the captured calls, but 8% slower on a small sprite whose
+  lengths are mostly one run of zeros, 7.6% more instructions in the Clefable
+  run, and 1.03× on the replay.
+- Keeping the shortest RLE's running minimum in locals: 2.11 instead of 1.90
+  seconds on 875,112 calls.
+- Skipping feedback states an earlier RLE seed of the same plan covered: 11.5%
+  of states, but the replay gained about 1% and the Clefable run 0.7% fewer
+  instructions.
+- A larger header-plan store: same-thread repeats of uncached plans fell from
+  10.6% at 8 MiB to 6.1% at 16 MiB and 3.7% at 32 MiB, for that memory per
+  thread.
+- 8,192 tree-cache entries: 0.4% fewer instructions in the Clefable run for
+  1.3 MiB more per thread.
+
+Artifacts: `work/efficiency-review-max-trees/`.
 
 ### `0141972`, 23 October 2026
 
