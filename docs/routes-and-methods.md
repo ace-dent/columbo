@@ -769,11 +769,13 @@ token and code-length arrays after a fingerprint match.
 Inside a header plan, each code-length code (19 symbols, at most 7 bits) comes
 from builders that are pure functions of the RLE histogram, and different code
 lengths often share a histogram. Each thread keeps a direct-mapped cache of
-4,096 code-length codes keyed by builder and histogram, verified on the
+16,384 code-length codes keyed by builder and histogram, verified on the
 complete key and emptied with the header-plan store. The four heap variants of
 the DeflOpt local rewrite share a record of the steps taken from one RLE seed:
 a variant that reaches an explored step, the same RLE and tree, moves to its
-recorded outcome instead of offering the same prices again.
+recorded outcome instead of offering the same prices again. Max's exhaustive
+header search finds the shortest RLE under each feedback tree once per header
+plan, since RLE seeds often reach the same tree.
 
 Besides the gates that skip repeated work (M9, M13, R12, `Established`, and
 fdAT deduplication), Columbo:

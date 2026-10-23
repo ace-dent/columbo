@@ -1948,3 +1948,133 @@ fn deflopt_local_rewrite_matches_the_reference_and_counts_its_symbols() {
         }
     }
 }
+
+/// `shortest_rle` before it used fixed buffers and counted frequencies.
+fn shortest_rle_reference(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
+    #[derive(Clone, Copy)]
+    struct Step {
+        next: usize,
+        token: RleToken,
+    }
+
+    let mut best = vec![INF; lengths.len() + 1];
+    let mut step = vec![None; lengths.len()];
+    let mut run = 0;
+    let mut zero_repeats = std::collections::VecDeque::<usize>::new();
+    best[lengths.len()] = 0;
+    for index in (0..lengths.len()).rev() {
+        if index + 1 < lengths.len() && lengths[index] == lengths[index + 1] {
+            run += 1;
+        } else {
+            run = 1;
+            zero_repeats.clear();
+        }
+
+        // Code 18 costs the same for every repeat from 11 to 138, so a
+        // monotonic deque keeps the cheapest suffix of that sliding window.
+        // Newer ends are smaller, so dropping equal costs keeps the preference
+        // for the shortest repeat.
+        let zero_repeat = if lengths[index] == 0 && costs[18] != 0 && run >= 11 {
+            let first_end = index + 11;
+            let last_end = index + run.min(138);
+            while zero_repeats.front().is_some_and(|&end| end > last_end) {
+                zero_repeats.pop_front();
+            }
+            while zero_repeats
+                .back()
+                .is_some_and(|&end| best[end] >= best[first_end])
+            {
+                zero_repeats.pop_back();
+            }
+            zero_repeats.push_back(first_end);
+            zero_repeats.front().map(|&end| end - index)
+        } else {
+            None
+        };
+
+        let mut consider = |count: usize, symbol: u8, extra: u8| {
+            let code = costs[usize::from(symbol)];
+            if code == 0 || index + count > lengths.len() {
+                return;
+            }
+            let cost = u64::from(code)
+                .saturating_add(rle_extra_bits(symbol))
+                .saturating_add(best[index + count]);
+            // Replace only on a strict improvement, so a tie keeps the option
+            // considered first: an explicit length, then codes 16, 17 and 18.
+            if cost < best[index] {
+                best[index] = cost;
+                step[index] = Some(Step {
+                    next: index + count,
+                    token: RleToken { symbol, extra },
+                });
+            }
+        };
+
+        consider(1, lengths[index], 0);
+        if index > 0 && lengths[index] == lengths[index - 1] {
+            for count in 3..=run.min(6) {
+                consider(count, 16, (count - 3) as u8);
+            }
+        }
+        if lengths[index] == 0 {
+            for count in 3..=run.min(10) {
+                consider(count, 17, (count - 3) as u8);
+            }
+            if let Some(count) = zero_repeat {
+                consider(count, 18, (count - 11) as u8);
+            }
+        }
+    }
+    if best[0] == INF {
+        return None;
+    }
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < lengths.len() {
+        let selected = step[index]?;
+        output.push(selected.token);
+        index = selected.next;
+    }
+    Some(output)
+}
+
+#[test]
+fn shortest_rle_matches_the_reference_and_counts_its_symbols() {
+    let mut random = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        random ^= random << 13;
+        random ^= random >> 7;
+        random ^= random << 17;
+        random
+    };
+    for case in 0..20_000 {
+        let len = 1 + next() as usize % MAX_DYNAMIC_CODE_LENGTH_COUNT;
+        // Long runs of zeros and repeats exercise codes 16, 17 and 18.
+        let mut lengths = Vec::with_capacity(len);
+        while lengths.len() < len {
+            let value = if next() % 3 == 0 {
+                0
+            } else {
+                (next() % 16) as u8
+            };
+            let run = 1 + next() as usize % 150;
+            lengths.extend(std::iter::repeat(value).take(run.min(len - lengths.len())));
+        }
+        let mut costs = [0_u8; 19];
+        for cost in &mut costs {
+            *cost = (next() % 8) as u8;
+        }
+        let expected = shortest_rle_reference(&lengths, &costs);
+        let actual = shortest_rle_with_frequencies(&lengths, &costs);
+        assert_eq!(
+            actual.as_ref().map(|(rle, _)| rle),
+            expected.as_ref(),
+            "case {case}"
+        );
+        assert_eq!(shortest_rle(&lengths, &costs), expected, "case {case}");
+        if let Some((rle, frequencies)) = actual {
+            assert_eq!(frequencies, rle_frequencies(&rle), "case {case}");
+        }
+    }
+}

@@ -71,6 +71,7 @@ gains where established.
 | 13 Oct 2026 | [`dc68b5f`](#dc68b5f-13-october-2026) | Header-plan reuse across routes (`header.rs`) | Route-local header-cache misses fall through to a per-thread store of packed completed plans, two generations within an 8 MiB charge | Default CPU 1.38× (33 inputs); peak memory +3.8 MiB median, +20.0 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 662 Rust, 13 Python tests |
 | 20 Oct 2026 | [`04d63bd`](#04d63bd-20-october-2026) | Repeated block plans, terminal reparses, entropy-cut logarithms (`block.rs`, `optimize.rs`, `stream/entropy_cut.rs`) | A per-thread store of completed block plans keyed by symbol counts, extra bits, source header and policy; an accepted terminal candidate's validated parse handed to the next method; the `c log2 c` table grown to the block's counts | Default CPU 1.29× (33 inputs); Partnership card 1.52× with 100 MiB less peak memory; peak memory +1.9 MiB median, +11.9 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 APNG inputs; 685 Rust, 13 Python tests |
 | 23 Oct 2026 | [`c94eb07`](#c94eb07-23-october-2026) | Code-length trees and DeflOpt local rewrites (`header.rs`, `huffman.rs`) | A per-thread cache of code-length trees by builder and RLE histogram; one record of local-rewrite steps shared by the four heap variants; rewrites count their symbols as they are built; packed heap keys | Default CPU 1.25× (33 inputs); large APNG files 1.22–1.39×; a completing Max run 1.56×; peak memory +0.2 MiB median, +3.1 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs, 7 large PNG/APNG files and a completing Max run; 20,000 rewrite comparisons; 681 Rust, 13 Python tests |
+| 23 Oct 2026 | [`0141972`](#0141972-23-october-2026) | Max header planning (`header.rs`) | Shortest RLEs found once per header plan and tree, in stack buffers, with their symbol counts; the code-length tree cache grown to 16,384 slots | Captured Max header plans 1.14×; completing Max runs 1.30× and 1.11×; Default CPU 1.01× (33 inputs); peak memory +1.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 20,000 shortest-RLE comparisons; 666 Rust, 13 Python tests |
 
 ## Entries
 
@@ -467,6 +468,74 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `0141972`, 23 October 2026
+
+Batches: median of three alternating runs for the header-plan replay and the
+completing Max runs; whole-file CPU over the 33 stratified Default inputs once
+per build in alternating order.
+
+Almost every Max run uses its whole allowance: given 60 seconds, 31 of the 33
+stratified inputs searched until the deadline, so a faster Max finds more in
+the same time rather than finishing sooner. A sampled profile of ten inputs in
+Max at 20 seconds (245,553 CPU samples) put 73% under
+`plan_for_trimmed_lengths_uncached`, 21% in `shortest_rle` and 29% in
+code-length trees. `shortest_rle`, which only Max's exhaustive header search
+calls, finds the cheapest RLE of a plan's code lengths under each feedback
+tree. Counters found 2.55 million exhaustive header plans calling it 18.6
+million times, 46% of them with a tree the same plan had already used, and the
+code-length cache returning 71% of Max's trees at 4,096 slots, 75% at 16,384
+and 77% at 65,536.
+
+- **Shortest RLE once per plan and tree.** A header plan's code lengths are
+  fixed, and its RLE seeds often reach the same feedback tree, so the plan
+  keeps each tree's shortest RLE with its symbol counts, which the feedback
+  pass counted again before.
+- **Stack buffers.** The shortest-RLE search keeps its costs, steps and
+  repeat-end deque in fixed buffers for a header's at most 316 code lengths,
+  instead of three allocations per call; longer input takes heap buffers.
+- **Larger code-length cache.** 16,384 slots, about 1.7 MiB per thread.
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed | 6.97 s | 6.10 s | 1.14× |
+| `036-Clefable-0.png`, Max completing its search | 8.48 s | 6.53 s | 1.30× |
+| `114-Tangela-1.png`, Max completing its search | 0.31 s | 0.28 s | 1.11× |
+| 33 Default inputs | 98.6 s | 97.8 s | 1.01× |
+
+The Clefable run retired 78.2 instead of 105.3 billion instructions. The replay
+plans every twentieth captured header plan, which spreads out the repeats the
+code-length cache relies on, so it understates the cache's share. Default
+peak memory rose 1.2 MiB at the median and 4.5 MiB at most, from the larger
+cache.
+
+Deadline-bound Max cannot show equivalence. On every sixteenth DeflOpt PNG by
+name (58 files, Max at 10 seconds, alternating builds), 56 outputs were
+identical; `4.2.03.png` was 4 bytes smaller, which did not repeat, and
+`hXlpvqi4.png-medium.png` 111 bytes larger in two of three reruns at 10
+seconds and equal at 20 and 40, a deadline cut like those of
+[23 October](../benchmark-miss-regression-audit.md#rows-that-grew-23-october).
+
+Equivalence: a new test compares the shortest-RLE search with the previous
+implementation on 20,000 random code-length sequences and trees, including
+its counted frequencies. The 89,255 replayed header plans matched the
+baseline's plan for plan. API comparisons on the 52 inputs, in Default with
+the 180-second budget and in zero-budget Max, matched in all 104 runs, and
+every CLI timing run and both completing Max runs matched byte for byte. Rust
+tests, including the private corpus, passed in release and debug modes, with
+documentation and Python tests, a locked build, formatting, all-feature Clippy
+with warnings denied and a package list without private fixtures or scratch
+artifacts. `__text` grew from 839,848 to 840,184 bytes; the shipped executable
+keeps its 925,616 bytes.
+
+Measured and rejected in the same review:
+
+- A 65,536-slot cache: 77% of Max's trees instead of 75%, for 6.8 MiB per
+  thread.
+- Keeping shortest RLEs per thread across plans: 52% of calls repeat there
+  against 46% within a plan, and the key would need the plan's code lengths.
+
+Artifacts: `work/efficiency-review-max-headers/`.
 
 ### `c94eb07`, 23 October 2026
 

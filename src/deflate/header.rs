@@ -4,7 +4,7 @@
 //! Dynamic-header construction and exact bit accounting.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 use super::huffman::{
     code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
@@ -468,11 +468,13 @@ struct CodeLengthTreeEntry {
     lengths: [u8; 19],
 }
 
-/// Slots in each thread's code-length tree cache, about 0.4 MiB. Header plans
+/// Slots in each thread's code-length tree cache, about 1.7 MiB. Header plans
 /// for different code lengths often share an RLE histogram, and repeats come
-/// close together: on 33 stratified Default inputs this size returned 46% of
-/// all code-length trees, against 56% for an unbounded cache.
-const CODE_LENGTH_TREE_CACHE_BITS: u32 = 12;
+/// close together: this size returned 49% of all code-length trees on 33
+/// stratified Default inputs (46% at 4,096 slots, 56% unbounded) and 75% in
+/// Max, whose exhaustive search asks more builders per histogram (71% at
+/// 4,096 slots, 77% at 65,536).
+const CODE_LENGTH_TREE_CACHE_BITS: u32 = 14;
 
 thread_local! {
     /// Code-length trees built on this thread, direct-mapped by builder and
@@ -2457,10 +2459,28 @@ fn plan_for_trimmed_lengths(
     Some(plan)
 }
 
+/// An RLE and its symbol frequencies.
+type CountedRle = (Vec<RleToken>, [u32; 19]);
+
 #[derive(Default)]
 struct HeaderPlanSearch {
     heap_scratch: DefloptHeapScratch,
     best: Option<DynamicPlan>,
+    /// Shortest RLEs of this plan's code lengths, with their symbol
+    /// frequencies, by code-length code: RLE seeds often reach the same
+    /// feedback tree.
+    shortest_rles: Vec<([u8; 19], Option<CountedRle>)>,
+}
+
+impl HeaderPlanSearch {
+    fn shortest_rle(&mut self, decoded_lengths: &[u8], tree: &[u8; 19]) -> Option<CountedRle> {
+        if let Some((_, rle)) = self.shortest_rles.iter().find(|(seen, _)| seen == tree) {
+            return rle.clone();
+        }
+        let rle = shortest_rle_with_frequencies(decoded_lengths, tree);
+        self.shortest_rles.push((*tree, rle.clone()));
+        rle
+    }
 }
 
 /// Plan a header for the code lengths exactly as given, trailing zeros
@@ -3244,12 +3264,11 @@ fn consider_rle(
         };
         let mut rewritten = rewrite_rle_deflopt_local(&rle, &tree);
         if exhaustive {
-            if let Some(shortest) = shortest_rle(decoded_lengths, &tree) {
+            if let Some(shortest) = search.shortest_rle(decoded_lengths, &tree) {
                 if rewritten.as_ref().map_or(true, |(local, _)| {
-                    rle_cost(&shortest, &tree) < rle_cost(local, &tree)
+                    rle_cost(&shortest.0, &tree) < rle_cost(local, &tree)
                 }) {
-                    let shortest_frequencies = rle_frequencies(&shortest);
-                    rewritten = Some((shortest, shortest_frequencies));
+                    rewritten = Some(shortest);
                 }
             }
         }
@@ -3343,7 +3362,7 @@ fn consider_deft4j_pruned_header(
 struct LocalRewriteSteps {
     /// RLEs reached from the seed and their symbol frequencies; state 0, the
     /// seed itself, is not stored.
-    states: Vec<(Vec<RleToken>, [u32; 19])>,
+    states: Vec<CountedRle>,
     steps: Vec<(usize, [u8; 19], LocalRewriteOutcome)>,
 }
 
@@ -3516,7 +3535,7 @@ fn local_rewrite_step(
 fn rewrite_rle_deflopt_local(
     input: &[RleToken],
     code_length_lengths: &[u8; 19],
-) -> Option<(Vec<RleToken>, [u32; 19])> {
+) -> Option<CountedRle> {
     // Built from the first change on: the last rewrite of a search usually
     // changes nothing.
     let mut output: Option<Vec<RleToken>> = None;
@@ -4016,23 +4035,56 @@ fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
 
 /// Find the cheapest RLE spelling of `lengths` under a fixed code-length code.
 pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleToken>> {
-    #[derive(Clone, Copy)]
-    struct Step {
-        next: usize,
-        token: RleToken,
-    }
+    shortest_rle_with_frequencies(lengths, costs).map(|(rle, _)| rle)
+}
 
-    let mut best = vec![INF; lengths.len() + 1];
-    let mut step = vec![None; lengths.len()];
+/// [`shortest_rle`] with the RLE's symbol frequencies, counted as it is
+/// assembled.
+fn shortest_rle_with_frequencies(lengths: &[u8], costs: &[u8; 19]) -> Option<CountedRle> {
+    // A header's code lengths fit fixed buffers on the stack; longer input
+    // takes the same search with buffers from the heap.
+    if lengths.len() <= MAX_DYNAMIC_CODE_LENGTH_COUNT {
+        let mut best = [INF; MAX_DYNAMIC_CODE_LENGTH_COUNT + 1];
+        let mut step = [None; MAX_DYNAMIC_CODE_LENGTH_COUNT];
+        let mut zero_repeats = [0; MAX_DYNAMIC_CODE_LENGTH_COUNT];
+        shortest_rle_in(lengths, costs, &mut best, &mut step, &mut zero_repeats)
+    } else {
+        let mut best = vec![INF; lengths.len() + 1];
+        let mut step = vec![None; lengths.len()];
+        let mut zero_repeats = vec![0; lengths.len()];
+        shortest_rle_in(lengths, costs, &mut best, &mut step, &mut zero_repeats)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RleStep {
+    next: usize,
+    token: RleToken,
+}
+
+/// [`shortest_rle`] in caller-provided buffers of at least `lengths.len() + 1`,
+/// `lengths.len()` and `lengths.len()` entries; `best` must hold `INF` and
+/// `step` `None`.
+fn shortest_rle_in(
+    lengths: &[u8],
+    costs: &[u8; 19],
+    best: &mut [u64],
+    step: &mut [Option<RleStep>],
+    zero_repeats: &mut [usize],
+) -> Option<CountedRle> {
+    let best = &mut best[..=lengths.len()];
+    let step = &mut step[..lengths.len()];
     let mut run = 0;
-    let mut zero_repeats = VecDeque::<usize>::new();
+    // A monotonic deque of repeat ends in `zero_repeats[front..back]`; each
+    // run of equal lengths restarts it, so `back` never passes the run length.
+    let (mut front, mut back) = (0, 0);
     best[lengths.len()] = 0;
     for index in (0..lengths.len()).rev() {
         if index + 1 < lengths.len() && lengths[index] == lengths[index + 1] {
             run += 1;
         } else {
             run = 1;
-            zero_repeats.clear();
+            (front, back) = (0, 0);
         }
 
         // Code 18 costs the same for every repeat from 11 to 138, so a
@@ -4042,17 +4094,15 @@ pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleTo
         let zero_repeat = if lengths[index] == 0 && costs[18] != 0 && run >= 11 {
             let first_end = index + 11;
             let last_end = index + run.min(138);
-            while zero_repeats.front().is_some_and(|&end| end > last_end) {
-                zero_repeats.pop_front();
+            while front < back && zero_repeats[front] > last_end {
+                front += 1;
             }
-            while zero_repeats
-                .back()
-                .is_some_and(|&end| best[end] >= best[first_end])
-            {
-                zero_repeats.pop_back();
+            while front < back && best[zero_repeats[back - 1]] >= best[first_end] {
+                back -= 1;
             }
-            zero_repeats.push_back(first_end);
-            zero_repeats.front().map(|&end| end - index)
+            zero_repeats[back] = first_end;
+            back += 1;
+            Some(zero_repeats[front] - index)
         } else {
             None
         };
@@ -4069,7 +4119,7 @@ pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleTo
             // considered first: an explicit length, then codes 16, 17 and 18.
             if cost < best[index] {
                 best[index] = cost;
-                step[index] = Some(Step {
+                step[index] = Some(RleStep {
                     next: index + count,
                     token: RleToken { symbol, extra },
                 });
@@ -4095,13 +4145,15 @@ pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleTo
         return None;
     }
     let mut output = Vec::new();
+    let mut frequencies = [0_u32; 19];
     let mut index = 0;
     while index < lengths.len() {
         let selected = step[index]?;
         output.push(selected.token);
+        frequencies[usize::from(selected.token.symbol)] += 1;
         index = selected.next;
     }
-    Some(output)
+    Some((output, frequencies))
 }
 
 #[cfg(test)]
