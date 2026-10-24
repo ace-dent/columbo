@@ -60,6 +60,20 @@ token, tree or partition method was taken forward; see
 [rejected or deferred experiments](#rejected-or-deferred-experiments). Probe
 and data: `work/new-method-probes-20261023/`.
 
+Follow-up, 24 October 2026 (`1f021ca`): three probes asked whether search
+rather than new transforms leaves bytes behind. Max given 60 instead of
+10 seconds saved 276 bytes (0.009%) on 38 deadline-bound DeflOpt PNGs, 26 of
+them unchanged. Restarting Max from four token-identical re-encodings of each
+source (one merged fixed or dynamic block, or the source blocks with fixed or
+fresh dynamic codes) and keeping the best of five saved 3 bytes (0.0006%) on
+103 small streams that complete; the wins came from one-block starts on
+sprites whose source opens with a short fixed block. Pricing R16's losing
+merges with the token-replay floor recovered none of them. Even re-pointing
+each existing match to its nearest equal-content distance, which Columbo's
+scope forbids, would save only 0.023% of bits: 771 of 116,017 matches could
+move. Outputs are at a fixed point for spelling, partition, time and starting
+point alike. Probe and data: `work/new-method-probes-20261024/`.
+
 ## Decision
 
 The Zopfli fork-network review produced one retained method: re-run Columbo's
@@ -315,6 +329,9 @@ Percentages are isolated controls and do not add linearly to whole-file time.
 | R2–R4 after R18 with R5 left in the sweep (`b831d49`) | Under `ApngDefault`, R5 then ran before the fit, kept token rewrites that beat only the unfitted header, and left the late R4 less to gain: in the full sticker benchmark 103 Default rows grew by 1,315 bytes against `6c81dfa`; on all 2,431 stickers 216 files grew by 3,072 bytes, against 58 by 1,059 bytes once R5 moved with the fit, which saved 67,715 bytes more | None: R5 compares against its parent, so it follows the fit |
 | R2–R4 again after a late R5 win (`ApngDefault`) | Refit the header after R5's late rewrite: never larger; on 178 APNG-heavy files 599 bytes on 60 (0.0025%), for 1.7% more median and 4% more total CPU; `apng-medium/ball.png` recovered 12 of the 78 bytes it lost when R5 moved | A cheaper refit, or a frame class where R5's rewrites are common |
 | Fractional-cost respelling | Zopfli's statistical cost model: price each symbol at −log2 p of the block's current counts, the exact marginal of its entropy bound, instead of its integer code length; iterate four passes of a per-match shortest path over literals and same-distance submatches, recounting each pass, every candidate priced by the planner. On 1,042 Huffman blocks of 150 Default outputs at `0d87ee8` (31.95 Mbit): the integer-cost control found 1,609 bits, fractional costs 1,615, the better of the two 2,536 (0.008%); re-planning the unchanged tokens found nothing | A block class whose spelling needs counts far from its current ones, where the integer iteration stalls |
+| Diversified Max restarts | Max at 60 seconds from the raw source and from four re-encodings of its own tokens (one merged fixed or dynamic block; the source blocks with fixed or fresh dynamic codes), keeping the best: on 103 small streams whose Max search completes, 3 bytes saved (515,922 → 515,919) for five times the CPU; one-block starts won on 7 streams and lost on 8, and alone totalled 1,348 bytes more | A start that is reliably better, not only different |
+| One-block Default floor beside Max | Default's complete floor from a one-block re-encoding as an extra Max competitor: beat Max from the source on 4 of the 103 streams, 1 byte and 14 bits in all, for about 90 ms per file. On `070-Weepinbell-2.png`, match-preserving feedback on one block reaches 1,539 bits and the compact payload-tree floor 1,530, while the source's leading 3-token fixed block keeps every route at 1,538 | A source class where a short leading fixed block is common |
+| R16 merges priced with re-spelling | Price a losing terminal merge again with R17's extended token floor: none of the four sprite witnesses above changed | A merge whose loss comes from match spellings the floor can repair |
 
 ### Execution
 
