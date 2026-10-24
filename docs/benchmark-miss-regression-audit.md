@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 23 October 2026 entry is the current state. Entries from 30 September keep
+The 24 October 2026 entry is the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,48 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+## DeflOpt and Defluff refresh on 24 October 2026
+
+### Benchmark state
+
+The DeflOpt and Defluff reports come from executable `18ba70c5…` (`f12cf8b`),
+which adds the code-length tree and local-rewrite reuse (`c6f01a6`), the Max
+header-planning speedups (`d72c937`, `f12cf8b`) and reporting changes. The
+deft4j reports were not refreshed. Against the DeflOpt state of 23 October
+(1,914 rows from `54df6aab…`):
+
+| Benchmark | Result |
+| --- | --- |
+| DeflOpt Default, 957 rows | 3 smaller, none larger; net −13 bytes / −103 bits; runtime 738.1 → 519.3 s |
+| DeflOpt Max, 939 rows with unchanged allowances | 178 smaller, 742 identical, 19 larger; net −1,526 bytes / −12,251 bits; runtime 8,650.8 → 7,927.4 s |
+| Defluff, 66 pairs | Unchanged: −109 bytes and −938 bits against Defluff, no misses |
+
+Every Max row is no larger than its Default row. The three smaller Default
+rows (`pokemon pixel art.png` −10 bytes, `IMG_8555.png` −2,
+`profile_gray_disallow_color.png` −1) differ only in their iCCP chunk: PNG
+metadata probes stop after 100 milliseconds, and the faster header planner
+gets further within them. Their image data is identical, and the earlier
+build itself varies by a byte on `pokemon pixel art.png` between runs.
+
+### Reference misses
+
+Unchanged: DeflOpt keeps the four strict-policy floors of 23 October
+(`sample-green-400x300.png` and `T_Grass.png`, both modes), each at parity in
+the relaxed audit.
+
+### Rows that grew
+
+Quiet serial reruns of the 19 DeflOpt Max rows that grew in bytes or bits, at
+their 10-second allowances, alternating builds of `0d87ee8` and `f12cf8b`
+twice each: ten repeat, by 1 to 8 bytes (about 35 bytes in all); four vary
+between runs; five tie in bytes. Given 20 seconds, the earlier build reaches
+the current build's 10-second sizes on the three largest
+(`grayscale_alpha_8_should_be_grayscale_trns_8.png` 67,053, `ask_02.png`
+36,117, `4.2.07.png` 725,430 bytes), and the current build ties or beats it
+(67,053, 36,116 and 725,420). These are deadline cuts: the output-preserving
+speedups move where a 10-second search stops, as with the block-plan store on
+[23 October](#rows-that-grew-23-october).
 
 ## DeflOpt and Defluff refresh on 23 October 2026
 
