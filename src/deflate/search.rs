@@ -4200,21 +4200,24 @@ fn expand_defluff_matches(
             return true;
         }
 
-        let literals_available = decoded
-            .iter()
-            .all(|&byte| literal_lengths.get(usize::from(byte)).copied().unwrap_or(0) != 0);
-        if !literals_available {
-            return false;
-        }
-        let literal_bits: u64 = decoded
-            .iter()
-            .map(|&byte| u64::from(literal_lengths[usize::from(byte)]))
-            .sum();
         let match_bits = u64::from(match_literal_length)
             + u64::from(length_extra_bits)
             + u64::from(match_distance_length)
             + u64::from(distance_extra_bits);
-        literal_bits < match_bits
+        // An unavailable literal or a sum reaching the match both keep it, so
+        // the scan can stop at either.
+        let mut literal_bits = 0_u64;
+        for &byte in decoded {
+            let length = literal_lengths.get(usize::from(byte)).copied().unwrap_or(0);
+            if length == 0 {
+                return false;
+            }
+            literal_bits += u64::from(length);
+            if literal_bits >= match_bits {
+                return false;
+            }
+        }
+        true
     })
 }
 
@@ -4747,14 +4750,14 @@ fn expand_matches_with_token_limit(
             else {
                 return false;
             };
-            let literal_bits: u64 = decoded
-                .iter()
-                .map(|&byte| estimated_length(literal_lengths, usize::from(byte)))
-                .sum();
             let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
                 + u64::from(length_extra_bits)
                 + estimated_length(distance_lengths, usize::from(distance_symbol))
                 + u64::from(distance_extra_bits);
+            let Some(literal_bits) = literal_bits_up_to(decoded, literal_lengths, match_bits)
+            else {
+                return false;
+            };
             literal_bits < match_bits || (include_equal && literal_bits == match_bits)
         },
     )
@@ -4784,15 +4787,13 @@ fn has_dearer_match(
                 let Some(decoded) = plain.get(offset..end) else {
                     return false;
                 };
-                let literal_bits: u64 = decoded
-                    .iter()
-                    .map(|&byte| estimated_length(literal_lengths, usize::from(byte)))
-                    .sum();
                 let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
                     + u64::from(length_extra_bits)
                     + estimated_length(distance_lengths, usize::from(distance_symbol))
                     + u64::from(distance_extra_bits);
-                if literal_bits < match_bits {
+                if literal_bits_up_to(decoded, literal_lengths, match_bits)
+                    .is_some_and(|literal_bits| literal_bits < match_bits)
+                {
                     return true;
                 }
                 offset = end;
@@ -4808,6 +4809,20 @@ fn estimated_length(lengths: &[u8], symbol: usize) -> u64 {
         .copied()
         .filter(|&length| length != 0)
         .map_or(15, u64::from)
+}
+
+/// The decoded bytes' [`estimated_length`] total as literals, or `None` once
+/// it exceeds `limit`. Every byte costs at least one bit, so a match longer
+/// than its own cost stops early instead of pricing all its bytes.
+fn literal_bits_up_to(decoded: &[u8], literal_lengths: &[u8], limit: u64) -> Option<u64> {
+    let mut bits = 0_u64;
+    for &byte in decoded {
+        bits += estimated_length(literal_lengths, usize::from(byte));
+        if bits > limit {
+            return None;
+        }
+    }
+    Some(bits)
 }
 
 pub(crate) fn rewrite_258_symbols(

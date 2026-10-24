@@ -495,3 +495,66 @@ fn iterated_slide_equals_repeated_slides_and_reaches_a_fixed_point() {
         "only {repeated} slides needed a second round"
     );
 }
+
+#[test]
+fn early_stopping_joining_price_matches_the_full_sum() {
+    let reference =
+        |token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool| -> Option<(u64, bool)> {
+            let own = token_cost(token, trees.0, trees.1);
+            if !joining || matches!(token, Token::Literal(_)) {
+                return own.map(|bits| (bits, false));
+            }
+            let literals = bytes.iter().try_fold(0_u64, |bits, &byte| {
+                bits.checked_add(token_cost(Token::Literal(byte), trees.0, trees.1)?)
+            });
+            match (own, literals) {
+                (Some(own), Some(literals)) if literals < own => Some((literals, true)),
+                (Some(own), _) => Some((own, false)),
+                (None, literals) => literals.map(|bits| (bits, true)),
+            }
+        };
+    let mut state = 0x2545_f491_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for case in 0..20_000 {
+        let literal: Vec<u8> = (0..286)
+            .map(|_| {
+                if next() % 6 == 0 {
+                    0
+                } else {
+                    (next() % 15 + 1) as u8
+                }
+            })
+            .collect();
+        let distances: Vec<u8> = (0..30)
+            .map(|_| {
+                if next() % 6 == 0 {
+                    0
+                } else {
+                    (next() % 15 + 1) as u8
+                }
+            })
+            .collect();
+        let length = [3_u16, 5, 12, 40, 258][(next() % 5) as usize];
+        let distance = [1_u16, 7, 300, 32_768][(next() % 4) as usize];
+        let token = if next() % 4 == 0 {
+            Token::Literal((next() % 6) as u8)
+        } else {
+            matched(length, distance)
+        };
+        let bytes: Vec<u8> = (0..token.decoded_len())
+            .map(|_| (next() % 6) as u8)
+            .collect();
+        for joining in [false, true] {
+            assert_eq!(
+                price(token, &bytes, (&literal, &distances), joining),
+                reference(token, &bytes, (&literal, &distances), joining),
+                "case {case} joining {joining}"
+            );
+        }
+    }
+}

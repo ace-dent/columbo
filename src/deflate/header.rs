@@ -2597,17 +2597,9 @@ struct RleSeedOpportunities {
     zero_18: bool,
 }
 
-fn rle_seed_opportunities(lengths: &[u8]) -> RleSeedOpportunities {
+fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
     let mut opportunities = RleSeedOpportunities::default();
-    let mut index = 0;
-    while index < lengths.len() {
-        let value = lengths[index];
-        let mut run = 1;
-        while index + run < lengths.len() && lengths[index + run] == value {
-            run += 1;
-        }
-        index += run;
-
+    for &(value, run) in runs {
         if value != 0 {
             let repeated = run.saturating_sub(1);
             opportunities.balanced_repeat |= repeated >= 7 && matches!(repeated % 6, 1 | 2);
@@ -2637,7 +2629,10 @@ fn rle_seed_opportunities(lengths: &[u8]) -> RleSeedOpportunities {
 /// `rle_mask` enables mask `m`; mask bits 0, 1 and 2 disable codes 16, 17 and
 /// 18.
 fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken>> {
-    let opportunities = rle_seed_opportunities(decoded_lengths);
+    // Every seed spells the same runs, so find them once.
+    let runs = length_runs(decoded_lengths);
+    let count = decoded_lengths.len();
+    let opportunities = rle_seed_opportunities(&runs);
     // Always keep bit 0: it also decides whether the balanced and zero-repeat
     // spellings run, even when disabling code 16 leaves the greedy spelling
     // unchanged.
@@ -2657,18 +2652,18 @@ fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken
         let no_16 = mask & 1 != 0;
         let no_17 = mask & 2 != 0;
         let no_18 = mask & 4 != 0;
-        let rle = greedy_rle(decoded_lengths, no_16, no_17, no_18);
+        let rle = greedy_rle_from_runs(&runs, count, no_16, no_17, no_18);
         push_unique(&mut candidates, rle);
 
         if !no_16 && opportunities.balanced_repeat {
-            let balanced = balanced_repeat_rle(decoded_lengths, no_17, no_18);
+            let balanced = balanced_repeat_rle_from_runs(&runs, count, no_17, no_18);
             push_unique(&mut candidates, balanced);
         }
 
         if !no_16 {
             let zero_variant = usize::from(no_17) | (usize::from(no_18) << 1);
             if opportunities.zero_repeat[zero_variant] {
-                let zero_repeat = columbo_zero_repeat_rle(decoded_lengths, no_17, no_18);
+                let zero_repeat = columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18);
                 push_unique(&mut candidates, zero_repeat);
             }
         }
@@ -3867,9 +3862,12 @@ fn reorder_code_length_lengths(lengths: &mut [u8; 19], frequencies: &[u32; 19]) 
     changed
 }
 
-fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
-    // Each token spells at least one length.
-    let mut output = Vec::with_capacity(lengths.len());
+/// A run of equal code lengths: the length and how many times it repeats.
+type LengthRun = (u8, usize);
+
+/// The maximal runs of equal values in `lengths`, in order.
+fn length_runs(lengths: &[u8]) -> Vec<LengthRun> {
+    let mut runs = Vec::with_capacity(lengths.len());
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -3877,8 +3875,26 @@ fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleT
         while index + run < lengths.len() && lengths[index + run] == value {
             run += 1;
         }
+        runs.push((value, run));
         index += run;
+    }
+    runs
+}
 
+fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
+    greedy_rle_from_runs(&length_runs(lengths), lengths.len(), no_16, no_17, no_18)
+}
+
+fn greedy_rle_from_runs(
+    runs: &[LengthRun],
+    length_count: usize,
+    no_16: bool,
+    no_17: bool,
+    no_18: bool,
+) -> Vec<RleToken> {
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(length_count);
+    for &(value, mut run) in runs {
         if value == 0 {
             while !no_18 && run >= 11 {
                 let count = run.min(138);
@@ -3922,21 +3938,23 @@ fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleT
     output
 }
 
+#[cfg(test)]
+fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
+    balanced_repeat_rle_from_runs(&length_runs(lengths), lengths.len(), no_17, no_18)
+}
+
 /// Generalize deft4j's balanced code-16 splits (4+3 and 4+4 for seven and
 /// eight repeats) to every run where greedy six-repeat codes would leave one or
 /// two explicit values.
-fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
+fn balanced_repeat_rle_from_runs(
+    runs: &[LengthRun],
+    length_count: usize,
+    no_17: bool,
+    no_18: bool,
+) -> Vec<RleToken> {
     // Each token spells at least one length.
-    let mut output = Vec::with_capacity(lengths.len());
-    let mut index = 0;
-    while index < lengths.len() {
-        let value = lengths[index];
-        let mut run = 1;
-        while index + run < lengths.len() && lengths[index + run] == value {
-            run += 1;
-        }
-        index += run;
-
+    let mut output = Vec::with_capacity(length_count);
+    for &(value, mut run) in runs {
         if value == 0 {
             while !no_18 && run >= 11 {
                 let count = run.min(138);
@@ -3984,21 +4002,23 @@ fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken
     output
 }
 
-/// Like `balanced_repeat_rle`, but four or more zeros left after the enabled
-/// codes 18 and 17 are spelled as one explicit zero followed by code 16, as
-/// deft4j allows.
+#[cfg(test)]
 fn columbo_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
-    // Each token spells at least one length.
-    let mut output = Vec::with_capacity(lengths.len());
-    let mut index = 0;
-    while index < lengths.len() {
-        let value = lengths[index];
-        let mut run = 1;
-        while index + run < lengths.len() && lengths[index + run] == value {
-            run += 1;
-        }
-        index += run;
+    columbo_zero_repeat_rle_from_runs(&length_runs(lengths), lengths.len(), no_17, no_18)
+}
 
+/// Like `balanced_repeat_rle_from_runs`, but four or more zeros left after the
+/// enabled codes 18 and 17 are spelled as one explicit zero followed by code
+/// 16, as deft4j allows.
+fn columbo_zero_repeat_rle_from_runs(
+    runs: &[LengthRun],
+    length_count: usize,
+    no_17: bool,
+    no_18: bool,
+) -> Vec<RleToken> {
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(length_count);
+    for &(value, mut run) in runs {
         if value == 0 {
             while !no_18 && run >= 11 {
                 let count = run.min(138);

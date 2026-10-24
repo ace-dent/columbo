@@ -65,6 +65,8 @@ struct Slot<'a> {
     overhead: u64,
     /// Whether a sweep moved the block since it was last planned.
     moved: bool,
+    /// Bumped whenever the block's tokens or code change.
+    generation: u32,
 }
 
 impl Slot<'_> {
@@ -93,6 +95,7 @@ impl Slot<'_> {
 
     /// Code the block from now on as `replanned` chose.
     fn adopt(&mut self, replanned: &PlannedBlock) -> Option<()> {
+        self.generation = self.generation.wrapping_add(1);
         self.code = match &replanned.representation {
             Representation::Stored => Code::Stored,
             Representation::Fixed => Code::Fixed,
@@ -123,14 +126,21 @@ fn price(token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool) -> Option<
     if !joining || matches!(token, Token::Literal(_)) {
         return own.map(|bits| (bits, false));
     }
-    let literals = bytes.iter().try_fold(0_u64, |bits, &byte| {
-        bits.checked_add(token_cost(Token::Literal(byte), trees.0, trees.1)?)
-    });
-    match (own, literals) {
-        (Some(own), Some(literals)) if literals < own => Some((literals, true)),
-        (Some(own), _) => Some((own, false)),
-        (None, literals) => literals.map(|bits| (bits, true)),
+    // Literal costs are never negative, so once their sum reaches the match's
+    // own cost the match is kept and the rest need not be priced.
+    let mut literals = 0_u64;
+    for &byte in bytes {
+        let Some(sum) = token_cost(Token::Literal(byte), trees.0, trees.1)
+            .and_then(|bits| literals.checked_add(bits))
+        else {
+            return own.map(|bits| (bits, false));
+        };
+        literals = sum;
+        if own.is_some_and(|own| literals >= own) {
+            return own.map(|bits| (bits, false));
+        }
     }
+    Some((literals, true))
 }
 
 struct Pair<'a> {
@@ -348,13 +358,17 @@ fn plan_slide(
             payload,
             overhead,
             moved: false,
+            generation: 0,
         });
     }
 
     // Another round helps only after a re-plan changes some trees.
     let mut plans = None;
+    let mut settled = Vec::new();
+    settled.try_reserve_exact(slots.len() - 1).ok()?;
+    settled.resize(slots.len() - 1, None);
     for _ in 0..max_rounds {
-        if !sweep(&mut slots, stop)? {
+        if !sweep(&mut slots, &mut settled, stop)? {
             break;
         }
         let (round, refitted) = assemble(blocks, &mut slots, options, refit, stop)?;
@@ -368,13 +382,25 @@ fn plan_slide(
 
 /// Sweep every boundary between two Huffman blocks until none moves, at most
 /// `MAX_SWEEPS` times. Returns whether any block moved.
-fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
+///
+/// A boundary's cheapest cut depends only on its two blocks' tokens and
+/// trees, so `settled[k]` keeps the generations of blocks `k` and `k + 1` when
+/// boundary `k` last found no cheaper cut, and an unchanged pair is skipped.
+fn sweep(
+    slots: &mut [Slot<'_>],
+    settled: &mut [Option<(u32, u32)>],
+    stop: &mut SearchStop<'_>,
+) -> Option<bool> {
     let mut changed = false;
     'sweeps: for _ in 0..MAX_SWEEPS {
         let mut moved = false;
         for k in 0..slots.len() - 1 {
             if stop.reached() {
                 break 'sweeps;
+            }
+            let generations = (slots[k].generation, slots[k + 1].generation);
+            if settled[k] == Some(generations) {
+                continue;
             }
             let (Some(left_trees), Some(right_trees)) =
                 (slots[k].code.trees(), slots[k + 1].code.trees())
@@ -390,6 +416,10 @@ fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
                 right_trees,
             };
             let Some((cut, left_bits, right_bits)) = cheaper_cut(&pair, stop) else {
+                // A stop can end the search early; only a complete one settles.
+                if !stop.reached() {
+                    settled[k] = Some(generations);
+                }
                 continue;
             };
             let (left_tokens, right_tokens) = pair.split(cut)?;
@@ -407,6 +437,7 @@ fn sweep(slots: &mut [Slot<'_>], stop: &mut SearchStop<'_>) -> Option<bool> {
                 slot.plain = Arc::new(plain);
                 slot.payload = payload;
                 slot.moved = true;
+                slot.generation = slot.generation.wrapping_add(1);
             }
             moved = true;
             changed = true;

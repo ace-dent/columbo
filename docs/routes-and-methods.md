@@ -794,6 +794,8 @@ fdAT deduplication), Columbo:
   replays replaced), or changed no-split topology with the terminal tree
   floors before discarding it, and a winning branch once, at the final stage;
 - prices bounded grouping ranges once before selecting the segmentation;
+- skips an R1c boundary while both its blocks are unchanged since its last
+  complete search found no cheaper cut;
 - merges per-block literal/length and distance histograms in fixed-size arrays
   when blocks join, and rebuilds a block histogram after plan adoption only
   when the token buffer changed.

@@ -2176,3 +2176,224 @@ fn shortest_rle_matches_the_reference_and_counts_its_symbols() {
         }
     }
 }
+
+/// The scanning spellers before they shared one run list.
+fn reference_greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
+    let mut index = 0;
+    while index < lengths.len() {
+        let value = lengths[index];
+        let mut run = 1;
+        while index + run < lengths.len() && lengths[index + run] == value {
+            run += 1;
+        }
+        index += run;
+
+        if value == 0 {
+            while !no_18 && run >= 11 {
+                let count = run.min(138);
+                output.push(RleToken {
+                    symbol: 18,
+                    extra: (count - 11) as u8,
+                });
+                run -= count;
+            }
+            while !no_17 && run >= 3 {
+                let count = run.min(10);
+                output.push(RleToken {
+                    symbol: 17,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        } else if !no_16 && run >= 4 {
+            output.push(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            run -= 1;
+            while run >= 3 {
+                let count = run.min(6);
+                output.push(RleToken {
+                    symbol: 16,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        }
+        output.extend(
+            std::iter::repeat(RleToken {
+                symbol: value,
+                extra: 0,
+            })
+            .take(run),
+        );
+    }
+    output
+}
+
+fn reference_balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
+    let mut index = 0;
+    while index < lengths.len() {
+        let value = lengths[index];
+        let mut run = 1;
+        while index + run < lengths.len() && lengths[index + run] == value {
+            run += 1;
+        }
+        index += run;
+
+        if value == 0 {
+            while !no_18 && run >= 11 {
+                let count = run.min(138);
+                output.push(RleToken {
+                    symbol: 18,
+                    extra: (count - 11) as u8,
+                });
+                run -= count;
+            }
+            while !no_17 && run >= 3 {
+                let count = run.min(10);
+                output.push(RleToken {
+                    symbol: 17,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        } else if run >= 4 {
+            output.push(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            run -= 1;
+            while run >= 3 {
+                let count = if matches!(run % 6, 1 | 2) && run >= 7 {
+                    4
+                } else {
+                    run.min(6)
+                };
+                output.push(RleToken {
+                    symbol: 16,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        }
+        output.extend(
+            std::iter::repeat(RleToken {
+                symbol: value,
+                extra: 0,
+            })
+            .take(run),
+        );
+    }
+    output
+}
+
+fn reference_columbo_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
+    // Each token spells at least one length.
+    let mut output = Vec::with_capacity(lengths.len());
+    let mut index = 0;
+    while index < lengths.len() {
+        let value = lengths[index];
+        let mut run = 1;
+        while index + run < lengths.len() && lengths[index + run] == value {
+            run += 1;
+        }
+        index += run;
+
+        if value == 0 {
+            while !no_18 && run >= 11 {
+                let count = run.min(138);
+                output.push(RleToken {
+                    symbol: 18,
+                    extra: (count - 11) as u8,
+                });
+                run -= count;
+            }
+            while !no_17 && run >= 3 {
+                let count = run.min(10);
+                output.push(RleToken {
+                    symbol: 17,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        }
+
+        if run >= 4 {
+            output.push(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            run -= 1;
+            while run >= 3 {
+                let count = if matches!(run % 6, 1 | 2) && run >= 7 {
+                    4
+                } else {
+                    run.min(6)
+                };
+                output.push(RleToken {
+                    symbol: 16,
+                    extra: (count - 3) as u8,
+                });
+                run -= count;
+            }
+        }
+        output.extend(
+            std::iter::repeat(RleToken {
+                symbol: value,
+                extra: 0,
+            })
+            .take(run),
+        );
+    }
+    output
+}
+
+#[test]
+fn run_list_spellings_match_the_scanning_spellers() {
+    let mut state = 0x3c6e_f372_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for case in 0..20_000 {
+        // Long zero runs and repeated values, so every repeat code appears.
+        let mut lengths = Vec::new();
+        while lengths.len() < 320 {
+            let value = if next() % 3 == 0 {
+                0
+            } else {
+                (next() % 15 + 1) as u8
+            };
+            let run = [1, 2, 3, 4, 7, 8, 11, 13, 40, 139, 150][(next() % 11) as usize];
+            lengths.extend(std::iter::repeat(value).take(run));
+        }
+        lengths.truncate((next() % 320) as usize);
+        let runs = length_runs(&lengths);
+        let count = lengths.len();
+        for mask in 0..8_u8 {
+            let (no_16, no_17, no_18) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
+            assert_eq!(
+                greedy_rle_from_runs(&runs, count, no_16, no_17, no_18),
+                reference_greedy_rle(&lengths, no_16, no_17, no_18),
+                "case {case} mask {mask}"
+            );
+            assert_eq!(
+                balanced_repeat_rle_from_runs(&runs, count, no_17, no_18),
+                reference_balanced_repeat_rle(&lengths, no_17, no_18),
+                "case {case} mask {mask}"
+            );
+            assert_eq!(
+                columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18),
+                reference_columbo_zero_repeat_rle(&lengths, no_17, no_18),
+                "case {case} mask {mask}"
+            );
+        }
+    }
+}

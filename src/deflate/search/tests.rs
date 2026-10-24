@@ -4,7 +4,8 @@
 use super::*;
 use crate::deflate::huffman::test_support::make_lengths_deflopt_heap;
 use crate::deflate::model::{
-    token_extra_bits, OriginalBits, SourceBlockType, LENGTH_BASE, LENGTH_EXTRA_BITS,
+    token_extra_bits, OriginalBits, SourceBlockType, DISTANCE_BASE, DISTANCE_EXTRA_BITS,
+    LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 
 /// Price the cumulative short-length bands (symbols 260, then 260..=261, up to
@@ -2120,4 +2121,187 @@ fn respell_from_literals_keeps_only_paying_matches_below_its_bound() {
         plan_respell_from_literals(&block, 0, &options, u64::MAX, &mut SearchStop::never())
             .is_none()
     );
+}
+
+/// Random tokens over `plain`, with code lengths that leave some symbols absent.
+fn random_literal_sum_case(
+    next: &mut impl FnMut() -> u32,
+) -> (Vec<Token>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let mut tokens = Vec::new();
+    let mut plain = Vec::new();
+    for _ in 0..(next() % 24 + 1) {
+        if next() % 3 == 0 {
+            let byte = (next() % 8) as u8;
+            tokens.push(Token::Literal(byte));
+            plain.push(byte);
+        } else {
+            let length = [3, 4, 9, 18, 67, 130, 258][(next() % 7) as usize];
+            let distance_symbol = (next() % 30) as u8;
+            let distance = DISTANCE_BASE[usize::from(distance_symbol)];
+            tokens.push(test_match(
+                length,
+                distance,
+                distance_symbol,
+                0,
+                DISTANCE_EXTRA_BITS[usize::from(distance_symbol)],
+            ));
+            plain.extend((0..length).map(|_| (next() % 8) as u8));
+        }
+    }
+    let lengths = |count: usize, next: &mut dyn FnMut() -> u32| -> Vec<u8> {
+        (0..count)
+            .map(|_| {
+                if next() % 5 == 0 {
+                    0
+                } else {
+                    (next() % 15 + 1) as u8
+                }
+            })
+            .collect()
+    };
+    let literal_lengths = lengths(286, next);
+    let distance_lengths = lengths(30, next);
+    (tokens, plain, literal_lengths, distance_lengths)
+}
+
+#[test]
+fn early_stopping_literal_sums_match_full_sums() {
+    let mut state = 0x6c07_8965_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for case in 0..20_000 {
+        let (tokens, plain, literal_lengths, distance_lengths) = random_literal_sum_case(&mut next);
+        let match_bits = |length_symbol: u16,
+                          distance_symbol: u8,
+                          length_extra_bits: u8,
+                          distance_extra_bits: u8| {
+            estimated_length(&literal_lengths, usize::from(length_symbol))
+                + u64::from(length_extra_bits)
+                + estimated_length(&distance_lengths, usize::from(distance_symbol))
+                + u64::from(distance_extra_bits)
+        };
+        let full_literal_bits = |decoded: &[u8]| -> u64 {
+            decoded
+                .iter()
+                .map(|&byte| estimated_length(&literal_lengths, usize::from(byte)))
+                .sum()
+        };
+        for include_equal in [false, true] {
+            let expected = expand_selected_matches_with_limits(
+                &tokens,
+                &plain,
+                MAX_TOKEN_CANDIDATE_BYTES,
+                usize::MAX,
+                |_, token, decoded| {
+                    let Token::Match {
+                        length_symbol,
+                        distance_symbol,
+                        length_extra_bits,
+                        distance_extra_bits,
+                        ..
+                    } = token
+                    else {
+                        return false;
+                    };
+                    let literal_bits = full_literal_bits(decoded);
+                    let match_bits = match_bits(
+                        length_symbol,
+                        distance_symbol,
+                        length_extra_bits,
+                        distance_extra_bits,
+                    );
+                    literal_bits < match_bits || (include_equal && literal_bits == match_bits)
+                },
+            );
+            let actual = expand_matches_with_token_limit(
+                &tokens,
+                &plain,
+                &literal_lengths,
+                &distance_lengths,
+                include_equal,
+                usize::MAX,
+            );
+            assert_eq!(
+                actual, expected,
+                "case {case} include_equal {include_equal}"
+            );
+        }
+
+        let mut offset = 0;
+        let mut expected_dearer = false;
+        for &token in &tokens {
+            if let Token::Match {
+                length,
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } = token
+            {
+                let decoded = &plain[offset..offset + usize::from(length)];
+                expected_dearer |= full_literal_bits(decoded)
+                    < match_bits(
+                        length_symbol,
+                        distance_symbol,
+                        length_extra_bits,
+                        distance_extra_bits,
+                    );
+            }
+            offset += token.decoded_len();
+        }
+        assert_eq!(
+            has_dearer_match(&tokens, &plain, &literal_lengths, &distance_lengths),
+            expected_dearer,
+            "case {case}"
+        );
+
+        let expected_defluff = expand_selected_matches(&tokens, &plain, |_, token, decoded| {
+            let Token::Match {
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } = token
+            else {
+                return false;
+            };
+            let match_literal_length = literal_lengths
+                .get(usize::from(length_symbol))
+                .copied()
+                .unwrap_or(0);
+            let match_distance_length = distance_lengths
+                .get(usize::from(distance_symbol))
+                .copied()
+                .unwrap_or(0);
+            if match_literal_length == 0 || match_distance_length == 0 {
+                return true;
+            }
+            if !decoded
+                .iter()
+                .all(|&byte| literal_lengths[usize::from(byte)] != 0)
+            {
+                return false;
+            }
+            let literal_bits: u64 = decoded
+                .iter()
+                .map(|&byte| u64::from(literal_lengths[usize::from(byte)]))
+                .sum();
+            literal_bits
+                < u64::from(match_literal_length)
+                    + u64::from(length_extra_bits)
+                    + u64::from(match_distance_length)
+                    + u64::from(distance_extra_bits)
+        });
+        assert_eq!(
+            expand_defluff_matches(&tokens, &plain, &literal_lengths, &distance_lengths),
+            expected_defluff,
+            "case {case}"
+        );
+    }
 }

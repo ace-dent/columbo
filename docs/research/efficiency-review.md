@@ -73,6 +73,7 @@ gains where established.
 | 23 Oct 2026 | [`c94eb07`](#c94eb07-23-october-2026) | Code-length trees and DeflOpt local rewrites (`header.rs`, `huffman.rs`) | A per-thread cache of code-length trees by builder and RLE histogram; one record of local-rewrite steps shared by the four heap variants; rewrites count their symbols as they are built; packed heap keys | Default CPU 1.25× (33 inputs); large APNG files 1.22–1.39×; a completing Max run 1.56×; peak memory +0.2 MiB median, +3.1 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs, 7 large PNG/APNG files and a completing Max run; 20,000 rewrite comparisons; 681 Rust, 13 Python tests |
 | 23 Oct 2026 | [`0141972`](#0141972-23-october-2026) | Max header planning (`header.rs`) | Shortest RLEs found once per header plan and tree, in stack buffers, with their symbol counts; the code-length tree cache grown to 16,384 slots | Captured Max header plans 1.14×; completing Max runs 1.30× and 1.11×; Default CPU 1.01× (33 inputs); peak memory +1.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 20,000 shortest-RLE comparisons; 666 Rust, 13 Python tests |
 | 23 Oct 2026 | [`d72c937`](#d72c937-23-october-2026) | Max header planning (`header.rs`, `huffman.rs`) | Code-length trees cached by RLE histogram, builders that must agree sharing one tree; repeat rewrites skipped when the RLE's symbol counts show nothing can change; one scan per shortest-RLE repeat window, in buffers kept for the header plan; RLE and tree buffers sized once; a branch-free Kraft sum; packed keys in Columbo's heaps | Captured Max header plans 1.26×; completing Max runs 1.29× and 1.12×; Default CPU 1.14× (33 inputs); peak memory −0.1 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 403,865 captured shortest-RLE calls; 20,000 rewrite and 768 heap-merge comparisons; 668 Rust, 7 Python tests |
+| 24 Oct 2026 | [`71ecf9f`](#71ecf9f-24-october-2026) | Default terminal and header work (`slide.rs`, `search.rs`, `header.rs`) | Slide boundaries skipped while both blocks are unchanged since their last search found no cheaper cut; literal-cost sums stopped once they decide the comparison with the match; code-length runs found once for every RLE seed | Default CPU 1.11× (33 inputs); completing Max runs 1.04× and 1.00× (3.4% and 1.1% fewer instructions); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 literal-sum, 20,000 joining-price and 20,000 run-list comparisons; 672 Rust, 7 Python tests |
 
 ## Entries
 
@@ -469,6 +470,115 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `71ecf9f`, 24 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the 33 stratified Default inputs, once per build in alternating order, in
+three comparisons; two alternating runs of each completing Max run and of the
+header-plan replay.
+
+A sampled Default profile of the 33 inputs (72,407 CPU samples) put 25% under
+code-length trees: 15% in the DeflOpt and order-key heap builders' sift-down
+and 9% in the rest of those builders. The code-length tree cache answered 51%
+of 75.3 million requests, and each heap variant was built about 4 million
+times, once per histogram the cache did not hold. Below those, three self
+costs repeated work whose outcome was already known: the fixed-tree boundary
+slide (R1c) at 5.8%, match-to-literal expansion at 5.5% and the greedy
+code-length RLE at 4.2%.
+
+- **Settled slide boundaries.** A boundary's cheapest cut depends only on its
+  two blocks' tokens and trees, yet every sweep and round searched every
+  boundary again. Each block now carries a generation that a move or a
+  re-plan bumps, and a boundary whose search found no cheaper cut records both
+  blocks' generations; it is skipped until either changes. A search the stop
+  cuts short records nothing. Counted in a test build, 59% of the slide's
+  27,374 searches on the 33 inputs repeated a pair, with the same tokens and
+  trees, that the same slide had already searched; on the Partnership card,
+  which made 22,002 of them, 64%.
+- **Literal sums that stop.** Match-to-literal expansion, the token replay's
+  dearer-match check and Defluff's expansion compare a match's cost with the
+  sum of its bytes' literal costs, and summed every byte first. Every literal
+  costs at least one bit, so the sum now stops as soon as it decides the
+  comparison: once it exceeds the match's cost, or reaches it where a tie
+  keeps the match. A 258-byte match costing 20 bits reads at most 21 of its
+  bytes. The slide prices a joining match, the cheaper of its own spelling and
+  its literals, the same way. The length-family deltas and ranked trials,
+  which need exact totals, still sum every byte.
+- **Code-length runs found once.** Header plans spell their code lengths as
+  RLE seeds under up to eight masks of codes 16, 17 and 18: greedily, and in
+  balanced and zero-repeat forms where the runs allow. Each spelling, and the
+  check for those forms, scanned the lengths for runs of equal values. The
+  runs are now found once per plan and every spelling reads that list, its
+  loop otherwise unchanged. This differs from the per-value run tables
+  rejected at [`d72c937`](#d72c937-23-october-2026), which changed how each
+  run is spelled.
+
+| Candidate | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| Settled slide boundaries | 84.2 s | 81.8 s | 1.03× | 0.0 / +0.8 MiB |
+| Plus literal sums that stop | 87.1 s | 80.5 s | 1.08× | −0.2 / +2.0 MiB |
+| Plus code-length runs found once (retained) | 84.9 s | 76.8 s | 1.11× | +0.1 / +3.0 MiB |
+
+In the same comparisons, the settled boundaries alone took 85.2 seconds and
+the stopping sums without the run list 78.5. Median peak memory was 39.4 MiB
+before and 39.1–39.3 MiB with each candidate; the largest increases are within
+run-to-run spread, since the settled marks take 12 bytes per boundary and the
+run list is freed once a plan's seeds are spelled. A second profile, with the
+first two changes, put the slide at 2.9% of samples and match expansion at
+2.9%.
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed | 4.88 s | 4.79 s | 1.02× |
+| `036-Clefable-0.png`, Max completing its search | 2.84 s | 2.72 s | 1.04× |
+| `114-Tangela-1.png`, Max completing its search | 0.27 s | 0.27 s | 1.00× |
+
+The Clefable run retired 61.5 instead of 63.7 billion instructions and the
+Tangela run 3.43 instead of 3.46 billion. Max header plans spend most of their
+time in the shortest RLE and code-length trees, so the replay changed little.
+
+Equivalence: new tests compare the stopping sums with full sums for all three
+expansion checks on 20,000 random token lists and code lengths, including
+missing codes; the slide's joining price with the previous one on 20,000
+random cases; and the run-list spellings with the previous scanning spellers
+on 20,000 random code-length lists under all eight masks. The 89,255 replayed
+header plans matched plan for plan. API comparisons on the 52 inputs, in
+Default with the 180-second budget and in zero-budget Max, matched in all 104
+runs, and every CLI timing run and both completing Max runs matched byte for
+byte. Rust tests, including the private corpus, passed in release and debug
+modes, with documentation and Python tests, a locked build, formatting,
+all-feature Clippy with warnings denied and a package list without private
+fixtures or scratch artifacts. `__text` grew from 844,288 to 845,520 bytes and
+the shipped executable from 925,616 to 925,632; the final source builds the
+tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Building the seven distinct DeflOpt and order-key heap variants together,
+  sharing their steps until their tie rules diverge: on 13,858 code-length
+  histograms the variants first diverged at step 1.1 of 11.4 on average,
+  leaving 51% of the separate work. A prototype took 0.157 against 0.175–0.200
+  seconds on 55,432 code-length histograms (1.11–1.27×), a few percent of
+  Default CPU at most, and 0.53 against 0.36 seconds on 4,000 payload
+  histograms (0.68×).
+- Floyd's bottom-up sift-down, which descends by the smaller child to a leaf
+  and sifts back up: 0.203 instead of 0.175 seconds on the same histograms,
+  and not exact. The heap is built in frequency order alone and the height
+  and order keys break ties only as nodes are taken, so the heap need not be
+  ordered by the full key a bottom-up descent assumes; the trees changed.
+- Passing the block-plan key's extra-bit total to the dynamic planner, which
+  sums it again on a store miss: about 0.75% of Default CPU, for a parameter
+  threaded through the planner's callers.
+- A larger code-length tree cache: 16,384 and 65,536 histogram entries would
+  have cut its misses by 1.8% and 4.7%, for about 4 and 20 MiB more per
+  thread.
+
+Not tried: reusing a cut search across slide calls. Another 20% of searches
+repeated a pair from an earlier slide, but the key would hash both blocks'
+tokens and trees.
+
+Artifacts: `work/efficiency-review-default-20261024/`.
 
 ### `d72c937`, 23 October 2026
 
