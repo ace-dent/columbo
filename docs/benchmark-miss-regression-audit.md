@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 24 October 2026 entry is the current state. Entries from 30 September keep
+The two 24 October 2026 entries are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,98 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="source-max-replaced-parents-24-october"></a>
+
+## Source-max replaced parents on 24 October 2026
+
+### Starting state
+
+At `f12cf8b` the hundred-file guard passes 91 of 100 floors. Seven failures
+keep their recorded causes: `crossroads.png` (+5 bytes),
+`074-Geodude-1.png` (+6 bits), Psyduck, Squirtle and Pikachu (1 bit each),
+Poliwrath (2 bits) and `test-conversion-truecoloralpha-grayscalealpha.png`
+(+2 bytes); `041-Zubat-0.png` is now 1 bit above its floor instead of 3. The
+ninth, `pkmn-col/107-Hitmonchan-2.png` (+1 byte), joined the guard in the
+refresh below. The reference misses are unchanged: DeflOpt's four
+strict-policy floors and none against Defluff.
+
+### A complete search ending above a cut one
+
+Hitmonchan's Max search completes, in about 6 seconds with `f12cf8b`, and ends
+at 447 bytes (1,584 bits) at every allowance. Its 446-byte floor (1,574 bits)
+came from `0d87ee8` cut at 10 seconds; given 20 or 40 seconds, `0d87ee8` also
+completes, in about 16 seconds, and ends at 447. A longer search ending above
+a shorter one breaks Max's first principle, that more time never costs
+savings.
+
+The deadline cut original-source Max (M12) at its first complete parent,
+126 tokens and 1,588 bits. Closed as a losing topology, that parent reaches
+1,574 bits through the compact payload-tree floor and its balanced closure.
+Given time, the route's first replay replaces it with a 127-token parent of
+1,587 bits, from which the same floors find nothing (1,584 bits). Capping the
+route at no replays restores 1,574 bits. `074-Geodude-1.png` is the case
+recorded on [17 October](#guard-17-october): the replay takes the route from
+1,854 to 1,852 bits, and the replaced parent finishes at 1,842 bits instead of
+1,848. `041-Zubat-0.png` is a third: without replays the current build ends at
+1,730 bits instead of 1,734.
+
+### Accepted change
+
+M12 keeps each complete parent its replays replace (moving the bytes, not
+copying them) and, after its final candidate, closes each one the same way:
+the compact balanced-tree cleanup (M4), then the terminal tree floors, kept
+only if strictly smaller. Each close starts only while routes may start (G0),
+so a run already at its deadline does no extra work. Any of those parents is
+what a deadline would have handed over, so a longer search can no longer end
+above a shorter one at a replay boundary. Ties keep the route's final
+candidate, so outputs change only where a replaced parent finishes strictly
+smaller, and such a parent is a new encoding, so it also clears the
+source-max fixed-point claim that would let M13 skip it. The gate is the
+mechanism, not a size: unbounded replays let a deadline choose the parent. The
+floor-seeded Max refinement, M11 and M13 also replay to a fixed point, but no
+guard floor or sample pointed at them, so they are unchanged. See
+[routes and methods](routes-and-methods.md).
+
+### Evidence
+
+| Cohort | Result |
+| --- | --- |
+| Every third DeflOpt PNG whose Max run completes (176 files at their allowances, builds run side by side) | Byte-identical; CPU 1,805.5 → 1,805.0 s |
+| Every second hard Pokémon sprite that completes in the timed deft4j corpus (177) | Byte-identical; CPU 956.8 → 956.6 s |
+| Every sixteenth DeflOpt PNG, Max at 10 seconds, alternating serial builds (58, most deadline-bound) | Byte-identical; CPU 836.3 → 836.0 s |
+| Hundred-file guard, serial at recorded allowances | 94 of 100 floors pass (91 before): Hitmonchan, Geodude and Zubat now pass; the six failures keep their recorded causes |
+
+Hitmonchan (446 bytes, 1,574 bits), Geodude (1,842 bits) and Zubat
+(1,730 bits) now meet or beat their floors at 10 and 40 seconds. Hitmonchan
+takes 1.3 seconds longer because the rewritten-seed refinement (M13) starts
+from the better parent; the closes themselves take about 25 ms. A probe that
+capped M12 at no replays was byte-identical on the first two cohorts, so a
+replaced parent rarely finishes better; where one does, it is now kept. API
+comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs, and two completing Max runs
+(`036-Clefable-0.png`, `114-Tangela-1.png`) matched byte for byte with
+unchanged instructions retired. A new test checks that the route keeps each
+replaced parent, valid and in order. `__text` grew from 841,128 to
+844,288 bytes, after keeping the bounded phase out of line (inlined, it
+pushed the scheduler out of its caller for 7,868 bytes); the shipped
+executable keeps its 925,616 bytes.
+
+### Not changed
+
+- `crossroads.png`: no replay-boundary parent reaches its 2,123-byte floor.
+  Capped at zero, one or two replays and given 120 seconds, every run ends at
+  2,128 bytes. The floor came from a deadline that cut the route mid-search, a
+  state no complete search passes through, so it stays recorded.
+- The other 18 DeflOpt Max rows that grew in the refresh below use their whole
+  allowance (about 11.5 seconds for 10) and are the deadline cuts recorded
+  there.
+- Psyduck, Squirtle, Pikachu, Poliwrath and
+  `test-conversion-truecoloralpha-grayscalealpha.png` keep their recorded
+  causes; refining both early-lineage parents was rejected on
+  [9 October](#guard-9-october).
+
+Artifacts: `work/source-max-replaced-parents/`.
 
 ## DeflOpt and Defluff refresh on 24 October 2026
 

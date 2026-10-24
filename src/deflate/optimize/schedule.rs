@@ -636,6 +636,9 @@ fn build_guaranteed_floor(
     Ok(floor)
 }
 
+// Out of line: inlined, it keeps `select_candidate` from inlining into its
+// one caller, which costs several KiB of code.
+#[inline(never)]
 fn run_bounded_phase(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -1765,7 +1768,6 @@ fn merge_source_max(
         deadline,
         progress,
     } = *context;
-    let (decoded_limit, identity) = (source.decoded_limit, source.identity);
     let source_max = if let Some(max_candidate) = state.source_max.take() {
         Some(max_candidate)
     } else {
@@ -1786,6 +1788,7 @@ fn merge_source_max(
     let Some(mut max_candidate) = source_max else {
         return Ok((None, false));
     };
+    let replaced_parents = std::mem::take(&mut max_candidate.replaced_parents);
     // M10d: save a compact parent to split after the timed routes, so the
     // split cannot take their time.
     let mut deferred_split_parent = None;
@@ -1802,8 +1805,42 @@ fn merge_source_max(
         deferred_split_parent = Some(parent);
     }
 
-    // M4: a smaller proven-feedback endpoint can hide the balanced-tree win
-    // reachable from source max, so run that cleanup before comparing.
+    let max_candidate = close_source_max_topology(context, eligibility, candidate, max_candidate)?;
+    let mut stabilized = candidate.is_encoding_stabilized_by(&max_candidate);
+    candidate.replace_if_smaller(max_candidate);
+
+    // A deadline can stop source max after any replay and hand over that
+    // parent, and a better parent can finish worse. Closing each parent the
+    // replays replaced keeps a longer search from ending above a shorter one.
+    // A winning parent is a new encoding, which no Max fixed point covers.
+    for parent in replaced_parents {
+        if !deadline.can_start_route() {
+            break;
+        }
+        let parent = close_source_max_topology(context, eligibility, candidate, parent)?;
+        if candidate.replace_if_smaller(parent) {
+            stabilized = false;
+        }
+    }
+    Ok((deferred_split_parent, stabilized))
+}
+
+/// Close one source-max candidate against the incumbent, after the compact
+/// balanced-tree cleanup (M4): a smaller proven-feedback endpoint can hide the
+/// balanced-tree win reachable from source max.
+fn close_source_max_topology(
+    context: &RouteContext<'_>,
+    eligibility: &RouteEligibility,
+    incumbent: &Candidate,
+    mut max_candidate: Candidate,
+) -> Result<Candidate> {
+    let RouteContext {
+        source,
+        options,
+        progress,
+        ..
+    } = *context;
+    let (decoded_limit, identity) = (source.decoded_limit, source.identity);
     if eligibility.compact_tree {
         let tree_step = progress.start("Columbo source-max balanced-tree floor");
         let mut tree = refine_with_compact_balanced_tree_floor(
@@ -1824,10 +1861,7 @@ fn merge_source_max(
             max_candidate.replace_if_smaller(tree);
         }
     }
-    let max_candidate = close_losing_topology(context, candidate, max_candidate)?;
-    let stabilized = candidate.is_encoding_stabilized_by(&max_candidate);
-    candidate.replace_if_smaller(max_candidate);
-    Ok((deferred_split_parent, stabilized))
+    close_losing_topology(context, incumbent, max_candidate)
 }
 
 /// Run one Max pass from the selected rewritten seed (M13), whose match choices

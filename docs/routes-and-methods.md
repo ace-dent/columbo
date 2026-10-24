@@ -558,7 +558,7 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | M10c · compact split cleanup | Prepared parent ≤16 KiB compressed; reparses to 2–4 blocks, none empty or stored; ≤128 KiB decoded; ≤16 Ki tokens; ≥1 block with ≥16 tokens and ≥128 decoded bytes. A later refined parent: distinct, and beats every early parent or passes G0. | Runs the compact split floor ([Boundary polishing](#boundary-polishing-inside-proven-matches)) on normal, floor-seeded, direct-deft, and refined-deft parents; each stage forwards a complete candidate. The bounded phase records its completed parent and any same-token, same-block endpoint as fixed points, so follow-up skips them; structurally changed descendants stay eligible. |
 | M10d · deferred source-max split | Max; `Complete` or `CompleteThenBounded`; distinct completed source-max parent ≤16 KiB compressed; reparses to 1–4 blocks, none empty or stored; ≤256 KiB decoded; ≤16 Ki tokens; ≥1 block with ≥16 tokens and ≥128 decoded bytes. | Keeps the compact parent during timed routes, then runs M10c's coarse-to-fine planner or bounded rescue (a one-block parent gains its second block). Not under `Shared`, `SharedExact`, `ApngMax`, or `Established`, whose time is reserved for later streams. |
 | M11 · fragmented collection | Max; optional routes not suppressed; G0; ≥64 source blocks; encoded source 16,000–100,000 bytes; no stored block. Collection: ≤4,096 tokens and ≤512 KiB decoded per run; yields fewer source blocks and 2–8 collected blocks. | Replays the fragmented seed until a metric fixed point or the deadline; the replay accepts 1–12 non-stored blocks. |
-| M12 · later source max | Max; reuse a completed earlier source-max candidate; skip if policy suppressed it; else start only while G0 allows. | Runs original-source Max before a rewritten seed, never repeating an initial source-max route. |
+| M12 · later source max | Max; reuse a completed earlier source-max candidate; skip if policy suppressed it; else start only while G0 allows. Each replaced parent: G0. | Runs original-source Max before a rewritten seed, never repeating an initial source-max route. The route keeps each complete parent its replays replaced; after its final candidate, each is closed the same way (M4, then the terminal tree floors) and kept only if strictly smaller. A deadline can hand over any of those parents, and a better parent can finish worse, so this keeps a longer search from ending above a shorter one ([evidence](benchmark-miss-regression-audit.md#source-max-replaced-parents-24-october)). |
 | M13 · rewritten-seed refinement | Max; selected candidate allowed (strict mode, or beats the source); no exact unexpired Max-planner fixed point; optional routes not suppressed; G0. | Reparses and runs the Max planner from the selected rewrite. |
 
 Replay limits: ordinary Default and compact-feedback lineages ≤3 replays;
@@ -790,9 +790,9 @@ fdAT deduplication), Columbo:
   completed bounded floor once for its grouping and Max descendants;
 - keeps the validated parse of a terminal method's accepted candidate for the
   next terminal method, which would otherwise parse the same bytes again;
-- closes a losing floor-seeded, deft4j, source-max, or changed no-split
-  topology with the terminal tree floors before discarding it, and a winning
-  branch once, at the final stage;
+- closes a losing floor-seeded, deft4j, source-max (and each parent its
+  replays replaced), or changed no-split topology with the terminal tree
+  floors before discarding it, and a winning branch once, at the final stage;
 - prices bounded grouping ranges once before selecting the segmentation;
 - merges per-block literal/length and distance histograms in fixed-size arrays
   when blocks join, and rebuilds a block histogram after plan adoption only

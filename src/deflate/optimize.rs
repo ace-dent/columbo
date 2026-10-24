@@ -574,6 +574,9 @@ struct Candidate {
     /// point before its stop. This describes the bytes, not the route that
     /// emitted them.
     max_planner_is_stable: bool,
+    /// Complete parents this candidate's own replays replaced, oldest first.
+    /// Only original-source Max keeps them, for its caller to close.
+    replaced_parents: Vec<Candidate>,
 }
 
 #[derive(Default)]
@@ -658,6 +661,7 @@ fn build_source_max_candidate(
             options,
             MAX_RAW_REPLAY_LIMIT,
             integrated_compact_proven,
+            true,
             expired,
         )?;
         return Ok(if candidate.route == "Original source" {
@@ -1557,6 +1561,7 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
         block_report: None,
         route: "Normal floor",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     })
 }
 
@@ -2605,8 +2610,16 @@ fn refine_with_terminal_header_search_cached(
     };
     let source = rewritten_input(candidate, &selected, decoded_limit, identity);
     // Zero replays keeps exactly the proposed tokens and tables.
-    let (refined, parsed) =
-        build_candidate_and_parse(source, plans, options, 0, ReplayPlanner::Full, stop, None)?;
+    let (refined, parsed) = build_candidate_and_parse(
+        source,
+        plans,
+        options,
+        0,
+        ReplayPlanner::Full,
+        stop,
+        None,
+        false,
+    )?;
     if !refined.is_strictly_smaller_than(candidate) {
         return Ok(None);
     }
@@ -3079,6 +3092,7 @@ fn continue_bounded_floor_lineage(
             rewritten,
             options,
             MAX_RAW_REPLAY_LIMIT,
+            false,
             false,
             &mut route_window.stop(),
         )?
@@ -4313,6 +4327,7 @@ fn build_candidate_from_established_floor(
     options: &Options,
     replay_limit: usize,
     integrated_compact_proven: bool,
+    keep_replaced_parents: bool,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
     let Some(plans) = plan_stream_from_established_floor(
@@ -4324,13 +4339,15 @@ fn build_candidate_from_established_floor(
     ) else {
         return source_candidate(source, options);
     };
-    build_candidate_from_plans(
+    build_candidate_from_plans_with_progress(
         source,
         plans,
         options,
         replay_limit,
         ReplayPlanner::Full,
         expired,
+        None,
+        keep_replaced_parents,
     )
 }
 
@@ -4363,6 +4380,7 @@ fn build_candidate_with_progress(
         ReplayPlanner::Full,
         expired,
         Some(progress),
+        true,
     )
 }
 
@@ -4403,6 +4421,7 @@ fn build_candidate_from_plans(
         replay_planner,
         expired,
         None,
+        false,
     )
 }
 
@@ -4417,6 +4436,7 @@ fn build_candidate_from_plans_with_progress(
     replay_planner: ReplayPlanner,
     expired: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
+    keep_replaced_parents: bool,
 ) -> Result<Candidate> {
     build_candidate_and_parse(
         source,
@@ -4426,12 +4446,14 @@ fn build_candidate_from_plans_with_progress(
         replay_planner,
         expired,
         progress,
+        keep_replaced_parents,
     )
     .map(|(candidate, _)| candidate)
 }
 
 /// [`build_candidate_from_plans_with_progress`], also returning the validated
-/// parse of the candidate's bytes when one was made.
+/// parse of the candidate's bytes when one was made. `keep_replaced_parents`
+/// keeps each complete parent an accepted replay replaces.
 #[allow(clippy::too_many_arguments)]
 fn build_candidate_and_parse(
     source: CandidateInput<'_>,
@@ -4441,6 +4463,7 @@ fn build_candidate_and_parse(
     replay_planner: ReplayPlanner,
     expired: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
+    keep_replaced_parents: bool,
 ) -> Result<(Candidate, Option<ParsedStream>)> {
     let (mut data, mut bits) = emit_plans(source.compressed, &plans, options.strict)?;
     let replay_limit = resolved_replay_limit(replay_limit, data.len());
@@ -4455,6 +4478,7 @@ fn build_candidate_and_parse(
     let mut validated = None;
     let mut output_max_distance = None;
     let mut max_planner_is_stable = false;
+    let mut replaced_parents = Vec::new();
     for round in 1..=replay_limit {
         if initial_loses && !options.strict {
             if let Some(progress) = progress {
@@ -4558,7 +4582,19 @@ fn build_candidate_and_parse(
                 true,
             );
         }
-        data = replay_data;
+        let parent = std::mem::replace(&mut data, replay_data);
+        if keep_replaced_parents {
+            replaced_parents.push(Candidate {
+                data: parent,
+                bits,
+                output_max_distance,
+                plans: Vec::new(),
+                block_report: None,
+                route: "Columbo source-max earlier parent",
+                max_planner_is_stable: false,
+                replaced_parents: Vec::new(),
+            });
+        }
         bits = replay_bits;
         plans = replay_plans;
         output_max_distance = None;
@@ -4585,6 +4621,7 @@ fn build_candidate_and_parse(
             "Normal route"
         },
         max_planner_is_stable,
+        replaced_parents,
     };
     Ok((candidate, validated))
 }
@@ -4608,6 +4645,7 @@ fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Can
         block_report: None,
         route: "Original source",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     })
 }
 

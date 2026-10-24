@@ -196,6 +196,7 @@ fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
                 block_report: None,
                 route: "test parent",
                 max_planner_is_stable: false,
+                replaced_parents: Vec::new(),
             };
             for strict in [false, true] {
                 let options = Options {
@@ -298,6 +299,7 @@ fn boundary_slide_runs_as_a_terminal_method_in_both_modes() {
         block_report: None,
         route: "test parent",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     for exhaustive in [false, true] {
         let options = Options {
@@ -457,6 +459,7 @@ fn max_terminal_headers_reach_small_blocks_inside_larger_streams() {
                 block_report: None,
                 route: "generated large terminal parent",
                 max_planner_is_stable: false,
+                replaced_parents: Vec::new(),
             };
             for exhaustive in [false, true] {
                 let options = Options {
@@ -553,6 +556,7 @@ fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
         block_report: None,
         route: "completed Max parent",
         max_planner_is_stable: true,
+        replaced_parents: Vec::new(),
     };
     assert_eq!(parent.bits, 1600);
     let mut cache = TerminalParseCache::default();
@@ -636,6 +640,7 @@ fn payload_tradeoff_leaves_discarded_empty_blocks_to_other_routes() {
         block_report: None,
         route: "empty-block parent",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     assert!(refine_with_terminal_header_search(
         TerminalHeaderSearch::PayloadTradeoff,
@@ -695,6 +700,7 @@ fn original_match_restoration_improves_a_completed_max_fixed_point() {
         block_report: None,
         route: "test Max endpoint",
         max_planner_is_stable: true,
+        replaced_parents: Vec::new(),
     };
     assert_eq!(parent.bits, 1740);
     let mut writer = BitWriter::default();
@@ -802,6 +808,7 @@ fn comparison_candidate(bytes: usize, bits: u64, marker: u8) -> Candidate {
         block_report: None,
         route: "test",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     }
 }
 
@@ -894,6 +901,7 @@ fn smoothed_tree_floor_rebuilds_multiple_huffman_blocks_exactly() {
         block_report: None,
         route: "test",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
 
     let refined =
@@ -925,6 +933,7 @@ fn smoothed_tree_floor_rebuilds_multiple_huffman_blocks_exactly() {
         block_report: None,
         route: "test",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     let (covered, compact) =
         refine_with_compact_payload_tree_floor(&candidate, &Options::default(), 1 << 20, identity)
@@ -1018,6 +1027,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
         block_report: None,
         route: "test",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     let (covered, compact) =
         refine_with_compact_payload_tree_floor(&parent, &Options::default(), 1 << 20, identity)
@@ -1178,6 +1188,7 @@ fn terminal_merges_follow_the_settled_finish() {
         block_report: None,
         route: "test",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     let merged_blocks = |candidate: &Candidate| {
         let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
@@ -2002,6 +2013,73 @@ fn default_source_topology_uses_the_no_split_class_above_a_decoded_floor() {
     let mut stored = blocks;
     stored[0].source_type = SourceBlockType::Stored;
     assert!(!default_source_topology_eligible(&stored, 1, floor));
+}
+
+#[test]
+fn source_max_replays_keep_each_replaced_parent() {
+    // Seeded with the source's own tokens under fixed codes, the first Max
+    // replay finds dynamic codes, so it is accepted and the seed becomes the
+    // oldest replaced parent. Strict output replays even a losing seed.
+    let parsed = parse_stream(FEEDBACK_RAW, 86).unwrap();
+    let source = CandidateInput {
+        compressed: FEEDBACK_RAW,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 86,
+        identity: StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        },
+    };
+    let fixed_seed = || {
+        parsed
+            .blocks
+            .iter()
+            .map(|block| PlannedBlock {
+                tokens: block.tokens.clone(),
+                plain: block.plain.clone(),
+                representation: Representation::Fixed,
+                bits: crate::deflate::block::fixed_block_bits(&block.tokens).unwrap(),
+                source_type: block.source_type,
+            })
+            .collect::<Vec<_>>()
+    };
+    let options = Options {
+        strict: true,
+        exhaustive: true,
+        ..Options::default()
+    };
+    for keep in [false, true] {
+        let (candidate, _) = build_candidate_and_parse(
+            source,
+            fixed_seed(),
+            &options,
+            MAX_RAW_REPLAY_LIMIT,
+            ReplayPlanner::Full,
+            &mut SearchStop::never(),
+            None,
+            keep,
+        )
+        .unwrap();
+        if !keep {
+            assert!(candidate.replaced_parents.is_empty());
+            continue;
+        }
+        let parents = &candidate.replaced_parents;
+        let (seed_data, seed_bits) = emit_plans(FEEDBACK_RAW, &fixed_seed(), true).unwrap();
+        assert_eq!(parents[0].data, seed_data);
+        assert_eq!(parents[0].bits, seed_bits);
+        for pair in parents.windows(2) {
+            assert!(pair[1].is_strictly_smaller_than(&pair[0]));
+        }
+        assert!(candidate.is_strictly_smaller_than(parents.last().unwrap()));
+        for parent in parents {
+            let reparsed = parse_validated_rewrite(&parent.data, 86, source.identity).unwrap();
+            assert_eq!(parent.bits, reparsed.meaningful_bits);
+            assert_eq!(parent.output_max_distance, Some(reparsed.max_distance));
+        }
+    }
 }
 
 #[test]
@@ -3307,6 +3385,7 @@ fn alphabet_boundaries_preserve_history_and_reprice_later_stored_padding() {
             block_report: None,
             route: "test parent",
             max_planner_is_stable: false,
+            replaced_parents: Vec::new(),
         };
         for strict in [false, true] {
             let result = refine_with_terminal_header_search(
@@ -3427,6 +3506,7 @@ fn header_tree_search_preserves_payload_and_stored_alignment() {
             block_report: None,
             route: "test parent",
             max_planner_is_stable: false,
+            replaced_parents: Vec::new(),
         };
         for strict in [false, true] {
             let result = refine_with_terminal_header_search(
@@ -3565,6 +3645,7 @@ fn code_length_rotations_preserve_tokens_and_stored_alignment() {
             block_report: None,
             route: "test parent",
             max_planner_is_stable: false,
+            replaced_parents: Vec::new(),
         };
         for strict in [false, true] {
             let result = refine_with_terminal_header_search(
@@ -3715,6 +3796,7 @@ fn coupled_swaps_preserve_tokens_histograms_and_stored_alignment() {
             block_report: None,
             route: "test parent",
             max_planner_is_stable: false,
+            replaced_parents: Vec::new(),
         };
         for strict in [false, true] {
             let result = refine_with_terminal_header_search(
@@ -3825,6 +3907,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         block_report: None,
         route: "generated terminal parent",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     let options = Options {
         exhaustive: true,
@@ -3950,6 +4033,7 @@ fn default_sweep_finishes_with_the_distance_ladder() {
         block_report: None,
         route: "generated distance-ladder parent",
         max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
     };
     let options = Options::default();
     let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
@@ -4059,6 +4143,7 @@ fn tree_response_searches_keep_history_and_stored_alignment_at_every_bit_offset(
                 block_report: None,
                 route: "response alignment parent",
                 max_planner_is_stable: false,
+                replaced_parents: Vec::new(),
             };
             for strict in [false, true] {
                 let result = refine_with_terminal_header_search(
