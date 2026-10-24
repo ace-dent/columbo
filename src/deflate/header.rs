@@ -14,7 +14,7 @@ use super::huffman::{
     make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into,
     make_lengths_order_heap_into_with_scratch, make_lengths_zopfli_package_from,
-    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, DefloptHeapScratch,
+    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, TreeBuildScratch,
     FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
@@ -447,7 +447,7 @@ impl CodeLengthBuilder {
     fn build(
         self,
         frequencies: &[u32; 19],
-        heap_scratch: &mut DefloptHeapScratch,
+        heap_scratch: &mut TreeBuildScratch,
     ) -> ([u8; 19], bool) {
         let mut lengths = [0_u8; 19];
         let mut unlimited = false;
@@ -467,14 +467,20 @@ impl CodeLengthBuilder {
                 heap_scratch,
             ),
             Self::Deft4jJavaHeap => {
-                make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7)
+                make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7, heap_scratch)
             }
             Self::DefluffLimited => {
-                unlimited =
-                    !make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, 7, 0);
+                unlimited = !make_lengths_columbo_defluff_limited_into(
+                    frequencies,
+                    &mut lengths,
+                    7,
+                    0,
+                    heap_scratch,
+                );
             }
             Self::Columbo(variant) => {
-                let repaired = make_lengths_into(frequencies, &mut lengths, 7, variant);
+                let repaired =
+                    make_lengths_into(frequencies, &mut lengths, 7, variant, heap_scratch);
                 unlimited = variant == 0 && !repaired;
             }
             Self::DefluffExact => make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0),
@@ -528,7 +534,7 @@ fn code_length_tree_slot(frequencies: &[u32; 19]) -> usize {
 fn code_length_tree(
     builder: CodeLengthBuilder,
     frequencies: &[u32; 19],
-    heap_scratch: &mut DefloptHeapScratch,
+    heap_scratch: &mut TreeBuildScratch,
 ) -> [u8; 19] {
     let Some(index) = builder.index() else {
         return builder.build(frequencies, heap_scratch).0;
@@ -766,18 +772,21 @@ pub(crate) fn score_existing_dynamic(
     Some(plan)
 }
 
+/// `extra_bits` is the [`token_extra_bits`] total of `tokens`, which the
+/// caller has usually summed already.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn best_dynamic_plan_cached(
     tokens: &[Token],
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
+    extra_bits: u64,
     original: Option<&DynamicPlan>,
     strict: bool,
     exhaustive: bool,
     stop: &mut SearchStop<'_>,
     header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
-    let extra_bits = token_extra_bits(tokens);
+    debug_assert_eq!(extra_bits, token_extra_bits(tokens));
     let source_exact = original.and_then(|plan| score_existing_dynamic(tokens, plan, strict));
     let source_is_compatible = source_exact.is_some();
     let mut best = source_exact;
@@ -1439,7 +1448,7 @@ const FREQUENCY_ONLY_HEAP_VARIANT: u32 = 3;
 
 fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<Vec<u8>> {
     let mut candidates = Vec::with_capacity(if exhaustive { 16 } else { 8 });
-    let mut heap_scratch = DefloptHeapScratch::default();
+    let mut heap_scratch = TreeBuildScratch::default();
     // Family order matters: of two equal complete plans, the earlier wins.
     // Without `exhaustive`, only the DeflOpt and order-key heaps run (at most
     // 64 pairs).
@@ -1997,7 +2006,7 @@ pub(crate) fn estimate_boundary_block_bits(
 
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
-    let mut heap_scratch = DefloptHeapScratch::default();
+    let mut heap_scratch = TreeBuildScratch::default();
     make_lengths_deflopt_heap_into_with_scratch(
         &build_literal_frequencies,
         &mut literal_lengths,
@@ -2042,7 +2051,7 @@ fn greedy_dynamic_header_bits(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     data_bits: u64,
-    heap_scratch: &mut DefloptHeapScratch,
+    heap_scratch: &mut TreeBuildScratch,
 ) -> Option<u64> {
     let hlit = trim_literal(literal_lengths);
     let hdist = trim_distance(distance_lengths);
@@ -2367,7 +2376,7 @@ fn deft4j_code_length_tree(rle: &[RleToken]) -> Option<[u8; 19]> {
     let lengths = code_length_tree(
         CodeLengthBuilder::Deft4jJavaHeap,
         &frequencies,
-        &mut DefloptHeapScratch::default(),
+        &mut TreeBuildScratch::default(),
     );
     if !code_length_tree_shape_is_valid(&lengths) {
         return None;
@@ -2518,7 +2527,7 @@ type CountedRle = (Vec<RleToken>, [u32; 19]);
 
 #[derive(Default)]
 struct HeaderPlanSearch {
-    heap_scratch: DefloptHeapScratch,
+    heap_scratch: TreeBuildScratch,
     best: Option<DynamicPlan>,
     /// Shortest RLEs of this plan's code lengths, with their symbol
     /// frequencies, by code-length code: RLE seeds often reach the same
@@ -3346,7 +3355,7 @@ fn consider_deft4j_pruned_header(
     rle: &[RleToken],
     frequencies: &[u32; 19],
     deft4j_lengths: &[u8],
-    heap_scratch: &mut DefloptHeapScratch,
+    heap_scratch: &mut TreeBuildScratch,
     best: &mut Option<DynamicPlan>,
 ) {
     if deft4j_lengths.len() != 19 || !code_length_tree_shape_is_valid(deft4j_lengths) {
@@ -3590,7 +3599,7 @@ fn local_rewrite_step(
 /// under the given tree. A code 17 of 3 to 6 zeros after a zero becomes code
 /// 16 when code 16's length is no longer. `frequencies` are the input's symbol
 /// frequencies. Returns `None` if nothing changes; otherwise the rewrite and
-/// its symbol frequencies, counted as it is built.
+/// its symbol frequencies, the input's adjusted at each change.
 fn rewrite_rle_deflopt_local(
     input: &[RleToken],
     frequencies: &[u32; 19],
@@ -3607,7 +3616,7 @@ fn rewrite_rle_deflopt_local(
     // Built from the first change on: a rewrite that passes the check above
     // can still change nothing.
     let mut output: Option<Vec<RleToken>> = None;
-    let mut frequencies = [0_u32; 19];
+    let mut rewritten_frequencies = *frequencies;
     let mut previous = None;
 
     for (index, &token) in input.iter().enumerate() {
@@ -3653,36 +3662,44 @@ fn rewrite_rle_deflopt_local(
             _ => return None,
         };
 
-        if (replacement.is_some() || repeated.is_some()) && output.is_none() {
-            let mut started = Vec::new();
-            // Expansions can outgrow the input, but not a header's lengths.
-            started
-                .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
-                .ok()?;
-            started.extend_from_slice(&input[..index]);
-            output = Some(started);
-        }
-        if let Some((value, count)) = repeated {
-            if let Some(output) = output.as_mut() {
-                output.extend(
-                    std::iter::repeat(RleToken {
-                        symbol: value,
-                        extra: 0,
-                    })
-                    .take(count),
-                );
-            }
-            frequencies[usize::from(value)] += count as u32;
-        } else {
-            let token = replacement.unwrap_or(token);
+        if replacement.is_none() && repeated.is_none() {
             if let Some(output) = output.as_mut() {
                 output.push(token);
             }
-            frequencies[usize::from(token.symbol)] += 1;
+            continue;
+        }
+        let output = match output.as_mut() {
+            Some(output) => output,
+            None => {
+                let mut started = Vec::new();
+                // Expansions can outgrow the input, but not a header's lengths.
+                started
+                    .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
+                    .ok()?;
+                started.extend_from_slice(&input[..index]);
+                output.insert(started)
+            }
+        };
+        rewritten_frequencies[usize::from(token.symbol)] -= 1;
+        if let Some((value, count)) = repeated {
+            output.extend(
+                std::iter::repeat(RleToken {
+                    symbol: value,
+                    extra: 0,
+                })
+                .take(count),
+            );
+            rewritten_frequencies[usize::from(value)] += count as u32;
+        } else if let Some(replacement) = replacement {
+            output.push(replacement);
+            rewritten_frequencies[usize::from(replacement.symbol)] += 1;
         }
     }
 
-    output.map(|output| (output, frequencies))
+    output.map(|output| {
+        debug_assert_eq!(rewritten_frequencies, rle_frequencies(&output));
+        (output, rewritten_frequencies)
+    })
 }
 
 /// Whether spelling out some repeat code of an RLE with these symbol
@@ -3736,15 +3753,16 @@ fn rewrite_rle_deft4j_literals(
         return None;
     }
     let mut rewritten_frequencies = *frequencies;
-    let mut output = Vec::new();
-    output.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
+    // Built from the first change on, like the DeflOpt rewrite's.
+    let mut output: Option<Vec<RleToken>> = None;
     let mut previous = None;
-    let mut changed = false;
 
-    for &token in input {
+    for (index, &token) in input.iter().enumerate() {
         let (value, count) = match token.symbol {
             value @ 0..=15 => {
-                output.push(token);
+                if let Some(output) = output.as_mut() {
+                    output.push(token);
+                }
                 previous = Some(value);
                 continue;
             }
@@ -3756,6 +3774,15 @@ fn rewrite_rle_deft4j_literals(
         let explicit = explicit_rle_cost(code_length_lengths, value, count);
         let repeat = rle_symbol_cost(code_length_lengths, token.symbol);
         if explicit < repeat || (include_equal && explicit == repeat) {
+            let output = match output.as_mut() {
+                Some(output) => output,
+                None => {
+                    let mut started = Vec::new();
+                    started.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
+                    started.extend_from_slice(&input[..index]);
+                    output.insert(started)
+                }
+            };
             if output.len().checked_add(count)? > MAX_DYNAMIC_CODE_LENGTH_COUNT {
                 return None;
             }
@@ -3768,13 +3795,12 @@ fn rewrite_rle_deft4j_literals(
             );
             rewritten_frequencies[usize::from(token.symbol)] -= 1;
             rewritten_frequencies[usize::from(value)] += count as u32;
-            changed = true;
-        } else {
+        } else if let Some(output) = output.as_mut() {
             output.push(token);
         }
         previous = Some(value);
     }
-    changed.then_some((output, rewritten_frequencies))
+    output.map(|output| (output, rewritten_frequencies))
 }
 
 fn explicit_rle_cost(lengths: &[u8; 19], symbol: u8, count: usize) -> u64 {
@@ -4069,9 +4095,23 @@ fn columbo_zero_repeat_rle_from_runs(
 }
 
 fn rle_frequencies(rle: &[RleToken]) -> [u32; 19] {
+    // Four interleaved tables, so a run of one symbol does not wait for each
+    // increment's store before the next.
+    let mut tables = [[0_u32; 19]; 4];
+    let mut chunks = rle.chunks_exact(4);
+    for chunk in &mut chunks {
+        for (table, token) in tables.iter_mut().zip(chunk) {
+            table[usize::from(token.symbol)] += 1;
+        }
+    }
+    for token in chunks.remainder() {
+        tables[0][usize::from(token.symbol)] += 1;
+    }
     let mut frequencies = [0_u32; 19];
-    for token in rle {
-        frequencies[usize::from(token.symbol)] += 1;
+    for table in &tables {
+        for (frequency, &count) in frequencies.iter_mut().zip(table) {
+            *frequency += count;
+        }
     }
     frequencies
 }
@@ -4087,14 +4127,23 @@ fn trim_code_lengths(lengths: &[u8; 19]) -> usize {
 /// histogram, so pricing many code-length codes for one spelling does not
 /// rescan its tokens.
 fn rle_frequency_cost(frequencies: &[u32; 19], lengths: &[u8; 19]) -> u64 {
-    frequencies
-        .iter()
-        .enumerate()
-        .filter(|&(_, &frequency)| frequency != 0)
-        .map(|(symbol, &frequency)| {
-            rle_symbol_cost(lengths, symbol as u8).saturating_mul(u64::from(frequency))
-        })
-        .fold(0_u64, |sum, value| sum.saturating_add(value).min(INF))
+    // A used symbol without a code makes the cost infinite. Otherwise each
+    // term is below 2^41, so wrapping arithmetic never wraps, and keeps
+    // release overflow checks out of the loop.
+    let mut sum = 0_u64;
+    let mut missing = false;
+    for symbol in 0..19 {
+        let frequency = u64::from(frequencies[symbol]);
+        let length = lengths[symbol];
+        missing |= frequency != 0 && length == 0;
+        let cost = u64::from(length).wrapping_add(RLE_EXTRA_BITS[symbol]);
+        sum = sum.wrapping_add(frequency.wrapping_mul(cost));
+    }
+    if missing {
+        INF
+    } else {
+        sum
+    }
 }
 
 fn dynamic_bits_from_rle_frequencies(
@@ -4158,7 +4207,7 @@ fn dynamic_bits(data_bits: u64, plan: &DynamicPlan) -> Option<u64> {
     bits.checked_add(data_bits)
 }
 
-fn rle_extra_bits(symbol: u8) -> u64 {
+const fn rle_extra_bits(symbol: u8) -> u64 {
     match symbol {
         16 => 2,
         17 => 3,
@@ -4166,6 +4215,17 @@ fn rle_extra_bits(symbol: u8) -> u64 {
         _ => 0,
     }
 }
+
+/// [`rle_extra_bits`] by symbol.
+const RLE_EXTRA_BITS: [u64; 19] = {
+    let mut bits = [0; 19];
+    let mut symbol = 0;
+    while symbol < bits.len() {
+        bits[symbol] = rle_extra_bits(symbol as u8);
+        symbol += 1;
+    }
+    bits
+};
 
 fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
     rle.iter()

@@ -74,6 +74,7 @@ gains where established.
 | 23 Oct 2026 | [`0141972`](#0141972-23-october-2026) | Max header planning (`header.rs`) | Shortest RLEs found once per header plan and tree, in stack buffers, with their symbol counts; the code-length tree cache grown to 16,384 slots | Captured Max header plans 1.14×; completing Max runs 1.30× and 1.11×; Default CPU 1.01× (33 inputs); peak memory +1.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 20,000 shortest-RLE comparisons; 666 Rust, 13 Python tests |
 | 23 Oct 2026 | [`d72c937`](#d72c937-23-october-2026) | Max header planning (`header.rs`, `huffman.rs`) | Code-length trees cached by RLE histogram, builders that must agree sharing one tree; repeat rewrites skipped when the RLE's symbol counts show nothing can change; one scan per shortest-RLE repeat window, in buffers kept for the header plan; RLE and tree buffers sized once; a branch-free Kraft sum; packed keys in Columbo's heaps | Captured Max header plans 1.26×; completing Max runs 1.29× and 1.12×; Default CPU 1.14× (33 inputs); peak memory −0.1 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 403,865 captured shortest-RLE calls; 20,000 rewrite and 768 heap-merge comparisons; 668 Rust, 7 Python tests |
 | 24 Oct 2026 | [`71ecf9f`](#71ecf9f-24-october-2026) | Default terminal and header work (`slide.rs`, `search.rs`, `header.rs`) | Slide boundaries skipped while both blocks are unchanged since their last search found no cheaper cut; literal-cost sums stopped once they decide the comparison with the match; code-length runs found once for every RLE seed | Default CPU 1.11× (33 inputs); completing Max runs 1.04× and 1.00× (3.4% and 1.1% fewer instructions); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 literal-sum, 20,000 joining-price and 20,000 run-list comparisons; 672 Rust, 7 Python tests |
+| 24 Oct 2026 | [`e79a60a`](#e79a60a-24-october-2026) | Tree builders, RLE counts, bit reading and plan-cache keys (`huffman.rs`, `header.rs`, `bitstream.rs`, `block.rs`) | Heap entries carry packed keys and sift-downs specialize by tie rule; deft4j's and the generic builder's buffers shared and deft4j's heap keyed; RLE counts in four tables and costs without saturation; rewrites adjust counts at changes; the bit reader loads eight bytes at a time; the planner reuses the block key's extra bits; the canonical cache keys on counts | Default CPU 1.21× (33 inputs); large inputs 1.11–1.27×; completing Max runs 1.08× and 1.04× (6.1% and 2.9% fewer instructions); captured header plans 1.12×; peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 large inputs; 89,255 replayed header plans; 2 completing Max runs; 6,000 shared-scratch and 4,000 bit-reader oracle comparisons; 674 Rust, 7 Python tests |
 
 ## Entries
 
@@ -470,6 +471,140 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `e79a60a`, 24 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the 33 stratified Default inputs, once per build in alternating order, in five
+comparisons; two alternating runs of each completing Max run and of the
+header-plan replay; one run of each build on five larger inputs.
+
+A sampled Default profile of the 33 inputs at `e79a60a` (66,017 CPU samples)
+still put 27% in the DeflOpt and order-key heap builders, 58% of that for
+code-length trees and 32% for payload trees. Allocation took 2.9%, and another
+1% went to `mach_absolute_time` in macOS's `free` and large-allocation paths:
+deft4j's builder reserved 1,024 nodes of 88 bytes on every call. Validation
+parsing took 7.4%, 6.2% of it decoding Huffman payloads. After the first two
+changes below, a build with header helpers kept out of line put counting an
+RLE seed's symbols at 2.5% and pricing a symbol histogram under a tree at
+1.4%.
+
+- **Keyed heap entries.** Each DeflOpt-style heap entry holds its frequency
+  above its tie field, the height or creation order, in one 64-bit key, beside
+  its index; a sift-down that breaks ties by frequency alone compares the
+  keys' high halves. The comparisons are those of the previous packed keys, so
+  every heap moves as before. The merge loop is specialized for each variant's
+  pair of tie rules, and the leaves' removal order, which only overflow repair
+  needs, is read from the branches' children when it does. On a sample of the
+  builder's inputs from the 33 Default runs (27,771 code-length, 13,614
+  distance and 13,428 literal/length histograms, each built in all eight
+  variants), every result matched. Medians of five runs: 0.358 instead of
+  0.406 seconds on the code-length histograms (1.13×), 0.289 instead of 0.345
+  on distance (1.19×) and 2.91 instead of 3.75 on literal/length ones
+  (1.29×).
+- **Shared tree buffers.** deft4j's Java-heap builder and the generic node
+  builder take their nodes and indices from the scratch the heap builder
+  already shares, renamed `TreeBuildScratch`, instead of allocating them on
+  every call; deft4j's buffers are sized to the alphabet. Allocation fell to
+  2.3% of samples and `mach_absolute_time` to 0.5%.
+- **Keyed Java heap.** deft4j's heap holds each node's frequency above its
+  index, so the heap no longer reads 88-byte nodes to compare frequencies,
+  the only key deft4j compares: 1.15× on code-length, 1.27× on distance and
+  1.29× on literal/length histograms.
+- **RLE counts and costs.** An RLE's symbols are counted in four interleaved
+  tables, so a run of one symbol does not wait for each increment's store:
+  2.6× on 104,029 RLE seeds of 220 tokens on average, spelled from the sampled
+  payload histograms. A histogram's cost under a tree no longer saturates each
+  term: a used symbol without a code gives `INF`, and otherwise each term is
+  below 2^41, so a wrapping sum over a table of extra bits vectorizes: 3.0×.
+- **Rewrites that count changes.** The DeflOpt local rewrite starts from its
+  input's counts and adjusts them at each change instead of recounting every
+  token, and deft4j's prune builds its output from the first change, as the
+  DeflOpt rewrite already did.
+- **Word-at-a-time bit reading.** With eight bytes of input left, the bit
+  reader loads them at once and keeps the whole bytes that fit, instead of
+  one byte per loop. Bits above those buffered are the input's next bits in
+  place, so a later load rewrites them unchanged, and a stored block's byte
+  copy first hands whole buffered bytes back to the input. Parsing four GZIP
+  fixtures took 0.184 instead of 0.244 seconds.
+- **Planner extra bits.** A block-plan store miss passes the extra-bit total
+  its key already summed to the dynamic planner, which summed it again. The
+  [`71ecf9f`](#71ecf9f-24-october-2026) review rejected this at about 0.75% of
+  CPU, expecting a parameter threaded through many callers; the planner has
+  two callers.
+- **Count fingerprints.** The canonical plan cache fingerprints a block's
+  token count and symbol counts, which its key compares too, instead of every
+  token, so its cost no longer grows with the block; blocks whose tokens
+  differ only in order share a chain, and the token comparison tells them
+  apart. Both block-plan fingerprints mix counts in four independent lanes.
+  Fingerprints only select entries, so neither change can alter a plan.
+
+| Candidate | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| Keyed heap entries | 76.5 s | 72.8 s | 1.05× | −0.2 / +1.2 MiB |
+| Plus shared tree buffers | 76.7 s | 72.6 s | 1.06× | −0.1 / +2.5 MiB |
+| Plus RLE counts and costs, bit reading, planner extra bits | 76.1 s | 67.7 s | 1.12× | −0.7 / −0.2 MiB |
+| Plus rewrites that count changes, lane fingerprints | 76.0 s | 64.1 s | 1.19× | −0.1 / +1.1 MiB |
+| Plus count fingerprints, keyed Java heap (retained) | 76.0 s | 62.6 s | 1.21× | −0.1 / +0.3 MiB |
+
+Each comparison after the first also reran the previous candidate, which took
+72.9, 71.6, 67.5 and 64.1 seconds. The peak-memory changes are within
+run-to-run spread.
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed | 4.62 s | 4.14 s | 1.12× |
+| `036-Clefable-0.png`, Max completing its search | 2.68 s | 2.48 s | 1.08× |
+| `114-Tangela-1.png`, Max completing its search | 0.26 s | 0.25 s | 1.04× |
+| `703080_80061…` (APNG), Default CPU | 15.1 s | 12.1 s | 1.25× |
+| `1172470_101537…` (APNG), Default CPU | 14.7 s | 11.6 s | 1.27× |
+| `bored.png`, Default CPU | 2.9 s | 2.6 s | 1.11× |
+| `elephant-2.png`, Default CPU | 3.4 s | 2.8 s | 1.22× |
+| `kzipmix-20200115-linux-static.tar.gz`, Default CPU | 10.2 s | 8.8 s | 1.16× |
+
+The Clefable run retired 57.8 instead of 61.5 billion instructions and the
+Tangela run 3.33 instead of 3.43 billion.
+
+Equivalence: the existing test comparing the heap builder with its
+independent node-based reference on 40,000 random alphabets, in both limits,
+variants and tie keys, still passes, as does the hole-against-swapping
+sift-down test, now on keyed entries. A new test builds 6,000 random
+alphabets with every builder in turn on one shared scratch and compares each
+with a fresh build. Another runs 4,000 random inputs of up to 40 bytes
+through 60 random peeks, reads, alignments and stored-byte reads, continuing
+after errors, against a reader that takes bits by index; it fails if stored
+reads do not hand back buffered bytes. The existing comparisons of both
+rewrites with their reference implementations, counts included, still pass,
+and debug builds check the DeflOpt rewrite's adjusted counts and the
+planner's extra bits. The 89,255 replayed header plans matched plan for plan.
+API comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs, and every CLI timing run, the five
+larger inputs and both completing Max runs matched byte for byte. Rust tests,
+including the private corpus, passed in release and debug modes, with
+documentation and Python tests, a locked build, formatting, all-feature
+Clippy with warnings denied and a package list without private fixtures or
+scratch artifacts. `__text` grew from 845,520 to 850,796 bytes, mostly the
+four specialized merge loops; the shipped executable keeps its 925,632
+bytes, and the final source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- A branch-free sift-down over sentinel-padded heaps, running a fixed
+  `floor(log2(len))` levels: exact, but 0.425 instead of 0.361 seconds on the
+  code-length sample and 3.04 instead of 2.91 on literal/length histograms.
+- Fixed-size stack arrays for alphabets of at most 32 symbols: 1.11× on
+  code-length histograms, but only with a second, fixed-size builder; the
+  shared slice-based builder on stack arrays or growing scratch gained 1.01–
+  1.04×.
+- Two or four interleaved tables for a block's token counts: 1.04–1.19× on
+  whole blocks of four GZIP fixtures, whose literals vary more than RLE
+  symbols, and 2.6–3.4× slower on 64-token slices.
+- Reading nodes by reference in the recursive depth assignment: no change; the
+  compiler already avoided the copies.
+- Fingerprinting every token in four lanes: the canonical fingerprint stayed
+  at 1.8% of samples, its cost the branch on each token's kind.
+
+Artifacts: `work/efficiency-review-default2-20261024/`.
 
 ### `71ecf9f`, 24 October 2026
 

@@ -1002,7 +1002,13 @@ fn first_leaf_at_depth(
 /// first. Over-long codes are shortened with zlib's overflow repair.
 pub(crate) fn make_lengths(frequencies: &[u32], max_bits: u8, variant: u32) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
-    make_lengths_into(frequencies, &mut lengths, max_bits, variant);
+    make_lengths_into(
+        frequencies,
+        &mut lengths,
+        max_bits,
+        variant,
+        &mut TreeBuildScratch::default(),
+    );
     lengths
 }
 
@@ -1013,19 +1019,33 @@ pub(crate) fn make_lengths_into(
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
+    scratch: &mut TreeBuildScratch,
 ) -> bool {
-    make_lengths_inner(frequencies, lengths, max_bits, variant)
+    make_lengths_inner(frequencies, lengths, max_bits, variant, scratch)
 }
 
 /// Return whether the unlimited tree was deeper than `max_bits` and needed
 /// repair.
-fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, variant: u32) -> bool {
+fn make_lengths_inner(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    variant: u32,
+    scratch: &mut TreeBuildScratch,
+) -> bool {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
-    let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
+    let TreeBuildScratch {
+        nodes,
+        node_indices: active,
+        ..
+    } = scratch;
+    nodes.clear();
+    active.clear();
+    nodes.reserve(frequencies.len().saturating_mul(2));
     // The two-queue merge appends each branch to the leaves.
-    let mut active = Vec::with_capacity(frequencies.len().saturating_mul(2));
+    active.reserve(frequencies.len().saturating_mul(2));
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency == 0 {
             continue;
@@ -1051,17 +1071,17 @@ fn make_lengths_inner(frequencies: &[u32], lengths: &mut [u8], max_bits: u8, var
         .sum();
     if variant <= 1 && total_frequency <= u64::from(u32::MAX) {
         if variant == 0 {
-            merge_generic_nodes_two_front(&mut nodes, &mut active, variant);
+            merge_generic_nodes_two_front(nodes, active, variant);
         } else {
-            merge_generic_nodes_reverse_front(&mut nodes, &mut active);
+            merge_generic_nodes_reverse_front(nodes, active);
         }
     } else if variant & 2 == 0 {
-        merge_generic_nodes_heap(&mut nodes, &mut active, variant);
+        merge_generic_nodes_heap(nodes, active, variant);
     } else {
-        merge_generic_nodes_dual_heap(&mut nodes, &mut active, variant);
+        merge_generic_nodes_dual_heap(nodes, active, variant);
     }
 
-    let max_depth = assign_depths(&nodes, active[0], 0, lengths);
+    let max_depth = assign_depths(nodes, active[0], 0, lengths);
     if max_depth <= usize::from(max_bits) {
         return false;
     }
@@ -1322,7 +1342,13 @@ pub(crate) fn make_lengths_columbo_defluff_limited(
     variant: u32,
 ) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
-    make_lengths_columbo_defluff_limited_into(frequencies, &mut lengths, max_bits, variant);
+    make_lengths_columbo_defluff_limited_into(
+        frequencies,
+        &mut lengths,
+        max_bits,
+        variant,
+        &mut TreeBuildScratch::default(),
+    );
     lengths
 }
 
@@ -1333,8 +1359,9 @@ pub(crate) fn make_lengths_columbo_defluff_limited_into(
     lengths: &mut [u8],
     max_bits: u8,
     _variant: u32,
+    scratch: &mut TreeBuildScratch,
 ) -> bool {
-    if !make_lengths_inner(frequencies, lengths, max_bits, 0) {
+    if !make_lengths_inner(frequencies, lengths, max_bits, 0, scratch) {
         return false;
     }
     apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
@@ -1366,7 +1393,13 @@ pub(crate) fn make_lengths_defluff_exact_into(
     }
 
     // Start package-merge from the `make_lengths` result, kept if it fails.
-    make_lengths_into(frequencies, lengths, max_bits, 0);
+    make_lengths_into(
+        frequencies,
+        lengths,
+        max_bits,
+        0,
+        &mut TreeBuildScratch::default(),
+    );
     apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
 }
 
@@ -1588,87 +1621,79 @@ fn package_lengths_are_valid(frequencies: &[u32], lengths: &[u8], max_bits: u8) 
     used == slots
 }
 
-#[derive(Debug, Clone, Copy)]
-enum HeapTie {
-    FrequencyOnly,
-    Height,
-    Order,
-}
-
 /// One live subtree in the DeflOpt-style heap. Leaves take indices
 /// `0..leaf_count` in symbol order and each branch the next index, so `index`
-/// is also the node's creation order; carrying the compared fields in the
-/// entry keeps every heap comparison local.
+/// is also the node's creation order. `key` holds the frequency in its high
+/// half and the tie field in its low half: the height for the DeflOpt heap,
+/// `index` for the order-key heap. One comparison of keys orders entries by
+/// frequency, then by the tie field; comparing only the high halves ignores
+/// ties.
 #[derive(Debug, Clone, Copy)]
 struct HeapEntry {
-    frequency: u32,
-    height: u32,
+    key: u64,
     index: u32,
 }
 
-/// Reusable buffers for the DeflOpt-style heap builder; no state carries over
-/// between builds.
+impl HeapEntry {
+    fn frequency(self) -> u32 {
+        (self.key >> 32) as u32
+    }
+
+    fn tie(self) -> u32 {
+        self.key as u32
+    }
+}
+
+fn heap_key(frequency: u32, tie: u32) -> u64 {
+    u64::from(frequency) << 32 | u64::from(tie)
+}
+
+/// Reusable buffers for the DeflOpt-style heap builder, deft4j's Java heap
+/// and the generic node builder; no state carries over between builds.
 #[derive(Default)]
-pub(crate) struct DefloptHeapScratch {
+pub(crate) struct TreeBuildScratch {
     heap: Vec<HeapEntry>,
     /// The symbol of each leaf, by leaf index.
     symbols: Vec<u32>,
     /// The two children of each branch, by branch index minus the leaf count.
     children: Vec<[u32; 2]>,
     depths: Vec<u32>,
-    /// Leaf symbols in reverse heap-removal order.
+    /// Leaf symbols in reverse heap-removal order, for overflow repair.
     leaf_order: Vec<u32>,
+    nodes: Vec<Node>,
+    /// The generic builder's live nodes.
+    node_indices: Vec<usize>,
+    java_heap: Vec<u64>,
 }
 
-/// The tie rule's order; tests check `heap_sift_down`'s packed keys against it.
-#[cfg(test)]
-fn heap_entry_less(a: HeapEntry, b: HeapEntry, tie: HeapTie) -> bool {
-    if a.frequency != b.frequency {
-        return a.frequency < b.frequency;
-    }
-    match tie {
-        HeapTie::FrequencyOnly => false,
-        HeapTie::Height => a.height < b.height,
-        HeapTie::Order => a.index < b.index,
-    }
-}
-
-fn heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
-    // One loop per tie rule. The frequency in the high half and the tie field
-    // in the low half order entries by frequency, then by the tie rule, in one
-    // comparison.
-    match tie {
-        HeapTie::FrequencyOnly => {
-            heap_sift_down_by(heap, start, |entry| u64::from(entry.frequency) << 32);
-        }
-        HeapTie::Height => heap_sift_down_by(heap, start, |entry| {
-            u64::from(entry.frequency) << 32 | u64::from(entry.height)
-        }),
-        HeapTie::Order => heap_sift_down_by(heap, start, |entry| {
-            u64::from(entry.frequency) << 32 | u64::from(entry.index)
-        }),
-    }
-}
-
+/// Restore the heap order below `start`, comparing whole keys, or only
+/// frequencies if `FREQUENCY_ONLY`.
 #[inline(always)]
-fn heap_sift_down_by(heap: &mut [HeapEntry], start: usize, key: impl Fn(HeapEntry) -> u64) {
+fn heap_sift_down<const FREQUENCY_ONLY: bool>(heap: &mut [HeapEntry], start: usize) {
+    let rank = |entry: HeapEntry| {
+        if FREQUENCY_ONLY {
+            entry.key >> 32
+        } else {
+            entry.key
+        }
+    };
     let entry = heap[start];
-    let entry_key = key(entry);
+    let entry_rank = rank(entry);
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             break;
         }
-        let mut child_key = key(heap[child]);
+        let mut child_rank = rank(heap[child]);
         if child + 1 < heap.len() {
-            let right_key = key(heap[child + 1]);
-            if right_key < child_key {
+            let right_rank = rank(heap[child + 1]);
+            if right_rank < child_rank {
                 child += 1;
-                child_key = right_key;
+                child_rank = right_rank;
             }
         }
-        if child_key >= entry_key {
+        if child_rank >= entry_rank {
             break;
         }
         heap[root] = heap[child];
@@ -1689,7 +1714,7 @@ pub(crate) fn make_lengths_deflopt_heap_into(
         max_bits,
         variant,
         false,
-        &mut DefloptHeapScratch::default(),
+        &mut TreeBuildScratch::default(),
     );
 }
 
@@ -1698,7 +1723,7 @@ pub(crate) fn make_lengths_deflopt_heap_into_with_scratch(
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
-    scratch: &mut DefloptHeapScratch,
+    scratch: &mut TreeBuildScratch,
 ) {
     make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false, scratch);
 }
@@ -1708,7 +1733,7 @@ pub(crate) fn make_lengths_order_heap_into_with_scratch(
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
-    scratch: &mut DefloptHeapScratch,
+    scratch: &mut TreeBuildScratch,
 ) {
     make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true, scratch);
 }
@@ -1719,22 +1744,22 @@ fn make_lengths_variant_heap_inner(
     max_bits: u8,
     variant: u32,
     use_order_tie: bool,
-    scratch: &mut DefloptHeapScratch,
+    scratch: &mut TreeBuildScratch,
 ) {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
-    let DefloptHeapScratch {
+    let TreeBuildScratch {
         heap,
         symbols,
         children,
         depths,
         leaf_order,
+        ..
     } = scratch;
     heap.clear();
     symbols.clear();
     children.clear();
-    leaf_order.clear();
     // Grow fresh buffers once rather than by doubling.
     heap.reserve(frequencies.len());
     symbols.reserve(frequencies.len());
@@ -1742,9 +1767,10 @@ fn make_lengths_variant_heap_inner(
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
             let index = u32::try_from(symbols.len()).expect("alphabet fits u32");
+            // Leaves have height 0.
+            let tie = if use_order_tie { index } else { 0 };
             heap.push(HeapEntry {
-                frequency,
-                height: 0,
+                key: heap_key(frequency, tie),
                 index,
             });
             symbols.push(u32::try_from(symbol).expect("alphabet fits u32"));
@@ -1760,58 +1786,21 @@ fn make_lengths_variant_heap_inner(
         _ => {}
     }
 
-    leaf_order.resize(leaf_count, 0);
-    let mut leaf_order_position = leaf_count;
     for start in (0..heap.len() / 2).rev() {
-        heap_sift_down(heap, start, HeapTie::FrequencyOnly);
+        heap_sift_down::<true>(heap, start);
     }
 
     // Variant bit 1 sets the tie rule of the sift-down after removing the
-    // first child, and bit 0 the one after inserting the parent.
-    let first_tie = if variant & 2 != 0 {
-        HeapTie::FrequencyOnly
-    } else if use_order_tie {
-        HeapTie::Order
-    } else {
-        HeapTie::Height
-    };
-    let second_tie = if variant & 1 != 0 {
-        HeapTie::FrequencyOnly
-    } else if use_order_tie {
-        HeapTie::Order
-    } else {
-        HeapTie::Height
-    };
-
+    // first child, and bit 0 the one after inserting the parent; a set bit
+    // compares frequencies only.
     let leaves = leaf_count as u32;
-    while heap.len() > 1 {
-        let left = heap[0];
-        if left.index < leaves {
-            leaf_order_position -= 1;
-            leaf_order[leaf_order_position] = symbols[left.index as usize];
-        }
-        let last = heap.pop().expect("heap is non-empty");
-        heap[0] = last;
-
-        heap_sift_down(heap, 0, first_tie);
-
-        let right = heap[0];
-        if right.index < leaves {
-            leaf_order_position -= 1;
-            leaf_order[leaf_order_position] = symbols[right.index as usize];
-        }
-        let index = leaves + u32::try_from(children.len()).expect("alphabet fits u32");
-        children.push([left.index, right.index]);
-        heap[0] = HeapEntry {
-            frequency: left.frequency.wrapping_add(right.frequency),
-            height: left.height.max(right.height) + 1,
-            index,
-        };
-
-        heap_sift_down(heap, 0, second_tie);
+    match variant & 3 {
+        0 => merge_heap::<false, false>(heap, children, leaves, use_order_tie),
+        1 => merge_heap::<false, true>(heap, children, leaves, use_order_tie),
+        2 => merge_heap::<true, false>(heap, children, leaves, use_order_tie),
+        _ => merge_heap::<true, true>(heap, children, leaves, use_order_tie),
     }
 
-    debug_assert_eq!(leaf_order_position, 0);
     // Every branch is created after both children, so one pass from the root,
     // the last branch, down to the first assigns every depth.
     depths.clear();
@@ -1829,7 +1818,51 @@ fn make_lengths_variant_heap_inner(
     if max_depth <= usize::from(max_bits) {
         return;
     }
+    // Each branch's children are the two entries removed before creating
+    // it, so the branches in reverse, right child first, give the leaves in
+    // reverse removal order.
+    leaf_order.clear();
+    for &[left, right] in children.iter().rev() {
+        for child in [right, left] {
+            if child < leaves {
+                leaf_order.push(symbols[child as usize]);
+            }
+        }
+    }
     repair_deflopt_overflow(leaf_order, lengths, max_bits, max_depth);
+}
+
+/// Merge the two least entries until one remains, recording each branch's
+/// children. `FIRST_FREQUENCY_ONLY` and `SECOND_FREQUENCY_ONLY` choose the tie
+/// rule of the sift-downs after removing the first child and after inserting
+/// the parent.
+fn merge_heap<const FIRST_FREQUENCY_ONLY: bool, const SECOND_FREQUENCY_ONLY: bool>(
+    heap: &mut Vec<HeapEntry>,
+    children: &mut Vec<[u32; 2]>,
+    leaves: u32,
+    use_order_tie: bool,
+) {
+    while heap.len() > 1 {
+        let left = heap[0];
+        let last = heap.pop().expect("heap is non-empty");
+        heap[0] = last;
+        heap_sift_down::<FIRST_FREQUENCY_ONLY>(heap, 0);
+
+        let right = heap[0];
+        let index = leaves + u32::try_from(children.len()).expect("alphabet fits u32");
+        children.push([left.index, right.index]);
+        let frequency = left.frequency().wrapping_add(right.frequency());
+        let tie = if use_order_tie {
+            index
+        } else {
+            left.tie().max(right.tie()) + 1
+        };
+        heap[0] = HeapEntry {
+            key: heap_key(frequency, tie),
+            index,
+        };
+        heap_sift_down::<SECOND_FREQUENCY_ONLY>(heap, 0);
+    }
 }
 
 fn repair_deflopt_overflow(leaf_order: &[u32], lengths: &mut [u8], max_bits: u8, max_depth: usize) {
@@ -1884,23 +1917,40 @@ fn repair_deflopt_overflow(leaf_order: &[u32], lengths: &mut [u8], max_bits: u8,
     }
 }
 
-fn java_heap_offer(nodes: &[Node], heap: &mut Vec<usize>, node: usize) {
+/// A heap entry: the node's frequency in the high half and its index in the
+/// low half, so comparisons, which deft4j makes on frequency alone, need not
+/// read the node.
+fn java_heap_entry(nodes: &[Node], node: usize) -> u64 {
+    debug_assert!(u32::try_from(node).is_ok());
+    u64::from(nodes[node].frequency) << 32 | node as u64
+}
+
+fn java_heap_frequency(entry: u64) -> u64 {
+    entry >> 32
+}
+
+fn java_heap_node(entry: u64) -> usize {
+    entry as u32 as usize
+}
+
+fn java_heap_offer(nodes: &[Node], heap: &mut Vec<u64>, node: usize) {
+    let entry = java_heap_entry(nodes, node);
     let mut position = heap.len();
-    heap.push(node);
+    heap.push(entry);
     while position > 0 {
         let parent = (position - 1) >> 1;
         // `java.util.PriorityQueue.siftUpComparable` stops on compare >= 0,
         // and deft4j compares only frequency, so an equal node stays put.
-        if nodes[node].frequency >= nodes[heap[parent]].frequency {
+        if java_heap_frequency(entry) >= java_heap_frequency(heap[parent]) {
             break;
         }
         heap[position] = heap[parent];
         position = parent;
     }
-    heap[position] = node;
+    heap[position] = entry;
 }
 
-fn java_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut position: usize, node: usize) {
+fn java_heap_sift_down(heap: &mut [u64], mut position: usize, entry: u64) {
     let half = heap.len() >> 1;
     while position < half {
         let mut child = position * 2 + 1;
@@ -1908,33 +1958,38 @@ fn java_heap_sift_down(nodes: &[Node], heap: &mut [usize], mut position: usize, 
         let right = child + 1;
         // `PriorityQueue` sift-down chooses the right child only when it is
         // strictly smaller.
-        if right < heap.len() && nodes[candidate].frequency > nodes[heap[right]].frequency {
+        if right < heap.len() && java_heap_frequency(candidate) > java_heap_frequency(heap[right]) {
             child = right;
             candidate = heap[child];
         }
-        if nodes[node].frequency <= nodes[candidate].frequency {
+        if java_heap_frequency(entry) <= java_heap_frequency(candidate) {
             break;
         }
         heap[position] = candidate;
         position = child;
     }
-    heap[position] = node;
+    heap[position] = entry;
 }
 
-fn java_heap_poll(nodes: &[Node], heap: &mut Vec<usize>) -> Option<usize> {
+fn java_heap_poll(heap: &mut Vec<u64>) -> Option<usize> {
     let result = *heap.first()?;
     let last = heap.pop().expect("heap is non-empty");
     if !heap.is_empty() {
-        java_heap_sift_down(nodes, heap, 0, last);
+        java_heap_sift_down(heap, 0, last);
     }
-    Some(result)
+    Some(java_heap_node(result))
 }
 
 /// Build the code lengths deft4j's `java.util.PriorityQueue` builder produces,
 /// falling back to the DeflOpt heap builder (variant 0) if that fails.
 pub(crate) fn make_lengths_deft4j_java_heap(frequencies: &[u32], max_bits: u8) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
-    make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, max_bits);
+    make_lengths_deft4j_java_heap_into(
+        frequencies,
+        &mut lengths,
+        max_bits,
+        &mut TreeBuildScratch::default(),
+    );
     lengths
 }
 
@@ -1942,19 +1997,30 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
+    scratch: &mut TreeBuildScratch,
 ) {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
-    let mut nodes = Vec::with_capacity(1024);
-    let mut heap = Vec::with_capacity(frequencies.len());
+    let TreeBuildScratch {
+        nodes,
+        java_heap: heap,
+        ..
+    } = scratch;
+    nodes.clear();
+    heap.clear();
+    // A tree has fewer than two nodes per leaf, and deft4j pads to two
+    // leaves; overflow repair may add nodes.
+    let leaves = frequencies.len().max(2);
+    nodes.reserve(leaves * 2);
+    heap.reserve(leaves);
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency == 0 {
             continue;
         }
         let index = nodes.len();
         nodes.push(Node::leaf(frequency, symbol, index));
-        java_heap_offer(&nodes, &mut heap, index);
+        java_heap_offer(nodes, heap, index);
     }
 
     // Like deft4j's `HuffmanTree`, add unused symbols with weight 1 until
@@ -1964,7 +2030,7 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
         if frequencies[symbol] == 0 {
             let index = nodes.len();
             nodes.push(Node::leaf(1, symbol, index));
-            java_heap_offer(&nodes, &mut heap, index);
+            java_heap_offer(nodes, heap, index);
         }
         symbol += 1;
     }
@@ -1972,7 +2038,9 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
     match heap.len() {
         0 => return,
         1 => {
-            lengths[nodes[heap[0]].symbol.expect("leaf has a symbol")] = 1;
+            lengths[nodes[java_heap_node(heap[0])]
+                .symbol
+                .expect("leaf has a symbol")] = 1;
             return;
         }
         _ => {}
@@ -1980,11 +2048,11 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
 
     let initial_count = heap.len();
     for _ in 0..initial_count - 1 {
-        let Some(left) = java_heap_poll(&nodes, &mut heap) else {
+        let Some(left) = java_heap_poll(heap) else {
             make_lengths_deflopt_heap_into(frequencies, lengths, max_bits, 0);
             return;
         };
-        let Some(right) = java_heap_poll(&nodes, &mut heap) else {
+        let Some(right) = java_heap_poll(heap) else {
             make_lengths_deflopt_heap_into(frequencies, lengths, max_bits, 0);
             return;
         };
@@ -2002,17 +2070,17 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
         nodes[right].parent = Some(index);
         nodes[right].side = 1;
         nodes.push(parent);
-        java_heap_offer(&nodes, &mut heap, index);
+        java_heap_offer(nodes, heap, index);
     }
 
-    let root = heap[0];
-    let max_depth = assign_depths(&nodes, root, 0, lengths);
+    let root = java_heap_node(heap[0]);
+    let max_depth = assign_depths(nodes, root, 0, lengths);
     if max_depth <= usize::from(max_bits) {
         return;
     }
 
     // deft4j reshapes the tree rather than redistributing length counts.
-    if !deft4j_repair_overlong_tree(&mut nodes, root, lengths, max_bits) {
+    if !deft4j_repair_overlong_tree(nodes, root, lengths, max_bits) {
         make_lengths_deflopt_heap_into(frequencies, lengths, max_bits, 0);
     }
 }

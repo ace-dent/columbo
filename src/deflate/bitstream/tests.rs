@@ -24,6 +24,78 @@ fn reads_and_writes_lsb_first() {
 }
 
 #[test]
+fn wide_reader_refill_matches_independent_bit_oracle() {
+    // Random reads near and past the end of short inputs; a failed peek
+    // leaves the reader usable, as Huffman decoding's bit-by-bit fallback
+    // needs.
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for case in 0..4_000 {
+        let input: Vec<u8> = (0..next() % 41).map(|_| next() as u8).collect();
+        let total_bits = input.len() as u64 * 8;
+        let oracle = |position: u64, bits: u8| -> Option<u32> {
+            (position + u64::from(bits) <= total_bits).then(|| {
+                (0..u64::from(bits)).fold(0_u32, |value, offset| {
+                    let bit = position + offset;
+                    let set = input[(bit / 8) as usize] >> (bit % 8) & 1;
+                    value | u32::from(set) << offset
+                })
+            })
+        };
+        let mut reader = BitReader::new(&input);
+        let mut position = 0_u64;
+        for step in 0..60 {
+            let bits = (next() % 33) as u8;
+            match next() % 5 {
+                0 => {
+                    let expected = oracle(position, bits);
+                    assert_eq!(reader.peek(bits).ok(), expected, "case {case} step {step}");
+                    if expected.is_some() && bits != 0 {
+                        let dropped = (next() % u64::from(bits) + 1) as u8;
+                        reader.drop_bits(dropped).unwrap();
+                        position += u64::from(dropped);
+                    }
+                }
+                1 | 2 => {
+                    let expected = oracle(position, bits);
+                    assert_eq!(reader.read(bits).ok(), expected, "case {case} step {step}");
+                    if expected.is_some() {
+                        position += u64::from(bits);
+                    }
+                }
+                3 => {
+                    let padding = ((8 - position % 8) % 8) as u8;
+                    reader.align_to_byte().unwrap();
+                    position += u64::from(padding);
+                }
+                _ => {
+                    let padding = ((8 - position % 8) % 8) as u8;
+                    reader.align_to_byte().unwrap();
+                    position += u64::from(padding);
+                    let count = (next() % 12) as usize;
+                    let start = (position / 8) as usize;
+                    let expected = input.get(start..start + count);
+                    assert_eq!(
+                        reader.read_aligned_bytes(count).ok(),
+                        expected,
+                        "case {case} step {step}"
+                    );
+                    if expected.is_some() {
+                        position += count as u64 * 8;
+                    }
+                }
+            }
+            assert_eq!(reader.bit_position(), position, "case {case} step {step}");
+        }
+    }
+}
+
+#[test]
 fn wide_writer_drain_matches_independent_bit_oracle() {
     #[derive(Clone, Copy)]
     enum Operation {

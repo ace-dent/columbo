@@ -5,6 +5,8 @@
 
 use crate::{Error, Result};
 
+/// Bits of `buffer` above `buffered_bits` are zero or the input's next bits in
+/// place, so loading a byte or word over them never changes a bit.
 pub(crate) struct BitReader<'a> {
     input: &'a [u8],
     byte_pos: usize,
@@ -24,10 +26,33 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    #[inline]
     fn fill(&mut self, bits: u8) -> Result<()> {
         if bits > 32 {
             return Err(Error::new("cannot read more than 32 bits at once"));
         }
+        if self.buffered_bits >= bits {
+            return Ok(());
+        }
+        // With eight bytes left, load them at once and keep the whole bytes
+        // that fit: at least four, as `buffered_bits` is below 32 here.
+        if let Some(word) = self
+            .input
+            .get(self.byte_pos..self.byte_pos + 8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        {
+            self.buffer |= u64::from_le_bytes(word) << self.buffered_bits;
+            let bytes = (64 - self.buffered_bits) / 8;
+            self.byte_pos += usize::from(bytes);
+            self.buffered_bits += bytes * 8;
+            return Ok(());
+        }
+        self.fill_bytes(bits)
+    }
+
+    /// Near the end of input, load one byte at a time.
+    #[cold]
+    fn fill_bytes(&mut self, bits: u8) -> Result<()> {
         while self.buffered_bits < bits {
             let byte = *self
                 .input
@@ -40,6 +65,7 @@ impl<'a> BitReader<'a> {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn peek(&mut self, bits: u8) -> Result<u32> {
         self.fill(bits)?;
         let mask = if bits == 32 {
@@ -50,6 +76,7 @@ impl<'a> BitReader<'a> {
         Ok((self.buffer & mask) as u32)
     }
 
+    #[inline]
     pub(crate) fn drop_bits(&mut self, bits: u8) -> Result<()> {
         if bits > self.buffered_bits {
             return Err(Error::new("cannot drop unavailable Deflate bits"));
@@ -79,9 +106,13 @@ impl<'a> BitReader<'a> {
     }
 
     pub(crate) fn read_aligned_bytes(&mut self, count: usize) -> Result<&'a [u8]> {
-        if self.buffered_bits != 0 {
+        if self.buffered_bits % 8 != 0 {
             return Err(Error::new("Deflate byte read is not aligned"));
         }
+        // Return whole buffered bytes to the input; they are its next bytes.
+        self.byte_pos -= usize::from(self.buffered_bits / 8);
+        self.buffer = 0;
+        self.buffered_bits = 0;
         let end = self
             .byte_pos
             .checked_add(count)

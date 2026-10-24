@@ -193,7 +193,11 @@ pub(crate) fn plan_reusable_block_with_header_cache(
             return plan;
         }
     }
-    let plan = plan_reusable_block_uncached(block, options, stop, header_cache);
+    // The key's extra bits spare the planner another pass over the tokens.
+    let extra_bits = key
+        .as_ref()
+        .map_or_else(|| token_extra_bits(&block.tokens), |key| key.extra_bits);
+    let plan = plan_reusable_block_uncached(block, options, stop, header_cache, extra_bits);
     // Stops only move forward, so one that is not reached now was not reached
     // while planning: the plan is complete.
     if let Some(key) = key.filter(|_| !stop.reached()) {
@@ -213,12 +217,14 @@ fn plan_reusable_block_uncached(
     options: &Options,
     stop: &mut SearchStop<'_>,
     header_cache: &mut HeaderPlanCache,
+    extra_bits: u64,
 ) -> ReusableBlockPlan {
     let fixed_bits = fixed_block_bits(&block.tokens).unwrap_or(u64::MAX);
     let dynamic = best_dynamic_plan_cached(
         &block.tokens,
         &block.literal_frequencies,
         &block.distance_frequencies,
+        extra_bits,
         block.original_dynamic.as_ref(),
         options.strict,
         options.exhaustive,
@@ -260,12 +266,10 @@ impl BlockPlanKey {
         let token_count = block.tokens.len();
         let extra_bits = token_extra_bits(&block.tokens);
         let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
-        for &count in block
-            .literal_frequencies
-            .iter()
-            .chain(&block.distance_frequencies)
-        {
-            mix_plan_fingerprint(&mut fingerprint, u64::from(count));
+        for counts in [&block.literal_frequencies[..], &block.distance_frequencies] {
+            mix_plan_fingerprint_lanes(&mut fingerprint, counts, |lane, count| {
+                mix_plan_fingerprint(lane, u64::from(count));
+            });
         }
         mix_plan_fingerprint(&mut fingerprint, token_count as u64);
         mix_plan_fingerprint(&mut fingerprint, extra_bits);
@@ -624,40 +628,16 @@ impl CanonicalPlanCache {
 /// FNV-1a-style hash of the tokens and options that only selects a collision
 /// chain; lookups compare every field, so a collision cannot cause a false hit.
 fn canonical_plan_fingerprint(block: &ParsedBlock, options: &Options) -> u64 {
+    // From the counts, which the key compares too, rather than the tokens: a
+    // block has 316 counts but can have thousands of tokens. Blocks whose
+    // tokens differ only in order share a chain, and the token comparison
+    // tells them apart.
     let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
     mix_plan_fingerprint(&mut fingerprint, block.tokens.len() as u64);
-    for &token in block.tokens.iter() {
-        match token {
-            Token::Literal(value) => {
-                mix_plan_fingerprint(&mut fingerprint, u64::from(value));
-            }
-            Token::Match {
-                length,
-                distance,
-                length_symbol,
-                distance_symbol,
-                length_extra,
-                distance_extra,
-                length_extra_bits,
-                distance_extra_bits,
-            } => {
-                mix_plan_fingerprint(
-                    &mut fingerprint,
-                    1_u64 << 63
-                        | u64::from(length)
-                        | (u64::from(distance) << 16)
-                        | (u64::from(length_symbol) << 32)
-                        | (u64::from(distance_symbol) << 48)
-                        | (u64::from(length_extra_bits) << 56),
-                );
-                mix_plan_fingerprint(
-                    &mut fingerprint,
-                    u64::from(length_extra)
-                        | (u64::from(distance_extra) << 16)
-                        | (u64::from(distance_extra_bits) << 32),
-                );
-            }
-        }
+    for counts in [&block.literal_frequencies[..], &block.distance_frequencies] {
+        mix_plan_fingerprint_lanes(&mut fingerprint, counts, |lane, count| {
+            mix_plan_fingerprint(lane, u64::from(count));
+        });
     }
     mix_plan_fingerprint(
         &mut fingerprint,
@@ -671,6 +651,36 @@ fn mix_plan_fingerprint(fingerprint: &mut u64, value: u64) {
     *fingerprint ^= value;
     *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
     *fingerprint ^= *fingerprint >> 32;
+}
+
+/// Mix `items` into `fingerprint` in four lanes, each item into one lane, so
+/// the lanes' multiplications overlap instead of each waiting for the last.
+/// Fingerprints only select entries, which callers compare in full.
+fn mix_plan_fingerprint_lanes<T: Copy>(
+    fingerprint: &mut u64,
+    items: &[T],
+    mix: impl Fn(&mut u64, T),
+) {
+    // Distinct seeds keep an item's lane part of the fingerprint.
+    let mut lanes = [
+        *fingerprint,
+        0x9e37_79b9_7f4a_7c15,
+        0x6a09_e667_f3bc_c908,
+        0xbb67_ae85_84ca_a73b,
+    ];
+    let mut chunks = items.chunks_exact(lanes.len());
+    for chunk in &mut chunks {
+        for (lane, &item) in lanes.iter_mut().zip(chunk) {
+            mix(lane, item);
+        }
+    }
+    for &item in chunks.remainder() {
+        mix(&mut lanes[0], item);
+    }
+    *fingerprint = lanes[0];
+    for &lane in &lanes[1..] {
+        mix_plan_fingerprint(fingerprint, lane);
+    }
 }
 
 pub(crate) fn plan_block_cached(

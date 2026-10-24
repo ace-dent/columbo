@@ -24,7 +24,7 @@ use super::header::{
 };
 use super::huffman::{
     make_lengths_columbo_defluff_limited, make_lengths_deflopt_heap_into_with_scratch,
-    make_lengths_defluff_exact, make_lengths_deft4j_java_heap, DefloptHeapScratch,
+    make_lengths_defluff_exact, make_lengths_deft4j_java_heap, TreeBuildScratch,
     FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::minima::SuffixMinima;
@@ -3042,7 +3042,7 @@ pub(crate) fn score_short_family_frequencies(
     let mut best = None;
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
-    let mut heap_scratch = DefloptHeapScratch::default();
+    let mut heap_scratch = TreeBuildScratch::default();
 
     // Stage 0 is the unchanged token stream; each later stage also expands the
     // next short-length symbol, matching the five token candidates built after
@@ -3121,7 +3121,7 @@ fn consider_short_family_tokens(
     let mut best_dynamic = None;
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
-    let mut heap_scratch = DefloptHeapScratch::default();
+    let mut heap_scratch = TreeBuildScratch::default();
     for variant in 0..4 {
         make_lengths_deflopt_heap_into_with_scratch(
             &literal_frequencies,
@@ -4609,6 +4609,7 @@ fn consider_all_literals(
         &[],
         &literal_frequencies,
         &distance_frequencies,
+        0,
         None,
         options.strict,
         false,

@@ -19,6 +19,7 @@ fn best_dynamic_plan(
         tokens,
         literal_frequencies,
         distance_frequencies,
+        token_extra_bits(tokens),
         original,
         strict,
         exhaustive,
@@ -1669,6 +1670,7 @@ fn code_length_reorder_early_exit_matches_the_full_pass() {
         state
     };
     let mut early_exits = 0;
+    let mut scratch = TreeBuildScratch::default();
     for case in 0..200_000 {
         let mut frequencies = [0_u32; 19];
         let mut lengths = [0_u8; 19];
@@ -1679,7 +1681,13 @@ fn code_length_reorder_early_exit_matches_the_full_pass() {
         }
         if case % 2 == 0 {
             // Trees from the builders themselves, which mostly pass the check.
-            make_lengths_into(&frequencies, &mut lengths, 7, (case % 4) as u32);
+            make_lengths_into(
+                &frequencies,
+                &mut lengths,
+                7,
+                (case % 4) as u32,
+                &mut scratch,
+            );
         } else {
             for length in lengths.iter_mut() {
                 *length = (next() % 8) as u8;

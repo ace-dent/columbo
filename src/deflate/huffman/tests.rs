@@ -141,7 +141,7 @@ fn make_lengths_order_heap_into(
         max_bits,
         variant,
         true,
-        &mut DefloptHeapScratch::default(),
+        &mut TreeBuildScratch::default(),
     );
 }
 
@@ -184,17 +184,23 @@ fn assert_bounded_lengths(frequencies: &[u32], lengths: &[u8], max_bits: u8) {
     }
 }
 
-fn swapping_heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
+fn swapping_heap_sift_down(heap: &mut [HeapEntry], start: usize, frequency_only: bool) {
+    let less = |a: HeapEntry, b: HeapEntry| {
+        if a.frequency() != b.frequency() {
+            return a.frequency() < b.frequency();
+        }
+        !frequency_only && a.tie() < b.tie()
+    };
     let mut root = start;
     loop {
         let mut child = root * 2 + 1;
         if child >= heap.len() {
             return;
         }
-        if child + 1 < heap.len() && heap_entry_less(heap[child + 1], heap[child], tie) {
+        if child + 1 < heap.len() && less(heap[child + 1], heap[child]) {
             child += 1;
         }
-        if !heap_entry_less(heap[child], heap[root], tie) {
+        if !less(heap[child], heap[root]) {
             return;
         }
         heap.swap(root, child);
@@ -204,11 +210,11 @@ fn swapping_heap_sift_down(heap: &mut [HeapEntry], start: usize, tie: HeapTie) {
 
 #[test]
 fn hole_heap_sift_matches_the_swapping_reference() {
+    // The tie field stands for a height or a creation order alike.
     let entries: Vec<HeapEntry> = (0..64_u32)
         .map(|index| HeapEntry {
-            frequency: (index * 17 + 5) % 13,
-            height: (index * 7 + 3) % 11,
-            index: 63 - index,
+            key: heap_key((index * 17 + 5) % 13, (index * 7 + 3) % 11),
+            index,
         })
         .collect();
 
@@ -223,11 +229,15 @@ fn hole_heap_sift_matches_the_swapping_reference() {
                 heap.swap(index, random as usize % (index + 1));
             }
             for start in 0..len {
-                for tie in [HeapTie::FrequencyOnly, HeapTie::Height, HeapTie::Order] {
+                for frequency_only in [false, true] {
                     let mut expected = heap.clone();
                     let mut actual = heap.clone();
-                    swapping_heap_sift_down(&mut expected, start, tie);
-                    heap_sift_down(&mut actual, start, tie);
+                    swapping_heap_sift_down(&mut expected, start, frequency_only);
+                    if frequency_only {
+                        heap_sift_down::<true>(&mut actual, start);
+                    } else {
+                        heap_sift_down::<false>(&mut actual, start);
+                    }
                     let index =
                         |heap: &[HeapEntry]| heap.iter().map(|e| e.index).collect::<Vec<_>>();
                     assert_eq!(index(&actual), index(&expected));
@@ -627,7 +637,13 @@ fn generic_overflow_repair_keeps_lengths_ordered_by_frequency() {
         }
         let max_bits = 5 + (state % 3) as u8;
         let mut lengths = vec![0; frequencies.len()];
-        if !make_lengths_inner(&frequencies, &mut lengths, max_bits, 0) {
+        if !make_lengths_inner(
+            &frequencies,
+            &mut lengths,
+            max_bits,
+            0,
+            &mut TreeBuildScratch::default(),
+        ) {
             continue;
         }
         repaired += 1;
@@ -1006,11 +1022,93 @@ fn caller_owned_output_matches_allocating_helpers() {
     make_lengths_defluff_exact_into(&frequencies, &mut output, 4, 0);
     assert_eq!(output, make_lengths_defluff_exact(&frequencies, 4, 0)[..]);
 
-    make_lengths_columbo_defluff_limited_into(&frequencies, &mut output, 4, 0);
+    make_lengths_columbo_defluff_limited_into(
+        &frequencies,
+        &mut output,
+        4,
+        0,
+        &mut TreeBuildScratch::default(),
+    );
     assert_eq!(
         output,
         make_lengths_columbo_defluff_limited(&frequencies, 4, 0)[..]
     );
+}
+
+#[test]
+fn shared_tree_scratch_matches_fresh_builds() {
+    // One scratch serves every builder in turn, as in a header search, so
+    // each must clear what the previous build left.
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut scratch = TreeBuildScratch::default();
+    for case in 0..6_000 {
+        let size = [19, 30, 286, 2][case % 4];
+        let range = [2, 6, 50, 1 << 16][case % 3];
+        let mut frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        if case % 5 == 0 {
+            // Fibonacci-like counts force overflow repair.
+            let (mut a, mut b) = (1_u32, 1_u32);
+            for frequency in frequencies.iter_mut().take(24) {
+                *frequency = a;
+                (a, b) = (b, a.saturating_add(b));
+            }
+        }
+        let max_bits = [7_u8, 15][case % 2];
+        let mut lengths = vec![0; size];
+
+        make_lengths_deft4j_java_heap_into(&frequencies, &mut lengths, max_bits, &mut scratch);
+        assert_eq!(
+            lengths,
+            make_lengths_deft4j_java_heap(&frequencies, max_bits),
+            "case {case}"
+        );
+        for variant in 0..4 {
+            make_lengths_into(&frequencies, &mut lengths, max_bits, variant, &mut scratch);
+            assert_eq!(
+                lengths,
+                make_lengths(&frequencies, max_bits, variant),
+                "case {case}, variant {variant}"
+            );
+            make_lengths_deflopt_heap_into_with_scratch(
+                &frequencies,
+                &mut lengths,
+                max_bits,
+                variant,
+                &mut scratch,
+            );
+            assert_eq!(
+                lengths,
+                make_lengths_deflopt_heap(&frequencies, max_bits, variant),
+                "case {case}, variant {variant}"
+            );
+        }
+        make_lengths_columbo_defluff_limited_into(
+            &frequencies,
+            &mut lengths,
+            max_bits,
+            0,
+            &mut scratch,
+        );
+        assert_eq!(
+            lengths,
+            make_lengths_columbo_defluff_limited(&frequencies, max_bits, 0),
+            "case {case}"
+        );
+    }
 }
 
 #[test]
@@ -1020,7 +1118,7 @@ fn reused_deflopt_heap_scratch_matches_standalone_builds() {
         &[10, 10, 10, 10, 3, 3, 1, 0, 0],
         &[1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 0, 0, 0],
     ];
-    let mut scratch = DefloptHeapScratch::default();
+    let mut scratch = TreeBuildScratch::default();
 
     for &frequencies in fixtures {
         for variant in 0..4 {
@@ -1275,7 +1373,7 @@ fn compact_variant_heap_matches_the_reference_builder() {
         state ^= state << 17;
         state
     };
-    let mut scratch = DefloptHeapScratch::default();
+    let mut scratch = TreeBuildScratch::default();
     let mut reference_scratch = ReferenceHeapScratch::default();
     for case in 0..40_000 {
         let size = match case % 4 {
@@ -1351,7 +1449,7 @@ fn frequency_only_heap_variant_ignores_the_tie_key() {
         state ^= state << 17;
         state
     };
-    let mut scratch = DefloptHeapScratch::default();
+    let mut scratch = TreeBuildScratch::default();
     for case in 0..20_000 {
         let size = [19, 30, 286][case % 3];
         let range = [2, 6, 50, 1 << 16][case % 4];

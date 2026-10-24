@@ -402,6 +402,7 @@ fn stored_block_plans_match_uncached_planning_in_any_token_order() {
                 &Options::default(),
                 &mut SearchStop::never(),
                 &mut HeaderPlanCache::new(),
+                token_extra_bits(&block.tokens),
             );
             if let Representation::Dynamic(original) = original.representation {
                 block.original_dynamic = original.try_clone();
@@ -418,6 +419,7 @@ fn stored_block_plans_match_uncached_planning_in_any_token_order() {
             &options,
             &mut SearchStop::never(),
             &mut HeaderPlanCache::new(),
+            token_extra_bits(&block.tokens),
         );
         for planned in [&block, &block, &reordered] {
             let plan = plan_reusable_block(planned, &options, &mut SearchStop::never());
@@ -441,6 +443,7 @@ fn stored_block_plan_rejects_a_fingerprint_collision() {
         &options,
         &mut SearchStop::never(),
         &mut HeaderPlanCache::new(),
+        token_extra_bits(&block.tokens),
     );
 
     let mut other_count = block.try_clone_shared().unwrap();
@@ -492,6 +495,7 @@ fn reached_stops_neither_use_nor_fill_stored_block_plans() {
         &options,
         &mut SearchStop::always(),
         &mut HeaderPlanCache::new(),
+        token_extra_bits(&block.tokens),
     );
     assert_same_reusable(&truncated, &expected);
     assert_same_reusable(
