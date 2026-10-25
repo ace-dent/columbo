@@ -969,6 +969,27 @@ fn assign_depths(nodes: &[Node], node_index: usize, depth: usize, lengths: &mut 
     left_depth.max(right_depth)
 }
 
+/// [`assign_depths`] from the root, for a tree built by merging: every branch
+/// follows its children and the root is the last node, so one pass from the
+/// end gives each node its depth before its children need it.
+fn assign_depths_from_last(nodes: &[Node], depths: &mut Vec<u32>, lengths: &mut [u8]) -> usize {
+    depths.clear();
+    depths.resize(nodes.len(), 0);
+    let mut max_depth = 0;
+    for (index, node) in nodes.iter().enumerate().rev() {
+        let depth = depths[index];
+        if let Some(symbol) = node.symbol {
+            lengths[symbol] = depth.min(u32::from(u8::MAX)) as u8;
+            max_depth = max_depth.max(depth as usize);
+        } else {
+            for child in [node.left, node.right] {
+                depths[child.expect("branch has two children")] = depth + 1;
+            }
+        }
+    }
+    max_depth
+}
+
 fn first_leaf_at_depth(
     nodes: &[Node],
     node_index: usize,
@@ -1039,6 +1060,7 @@ fn make_lengths_inner(
     let TreeBuildScratch {
         nodes,
         node_indices: active,
+        depths,
         ..
     } = scratch;
     nodes.clear();
@@ -1081,7 +1103,8 @@ fn make_lengths_inner(
         merge_generic_nodes_dual_heap(nodes, active, variant);
     }
 
-    let max_depth = assign_depths(nodes, active[0], 0, lengths);
+    debug_assert_eq!(active[0], nodes.len() - 1);
+    let max_depth = assign_depths_from_last(nodes, depths, lengths);
     if max_depth <= usize::from(max_bits) {
         return false;
     }
@@ -1578,22 +1601,29 @@ fn apply_package_merge(
     if previous.len() < target {
         return;
     }
-    let mut candidate = vec![0_u8; frequencies.len()];
+    // A leaf's length is how often it occurs in the selected nodes. Every
+    // package follows the nodes it pairs, so one pass from the end hands each
+    // node's count to its children before they are read.
+    let mut occurrences = vec![0_u8; nodes.len()];
     for &node in previous.iter().take(target) {
-        accumulate_package_lengths(&nodes, node, &mut candidate);
+        occurrences[node] += 1;
+    }
+    let mut candidate = vec![0_u8; frequencies.len()];
+    for (index, node) in nodes.iter().enumerate().rev() {
+        let count = occurrences[index];
+        if count == 0 {
+            continue;
+        }
+        match node.kind {
+            PackageKind::Leaf(symbol) => candidate[symbol] += count,
+            PackageKind::Pair(left, right) => {
+                occurrences[left] += count;
+                occurrences[right] += count;
+            }
+        }
     }
     if package_lengths_are_valid(frequencies, &candidate, max_bits) {
         lengths.copy_from_slice(&candidate);
-    }
-}
-
-fn accumulate_package_lengths(nodes: &[PackageNode], node_index: usize, lengths: &mut [u8]) {
-    match nodes[node_index].kind {
-        PackageKind::Leaf(symbol) => lengths[symbol] += 1,
-        PackageKind::Pair(left, right) => {
-            accumulate_package_lengths(nodes, left, lengths);
-            accumulate_package_lengths(nodes, right, lengths);
-        }
     }
 }
 
@@ -2005,6 +2035,7 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
     let TreeBuildScratch {
         nodes,
         java_heap: heap,
+        depths,
         ..
     } = scratch;
     nodes.clear();
@@ -2074,7 +2105,8 @@ pub(crate) fn make_lengths_deft4j_java_heap_into(
     }
 
     let root = java_heap_node(heap[0]);
-    let max_depth = assign_depths(nodes, root, 0, lengths);
+    debug_assert_eq!(root, nodes.len() - 1);
+    let max_depth = assign_depths_from_last(nodes, depths, lengths);
     if max_depth <= usize::from(max_bits) {
         return;
     }

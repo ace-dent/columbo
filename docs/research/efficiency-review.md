@@ -75,6 +75,7 @@ gains where established.
 | 23 Oct 2026 | [`d72c937`](#d72c937-23-october-2026) | Max header planning (`header.rs`, `huffman.rs`) | Code-length trees cached by RLE histogram, builders that must agree sharing one tree; repeat rewrites skipped when the RLE's symbol counts show nothing can change; one scan per shortest-RLE repeat window, in buffers kept for the header plan; RLE and tree buffers sized once; a branch-free Kraft sum; packed keys in Columbo's heaps | Captured Max header plans 1.26×; completing Max runs 1.29× and 1.12×; Default CPU 1.14× (33 inputs); peak memory −0.1 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 403,865 captured shortest-RLE calls; 20,000 rewrite and 768 heap-merge comparisons; 668 Rust, 7 Python tests |
 | 24 Oct 2026 | [`71ecf9f`](#71ecf9f-24-october-2026) | Default terminal and header work (`slide.rs`, `search.rs`, `header.rs`) | Slide boundaries skipped while both blocks are unchanged since their last search found no cheaper cut; literal-cost sums stopped once they decide the comparison with the match; code-length runs found once for every RLE seed | Default CPU 1.11× (33 inputs); completing Max runs 1.04× and 1.00× (3.4% and 1.1% fewer instructions); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 literal-sum, 20,000 joining-price and 20,000 run-list comparisons; 672 Rust, 7 Python tests |
 | 24 Oct 2026 | [`e79a60a`](#e79a60a-24-october-2026) | Tree builders, RLE counts, bit reading and plan-cache keys (`huffman.rs`, `header.rs`, `bitstream.rs`, `block.rs`) | Heap entries carry packed keys and sift-downs specialize by tie rule; deft4j's and the generic builder's buffers shared and deft4j's heap keyed; RLE counts in four tables and costs without saturation; rewrites adjust counts at changes; the bit reader loads eight bytes at a time; the planner reuses the block key's extra bits; the canonical cache keys on counts | Default CPU 1.21× (33 inputs); large inputs 1.11–1.27×; completing Max runs 1.08× and 1.04× (6.1% and 2.9% fewer instructions); captured header plans 1.12×; peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 large inputs; 89,255 replayed header plans; 2 completing Max runs; 6,000 shared-scratch and 4,000 bit-reader oracle comparisons; 674 Rust, 7 Python tests |
+| 25 Oct 2026 | [`bab3748`](#bab3748-25-october-2026) | Short-family pricing, tree depths, package-merge, header-plan buffers, RLE rewrites (`search.rs`, `huffman.rs`, `header.rs`) | The short-family floor prices trees from its tokens' counts; merged trees get their depths in one pass; package-merge counts lengths in one pass; each thread reuses its header-plan search buffers; the RLE rewrites copy unchanged runs whole | Default CPU 1.05× (33 inputs); captured header plans 1.04×; a completing Max run 1.2% fewer instructions; peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 package-merge and 6,000 depth comparisons; 677 Rust, 7 Python tests |
 
 ## Entries
 
@@ -471,6 +472,91 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `bab3748`, 25 October 2026
+
+Batches: none; whole-file CPU (user plus system) and peak resident memory over
+the 33 stratified Default inputs, once per build in alternating order, in three
+comparisons; two alternating runs of each completing Max run and of the
+header-plan replay.
+
+A sampled Default profile of the 33 inputs at `bab3748` (54,301 CPU samples)
+still put 27% in the DeflOpt and order-key heap builders and 48% under the
+uncached header planner. The rest spread over steps of 1% to 4%. Several
+repeated work whose result was already known: the short-family floor priced
+four trees per length family by rescanning its tokens (`token_bits`, 1.7% of
+samples), merged trees got their depths by recursion (1.8%), package-merge
+walked each selected package's leaves recursively (0.8%), and each of the
+777,383 uncached header plans started from empty buffers.
+
+- **Short-family pricing from counts.** The floor already counts its expanded
+  tokens to build each tree; a tree's data bits are the counts times the code
+  lengths plus the extra bits, so each of the four trees per length family is
+  priced in one pass over 316 counts instead of over the tokens. The counts
+  are taken before the floor's added distance codes, and an unusable code
+  rejects a tree in the same cases.
+- **Tree depths in one pass.** deft4j's Java-heap builder and the generic node
+  builder create every branch after its children, with the root last, so one
+  pass from the last node gives each node its depth before its children need
+  it; deft4j's overflow repair, which re-parents nodes, still walks the tree.
+- **Package-merge counts.** A leaf's length is how often it occurs in the
+  selected nodes. Every package follows the nodes it pairs, so one pass from
+  the last node hands each node's count to its children, instead of walking
+  each selected package's leaves.
+- **Reused header-plan buffers.** Each thread keeps the uncached header
+  planner's search, with its tree-builder and shortest-RLE buffers, between
+  plans; the best plan and the shortest-RLE memo, which belong to one plan's
+  code lengths, are cleared for each plan.
+- **Whole-run rewrite copies.** The DeflOpt and deft4j RLE rewrites copy each
+  unchanged run of tokens in one slice at the next change or the end, instead
+  of pushing every token after the first change.
+
+| Candidate | CPU before | CPU after | Speedup | Peak memory, median / largest increase |
+| --- | ---: | ---: | ---: | ---: |
+| Short-family pricing, tree depths, package-merge counts | 65.7 s | 63.3 s | 1.04× | −0.2 / +4.2 MiB |
+| Plus reused header-plan buffers | 62.9 s | 61.0 s | 1.03× | −0.2 / +0.4 MiB |
+| Plus whole-run rewrite copies (retained) | 63.4 s | 60.5 s | 1.05× | 0.0 / +1.0 MiB |
+
+Each comparison after the first also reran the previous candidate, which took
+61.3 seconds both times.
+
+| Measure | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed | 4.24 s | 4.08 s | 1.04× |
+| `036-Clefable-0.png`, Max completing its search | 2.50 s | 2.44 s | 1.02× |
+| `114-Tangela-1.png`, Max completing its search | 0.25 s | 0.25 s | 1.00× |
+
+The Clefable run retired 57.1 instead of 57.8 billion instructions; the
+Tangela run 3.34 instead of 3.33 billion.
+
+Equivalence: a new test compares package-merge with its previous recursive
+form on 20,000 random alphabets, depth limits from 4 to 15 bits and both tie
+rules; another builds 6,000 random alphabets with the generic builder's four
+variants and deft4j's builder, unlimited, and compares the lengths with the
+recursive walk over the same nodes, and debug builds check that each merged
+tree's root is its last node. The existing comparisons of both RLE rewrites
+with their reference implementations, counts included, still pass. The
+89,255 replayed header plans matched plan for plan. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every CLI timing run and both completing Max runs matched
+byte for byte. Rust tests, including the private corpus, passed in release and
+debug modes, with documentation and Python tests, a locked build, formatting,
+all-feature Clippy with warnings denied and a package list without private
+fixtures or scratch artifacts. `__text` grew from 853,932 to 855,572 bytes; the
+shipped executable keeps its 942,048 bytes.
+
+Measured and rejected in the same review:
+
+- A per-thread cache of payload trees by histogram: over the 33 inputs, only
+  4.6% of the 92,109 literal/length histograms the dynamic planner builds
+  trees for repeat on their thread, even without a size limit; distance
+  histograms repeat 24%, but their 30-symbol trees are cheap.
+- A larger header-plan store: 6.6% of uncached header plans repeat one their
+  thread planned before, 7.7% of the uncached planning time.
+- Copying a header plan's payload code lengths only once it is chosen: the
+  copies on each improvement cost 0.17% of samples.
+
+Artifacts: `work/efficiency-review-default3-20261025/`.
 
 ### `e79a60a`, 24 October 2026
 

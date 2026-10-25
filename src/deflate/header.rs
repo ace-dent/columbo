@@ -3,7 +3,7 @@
 
 //! Dynamic-header construction and exact bit accounting.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::huffman::{
@@ -2583,7 +2583,15 @@ fn plan_for_trimmed_lengths_uncached(
     decoded_length_storage[literal_lengths.len()..decoded_length_count]
         .copy_from_slice(distance_lengths);
     let decoded_lengths = &decoded_length_storage[..decoded_length_count];
-    let mut search = HeaderPlanSearch::default();
+    // This thread's buffers, reused between plans; the best plan and the
+    // shortest RLEs belong to one plan's code lengths.
+    let mut search = HEADER_PLAN_SEARCH
+        .try_with(Cell::take)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    search.best = None;
+    search.shortest_rles.clear();
     for rle in rle_seed_candidates(decoded_lengths, rle_mask) {
         consider_rle(
             data_bits,
@@ -2595,7 +2603,14 @@ fn plan_for_trimmed_lengths_uncached(
             &mut search,
         );
     }
-    search.best
+    let best = search.best.take();
+    let _ = HEADER_PLAN_SEARCH.try_with(|cell| cell.set(Some(search)));
+    best
+}
+
+thread_local! {
+    /// The uncached header planner's buffers on this thread, between plans.
+    static HEADER_PLAN_SEARCH: Cell<Option<HeaderPlanSearch>> = const { Cell::new(None) };
 }
 
 #[derive(Default)]
@@ -3616,6 +3631,9 @@ fn rewrite_rle_deflopt_local(
     // Built from the first change on: a rewrite that passes the check above
     // can still change nothing.
     let mut output: Option<Vec<RleToken>> = None;
+    // Input before this index is already in `output`; unchanged runs are
+    // copied whole at the next change or the end.
+    let mut copied = 0;
     let mut rewritten_frequencies = *frequencies;
     let mut previous = None;
 
@@ -3663,9 +3681,6 @@ fn rewrite_rle_deflopt_local(
         };
 
         if replacement.is_none() && repeated.is_none() {
-            if let Some(output) = output.as_mut() {
-                output.push(token);
-            }
             continue;
         }
         let output = match output.as_mut() {
@@ -3676,10 +3691,11 @@ fn rewrite_rle_deflopt_local(
                 started
                     .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
                     .ok()?;
-                started.extend_from_slice(&input[..index]);
                 output.insert(started)
             }
         };
+        output.extend_from_slice(&input[copied..index]);
+        copied = index + 1;
         rewritten_frequencies[usize::from(token.symbol)] -= 1;
         if let Some((value, count)) = repeated {
             output.extend(
@@ -3696,7 +3712,8 @@ fn rewrite_rle_deflopt_local(
         }
     }
 
-    output.map(|output| {
+    output.map(|mut output| {
+        output.extend_from_slice(&input[copied..]);
         debug_assert_eq!(rewritten_frequencies, rle_frequencies(&output));
         (output, rewritten_frequencies)
     })
@@ -3753,16 +3770,15 @@ fn rewrite_rle_deft4j_literals(
         return None;
     }
     let mut rewritten_frequencies = *frequencies;
-    // Built from the first change on, like the DeflOpt rewrite's.
+    // Built from the first change on, like the DeflOpt rewrite's, with
+    // unchanged runs copied whole.
     let mut output: Option<Vec<RleToken>> = None;
+    let mut copied = 0;
     let mut previous = None;
 
     for (index, &token) in input.iter().enumerate() {
         let (value, count) = match token.symbol {
             value @ 0..=15 => {
-                if let Some(output) = output.as_mut() {
-                    output.push(token);
-                }
                 previous = Some(value);
                 continue;
             }
@@ -3779,10 +3795,11 @@ fn rewrite_rle_deft4j_literals(
                 None => {
                     let mut started = Vec::new();
                     started.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
-                    started.extend_from_slice(&input[..index]);
                     output.insert(started)
                 }
             };
+            output.extend_from_slice(&input[copied..index]);
+            copied = index + 1;
             if output.len().checked_add(count)? > MAX_DYNAMIC_CODE_LENGTH_COUNT {
                 return None;
             }
@@ -3795,12 +3812,13 @@ fn rewrite_rle_deft4j_literals(
             );
             rewritten_frequencies[usize::from(token.symbol)] -= 1;
             rewritten_frequencies[usize::from(value)] += count as u32;
-        } else if let Some(output) = output.as_mut() {
-            output.push(token);
         }
         previous = Some(value);
     }
-    output.map(|output| (output, rewritten_frequencies))
+    output.map(|mut output| {
+        output.extend_from_slice(&input[copied..]);
+        (output, rewritten_frequencies)
+    })
 }
 
 fn explicit_rle_cost(lengths: &[u8; 19], symbol: u8, count: usize) -> u64 {

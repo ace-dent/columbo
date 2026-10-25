@@ -3116,8 +3116,12 @@ fn consider_short_family_tokens(
     options: &Options,
     best: &mut PlannedBlock,
 ) {
-    let (literal_frequencies, mut distance_frequencies) = count_frequencies(&tokens);
+    let (literal_frequencies, token_distance_frequencies) = count_frequencies(&tokens);
+    let mut distance_frequencies = token_distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
+    // The tokens' own counts, before the floor's added distance codes, price
+    // each tree as a pass over the tokens would.
+    let extra_bits = token_extra_bits(&tokens);
     let mut best_dynamic = None;
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
@@ -3137,12 +3141,21 @@ fn consider_short_family_tokens(
             variant,
             &mut heap_scratch,
         );
-        let Some(dynamic) = plan_for_explicit_lengths(
-            &tokens,
+        let Some(dynamic) = token_bits_from_frequencies(
+            &literal_frequencies,
+            &token_distance_frequencies,
             &literal_lengths,
             &distance_lengths,
-            options.exhaustive,
-        ) else {
+            extra_bits,
+        )
+        .and_then(|data_bits| {
+            plan_for_explicit_lengths_with_cost(
+                &literal_lengths,
+                &distance_lengths,
+                data_bits,
+                options.exhaustive,
+            )
+        }) else {
             continue;
         };
         if best_dynamic

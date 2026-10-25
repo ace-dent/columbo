@@ -1522,3 +1522,175 @@ fn leaf_key_sorts_match_the_comparator_sorts() {
         }
     }
 }
+
+/// `apply_package_merge` as it was before its lengths were counted in one
+/// pass: each selected node's leaves are found by a recursive walk.
+fn reference_package_merge(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    tie: PackageMergeTie,
+) {
+    fn accumulate(nodes: &[PackageNode], node_index: usize, lengths: &mut [u8]) {
+        match nodes[node_index].kind {
+            PackageKind::Leaf(symbol) => lengths[symbol] += 1,
+            PackageKind::Pair(left, right) => {
+                accumulate(nodes, left, lengths);
+                accumulate(nodes, right, lengths);
+            }
+        }
+    }
+    let leaf_count = frequencies
+        .iter()
+        .filter(|&&frequency| frequency != 0)
+        .count();
+    if leaf_count < 2 || max_bits == 0 {
+        return;
+    }
+    let target = 2 * leaf_count - 2;
+    let mut nodes = Vec::new();
+    let mut keys = Vec::new();
+    for (symbol, &frequency) in frequencies.iter().enumerate() {
+        if frequency == 0 {
+            continue;
+        }
+        keys.push(leaf_key(frequency, nodes.len() as u32));
+        nodes.push(PackageNode {
+            weight: u64::from(frequency),
+            kind: PackageKind::Leaf(symbol),
+        });
+    }
+    keys.sort_unstable();
+    let leaves: Vec<usize> = keys.iter().map(|&key| leaf_key_tie(key) as usize).collect();
+    let mut previous = leaves.clone();
+    for _level in 1..max_bits {
+        let package_count = previous.len() / 2;
+        let package_start = nodes.len();
+        for pair in previous.chunks_exact(2) {
+            nodes.push(PackageNode {
+                weight: nodes[pair[0]].weight + nodes[pair[1]].weight,
+                kind: PackageKind::Pair(pair[0], pair[1]),
+            });
+        }
+        let mut current = Vec::new();
+        let (mut leaf_position, mut package_position) = (0, 0);
+        while current.len() < target
+            && (leaf_position < leaf_count || package_position < package_count)
+        {
+            let take_leaf = package_position >= package_count
+                || (leaf_position < leaf_count
+                    && match tie {
+                        PackageMergeTie::LeafFirst => {
+                            nodes[leaves[leaf_position]].weight
+                                <= nodes[package_start + package_position].weight
+                        }
+                        PackageMergeTie::PackageFirst => {
+                            nodes[leaves[leaf_position]].weight
+                                < nodes[package_start + package_position].weight
+                        }
+                    });
+            if take_leaf {
+                current.push(leaves[leaf_position]);
+                leaf_position += 1;
+            } else {
+                current.push(package_start + package_position);
+                package_position += 1;
+            }
+        }
+        previous = current;
+    }
+    if previous.len() < target {
+        return;
+    }
+    let mut candidate = vec![0_u8; frequencies.len()];
+    for &node in previous.iter().take(target) {
+        accumulate(&nodes, node, &mut candidate);
+    }
+    if package_lengths_are_valid(frequencies, &candidate, max_bits) {
+        lengths.copy_from_slice(&candidate);
+    }
+}
+
+#[test]
+fn package_merge_counts_match_the_recursive_walk() {
+    let mut state = 0x510e_527f_ade6_82d1_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for case in 0..20_000 {
+        let size = [19, 30, 286, 2 + (case % 40)][case % 4];
+        let range = [2, 6, 50, 1 << 20][case % 4];
+        let mut frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        if case % 5 == 0 {
+            // Fibonacci-like counts need the limit.
+            let (mut a, mut b) = (1_u32, 1_u32);
+            for frequency in frequencies.iter_mut().take(24) {
+                *frequency = a;
+                (a, b) = (b, a.saturating_add(b));
+            }
+        }
+        let max_bits = [4_u8, 7, 9, 15][case % 4];
+        for tie in [PackageMergeTie::LeafFirst, PackageMergeTie::PackageFirst] {
+            let seed: Vec<u8> = (0..size).map(|symbol| (symbol % 3) as u8).collect();
+            let mut actual = seed.clone();
+            let mut expected = seed;
+            apply_package_merge(&frequencies, &mut actual, max_bits, tie);
+            reference_package_merge(&frequencies, &mut expected, max_bits, tie);
+            assert_eq!(actual, expected, "case {case}, limit {max_bits}");
+        }
+    }
+}
+
+#[test]
+fn merged_tree_depths_match_the_recursive_walk() {
+    // With no limit to repair, each builder's lengths are its tree's depths,
+    // which the recursive walk from the root gives too.
+    let mut state = 0x9b05_688c_2b3e_6c1f_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut scratch = TreeBuildScratch::default();
+    for case in 0..6_000 {
+        let size = [19, 30, 286, 2][case % 4];
+        let range = [2, 6, 50, 1 << 16][case % 3];
+        let frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        let mut lengths = vec![0; size];
+        let check = |lengths: &[u8], scratch: &TreeBuildScratch| {
+            let mut expected = vec![0; size];
+            if let Some(root) = scratch.nodes.len().checked_sub(1) {
+                if scratch.nodes.len() > 1 {
+                    assign_depths(&scratch.nodes, root, 0, &mut expected);
+                    assert_eq!(lengths, &expected[..], "case {case}");
+                }
+            }
+        };
+        for variant in 0..4 {
+            make_lengths_into(&frequencies, &mut lengths, u8::MAX, variant, &mut scratch);
+            check(&lengths, &scratch);
+        }
+        make_lengths_deft4j_java_heap_into(&frequencies, &mut lengths, u8::MAX, &mut scratch);
+        check(&lengths, &scratch);
+    }
+}
