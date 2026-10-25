@@ -666,15 +666,25 @@ fn node_less(nodes: &[Node], a: usize, b: usize, variant: u32) -> bool {
 /// one of node indices would.
 type KeyedNode = (u64, usize);
 
-fn keyed_heap(nodes: &[Node], members: &[usize], variant: u32) -> Vec<KeyedNode> {
-    let mut heap: Vec<KeyedNode> = members
-        .iter()
-        .map(|&node| (node_key(&nodes[node], variant), node))
-        .collect();
+/// Reusable buffers for the generic builder's heap merges.
+#[derive(Default)]
+pub(crate) struct KeyedHeaps {
+    increasing: Vec<KeyedNode>,
+    decreasing: Vec<KeyedNode>,
+    is_active: Vec<bool>,
+}
+
+/// Fill `heap` with `members` keyed for `variant`, in heap order.
+fn fill_keyed_heap(heap: &mut Vec<KeyedNode>, nodes: &[Node], members: &[usize], variant: u32) {
+    heap.clear();
+    heap.extend(
+        members
+            .iter()
+            .map(|&node| (node_key(&nodes[node], variant), node)),
+    );
     for start in (0..heap.len() / 2).rev() {
-        keyed_heap_sift_down(&mut heap, start);
+        keyed_heap_sift_down(heap, start);
     }
-    heap
 }
 
 fn keyed_heap_sift_down(heap: &mut [KeyedNode], mut root: usize) {
@@ -717,15 +727,20 @@ fn keyed_heap_push(heap: &mut Vec<KeyedNode>, entry: KeyedNode) {
     }
 }
 
-fn merge_generic_nodes_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
-    let mut heap = keyed_heap(nodes, active, variant);
+fn merge_generic_nodes_heap(
+    nodes: &mut Vec<Node>,
+    active: &mut Vec<usize>,
+    variant: u32,
+    heap: &mut Vec<KeyedNode>,
+) {
+    fill_keyed_heap(heap, nodes, active, variant);
     while heap.len() > 1 {
-        let left = keyed_heap_pop(&mut heap).expect("two nodes remain");
-        let right = keyed_heap_pop(&mut heap).expect("one node remains");
+        let left = keyed_heap_pop(heap).expect("two nodes remain");
+        let right = keyed_heap_pop(heap).expect("one node remains");
         let index = nodes.len();
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
-        keyed_heap_push(&mut heap, (node_key(&nodes[index], variant), index));
+        keyed_heap_push(heap, (node_key(&nodes[index], variant), index));
     }
     active.clear();
     active.extend(heap.first().map(|&(_, root)| root));
@@ -743,29 +758,39 @@ fn keyed_heap_pop_active(heap: &mut Vec<KeyedNode>, active: &[bool]) -> Option<u
 /// Merge for variants 2 and 3, whose first and second child break ties in
 /// opposite directions: one heap per tie order, and a node taken from one is
 /// skipped by the other.
-fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>, variant: u32) {
+fn merge_generic_nodes_dual_heap(
+    nodes: &mut Vec<Node>,
+    active: &mut Vec<usize>,
+    variant: u32,
+    heaps: &mut KeyedHeaps,
+) {
     debug_assert_ne!(variant & 2, 0);
-    let mut increasing_order = keyed_heap(nodes, active, 0);
-    let mut decreasing_order = keyed_heap(nodes, active, 1);
+    let KeyedHeaps {
+        increasing: increasing_order,
+        decreasing: decreasing_order,
+        is_active,
+    } = heaps;
+    fill_keyed_heap(increasing_order, nodes, active, 0);
+    fill_keyed_heap(decreasing_order, nodes, active, 1);
 
     let leaf_count = active.len();
-    let mut is_active = Vec::with_capacity(leaf_count.saturating_mul(2));
+    is_active.clear();
     is_active.resize(nodes.len(), true);
     let mut remaining = leaf_count;
     while remaining > 1 {
         let reverse_first = variant & 1 != 0;
         let left = if reverse_first {
-            keyed_heap_pop_active(&mut decreasing_order, &is_active)
+            keyed_heap_pop_active(decreasing_order, is_active)
         } else {
-            keyed_heap_pop_active(&mut increasing_order, &is_active)
+            keyed_heap_pop_active(increasing_order, is_active)
         }
         .expect("two nodes remain");
         is_active[left] = false;
 
         let right = if reverse_first {
-            keyed_heap_pop_active(&mut increasing_order, &is_active)
+            keyed_heap_pop_active(increasing_order, is_active)
         } else {
-            keyed_heap_pop_active(&mut decreasing_order, &is_active)
+            keyed_heap_pop_active(decreasing_order, is_active)
         }
         .expect("one node remains");
         is_active[right] = false;
@@ -774,12 +799,12 @@ fn merge_generic_nodes_dual_heap(nodes: &mut Vec<Node>, active: &mut Vec<usize>,
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
         is_active.push(true);
-        keyed_heap_push(&mut increasing_order, (node_key(&nodes[index], 0), index));
-        keyed_heap_push(&mut decreasing_order, (node_key(&nodes[index], 1), index));
+        keyed_heap_push(increasing_order, (node_key(&nodes[index], 0), index));
+        keyed_heap_push(decreasing_order, (node_key(&nodes[index], 1), index));
         remaining -= 1;
     }
 
-    let root = keyed_heap_pop_active(&mut increasing_order, &is_active).expect("one root remains");
+    let root = keyed_heap_pop_active(increasing_order, is_active).expect("one root remains");
     active.clear();
     active.push(root);
 }
@@ -1061,6 +1086,7 @@ fn make_lengths_inner(
         nodes,
         node_indices: active,
         depths,
+        keyed_heaps,
         ..
     } = scratch;
     nodes.clear();
@@ -1098,9 +1124,9 @@ fn make_lengths_inner(
             merge_generic_nodes_reverse_front(nodes, active);
         }
     } else if variant & 2 == 0 {
-        merge_generic_nodes_heap(nodes, active, variant);
+        merge_generic_nodes_heap(nodes, active, variant, &mut keyed_heaps.increasing);
     } else {
-        merge_generic_nodes_dual_heap(nodes, active, variant);
+        merge_generic_nodes_dual_heap(nodes, active, variant, keyed_heaps);
     }
 
     debug_assert_eq!(active[0], nodes.len() - 1);
@@ -1694,6 +1720,7 @@ pub(crate) struct TreeBuildScratch {
     /// The generic builder's live nodes.
     node_indices: Vec<usize>,
     java_heap: Vec<u64>,
+    keyed_heaps: KeyedHeaps,
 }
 
 /// Restore the heap order below `start`, comparing whole keys, or only

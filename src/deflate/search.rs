@@ -12,6 +12,7 @@
 
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::sort::SortShared;
@@ -3903,7 +3904,7 @@ fn plan_block_with_search_policy(
     if try_ordered_queue && !stop.reached() {
         let alternate =
             pre_individual.filter(|alternate| !same_tokens(&alternate.tokens, &best.tokens));
-        let mut seen = HashSet::new();
+        let mut seen = SeenTokens::default();
         // Queue edges only expand matches, so they cannot restore a match that
         // individual pruning removed. Search the intact root first, since it
         // reaches a superset of states.
@@ -3954,6 +3955,52 @@ fn plan_block_with_search_policy(
     best
 }
 
+/// Token sequences the ordered queue has visited. The set only answers
+/// membership and compares whole sequences, so any hash gives the same
+/// results; it holds at most a few hundred, so collisions cost little.
+type SeenTokens = HashSet<Vec<Token>, BuildHasherDefault<TokenSequenceHasher>>;
+
+/// A multiply-rotate hash of each field, much cheaper than the default
+/// SipHash over thousands of tokens.
+#[derive(Default)]
+struct TokenSequenceHasher(u64);
+
+impl Hasher for TokenSequenceHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u16(&mut self, value: u16) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write_u64(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.write_u64(value as u64);
+    }
+}
+
 struct QueueState {
     tokens: Vec<Token>,
     bits: u64,
@@ -3976,7 +4023,7 @@ fn ordered_state_queue(
     options: &Options,
     stop: &mut SearchStop<'_>,
     best: &mut PlannedBlock,
-    seen: &mut HashSet<Vec<Token>>,
+    seen: &mut SeenTokens,
 ) {
     const BEAM: usize = 8;
     const DEPTH: usize = 5;

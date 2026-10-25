@@ -522,10 +522,16 @@ thread_local! {
 
 fn code_length_tree_slot(frequencies: &[u32; 19]) -> usize {
     const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
-    let mut hash = 0_u64;
-    for &frequency in frequencies {
-        hash = (hash ^ u64::from(frequency)).wrapping_mul(MULTIPLIER);
+    // Four lanes, so the multiplications overlap instead of each waiting for
+    // the last; a hit still compares the whole histogram.
+    let mut lanes = [0_u64, 1, 2, 3];
+    for (index, &frequency) in frequencies.iter().enumerate() {
+        let lane = &mut lanes[index % lanes.len()];
+        *lane = (*lane ^ u64::from(frequency)).wrapping_mul(MULTIPLIER);
     }
+    let hash = lanes
+        .iter()
+        .fold(0_u64, |hash, &lane| (hash ^ lane).wrapping_mul(MULTIPLIER));
     (hash >> (u64::BITS - CODE_LENGTH_TREE_CACHE_BITS)) as usize
 }
 
@@ -3341,8 +3347,10 @@ fn consider_rle(
         let mut rewritten = rewrite_rle_deflopt_local(&rle, &frequencies, &tree);
         if exhaustive {
             if let Some(shortest) = search.shortest_rle(decoded_lengths, &tree) {
-                if rewritten.as_ref().map_or(true, |(local, _)| {
-                    rle_cost(&shortest.0, &tree) < rle_cost(local, &tree)
+                // Both carry their exact symbol counts, which price them as
+                // their tokens would.
+                if rewritten.as_ref().map_or(true, |(_, local)| {
+                    rle_frequency_cost(&shortest.1, &tree) < rle_frequency_cost(local, &tree)
                 }) {
                     rewritten = Some(shortest);
                 }
@@ -4245,6 +4253,7 @@ const RLE_EXTRA_BITS: [u64; 19] = {
     bits
 };
 
+#[cfg(test)]
 fn rle_cost(rle: &[RleToken], lengths: &[u8; 19]) -> u64 {
     rle.iter()
         .map(|token| rle_symbol_cost(lengths, token.symbol))
@@ -4380,24 +4389,25 @@ fn shortest_rle_with_frequencies(
     // Each token spells at least one length.
     let mut output = Vec::new();
     output.try_reserve_exact(len).ok()?;
-    let mut frequencies = [0_u32; 19];
     let mut index = 0;
     while index < lengths.len() {
         let selected = step[index]?;
         output.push(selected.token);
-        frequencies[usize::from(selected.token.symbol)] += 1;
         index = selected.next;
     }
+    let frequencies = rle_frequencies(&output);
     Some((output, frequencies))
 }
 
 /// The position of the first smallest value in a nonempty slice.
 fn earliest_minimum(values: &[u64]) -> usize {
+    // Selects rather than branches: which value is smallest is unpredictable.
     let mut position = 0;
+    let mut minimum = values[0];
     for (index, &value) in values.iter().enumerate().skip(1) {
-        if value < values[position] {
-            position = index;
-        }
+        let smaller = value < minimum;
+        minimum = if smaller { value } else { minimum };
+        position = if smaller { index } else { position };
     }
     position
 }

@@ -76,6 +76,7 @@ gains where established.
 | 24 Oct 2026 | [`71ecf9f`](#71ecf9f-24-october-2026) | Default terminal and header work (`slide.rs`, `search.rs`, `header.rs`) | Slide boundaries skipped while both blocks are unchanged since their last search found no cheaper cut; literal-cost sums stopped once they decide the comparison with the match; code-length runs found once for every RLE seed | Default CPU 1.11× (33 inputs); completing Max runs 1.04× and 1.00× (3.4% and 1.1% fewer instructions); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 literal-sum, 20,000 joining-price and 20,000 run-list comparisons; 672 Rust, 7 Python tests |
 | 24 Oct 2026 | [`e79a60a`](#e79a60a-24-october-2026) | Tree builders, RLE counts, bit reading and plan-cache keys (`huffman.rs`, `header.rs`, `bitstream.rs`, `block.rs`) | Heap entries carry packed keys and sift-downs specialize by tie rule; deft4j's and the generic builder's buffers shared and deft4j's heap keyed; RLE counts in four tables and costs without saturation; rewrites adjust counts at changes; the bit reader loads eight bytes at a time; the planner reuses the block key's extra bits; the canonical cache keys on counts | Default CPU 1.21× (33 inputs); large inputs 1.11–1.27×; completing Max runs 1.08× and 1.04× (6.1% and 2.9% fewer instructions); captured header plans 1.12×; peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default and 5 large inputs; 89,255 replayed header plans; 2 completing Max runs; 6,000 shared-scratch and 4,000 bit-reader oracle comparisons; 674 Rust, 7 Python tests |
 | 25 Oct 2026 | [`bab3748`](#bab3748-25-october-2026) | Short-family pricing, tree depths, package-merge, header-plan buffers, RLE rewrites (`search.rs`, `huffman.rs`, `header.rs`) | The short-family floor prices trees from its tokens' counts; merged trees get their depths in one pass; package-merge counts lengths in one pass; each thread reuses its header-plan search buffers; the RLE rewrites copy unchanged runs whole | Default CPU 1.05× (33 inputs); captured header plans 1.04×; a completing Max run 1.2% fewer instructions; peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs; 89,255 replayed header plans; 2 completing Max runs; 20,000 package-merge and 6,000 depth comparisons; 677 Rust, 7 Python tests |
+| 25 Oct 2026 | [`d96ab5c`](#d96ab5c-25-october-2026) | Max header search and ordered queue (`header.rs`, `huffman.rs`, `search.rs`) | The generic builder's heap merges reuse their buffers; the shortest RLE picks its earliest minimum without branches, is counted in four tables and compared with the local rewrite from counts; the code-length tree slot is hashed in four lanes; the ordered queue's visited token sequences use a multiply-rotate hash instead of SipHash | Completing Max runs 3.4% and 10.5% fewer instructions; captured header plans 1.03×; Default CPU unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 20,000 minimum and 20,000 cost comparisons; 679 Rust, 7 Python tests |
 
 ## Entries
 
@@ -472,6 +473,83 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `d96ab5c`, 25 October 2026
+
+Batches: two alternating runs of the header-plan replay and of each completing
+Max run; one paired run of each build on every sixteenth DeflOpt PNG by name
+(58 files, Max at 10 seconds, alternating order); whole-file Default CPU over
+the 33 stratified inputs, once per build in alternating order.
+
+A sampled profile of ten inputs in Max at 20 seconds (236,923 CPU samples) put
+47% under the ordered state queue, Max's beam search over token states, and
+71% under the uncached header planner. The shortest-RLE search took 18.9% of
+samples, with its earliest-minimum scan another 2.3% when kept out of line;
+the DeflOpt and order-key heaps 13.6%; and the generic node builder, which
+Max runs for four more code-length trees per histogram, 10.4%, of which its
+two-heap merge took 3.7%. The queue hashed each visited token sequence with
+the standard library's SipHash (1%), and allocation took 4.5%.
+
+- **Generic builder buffers.** The generic builder's heap merges fill the
+  keyed heaps and active flags kept in the shared tree-building scratch
+  instead of allocating them on every build.
+- **Earliest minimum by selection.** The shortest-RLE search finds the first
+  smallest remainder of each repeat window with conditional selects; which
+  value is smallest is unpredictable, so the branches mispredicted.
+- **Shortest RLE counted after assembly.** Its symbols are counted in four
+  interleaved tables once the path is assembled, instead of one increment per
+  token as it is.
+- **Comparison from counts.** The feedback pass compares the shortest RLE
+  with the DeflOpt local rewrite under the feedback tree. Both arrive with
+  their exact symbol counts, which price them as their tokens would, so the
+  comparison no longer walks their tokens.
+- **Tree slot in four lanes.** The code-length tree cache hashes its 19-count
+  histogram in four independent lanes, so the multiplications overlap. A hit
+  still compares the whole histogram.
+- **Visited token sequences.** The ordered queue's set of visited token
+  sequences only answers membership and compares whole sequences, so it uses
+  a multiply-rotate hash of each field instead of SipHash; it holds a few
+  hundred sequences at most, so collisions cost little.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed, first four changes | 3.98 s | 3.84 s | 1.04× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 57.06 billion | 55.13 billion | −3.4% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 3.34 billion | 2.99 billion | −10.5% |
+| 33 Default inputs, CPU | 59.9 s | 59.4 s | 1.01× |
+
+With all six changes the replay took 3.85 and 3.94 seconds against 3.96 and
+3.95, a noisier pair. Default peak memory was unchanged.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating
+builds), all 58 outputs were identical, in 469.2 instead of 470.3 seconds.
+
+Equivalence: new tests compare the branch-free earliest minimum with the
+previous scan on 20,000 random windows with ties and unreachable entries, and
+the count-based price of an RLE with its token walk on 20,000 random RLEs and
+trees, including unusable codes. The existing comparisons of the generic
+builder's heap merges with their reference implementations pass with the
+buffers, as does the shared-scratch test. The 89,255 replayed header plans
+matched plan for plan. API comparisons on the 52 inputs, in Default with the
+180-second budget and in zero-budget Max, matched in all 104 runs, and every
+Default timing run and both completing Max runs matched byte for byte. Rust
+tests, including the private corpus, passed in release and debug modes, with
+documentation and Python tests, a locked build, formatting, all-feature Clippy
+with warnings denied and a package list without private fixtures or scratch
+artifacts. `__text` grew from 855,572 to 855,804 bytes; the shipped executable
+keeps its 942,048 bytes.
+
+Not changed in the same review:
+
+- The shortest-RLE search itself, the largest Max cost: spelling each run
+  from per-value tables, which a run's independence would allow, was measured
+  and rejected at [`d72c937`](#d72c937-23-october-2026).
+- A sorted list in place of the generic builder's two heaps: its keys are
+  distinct, so heap layout cannot affect the result, but payload alphabets
+  would need a second structure for 3.7% of samples.
+
+Artifacts: `work/efficiency-review-max-20261025/`.
 
 ### `bab3748`, 25 October 2026
 

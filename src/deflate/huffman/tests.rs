@@ -879,14 +879,24 @@ fn keyed_heap_merges_match_the_node_heap_reference() {
                 let (mut keyed_nodes, mut keyed_active) = (nodes.clone(), active.clone());
                 let (mut reference_nodes, mut reference_active) = (nodes.clone(), active.clone());
                 if variant & 2 == 0 {
-                    merge_generic_nodes_heap(&mut keyed_nodes, &mut keyed_active, variant);
+                    merge_generic_nodes_heap(
+                        &mut keyed_nodes,
+                        &mut keyed_active,
+                        variant,
+                        &mut Vec::new(),
+                    );
                     reference_merge_generic_nodes_heap(
                         &mut reference_nodes,
                         &mut reference_active,
                         variant,
                     );
                 } else {
-                    merge_generic_nodes_dual_heap(&mut keyed_nodes, &mut keyed_active, variant);
+                    merge_generic_nodes_dual_heap(
+                        &mut keyed_nodes,
+                        &mut keyed_active,
+                        variant,
+                        &mut KeyedHeaps::default(),
+                    );
                     reference_merge_generic_nodes_dual_heap(
                         &mut reference_nodes,
                         &mut reference_active,

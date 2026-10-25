@@ -2405,3 +2405,68 @@ fn run_list_spellings_match_the_scanning_spellers() {
         }
     }
 }
+
+#[test]
+fn branch_free_earliest_minimum_matches_the_scan() {
+    let reference = |values: &[u64]| {
+        let mut position = 0;
+        for (index, &value) in values.iter().enumerate().skip(1) {
+            if value < values[position] {
+                position = index;
+            }
+        }
+        position
+    };
+    let mut state = 0x1f83_d9ab_fb41_bd6b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for case in 0..20_000 {
+        let len = 1 + (next() % 8) as usize;
+        // Few distinct values make ties common; INF stands for unreachable.
+        let values: Vec<u64> = (0..len)
+            .map(|_| match next() % 5 {
+                0 => INF,
+                _ => next() % [3, 50][case % 2],
+            })
+            .collect();
+        assert_eq!(earliest_minimum(&values), reference(&values), "{values:?}");
+    }
+}
+
+#[test]
+fn counted_rle_cost_matches_the_token_walk() {
+    let mut state = 0x5be0_cd19_137e_2179_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..20_000 {
+        let rle: Vec<RleToken> = (0..(next() % 64) as usize)
+            .map(|_| {
+                let symbol = (next() % 19) as u8;
+                let extra = match symbol {
+                    16 => next() % 4,
+                    17 => next() % 8,
+                    18 => next() % 128,
+                    _ => 0,
+                } as u8;
+                RleToken { symbol, extra }
+            })
+            .collect();
+        // Zero lengths, used or not, test the unusable-code case.
+        let mut lengths = [0_u8; 19];
+        for length in lengths.iter_mut() {
+            *length = (next() % 9) as u8;
+        }
+        assert_eq!(
+            rle_frequency_cost(&rle_frequencies(&rle), &lengths),
+            rle_cost(&rle, &lengths)
+        );
+    }
+}
