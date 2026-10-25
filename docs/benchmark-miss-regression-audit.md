@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The two 24 October 2026 entries are the current state. Entries from 30 September keep
+The three 24 October 2026 entries are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,73 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="deft4j-refresh-24-october"></a>
+
+## deft4j and Defluff refresh on 24 October 2026
+
+### Benchmark state
+
+The timed deft4j and Defluff reports come from executable `23035349…`:
+`e79a60a` with the tree-builder, RLE, bit-reader and plan-key speedups of the
+[efficiency review](research/efficiency-review.md#e79a60a-24-october-2026),
+whose outputs match `e79a60a` wherever a search completes. The APNG reports
+were not refreshed and stay at `ab9a0cd7…` (`b831d49`). Against the timed
+deft4j state of 16 October (1,621 rows from `f6ce13ca…`, `9d5f818`), with
+unchanged allowances:
+
+| Benchmark | Result |
+| --- | --- |
+| Timed deft4j Max, 1,621 rows | 328 smaller, 1,269 identical, 24 larger (15 in bytes); net −5,083 bytes / −40,644 bits; runtime 16,313.6 → 13,872.6 s |
+| By format | PNG −4,484 bytes (312 smaller, 22 larger); GZIP −570 (all 7 smaller); ZIP −29 (9 smaller, 2 larger); zlib unchanged |
+| Defluff, 66 pairs | Unchanged: −109 bytes and −938 bits against Defluff, no misses |
+
+The largest gains are `Partnership_Card___John_Lewis_Finance.png` (−441
+bytes) and `kzipmix-20200115-linux-static.tar.gz` (−423). Other applications
+loaded the machine in the last half hour of the deft4j run, so every row that
+grew was rerun quietly before attribution.
+
+### Reference misses
+
+Unchanged: the same 12 timed deft4j misses, by the same 0–1 bytes and 2–3
+bits. The relaxed audit puts 11 at parity with `--strict 0`; the twelfth is
+the preserved `oxipng/c2pa-signed.png`. The report's five prior-result
+annotations (crossroads, Squirtle, Poliwrath, Pikachu and Psyduck) are rows
+identical to the 16 October state, compared with older floors of the
+hundred-file guard whose causes are recorded
+[below](#source-max-replaced-parents-24-october).
+
+### Rows that grew
+
+All 24 rows repeat their sizes in two quiet serial reruns at their
+allowances. Run once at their allowances, builds from `9d5f818` on show where
+each first grew:
+
+| First larger at | Rows | Changes in that range |
+| --- | ---: | --- |
+| `6c81dfa` | 9 | R18, the late terminal tree floor, adds Max work |
+| `0d87ee8` | 2 | Block-plan store and code-size changes |
+| `f12cf8b` | 12 | Code-length tree and Max header-planning speedups |
+| This build | 1 | 1 bit on `rgb_trns_8_should_be_palette_8.png` |
+
+Given three times their allowances, six reach or beat their earlier sizes:
+`Apricot512.png` (298,494 bytes, against 298,555), `4.2.07.png` (725,411),
+`5.1.09.png` (53,832), `file04.png` (284,020), `frymire.png` (343,180) and
+`sample_40-fs8.png` (5,066). Fifteen still use their whole allowance at 30 to
+66 seconds, so where their searches end is unknown.
+
+The other three, `basi3p04.png`, `g8t.png` and `108-Lickitung-1.png`, stop at
+about 8 of their 10 seconds, but that is Max's closing margin, not a finished
+search. Given 60 seconds, `0d87ee8` completes in 20 to 22 seconds and ends at
+1,319, 1,180 and 1,715 bits, the sizes `f12cf8b` and this build reach within
+10 seconds; its 1,318-, 1,177- and 1,714-bit outputs were deadline cuts. The
+speedups moved these rows by completing more of the same search, not by
+changing it. Like Hitmonchan [below](#source-max-replaced-parents-24-october),
+each search ends 1 to 3 bits above what it returns when cut at 10 seconds,
+which Max's first principle rules out; they are left for a separate
+investigation.
+
+Artifacts: `work/deft4j-refresh-20261024/`.
 
 <a id="source-max-replaced-parents-24-october"></a>
 
