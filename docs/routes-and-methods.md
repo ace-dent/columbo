@@ -782,7 +782,12 @@ rewrites first check the RLE's symbol counts against the tree, and return
 unchanged without reading the RLE when no repeat code could be cheaper spelled
 out (or, for DeflOpt, become code 16). Max's exhaustive header search finds
 the shortest RLE under each feedback tree once per header plan, since RLE seeds
-often reach the same tree.
+often reach the same tree. No repeat code crosses a run of equal code lengths,
+so the shortest RLE spells each run on its own, and a run's cheapest spelling
+depends only on its length and the costs of its own code and of the repeat
+codes that can spell it. Each thread keeps those spellings by run length for
+each combination of costs, up to 131,072 run lengths, and empties them with
+the header-plan store.
 
 Besides the gates that skip repeated work (M9, M13, R12, `Established`, and
 fdAT deduplication), Columbo:

@@ -188,23 +188,38 @@ impl PackedDynamicPlan {
             return None;
         }
         let length_count = plan.hlit + plan.hdist;
+        if plan
+            .literal_lengths
+            .iter()
+            .chain(&plan.distance_lengths)
+            .any(|&length| length > 15)
+        {
+            return None;
+        }
+        let length_bytes = length_count.div_ceil(2);
         let mut packed = Vec::new();
         packed
-            .try_reserve_exact(length_count.div_ceil(2) + 2 * plan.rle.len())
+            .try_reserve_exact(length_bytes + 2 * plan.rle.len())
             .ok()?;
-        let mut pending = None;
-        for &length in plan.literal_lengths.iter().chain(&plan.distance_lengths) {
-            if length > 15 {
-                return None;
-            }
-            match pending.take() {
-                None => pending = Some(length),
-                Some(low) => packed.push(low | (length << 4)),
-            }
+        let pack_pair = |pair: &[u8]| pair[0] | (pair[1] << 4);
+        let mut literal_pairs = plan.literal_lengths.chunks_exact(2);
+        packed.extend(literal_pairs.by_ref().map(pack_pair));
+        // An odd literal length pairs with the first distance length.
+        let mut distance_lengths = &plan.distance_lengths[..];
+        if let [low] = literal_pairs.remainder() {
+            let (high, rest) = distance_lengths
+                .split_first()
+                .map_or((0, &[][..]), |(&high, rest)| (high, rest));
+            packed.push(low | (high << 4));
+            distance_lengths = rest;
         }
-        packed.extend(pending);
-        for token in &plan.rle {
-            packed.extend([token.symbol, token.extra]);
+        let mut distance_pairs = distance_lengths.chunks_exact(2);
+        packed.extend(distance_pairs.by_ref().map(pack_pair));
+        packed.extend(distance_pairs.remainder());
+        packed.resize(length_bytes + 2 * plan.rle.len(), 0);
+        for (pair, token) in packed[length_bytes..].chunks_exact_mut(2).zip(&plan.rle) {
+            pair[0] = token.symbol;
+            pair[1] = token.extra;
         }
         Some(Self {
             hlit: u16::try_from(plan.hlit).ok()?,
@@ -392,10 +407,11 @@ fn stored_header_plan_kernel(
     Some(plan)
 }
 
-/// Drop this thread's stored header plans and code-length trees. A top-level
-/// optimization calls this on return, so library callers keep no plans between
-/// inputs; worker threads free theirs when they exit.
+/// Drop this thread's stored header plans, code-length trees and run
+/// spellings. A top-level optimization calls this on return, so library callers
+/// keep no plans between inputs; worker threads free theirs when they exit.
 pub(crate) fn release_thread_header_plans() {
+    let _ = HEADER_PLAN_SEARCH.try_with(Cell::take);
     let _ = HEADER_PLAN_STORE.try_with(|store| {
         if let Ok(mut store) = store.try_borrow_mut() {
             *store = HeaderPlanStore::default();
@@ -520,6 +536,15 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Whether two RLE histograms are equal, without a call to the C library's
+/// comparison: the differences are combined, so the comparison vectorizes.
+fn same_histogram(left: &[u32; 19], right: &[u32; 19]) -> bool {
+    left.iter()
+        .zip(right)
+        .fold(0, |differences, (left, right)| differences | (left ^ right))
+        == 0
+}
+
 fn code_length_tree_slot(frequencies: &[u32; 19]) -> usize {
     const MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
     // Four lanes, so the multiplications overlap instead of each waiting for
@@ -542,63 +567,84 @@ fn code_length_tree(
     frequencies: &[u32; 19],
     heap_scratch: &mut TreeBuildScratch,
 ) -> [u8; 19] {
-    let Some(index) = builder.index() else {
-        return builder.build(frequencies, heap_scratch).0;
-    };
-    let slot = code_length_tree_slot(frequencies);
-    let cached = CODE_LENGTH_TREES
-        .try_with(|cache| {
-            let cache = cache.try_borrow().ok()?;
-            let entry = cache.as_ref()?.get(slot)?;
-            (entry.built & (1 << index) != 0 && entry.frequencies == *frequencies)
-                .then_some(entry.lengths[index])
-        })
-        .ok()
-        .flatten();
-    if let Some(lengths) = cached {
-        return lengths;
+    CodeLengthTrees::new(frequencies).get(builder, heap_scratch)
+}
+
+/// One RLE histogram's slot in this thread's code-length tree cache, found
+/// once for every builder a header search asks for.
+struct CodeLengthTrees<'a> {
+    frequencies: &'a [u32; 19],
+    slot: usize,
+}
+
+impl<'a> CodeLengthTrees<'a> {
+    fn new(frequencies: &'a [u32; 19]) -> Self {
+        Self {
+            frequencies,
+            slot: code_length_tree_slot(frequencies),
+        }
     }
 
-    let (lengths, unlimited) = builder.build(frequencies, heap_scratch);
-    let _ = CODE_LENGTH_TREES.try_with(|cache| {
-        let Ok(mut cache) = cache.try_borrow_mut() else {
-            return;
+    /// [`code_length_tree`] for this histogram.
+    fn get(&self, builder: CodeLengthBuilder, heap_scratch: &mut TreeBuildScratch) -> [u8; 19] {
+        let Self { frequencies, slot } = *self;
+        let Some(index) = builder.index() else {
+            return builder.build(frequencies, heap_scratch).0;
         };
-        if cache.is_none() {
-            let mut entries = Vec::new();
-            if entries
-                .try_reserve_exact(1 << CODE_LENGTH_TREE_CACHE_BITS)
-                .is_err()
-            {
+        let cached = CODE_LENGTH_TREES
+            .try_with(|cache| {
+                let cache = cache.try_borrow().ok()?;
+                let entry = cache.as_ref()?.get(slot)?;
+                (entry.built & (1 << index) != 0 && same_histogram(&entry.frequencies, frequencies))
+                    .then_some(entry.lengths[index])
+            })
+            .ok()
+            .flatten();
+        if let Some(lengths) = cached {
+            return lengths;
+        }
+
+        let (lengths, unlimited) = builder.build(frequencies, heap_scratch);
+        let _ = CODE_LENGTH_TREES.try_with(|cache| {
+            let Ok(mut cache) = cache.try_borrow_mut() else {
                 return;
+            };
+            if cache.is_none() {
+                let mut entries = Vec::new();
+                if entries
+                    .try_reserve_exact(1 << CODE_LENGTH_TREE_CACHE_BITS)
+                    .is_err()
+                {
+                    return;
+                }
+                entries.resize(
+                    1 << CODE_LENGTH_TREE_CACHE_BITS,
+                    EMPTY_CODE_LENGTH_TREE_ENTRY,
+                );
+                *cache = Some(entries.into_boxed_slice());
             }
-            entries.resize(
-                1 << CODE_LENGTH_TREE_CACHE_BITS,
-                EMPTY_CODE_LENGTH_TREE_ENTRY,
-            );
-            *cache = Some(entries.into_boxed_slice());
-        }
-        let Some(entry) = cache.as_mut().and_then(|entries| entries.get_mut(slot)) else {
-            return;
-        };
-        if entry.frequencies != *frequencies {
-            entry.frequencies = *frequencies;
-            entry.built = 0;
-        }
-        let shared: &[CodeLengthBuilder] = if unlimited {
-            &[
-                CodeLengthBuilder::DefluffLimited,
-                CodeLengthBuilder::Columbo(0),
-            ]
-        } else {
-            &[builder]
-        };
-        for index in shared.iter().filter_map(|builder| builder.index()) {
-            entry.lengths[index] = lengths;
-            entry.built |= 1 << index;
-        }
-    });
-    lengths
+            let Some(entry) = cache.as_mut().and_then(|entries| entries.get_mut(slot)) else {
+                return;
+            };
+            if !same_histogram(&entry.frequencies, frequencies) {
+                entry.frequencies = *frequencies;
+                entry.built = 0;
+            }
+            let shared: &[CodeLengthBuilder] = if unlimited {
+                &[
+                    CodeLengthBuilder::DefluffLimited,
+                    CodeLengthBuilder::Columbo(0),
+                ]
+            } else {
+                &[builder]
+            };
+            for index in shared.iter().filter_map(|builder| builder.index()) {
+                entry.lengths[index] = lengths;
+                entry.built |= 1 << index;
+            }
+        });
+        lengths
+    }
 }
 
 fn header_plan_fingerprint(
@@ -608,13 +654,20 @@ fn header_plan_fingerprint(
     rle_mask: u8,
 ) -> u64 {
     let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
-    mix_header_plan_fingerprint(&mut fingerprint, literal_lengths.len() as u64);
-    for &length in literal_lengths {
-        mix_header_plan_fingerprint(&mut fingerprint, u64::from(length));
-    }
-    mix_header_plan_fingerprint(&mut fingerprint, distance_lengths.len() as u64);
-    for &length in distance_lengths {
-        mix_header_plan_fingerprint(&mut fingerprint, u64::from(length));
+    for lengths in [literal_lengths, distance_lengths] {
+        // Eight lengths a step; the count tells a short last step's zero
+        // padding from lengths.
+        mix_header_plan_fingerprint(&mut fingerprint, lengths.len() as u64);
+        let mut chunks = lengths.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().expect("chunks hold eight lengths"));
+            mix_header_plan_fingerprint(&mut fingerprint, word);
+        }
+        if !chunks.remainder().is_empty() {
+            let mut word = [0_u8; 8];
+            word[..chunks.remainder().len()].copy_from_slice(chunks.remainder());
+            mix_header_plan_fingerprint(&mut fingerprint, u64::from_le_bytes(word));
+        }
     }
     mix_header_plan_fingerprint(
         &mut fingerprint,
@@ -625,8 +678,10 @@ fn header_plan_fingerprint(
 
 #[inline]
 fn mix_header_plan_fingerprint(fingerprint: &mut u64, value: u64) {
+    // An odd multiplier with bits throughout carries each input bit upward,
+    // and the shift folds the high half back down.
     *fingerprint ^= value;
-    *fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    *fingerprint = fingerprint.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     *fingerprint ^= *fingerprint >> 32;
 }
 
@@ -2535,6 +2590,8 @@ type CountedRle = (Vec<RleToken>, [u32; 19]);
 struct HeaderPlanSearch {
     heap_scratch: TreeBuildScratch,
     best: Option<DynamicPlan>,
+    /// This plan's runs of equal code lengths, which every RLE spells.
+    runs: Vec<LengthRun>,
     /// Shortest RLEs of this plan's code lengths, with their symbol
     /// frequencies, by code-length code: RLE seeds often reach the same
     /// feedback tree.
@@ -2543,14 +2600,21 @@ struct HeaderPlanSearch {
 }
 
 impl HeaderPlanSearch {
-    fn shortest_rle(&mut self, decoded_lengths: &[u8], tree: &[u8; 19]) -> Option<CountedRle> {
-        if let Some((_, rle)) = self.shortest_rles.iter().find(|(seen, _)| seen == tree) {
-            return rle.clone();
-        }
-        let rle =
-            shortest_rle_with_frequencies(decoded_lengths, tree, &mut self.shortest_rle_scratch);
-        self.shortest_rles.push((*tree, rle.clone()));
-        rle
+    fn shortest_rle(&mut self, length_count: usize, tree: &[u8; 19]) -> Option<&CountedRle> {
+        let index = match self.shortest_rles.iter().position(|(seen, _)| seen == tree) {
+            Some(index) => index,
+            None => {
+                let rle = shortest_rle_from_runs(
+                    &self.runs,
+                    length_count,
+                    tree,
+                    &mut self.shortest_rle_scratch,
+                );
+                self.shortest_rles.push((*tree, rle));
+                self.shortest_rles.len() - 1
+            }
+        };
+        self.shortest_rles[index].1.as_ref()
     }
 }
 
@@ -2598,7 +2662,9 @@ fn plan_for_trimmed_lengths_uncached(
         .unwrap_or_default();
     search.best = None;
     search.shortest_rles.clear();
-    for rle in rle_seed_candidates(decoded_lengths, rle_mask) {
+    // Every RLE spells the same runs, so find them once.
+    length_runs_into(decoded_lengths, &mut search.runs);
+    for rle in rle_seed_candidates_from_runs(&search.runs, decoded_length_count, rle_mask) {
         consider_rle(
             data_bits,
             literal_lengths,
@@ -2658,11 +2724,23 @@ fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
 /// Return each distinct RLE seed once, in first-seen order. Bit `m` of
 /// `rle_mask` enables mask `m`; mask bits 0, 1 and 2 disable codes 16, 17 and
 /// 18.
+#[cfg(test)]
 fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken>> {
-    // Every seed spells the same runs, so find them once.
-    let runs = length_runs(decoded_lengths);
-    let count = decoded_lengths.len();
-    let opportunities = rle_seed_opportunities(&runs);
+    rle_seed_candidates_from_runs(
+        &length_runs(decoded_lengths),
+        decoded_lengths.len(),
+        rle_mask,
+    )
+}
+
+/// [`rle_seed_candidates`] for code lengths given as their `runs`, `count`
+/// lengths in all.
+fn rle_seed_candidates_from_runs(
+    runs: &[LengthRun],
+    count: usize,
+    rle_mask: u8,
+) -> Vec<Vec<RleToken>> {
+    let opportunities = rle_seed_opportunities(runs);
     // Always keep bit 0: it also decides whether the balanced and zero-repeat
     // spellings run, even when disabling code 16 leaves the greedy spelling
     // unchanged.
@@ -2682,18 +2760,18 @@ fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken
         let no_16 = mask & 1 != 0;
         let no_17 = mask & 2 != 0;
         let no_18 = mask & 4 != 0;
-        let rle = greedy_rle_from_runs(&runs, count, no_16, no_17, no_18);
+        let rle = greedy_rle_from_runs(runs, count, no_16, no_17, no_18);
         push_unique(&mut candidates, rle);
 
         if !no_16 && opportunities.balanced_repeat {
-            let balanced = balanced_repeat_rle_from_runs(&runs, count, no_17, no_18);
+            let balanced = balanced_repeat_rle_from_runs(runs, count, no_17, no_18);
             push_unique(&mut candidates, balanced);
         }
 
         if !no_16 {
             let zero_variant = usize::from(no_17) | (usize::from(no_18) << 1);
             if opportunities.zero_repeat[zero_variant] {
-                let zero_repeat = columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18);
+                let zero_repeat = columbo_zero_repeat_rle_from_runs(runs, count, no_17, no_18);
                 push_unique(&mut candidates, zero_repeat);
             }
         }
@@ -3214,6 +3292,7 @@ fn consider_rle(
     for pass in 0..passes {
         let variants = 4;
         code_length_candidates.clear();
+        let trees = CodeLengthTrees::new(&frequencies);
         for variant in 0..variants {
             // Variant 3 breaks both ties by frequency alone, so on the same
             // frequencies its order-key tree is the DeflOpt tree the local
@@ -3222,9 +3301,8 @@ fn consider_rle(
                 .then_some(prescored_deflopt_trees[variant as usize])
                 .flatten();
             let order_lengths = prescored_order_tree.unwrap_or_else(|| {
-                code_length_tree(
+                trees.get(
                     CodeLengthBuilder::OrderHeap(variant),
-                    &frequencies,
                     &mut search.heap_scratch,
                 )
             });
@@ -3232,11 +3310,8 @@ fn consider_rle(
             // deft4j's tree builder is slow on the data alphabets but cheap
             // on the code-length alphabet, so every header search includes it.
             if variant == 0 {
-                let deft4j_lengths = code_length_tree(
-                    CodeLengthBuilder::Deft4jJavaHeap,
-                    &frequencies,
-                    &mut search.heap_scratch,
-                );
+                let deft4j_lengths =
+                    trees.get(CodeLengthBuilder::Deft4jJavaHeap, &mut search.heap_scratch);
                 consider_deft4j_pruned_header(
                     data_bits,
                     literal_lengths,
@@ -3248,11 +3323,8 @@ fn consider_rle(
                     &mut search.best,
                 );
                 push_unique(&mut code_length_candidates, deft4j_lengths);
-                let defluff_limited_lengths = code_length_tree(
-                    CodeLengthBuilder::DefluffLimited,
-                    &frequencies,
-                    &mut search.heap_scratch,
-                );
+                let defluff_limited_lengths =
+                    trees.get(CodeLengthBuilder::DefluffLimited, &mut search.heap_scratch);
                 push_unique(&mut code_length_candidates, defluff_limited_lengths);
             }
             if exhaustive {
@@ -3264,26 +3336,21 @@ fn consider_rle(
                     }
                 } else if variant != FREQUENCY_ONLY_HEAP_VARIANT {
                     // Variant 3's DeflOpt tree is the order-key tree above.
-                    let deflopt_lengths = code_length_tree(
+                    let deflopt_lengths = trees.get(
                         CodeLengthBuilder::DefloptHeap(variant),
-                        &frequencies,
                         &mut search.heap_scratch,
                     );
                     push_unique(&mut code_length_candidates, deflopt_lengths);
                 }
-                let columbo_lengths = code_length_tree(
+                let columbo_lengths = trees.get(
                     CodeLengthBuilder::Columbo(variant),
-                    &frequencies,
                     &mut search.heap_scratch,
                 );
                 push_unique(&mut code_length_candidates, columbo_lengths);
 
                 if variant == 0 {
-                    let defluff_lengths = code_length_tree(
-                        CodeLengthBuilder::DefluffExact,
-                        &frequencies,
-                        &mut search.heap_scratch,
-                    );
+                    let defluff_lengths =
+                        trees.get(CodeLengthBuilder::DefluffExact, &mut search.heap_scratch);
                     push_unique(&mut code_length_candidates, defluff_lengths);
                 }
             }
@@ -3346,13 +3413,13 @@ fn consider_rle(
         };
         let mut rewritten = rewrite_rle_deflopt_local(&rle, &frequencies, &tree);
         if exhaustive {
-            if let Some(shortest) = search.shortest_rle(decoded_lengths, &tree) {
+            if let Some(shortest) = search.shortest_rle(decoded_lengths.len(), &tree) {
                 // Both carry their exact symbol counts, which price them as
                 // their tokens would.
                 if rewritten.as_ref().map_or(true, |(_, local)| {
                     rle_frequency_cost(&shortest.1, &tree) < rle_frequency_cost(local, &tree)
                 }) {
-                    rewritten = Some(shortest);
+                    rewritten = Some(shortest.clone());
                 }
             }
         }
@@ -3919,7 +3986,15 @@ type LengthRun = (u8, usize);
 
 /// The maximal runs of equal values in `lengths`, in order.
 fn length_runs(lengths: &[u8]) -> Vec<LengthRun> {
-    let mut runs = Vec::with_capacity(lengths.len());
+    let mut runs = Vec::new();
+    length_runs_into(lengths, &mut runs);
+    runs
+}
+
+/// [`length_runs`] into a reused buffer.
+fn length_runs_into(lengths: &[u8], runs: &mut Vec<LengthRun>) {
+    runs.clear();
+    runs.reserve(lengths.len());
     let mut index = 0;
     while index < lengths.len() {
         let value = lengths[index];
@@ -3930,7 +4005,6 @@ fn length_runs(lengths: &[u8]) -> Vec<LengthRun> {
         runs.push((value, run));
         index += run;
     }
-    runs
 }
 
 fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
@@ -4204,17 +4278,37 @@ fn consider_dynamic_header(
     let hclen = trim_code_lengths(&code_length_lengths);
     let bits =
         dynamic_bits_from_rle_frequencies(data_bits, hclen, frequencies, &code_length_lengths)?;
-    if best.as_ref().map_or(true, |current| bits < current.bits) {
-        *best = Some(DynamicPlan {
-            literal_lengths: literal_lengths.to_vec(),
-            distance_lengths: distance_lengths.to_vec(),
-            code_length_lengths,
-            rle: rle.to_vec(),
-            hlit: literal_lengths.len(),
-            hdist: distance_lengths.len(),
-            hclen,
-            bits,
-        });
+    match best {
+        Some(current) if bits >= current.bits => {}
+        // A search improves its best plan several times; reuse its buffers.
+        Some(current) => {
+            for (buffer, lengths) in [
+                (&mut current.literal_lengths, literal_lengths),
+                (&mut current.distance_lengths, distance_lengths),
+            ] {
+                buffer.clear();
+                buffer.extend_from_slice(lengths);
+            }
+            current.rle.clear();
+            current.rle.extend_from_slice(rle);
+            current.code_length_lengths = code_length_lengths;
+            current.hlit = literal_lengths.len();
+            current.hdist = distance_lengths.len();
+            current.hclen = hclen;
+            current.bits = bits;
+        }
+        None => {
+            *best = Some(DynamicPlan {
+                literal_lengths: literal_lengths.to_vec(),
+                distance_lengths: distance_lengths.to_vec(),
+                code_length_lengths,
+                rle: rle.to_vec(),
+                hlit: literal_lengths.len(),
+                hdist: distance_lengths.len(),
+                hclen,
+                bits,
+            });
+        }
     }
     Some(bits)
 }
@@ -4266,150 +4360,315 @@ pub(super) fn shortest_rle(lengths: &[u8], costs: &[u8; 19]) -> Option<Vec<RleTo
         .map(|(rle, _)| rle)
 }
 
-#[derive(Clone, Copy)]
-struct RleStep {
-    next: usize,
-    token: RleToken,
+/// Marks a run length no spelling reaches; no code-length symbol is this large.
+const UNSET_RLE_STEP: RleToken = RleToken {
+    symbol: u8::MAX,
+    extra: 0,
+};
+
+/// Slots for run spellings: one for each zero-run key of four 3-bit costs,
+/// then one for each other key of two.
+const RUN_SPELLING_SLOTS: usize = (1 << 12) + (1 << 6);
+/// A slot with no run spellings yet.
+const NO_RUN_SPELLINGS: u16 = u16::MAX;
+
+/// Run-spelling entries a thread keeps, 4 bytes each, before dropping them all.
+const MAX_RUN_SPELLING_ENTRIES: usize = 1 << 17;
+
+/// The cheapest spellings of runs of one code length, by run length, under the
+/// costs that can spell it: its own code and code 16, and for zeros codes 17
+/// and 18. No code crosses a run of equal lengths, since code 16 repeats the
+/// previous length and codes 17 and 18 write zeros, so a run's spelling depends
+/// only on its length and these costs. A token below 16 stands for the run's
+/// own length.
+#[derive(Default)]
+struct RunSpellings {
+    /// Whether the length is zero, then the costs these spellings are for.
+    key: u64,
+    /// `first[run]` starts a run of `run` lengths, or is [`UNSET_RLE_STEP`]
+    /// when no spelling exists.
+    first: Vec<RleToken>,
+    /// `inside[left]` spells on from a later position of a run with `left`
+    /// lengths still to spell, where code 16 can repeat the length before.
+    inside: Vec<RleToken>,
 }
 
-/// Buffers for [`shortest_rle_with_frequencies`], reused between searches. A
-/// search writes every entry it reads first, so they are never cleared.
+/// Run spellings for [`shortest_rle_with_frequencies`], kept between searches
+/// on one thread, and the buffers that build them.
 #[derive(Default)]
 struct ShortestRleScratch {
-    best: Vec<u64>,
-    step: Vec<Option<RleStep>>,
+    /// The index in `spellings` for each cost slot, or [`NO_RUN_SPELLINGS`].
+    slots: Vec<u16>,
+    spellings: Vec<RunSpellings>,
+    /// Run lengths held by all `spellings`.
+    entries: usize,
+    /// Each count of lengths left's cheapest cost, while spellings are built.
+    costs: Vec<u64>,
+    /// Code 18's deque while spellings are built.
     zero_repeats: Vec<usize>,
 }
 
-/// [`shortest_rle`] with the RLE's symbol frequencies, counted as it is
-/// assembled. `None` also when the buffers cannot grow.
+impl ShortestRleScratch {
+    /// The index of the spellings of runs of `value` up to `run` long under
+    /// `costs`, building or extending them if needed, and whether an index
+    /// found earlier may now hold other spellings. `None` if buffers cannot
+    /// grow.
+    fn run_spellings(
+        &mut self,
+        value: u8,
+        costs: &[u8; 19],
+        run: usize,
+        longest: usize,
+    ) -> Option<(u16, bool)> {
+        let explicit = costs[usize::from(value)];
+        let zero = value == 0;
+        let (short_zero, long_zero) = if zero { (costs[17], costs[18]) } else { (0, 0) };
+        let key = u64::from(zero) << 32
+            | u64::from(u32::from_le_bytes([
+                explicit, costs[16], short_zero, long_zero,
+            ]));
+        let slot = if zero {
+            usize::from(explicit & 7)
+                | usize::from(costs[16] & 7) << 3
+                | usize::from(short_zero & 7) << 6
+                | usize::from(long_zero & 7) << 9
+        } else {
+            (1 << 12) | usize::from(explicit & 7) | usize::from(costs[16] & 7) << 3
+        };
+        if self.slots.is_empty() {
+            self.slots.try_reserve_exact(RUN_SPELLING_SLOTS).ok()?;
+            self.slots.resize(RUN_SPELLING_SLOTS, NO_RUN_SPELLINGS);
+        }
+        let mut index = self.slots[slot];
+        if let Some(spellings) = self.spellings.get(usize::from(index)) {
+            if spellings.key == key && spellings.first.len() > run {
+                return Some((index, false));
+            }
+        }
+        // Build at least twice the old length, so a run that keeps growing
+        // rebuilds its spellings only a few times. Costs above 7 bits can
+        // share a slot, whose spellings are then rebuilt for the new key.
+        let (old, mut replaced) = match self.spellings.get(usize::from(index)) {
+            Some(spellings) if spellings.key == key => (spellings.first.len(), false),
+            Some(_) => (0, true),
+            None => (0, false),
+        };
+        let length = run.max(old.saturating_mul(2).min(longest)) + 1;
+        if self.entries + length > MAX_RUN_SPELLING_ENTRIES {
+            replaced = true;
+            self.spellings.clear();
+            self.slots.fill(NO_RUN_SPELLINGS);
+            self.entries = 0;
+            index = NO_RUN_SPELLINGS;
+        }
+        if index == NO_RUN_SPELLINGS {
+            index = u16::try_from(self.spellings.len()).ok()?;
+            self.spellings.try_reserve(1).ok()?;
+            self.spellings.push(RunSpellings::default());
+            self.slots[slot] = index;
+        }
+        let spellings = &mut self.spellings[usize::from(index)];
+        self.entries = self.entries - spellings.first.len() + length;
+        spellings.key = key;
+        build_run_spellings(
+            spellings,
+            [explicit, costs[16], short_zero, long_zero],
+            zero,
+            length,
+            &mut self.costs,
+            &mut self.zero_repeats,
+        )?;
+        Some((index, replaced))
+    }
+}
+
+/// Fill `spellings` for runs shorter than `length` under the costs of a run's
+/// own code and codes 16, 17 and 18, the last two only for `zero`. Lengths left
+/// are solved from a run's end, each from shorter ones. A tie keeps the option
+/// offered first: an explicit length, then codes 16, 17 and 18, each with its
+/// shortest repeat. Costs stay below `INF` plus a few bits, so sums cannot
+/// overflow, and a sum through an unreachable `INF` never wins.
+fn build_run_spellings(
+    spellings: &mut RunSpellings,
+    [explicit, repeat, short_zero, long_zero]: [u8; 4],
+    zero: bool,
+    length: usize,
+    costs: &mut Vec<u64>,
+    zero_repeats: &mut Vec<usize>,
+) -> Option<()> {
+    let RunSpellings { first, inside, .. } = spellings;
+    for buffer in [&mut *first, &mut *inside] {
+        buffer.clear();
+        buffer.try_reserve_exact(length).ok()?;
+    }
+    costs.clear();
+    costs.try_reserve_exact(length).ok()?;
+    zero_repeats.clear();
+    zero_repeats.try_reserve_exact(length).ok()?;
+    let price =
+        |cost: u8, symbol: u8| (cost != 0).then(|| u64::from(cost) + rle_extra_bits(symbol));
+    let explicit = price(explicit, 0);
+    let repeat = price(repeat, 16);
+    let short_zero = if zero { price(short_zero, 17) } else { None };
+    let long_zero = if zero { price(long_zero, 18) } else { None };
+
+    // `costs[left]` is the cheapest spelling of a run's last `left` lengths
+    // past its first; a run's end costs nothing more.
+    first.push(UNSET_RLE_STEP);
+    inside.push(UNSET_RLE_STEP);
+    costs.push(0);
+    // Code 18 costs the same for every repeat from 11 to 138, so a monotonic
+    // deque in `zero_repeats[front..]` keeps the cheapest of what it can leave
+    // to spell. Newer entries are shorter repeats, so dropping equal costs
+    // keeps the preference for the shortest.
+    let mut front = 0;
+    for left in 1..length {
+        let mut best_inside = (INF, UNSET_RLE_STEP);
+        let mut best_first = (INF, UNSET_RLE_STEP);
+        let mut offer = |cost: u64, symbol: u8, extra: u8, at_first: bool| {
+            let token = RleToken { symbol, extra };
+            if cost < best_inside.0 {
+                best_inside = (cost, token);
+            }
+            if at_first && cost < best_first.0 {
+                best_first = (cost, token);
+            }
+        };
+        let long_count = if long_zero.is_some() && left >= 11 {
+            let newest = left - 11;
+            while front < zero_repeats.len() && left - zero_repeats[front] > 138 {
+                front += 1;
+            }
+            while zero_repeats.len() > front
+                && zero_repeats
+                    .last()
+                    .is_some_and(|&last| costs[last] >= costs[newest])
+            {
+                zero_repeats.pop();
+            }
+            zero_repeats.push(newest);
+            Some(left - zero_repeats[front])
+        } else {
+            None
+        };
+        if let Some(explicit) = explicit {
+            offer(explicit + costs[left - 1], 0, 0, true);
+        }
+        if left >= 3 {
+            // Repeats in order of count, so the earliest minimum is the
+            // shortest repeat.
+            let window = |most: usize| {
+                let mut count = 3;
+                for candidate in 4..=left.min(most) {
+                    if costs[left - candidate] < costs[left - count] {
+                        count = candidate;
+                    }
+                }
+                count
+            };
+            if let Some(repeat) = repeat {
+                let count = window(6);
+                offer(repeat + costs[left - count], 16, (count - 3) as u8, false);
+            }
+            if let Some(short_zero) = short_zero {
+                let count = window(10);
+                offer(
+                    short_zero + costs[left - count],
+                    17,
+                    (count - 3) as u8,
+                    true,
+                );
+            }
+            if let (Some(long_zero), Some(count)) = (long_zero, long_count) {
+                offer(
+                    long_zero + costs[left - count],
+                    18,
+                    (count - 11) as u8,
+                    true,
+                );
+            }
+        }
+        costs.push(best_inside.0);
+        inside.push(best_inside.1);
+        first.push(best_first.1);
+    }
+    Some(())
+}
+
+/// [`shortest_rle`] with the RLE's symbol frequencies. Each run of equal
+/// lengths takes its cheapest spelling, kept in `scratch` for the next search
+/// with the same costs. `None` also when the buffers cannot grow.
 fn shortest_rle_with_frequencies(
     lengths: &[u8],
     costs: &[u8; 19],
     scratch: &mut ShortestRleScratch,
 ) -> Option<CountedRle> {
-    let len = lengths.len();
-    if scratch.best.len() <= len {
-        scratch
-            .best
-            .try_reserve_exact(len + 1 - scratch.best.len())
-            .ok()?;
-        scratch
-            .step
-            .try_reserve_exact(len - scratch.step.len())
-            .ok()?;
-        scratch
-            .zero_repeats
-            .try_reserve_exact(len - scratch.zero_repeats.len())
-            .ok()?;
-        scratch.best.resize(len + 1, INF);
-        scratch.step.resize(len, None);
-        scratch.zero_repeats.resize(len, 0);
-    }
-    let best = &mut scratch.best[..=len];
-    let step = &mut scratch.step[..len];
-    let zero_repeats = &mut scratch.zero_repeats[..len];
-    let mut run = 0;
-    // A monotonic deque of repeat ends in `zero_repeats[front..back]`; each
-    // run of equal lengths restarts it, so `back` never passes the run length.
-    let (mut front, mut back) = (0, 0);
-    // Positions are solved from the end, each before any earlier position
-    // reads it. `step` is read only along a path of finite costs, each step of
-    // which this search wrote.
-    best[len] = 0;
-    for index in (0..len).rev() {
-        best[index] = INF;
-        if index + 1 < len && lengths[index] == lengths[index + 1] {
-            run += 1;
-        } else {
-            run = 1;
-            (front, back) = (0, 0);
-        }
+    shortest_rle_from_runs(&length_runs(lengths), lengths.len(), costs, scratch)
+}
 
-        // Code 18 costs the same for every repeat from 11 to 138, so a
-        // monotonic deque keeps the cheapest suffix of that sliding window.
-        // Newer ends are smaller, so dropping equal costs keeps the preference
-        // for the shortest repeat.
-        let zero_repeat = if lengths[index] == 0 && costs[18] != 0 && run >= 11 {
-            let first_end = index + 11;
-            let last_end = index + run.min(138);
-            while front < back && zero_repeats[front] > last_end {
-                front += 1;
-            }
-            while front < back && best[zero_repeats[back - 1]] >= best[first_end] {
-                back -= 1;
-            }
-            zero_repeats[back] = first_end;
-            back += 1;
-            Some(zero_repeats[front] - index)
-        } else {
-            None
-        };
-
-        // Replace only on a strict improvement, so a tie keeps the option
-        // considered first: an explicit length, then codes 16, 17 and 18, each
-        // with its shortest repeat. Costs stay below `INF` plus a few bits, so
-        // plain sums cannot overflow, and a sum through an unreachable `INF`
-        // never wins.
-        let value = lengths[index];
-        let mut choose = |best: &mut [u64], count: usize, symbol: u8, extra: u8| {
-            let cost = u64::from(costs[usize::from(symbol)])
-                + rle_extra_bits(symbol)
-                + best[index + count];
-            if cost < best[index] {
-                best[index] = cost;
-                step[index] = Some(RleStep {
-                    next: index + count,
-                    token: RleToken { symbol, extra },
-                });
-            }
-        };
-        if costs[usize::from(value)] != 0 {
-            choose(best, 1, value, 0);
-        }
-        // Every repeat of a code costs the same bits, so the shortest repeat
-        // with the cheapest remainder is the one a count-by-count scan keeps.
-        if index > 0 && value == lengths[index - 1] && costs[16] != 0 && run >= 3 {
-            let count = 3 + earliest_minimum(&best[index + 3..=index + run.min(6)]);
-            choose(best, count, 16, (count - 3) as u8);
-        }
-        if value == 0 {
-            if costs[17] != 0 && run >= 3 {
-                let count = 3 + earliest_minimum(&best[index + 3..=index + run.min(10)]);
-                choose(best, count, 17, (count - 3) as u8);
-            }
-            if let Some(count) = zero_repeat {
-                choose(best, count, 18, (count - 11) as u8);
-            }
-        }
-    }
-    if best[0] == INF {
-        return None;
-    }
+/// [`shortest_rle_with_frequencies`] for code lengths given as their `runs`,
+/// `length_count` lengths in all.
+fn shortest_rle_from_runs(
+    runs: &[LengthRun],
+    length_count: usize,
+    costs: &[u8; 19],
+    scratch: &mut ShortestRleScratch,
+) -> Option<CountedRle> {
     // Each token spells at least one length.
     let mut output = Vec::new();
-    output.try_reserve_exact(len).ok()?;
-    let mut index = 0;
-    while index < lengths.len() {
-        let selected = step[index]?;
-        output.push(selected.token);
-        index = selected.next;
+    output.try_reserve_exact(length_count).ok()?;
+    // This search's spellings by length, found once each.
+    let mut by_value = [NO_RUN_SPELLINGS; 16];
+    for &(value, mut run) in runs {
+        let known = by_value
+            .get(usize::from(value))
+            .and_then(|&known| scratch.spellings.get(usize::from(known)))
+            .filter(|spellings| spellings.first.len() > run);
+        let spellings = match known {
+            Some(spellings) => spellings,
+            None => {
+                let (found, replaced) = scratch.run_spellings(value, costs, run, length_count)?;
+                if replaced {
+                    by_value = [NO_RUN_SPELLINGS; 16];
+                }
+                if let Some(known) = by_value.get_mut(usize::from(value)) {
+                    *known = found;
+                }
+                &scratch.spellings[usize::from(found)]
+            }
+        };
+        let mut token = spellings.first[run];
+        if run == 1 && token.symbol < 16 {
+            output.push(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            continue;
+        }
+        loop {
+            let count = match token.symbol {
+                0..=15 => 1,
+                16 | 17 => usize::from(token.extra) + 3,
+                18 => usize::from(token.extra) + 11,
+                _ => return None,
+            };
+            output.push(if token.symbol < 16 {
+                RleToken {
+                    symbol: value,
+                    extra: 0,
+                }
+            } else {
+                token
+            });
+            run -= count;
+            if run == 0 {
+                break;
+            }
+            token = spellings.inside[run];
+        }
     }
     let frequencies = rle_frequencies(&output);
     Some((output, frequencies))
-}
-
-/// The position of the first smallest value in a nonempty slice.
-fn earliest_minimum(values: &[u64]) -> usize {
-    // Selects rather than branches: which value is smallest is unpredictable.
-    let mut position = 0;
-    let mut minimum = values[0];
-    for (index, &value) in values.iter().enumerate().skip(1) {
-        let smaller = value < minimum;
-        minimum = if smaller { value } else { minimum };
-        position = if smaller { index } else { position };
-    }
-    position
 }
 
 #[cfg(test)]

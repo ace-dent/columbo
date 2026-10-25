@@ -944,30 +944,50 @@ fn take_reverse_front(
     }
 }
 
+/// Reusable buffers for the generic builder's reverse two-queue merge.
+#[derive(Default)]
+pub(crate) struct ReverseFront {
+    leaves: Vec<usize>,
+    runs: VecDeque<ReverseBranchRun>,
+    previous: Vec<Option<usize>>,
+}
+
 /// Two-queue merge for variant 1, which prefers the newest node on equal
 /// frequency; a linked stack per run of equal frequencies gives the newest
 /// branch in constant time.
-fn merge_generic_nodes_reverse_front(nodes: &mut Vec<Node>, active: &mut Vec<usize>) {
+fn merge_generic_nodes_reverse_front(
+    nodes: &mut Vec<Node>,
+    active: &mut Vec<usize>,
+    buffers: &mut ReverseFront,
+) {
     sort_generic_nodes(nodes, active, 1);
 
-    let leaves = active.clone();
+    let ReverseFront {
+        leaves,
+        runs,
+        previous,
+    } = buffers;
+    leaves.clear();
+    leaves.extend_from_slice(active);
     let mut leaf = 0;
-    let mut runs = VecDeque::with_capacity(leaves.len());
+    runs.clear();
+    runs.reserve(leaves.len());
     // One entry per node, branches included.
-    let mut previous = Vec::with_capacity(nodes.len().saturating_mul(2));
+    previous.clear();
+    previous.reserve(nodes.len().saturating_mul(2));
     previous.resize(nodes.len(), None);
     let mut remaining = leaves.len();
     while remaining > 1 {
-        let left = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
-        let right = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
+        let left = take_reverse_front(nodes, leaves, &mut leaf, runs, previous);
+        let right = take_reverse_front(nodes, leaves, &mut leaf, runs, previous);
         let index = nodes.len();
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
-        push_reverse_branch(&mut runs, &mut previous, index, frequency);
+        push_reverse_branch(runs, previous, index, frequency);
         remaining -= 1;
     }
 
-    let root = take_reverse_front(nodes, &leaves, &mut leaf, &mut runs, &previous);
+    let root = take_reverse_front(nodes, leaves, &mut leaf, runs, previous);
     active.clear();
     active.push(root);
 }
@@ -1087,6 +1107,7 @@ fn make_lengths_inner(
         node_indices: active,
         depths,
         keyed_heaps,
+        reverse_front,
         ..
     } = scratch;
     nodes.clear();
@@ -1121,7 +1142,7 @@ fn make_lengths_inner(
         if variant == 0 {
             merge_generic_nodes_two_front(nodes, active, variant);
         } else {
-            merge_generic_nodes_reverse_front(nodes, active);
+            merge_generic_nodes_reverse_front(nodes, active, reverse_front);
         }
     } else if variant & 2 == 0 {
         merge_generic_nodes_heap(nodes, active, variant, &mut keyed_heaps.increasing);
@@ -1721,6 +1742,7 @@ pub(crate) struct TreeBuildScratch {
     node_indices: Vec<usize>,
     java_heap: Vec<u64>,
     keyed_heaps: KeyedHeaps,
+    reverse_front: ReverseFront,
 }
 
 /// Restore the heap order below `start`, comparing whole keys, or only

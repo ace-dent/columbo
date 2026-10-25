@@ -1732,6 +1732,74 @@ fn random_trimmed_lengths(next: &mut impl FnMut() -> u64) -> (Vec<u8>, Vec<u8>) 
     (literal, distance)
 }
 
+/// The packing before lengths were packed in pairs: one length at a time, then
+/// each RLE token's two bytes.
+fn packed_bytes_reference(plan: &DynamicPlan) -> Option<Vec<u8>> {
+    let mut packed = Vec::new();
+    let mut pending = None;
+    for &length in plan.literal_lengths.iter().chain(&plan.distance_lengths) {
+        if length > 15 {
+            return None;
+        }
+        match pending.take() {
+            None => pending = Some(length),
+            Some(low) => packed.push(low | (length << 4)),
+        }
+    }
+    packed.extend(pending);
+    for token in &plan.rle {
+        packed.extend([token.symbol, token.extra]);
+    }
+    Some(packed)
+}
+
+#[test]
+fn packed_plans_match_length_by_length_packing() {
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for case in 0..2_000 {
+        // Odd and even counts on both sides, empty sides and 32 distances.
+        let hlit = (next() % 290) as usize;
+        let hdist = (next() % 34) as usize;
+        let mut lengths: Vec<u8> = (0..hlit + hdist).map(|_| (next() % 16) as u8).collect();
+        if case % 10 == 0 && !lengths.is_empty() {
+            let at = (next() as usize) % lengths.len();
+            lengths[at] = 16;
+        }
+        let rle = (0..next() % 80)
+            .map(|_| RleToken {
+                symbol: (next() % 19) as u8,
+                extra: (next() % 128) as u8,
+            })
+            .collect();
+        let plan = DynamicPlan {
+            literal_lengths: lengths[..hlit].to_vec(),
+            distance_lengths: lengths[hlit..].to_vec(),
+            code_length_lengths: std::array::from_fn(|_| (next() % 8) as u8),
+            rle,
+            hlit,
+            hdist,
+            hclen: (next() % 16) as usize,
+            bits: next() % 100_000,
+        };
+        let packed = PackedDynamicPlan::pack(&plan);
+        assert_eq!(
+            packed.as_ref().map(|packed| packed.packed.to_vec()),
+            packed_bytes_reference(&plan),
+            "hlit {hlit}, hdist {hdist}",
+        );
+        if let Some(packed) = packed {
+            assert!(packed.matches(&plan));
+            assert_eq!(packed.unpack(), Some(plan));
+        }
+    }
+}
+
 #[test]
 fn stored_header_plans_round_trip_through_generation_turnover() {
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
@@ -1834,6 +1902,7 @@ fn thread_header_plans_match_uncached_planning() {
     }
     release_thread_header_plans();
     assert!(HEADER_PLAN_STORE.with(|store| store.borrow().current.plans.is_empty()));
+    assert!(HEADER_PLAN_SEARCH.with(Cell::take).is_none());
 }
 
 /// The local rewrite before it counted frequencies and allocated on the first
@@ -2407,34 +2476,53 @@ fn run_list_spellings_match_the_scanning_spellers() {
 }
 
 #[test]
-fn branch_free_earliest_minimum_matches_the_scan() {
-    let reference = |values: &[u64]| {
-        let mut position = 0;
-        for (index, &value) in values.iter().enumerate().skip(1) {
-            if value < values[position] {
-                position = index;
-            }
-        }
-        position
-    };
-    let mut state = 0x1f83_d9ab_fb41_bd6b_u64;
+fn kept_run_spellings_match_fresh_searches() {
+    // One scratch kept across searches, as a header-plan thread keeps it, so
+    // spellings are reused, grown, rebuilt for another key in their slot and
+    // dropped at the entry limit. None of that may change a result.
+    let mut state = 0x9b05_688c_2b3e_6c1f_u64;
     let mut next = move || {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
         state
     };
-    for case in 0..20_000 {
-        let len = 1 + (next() % 8) as usize;
-        // Few distinct values make ties common; INF stands for unreachable.
-        let values: Vec<u64> = (0..len)
-            .map(|_| match next() % 5 {
-                0 => INF,
-                _ => next() % [3, 50][case % 2],
-            })
-            .collect();
-        assert_eq!(earliest_minimum(&values), reference(&values), "{values:?}");
+    let mut kept = ShortestRleScratch::default();
+    let mut dropped = false;
+    for case in 0..6_000 {
+        let len = 1 + (next() % 318) as usize;
+        let mut lengths = Vec::with_capacity(len);
+        while lengths.len() < len {
+            let value = match next() % 2 {
+                0 => 0,
+                _ => (next() % 16) as u8,
+            };
+            let run = 1 + (next() % [4, 40, 320][case % 3]) as usize;
+            lengths.extend(std::iter::repeat(value).take(run.min(len - lengths.len())));
+        }
+        // Costs above 7 share a slot with the key of their low three bits.
+        let most = if case % 5 == 0 { 16 } else { 8 };
+        let costs: [u8; 19] = std::array::from_fn(|_| (next() % most) as u8);
+        let tables = kept.spellings.len();
+        let result = shortest_rle_with_frequencies(&lengths, &costs, &mut kept);
+        dropped |= kept.spellings.len() < tables;
+        assert_eq!(
+            result,
+            shortest_rle_with_frequencies(&lengths, &costs, &mut ShortestRleScratch::default()),
+            "lengths {lengths:?}, costs {costs:?}",
+        );
+        if let Some((rle, frequencies)) = &result {
+            assert_eq!(*frequencies, rle_frequencies(rle));
+        }
+        if case % 40 == 0 {
+            assert_eq!(
+                result.map(|(rle, _)| rle),
+                scanned_shortest_rle(&lengths, &costs),
+                "lengths {lengths:?}, costs {costs:?}",
+            );
+        }
     }
+    assert!(dropped, "the searches never reached the entry limit");
 }
 
 #[test]
