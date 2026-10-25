@@ -574,8 +574,10 @@ struct Candidate {
     /// point before its stop. This describes the bytes, not the route that
     /// emitted them.
     max_planner_is_stable: bool,
-    /// Complete parents this candidate's own replays replaced, oldest first.
-    /// Only original-source Max keeps them, for its caller to close.
+    /// Complete candidates this one replaced, by its own replays or as a
+    /// lineage step or later route, oldest first. Only Max keeps them: it
+    /// closes original-source Max's replay parents after that route, and the
+    /// rest before its terminal searches.
     replaced_parents: Vec<Candidate>,
 }
 
@@ -620,6 +622,27 @@ impl Candidate {
         } else {
             false
         }
+    }
+
+    /// Like [`Self::replace_if_smaller`], but with `keep` (Max) the replaced
+    /// candidate, bytes only, and the parents of both stay in
+    /// `replaced_parents`: a deadline before the replacement would have
+    /// handed that candidate over, and a smaller one can close larger.
+    fn replace_keeping_parent(&mut self, mut contender: Self, keep: bool) -> bool {
+        if !keep {
+            return self.replace_if_smaller(contender);
+        }
+        if !contender.is_strictly_smaller_than(self) {
+            self.replaced_parents
+                .append(&mut contender.replaced_parents);
+            return false;
+        }
+        let mut parent = std::mem::replace(self, contender);
+        self.replaced_parents.append(&mut parent.replaced_parents);
+        parent.plans = Vec::new();
+        parent.block_report = None;
+        self.replaced_parents.push(parent);
+        true
     }
 
     /// Whether another candidate proved this exact encoding to be a Max
@@ -940,7 +963,7 @@ fn refine_bounded_deft4j_lineage(
                         &seeded,
                         narrow_candidate,
                     );
-                    seeded.replace_if_smaller(refined);
+                    seeded.replace_keeping_parent(refined, options.exhaustive);
                 }
                 if continue_no_split && deadline.can_start_route() {
                     let mut route_stop = deadline.hard_stop();
@@ -953,7 +976,7 @@ fn refine_bounded_deft4j_lineage(
                         &mut route_stop,
                         &mut refinement_stop,
                     )? {
-                        seeded.replace_if_smaller(continued);
+                        seeded.replace_keeping_parent(continued, options.exhaustive);
                     }
                 }
                 let narrow_already_wins =
@@ -969,10 +992,15 @@ fn refine_bounded_deft4j_lineage(
                         identity,
                         &mut deadline.bounded_stop(stop_at_soft_deadline),
                     )? {
-                        seeded.replace_if_smaller(terminal);
+                        seeded.replace_keeping_parent(terminal, options.exhaustive);
                     }
                 }
-                replace_optional_if_smaller(deft4j_candidate, seeded);
+                match deft4j_candidate {
+                    Some(deft4j) => {
+                        deft4j.replace_keeping_parent(seeded, options.exhaustive);
+                    }
+                    None => *deft4j_candidate = Some(seeded),
+                }
             }
         }
     } else if let Some(deft4j) = deft4j_candidate.as_ref() {
@@ -1004,7 +1032,7 @@ fn refine_bounded_deft4j_lineage(
                 &mut route_stop,
                 &mut refinement_stop,
             )? {
-                refined.replace_if_smaller(continued);
+                refined.replace_keeping_parent(continued, options.exhaustive);
             }
         }
         // Neither source max nor Max on the unrefined parent covers a new
@@ -1020,9 +1048,11 @@ fn refine_bounded_deft4j_lineage(
                 identity,
                 &mut deadline.bounded_stop(stop_at_soft_deadline),
             )?;
-            refined.replace_if_smaller(continued);
+            refined.replace_keeping_parent(continued, options.exhaustive);
         }
-        replace_optional_if_smaller(deft4j_candidate, refined);
+        if let Some(deft4j) = deft4j_candidate.as_mut() {
+            deft4j.replace_keeping_parent(refined, options.exhaustive);
+        }
     }
     Ok(())
 }
@@ -1678,9 +1708,25 @@ fn improve_default_floor_with_feedback(
     improve_with_terminal_tree_floors(source, options, floor_work, progress, candidate)
 }
 
+/// Apply the terminal tree floors to one complete candidate, keeping the
+/// candidates it replaced for Max's final close.
+fn improve_with_terminal_tree_floors(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    mut candidate: Candidate,
+) -> Result<Candidate> {
+    let parents = std::mem::take(&mut candidate.replaced_parents);
+    let mut closed =
+        improve_with_terminal_tree_floors_inner(source, options, floor_work, progress, candidate)?;
+    closed.replaced_parents.extend(parents);
+    Ok(closed)
+}
+
 /// Apply the terminal tree floors to one complete candidate. Keep every
 /// Default tree-only pass here, so Max cannot fall behind Default.
-fn improve_with_terminal_tree_floors(
+fn improve_with_terminal_tree_floors_inner(
     source: CandidateInput<'_>,
     options: &Options,
     floor_work: DefaultFloorWork<'_>,

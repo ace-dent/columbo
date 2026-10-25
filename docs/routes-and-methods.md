@@ -406,7 +406,7 @@ flowchart TD
     CDEFAULT --> M10D{"M10d · saved source-max parent<br/>Complete or CompleteThenBounded"}
     M10D -- "Eligible" --> DSPLIT["🟡 Deferred bounded split finalization"]
     M10D -- "Ineligible" --> FINALFLOORS
-    DSPLIT --> FINALFLOORS["🟡 Terminal tree floors"]
+    DSPLIT --> FINALFLOORS["🟡 Terminal tree floors<br/>M14 · also each replaced candidate + G0"]
     FINALFLOORS --> R1{"R1 · original-match restoration + G0"}
     R1 -- "Yes" --> RESTORE["🟢 Restore certified matches under unchanged trees"]
     R1 -- "No" --> R1B{"R1b · strict degenerate distance tree + G0"}
@@ -560,6 +560,7 @@ the Max-only R6–R11 add no mandatory Default work, time, or grace.
 | M11 · fragmented collection | Max; optional routes not suppressed; G0; ≥64 source blocks; encoded source 16,000–100,000 bytes; no stored block. Collection: ≤4,096 tokens and ≤512 KiB decoded per run; yields fewer source blocks and 2–8 collected blocks. | Replays the fragmented seed until a metric fixed point or the deadline; the replay accepts 1–12 non-stored blocks. |
 | M12 · later source max | Max; reuse a completed earlier source-max candidate; skip if policy suppressed it; else start only while G0 allows. Each replaced parent: G0. | Runs original-source Max before a rewritten seed, never repeating an initial source-max route. The route keeps each complete parent its replays replaced; after its final candidate, each is closed the same way (M4, then the terminal tree floors) and kept only if strictly smaller. A deadline can hand over any of those parents, and a better parent can finish worse, so this keeps a longer search from ending above a shorter one ([evidence](benchmark-miss-regression-audit.md#source-max-replaced-parents-24-october)). |
 | M13 · rewritten-seed refinement | Max; selected candidate allowed (strict mode, or beats the source); no exact unexpired Max-planner fixed point; optional routes not suppressed; G0. | Reparses and runs the Max planner from the selected rewrite. |
+| M14 · replaced-candidate close | Max; final stage; each distinct complete candidate that a lineage step (M7a, M2c, M10b's refinements and continuations) or a later route (the floor-seeded and deft4j topologies, M11, M12, M13, M2 late) replaced; G0 for each. | After the terminal tree floors on the final incumbent, applies them to each such candidate. The incumbent is finished through R1–R18 first; then, while G0 allows, the smallest closed candidate that beats the closed incumbent is finished too, and the smaller endpoint is kept (a tie keeps the incumbent's). A deadline before a replacement would have handed the replaced candidate to these steps, and neither the tree floors nor R1–R18 is monotone in its starting size, so this keeps a longer search from ending above a shorter one ([evidence](benchmark-miss-regression-audit.md#replaced-candidates-25-october)). M12's own replay parents are still closed when M12 ends. |
 
 Replay limits: ordinary Default and compact-feedback lineages ≤3 replays;
 terminal merge ≤2; direct deft candidates none until a scheduled refinement.
@@ -792,7 +793,10 @@ fdAT deduplication), Columbo:
   next terminal method, which would otherwise parse the same bytes again;
 - closes a losing floor-seeded, deft4j, source-max (and each parent its
   replays replaced), or changed no-split topology with the terminal tree
-  floors before discarding it, and a winning branch once, at the final stage;
+  floors before discarding it, and a winning branch once, at the final stage,
+  where Max also closes each candidate a lineage step or later route replaced
+  (M14) and, when the best of them closes smaller than the incumbent, finishes
+  both and keeps the smaller endpoint;
 - prices bounded grouping ranges once before selecting the segmentation;
 - skips an R1c boundary while both its blocks are unchanged since its last
   complete search found no cheaper cut;

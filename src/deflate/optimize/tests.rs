@@ -4214,3 +4214,50 @@ fn terminal_parse_cache_reuses_only_identical_validated_bytes() {
     assert!(cache.parse(&[0x03, 0x00, 0x00], 1, empty).is_err());
     assert!(cache.entry.is_none());
 }
+
+#[test]
+fn max_replacements_keep_the_replaced_candidate_and_both_histories() {
+    let candidate = |bytes: usize, bits: u64, route: &'static str| Candidate {
+        data: vec![0; bytes],
+        bits,
+        output_max_distance: None,
+        plans: Vec::new(),
+        block_report: None,
+        route,
+        max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
+    };
+
+    // Default keeps nothing.
+    let mut incumbent = candidate(10, 80, "incumbent");
+    assert!(incumbent.replace_keeping_parent(candidate(9, 72, "smaller"), false));
+    assert!(incumbent.replaced_parents.is_empty());
+
+    // A winner keeps its own parents, then the incumbent's, then the
+    // incumbent itself.
+    let mut incumbent = candidate(10, 80, "incumbent");
+    incumbent.replaced_parents.push(candidate(12, 96, "older"));
+    let mut winner = candidate(9, 72, "winner");
+    winner
+        .replaced_parents
+        .push(candidate(11, 88, "winner's parent"));
+    assert!(incumbent.replace_keeping_parent(winner, true));
+    assert_eq!(incumbent.route, "winner");
+    let routes: Vec<_> = incumbent
+        .replaced_parents
+        .iter()
+        .map(|parent| parent.route)
+        .collect();
+    assert_eq!(routes, ["winner's parent", "older", "incumbent"]);
+
+    // A tie keeps the incumbent but still hands over the contender's parents.
+    let mut tie = candidate(9, 72, "tie");
+    tie.replaced_parents
+        .push(candidate(13, 104, "tie's parent"));
+    assert!(!incumbent.replace_keeping_parent(tie, true));
+    assert_eq!(incumbent.route, "winner");
+    assert_eq!(
+        incumbent.replaced_parents.last().map(|parent| parent.route),
+        Some("tie's parent")
+    );
+}

@@ -964,7 +964,7 @@ fn continue_floor_seeded(
                 .floor_seeded
                 .as_mut()
                 .expect("continuation requires a floor-seeded candidate");
-            floor_seeded_changed = seeded.replace_if_smaller(refined);
+            floor_seeded_changed = seeded.replace_keeping_parent(refined, options.exhaustive);
         }
     }
     if let Some(step) = floor_seeded_step {
@@ -1289,7 +1289,12 @@ fn run_bounded_refinement(
             state.suppress_later_source_max = true;
         }
         if let Some(continued) = follow_up.narrow {
-            replace_optional_if_smaller(&mut state.narrow, continued);
+            match state.narrow.as_mut() {
+                Some(narrow) => {
+                    narrow.replace_keeping_parent(continued, options.exhaustive);
+                }
+                None => state.narrow = Some(continued),
+            }
         }
     }
     if let Some(step) = narrow_step {
@@ -1675,13 +1680,13 @@ fn merge_independent_topologies(
 
     if let Some(seeded) = state.floor_seeded.take() {
         let seeded = close_losing_topology(context, candidate, seeded)?;
-        candidate.replace_if_smaller(seeded);
+        candidate.replace_keeping_parent(seeded, options.exhaustive);
     }
 
     if let Some(mut deft4j) = state.deft4j.take() {
         deft4j.plans.clear();
         let deft4j = close_losing_topology(context, candidate, deft4j)?;
-        candidate.replace_if_smaller(deft4j);
+        candidate.replace_keeping_parent(deft4j, options.exhaustive);
     }
     Ok(())
 }
@@ -1729,7 +1734,7 @@ fn run_fragmented_collection(
         fragmented.plans.clear();
     }
     if let Some(fragmented) = fragmented {
-        candidate.replace_if_smaller(fragmented);
+        candidate.replace_keeping_parent(fragmented, options.exhaustive);
     }
     Ok(())
 }
@@ -1807,7 +1812,7 @@ fn merge_source_max(
 
     let max_candidate = close_source_max_topology(context, eligibility, candidate, max_candidate)?;
     let mut stabilized = candidate.is_encoding_stabilized_by(&max_candidate);
-    candidate.replace_if_smaller(max_candidate);
+    candidate.replace_keeping_parent(max_candidate, options.exhaustive);
 
     // A deadline can stop source max after any replay and hand over that
     // parent, and a better parent can finish worse. Closing each parent the
@@ -1903,7 +1908,7 @@ fn refine_rewritten_seed(
         &mut deadline.hard_stop(),
     )?;
     step.finish(Some(context.report(&seeded)));
-    candidate.replace_if_smaller(seeded);
+    candidate.replace_keeping_parent(seeded, options.exhaustive);
     Ok(())
 }
 
@@ -1943,7 +1948,7 @@ fn run_complementary_no_split(
     };
     let contender = close_losing_topology(context, candidate, contender)?;
     step.finish(Some(context.report(&contender)));
-    candidate.replace_if_smaller(contender);
+    candidate.replace_keeping_parent(contender, options.exhaustive);
     Ok(())
 }
 
@@ -2019,19 +2024,66 @@ fn finish_terminal_searches(
     let RouteContext {
         source,
         options,
+        progress,
+        deadline,
+        ..
+    } = *context;
+    // Default runs these floors inside `improve_default_floor_with_feedback`.
+    if !options.exhaustive {
+        return finish_closed_candidate(context, deadlines, candidate);
+    }
+    let terminal_work = DefaultFloorWork::Timed(deadlines.terminal_work());
+
+    // Max applies them again to its final incumbent and, while routes may
+    // start, to each distinct complete candidate it replaced: a deadline could
+    // have handed any of those to the terminal searches, and a smaller
+    // candidate can close larger. The terminal searches can also end lower
+    // from a larger start, so the closed incumbent is finished first and the
+    // smallest closed parent that beats it is finished too, as time allows,
+    // keeping the smaller endpoint.
+    let mut parents: Vec<Candidate> = Vec::new();
+    for parent in std::mem::take(&mut candidate.replaced_parents) {
+        if parent.data != candidate.data && parents.iter().all(|kept| kept.data != parent.data) {
+            parents.push(parent);
+        }
+    }
+    let candidate =
+        improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
+    let mut best_parent: Option<Candidate> = None;
+    for parent in parents {
+        if !deadline.can_start_route() {
+            break;
+        }
+        let parent =
+            improve_with_terminal_tree_floors(source, options, terminal_work, progress, parent)?;
+        if parent.is_strictly_smaller_than(best_parent.as_ref().unwrap_or(&candidate)) {
+            best_parent = Some(parent);
+        }
+    }
+    let mut finished = finish_closed_candidate(context, deadlines, candidate)?;
+    if let Some(parent) = best_parent.filter(|_| deadline.can_start_route()) {
+        let parent = finish_closed_candidate(context, deadlines, parent)?;
+        finished.replace_if_smaller(parent);
+    }
+    finished.replaced_parents.clear();
+    Ok(finished)
+}
+
+/// The terminal methods, then the tree floors once more (R18), then, for
+/// `ApngDefault`, R2–R5.
+fn finish_closed_candidate(
+    context: &RouteContext<'_>,
+    deadlines: &StreamDeadlines,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    let RouteContext {
+        source,
+        options,
         default_floor,
         progress,
         ..
     } = *context;
     let terminal_work = DefaultFloorWork::Timed(deadlines.terminal_work());
-
-    // Default runs these floors inside `improve_default_floor_with_feedback`;
-    // Max applies them again only to its final incumbent.
-    if options.exhaustive {
-        candidate =
-            improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
-    }
-
     let restoration_work = if default_floor == DefaultFloor::MandatoryComplete {
         DefaultFloorWork::Mandatory
     } else {

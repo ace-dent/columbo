@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The three 24 October 2026 entries are the current state. Entries from 30 September keep
+The 25 October 2026 entry and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,109 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="replaced-candidates-25-october"></a>
+
+## Replaced candidates on 25 October 2026
+
+### Starting state
+
+At `f9011a2` the hundred-file guard passes 94 of 100 floors, with the six
+recorded failures: `crossroads.png` (+5 bytes), Psyduck, Squirtle and Pikachu
+(1 bit each), Poliwrath (2 bits) and
+`test-conversion-truecoloralpha-grayscalealpha.png` (+2 bytes). The reference
+misses are the strict-policy floors: DeflOpt's four, and timed deft4j's 12, 11
+at parity with `--strict 0` plus the preserved signed PNG; none against
+Defluff. The [deft4j refresh](#deft4j-refresh-24-october) left 24 rows that
+grew, three of them searches that end above their 10-second cut.
+
+### Complete searches ending above a cut one
+
+- `basi3p04.png`: cut at 10 seconds, `0d87ee8` hands original-source Max's
+  1,353-bit result to the closing floors (1,344, then 1,320 bits) and the
+  terminal searches end at 1,318. Given time, the rewritten-seed refinement
+  (M13) replaces that 1,344-bit incumbent with a 1,321-bit candidate, which the
+  floors leave at 1,321, and the search ends at 1,319.
+- `108-Lickitung-1.png`: the deft4j-derived refinement (M10b) replaces its
+  1,727-bit parent with a 1,720-bit one. Closed as a losing topology, the
+  parent reaches 1,714 bits and the refinement only 1,716.
+- `g8t.png`: the cut falls inside original-source Max's block search, whose
+  1,211-bit state ends at 1,177 bits; the finished search's 1,200-bit result
+  ends at 1,180. Like crossroads, this is a state inside one search.
+
+[`1f021ca`](#source-max-replaced-parents-24-october) kept the parents that
+original-source Max's replays replace. Every other lineage step, and every
+route that displaces the incumbent, still dropped the candidate it replaced,
+although neither the tree floors nor the terminal searches are monotone in
+their starting size.
+
+### Accepted change
+
+M14, the replaced-candidate close. In Max, each lineage step (M7a, M2c and
+M10b's refinements and continuations) and each later route that displaces the
+incumbent (the floor-seeded and deft4j topologies, M11, M12, M13 and M2 late)
+keeps the candidate it replaced, as bytes only, with that candidate's own
+replaced candidates. After the terminal tree floors on the final incumbent,
+each distinct one is closed with the same floors while G0 allows. The
+incumbent is finished through R1–R18 first; the smallest closed candidate that
+beats the closed incumbent is then finished too while G0 allows, and the
+smaller endpoint is kept, a tie keeping the incumbent's. A deadline before any
+replacement would have handed the replaced candidate to exactly these steps,
+so with enough time a longer search no longer ends above a shorter one this
+way. Default is unchanged.
+
+| Check | Result |
+| --- | --- |
+| 369 early-finishing timed deft4j rows (every third of the 1,107 that finish before their deadline) | 2 smaller (`rgba_8_should_be_rgba_8.png` −6 bytes, `063-Abra-0.png` −3 bits), none larger; 1,740.2 → 1,715.7 s |
+| `basi3p04.png`, `108-Lickitung-1.png`, `cm9n0g04.png` at 10, 20 and 60 seconds | 1,319 → 1,318 bits at each; 1,715 → 1,714 from 20 seconds (at 10 the search uses its whole allowance); 1,361 unchanged |
+| Hundred-file guard | 94 of 100, the same six failures |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+| Completing Max runs (`036-Clefable-0.png` at 150 seconds, `114-Tangela-1.png`) | Identical bytes and instructions retired |
+| Peak memory, three files given 60 seconds | Identical outputs; 276 → 261, 104 → 104 and 388 → 379 MiB |
+
+Deadline-bound runs keep HEAD's path: on `monarch.PNG`, whose search uses its
+whole 16 seconds, the verbose step sequence and output match HEAD's. `__text`
+grew from 850,796 to 853,932 bytes; `__TEXT` had 698 bytes of slack, so the
+shipped executable crosses one 16 KiB page (925,632 → 942,048 bytes).
+
+Measured and rejected in the same review:
+
+- **Closing replaced candidates after the route deadline too.** Paired runs
+  of every sixteenth timed deft4j row and the 24 that grew (126 rows), each
+  difference rerun three times: `Cookies.png` −9 bytes, `sample_40-fs8.png`
+  −9, `ask_02.png` −7, `sample_30-fs8.png` −5, and a bit each on `basi3p04`,
+  Lickitung and `4.2.03.png`, but `monarch.PNG` grew 2 to 3 bytes in every
+  run: closing its three candidates took 170 ms, and the incumbent's final
+  bounded-depth floor then met the hard stop. `grayscale_alpha_16` varied by
+  up to 300 bytes between runs and was 110 bytes larger on average. Closing
+  replaced candidates is optional work, so,
+  like M12's parents, it waits on G0.
+- **Finishing only the smallest closed candidate.** `cm9n0g04.png` grew
+  2 bits: a parent closed smaller than the incumbent, then finished 2 bits
+  above the incumbent's endpoint. Finishing both, as D4 does, keeps it.
+
+### Not changed
+
+- `g8t.png` and `crossroads.png`: states inside one search, which no
+  lineage-level candidate reaches.
+- The guard's other failures, on HEAD at 10 and 60 seconds: crossroads ends
+  at 2,128 bytes at both, completing in 48 seconds; Psyduck, Squirtle, Pikachu
+  and Poliwrath complete in 1 to 3 seconds at the same sizes, so their floors
+  come from earlier paths with recorded causes; `test-conversion` uses its
+  whole allowance at 60 and 120 seconds, where `9d5f818` also ends at
+  51,861 bytes, so its 51,859-byte floor and the 16 October row of 51,857 were
+  deadline cuts.
+- Other rows that grew, given 120 seconds on this build and on `9d5f818`:
+  `sample_14.png` ends at 7,066 bytes on both (`9d5f818`'s 7,062 was a
+  10-second cut); `test-convertir-truecoloralpha-trns.png` regains its
+  9,630 bytes on this build (`9d5f818` 9,633); `drive-blue-network-fs8.png`
+  (13,100 against 13,099) and `heart2-fs8.png` (2 bits) stay within a byte.
+  `sample_68-fs8.png` stays at 9,888 bytes, 10 above `9d5f818`'s 9,878 at both
+  10 and 120 seconds. It first grew at `6c81dfa` (R18), which made its Default
+  output 23 bytes smaller (9,948 → 9,925), so it is recorded as a path effect.
+- The reference misses, all strict-policy floors.
+
+Artifacts: `work/replaced-parents-20261025/`.
 
 <a id="deft4j-refresh-24-october"></a>
 
