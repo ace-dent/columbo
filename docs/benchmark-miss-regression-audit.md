@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The two 25 October 2026 entries and the three of 24 October are the current state. Entries from 30 September keep
+The 26 October 2026 entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,60 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="apng-refresh-26-october"></a>
+
+## APNG refresh on 26 October 2026
+
+### Benchmark state
+
+The APNG reports come from executable `7c6fbb5b…` (`5a40906`). Against the
+reports of `ab9a0cd7…` (`b831d49`, 17 October), with unchanged allowances:
+
+| Benchmark | Result |
+| --- | --- |
+| APNG Max, 2,431 pairs | 2,215 smaller, 86 larger (73 in bytes); net −158,105 bytes / −1,266,315 bits; no deft4j misses or errors; lead over deft4j 3,649,438 → 3,807,543 bytes; runtime 49,977 → 49,455 s |
+| APNG Default, 2,431 files | 1,826 smaller and 254 larger in bytes (262 larger in bits), by 3,717 bytes; net −67,748 bytes / −543,646 bits; runtime 3,899 → 1,874 s; Default-not-faster flags 0; Max no larger than Default on every file |
+
+One APNG Max run fills the machine on its own: 17 threads at about 700% CPU
+on eight cores. The load average of 14 to 29 during the Max run came from
+the benchmark itself, so every row that grew was rerun with both builds in
+the same conditions before attribution.
+
+<a id="rows-that-grew-26-october"></a>
+
+### Rows that grew
+
+APNG Default: run with builds of `b831d49` and `04d63bd`, all 272 rows that
+grew in bytes or bits have their current sizes at `04d63bd`, the R5 move
+whose full comparison against `b831d49` is recorded in
+[R5 follows the fit](research/apng-header-fit-validation.md#r5-follows-the-fit):
+1,826 smaller and 254 larger, by 3,717 bytes. Default runs complete well
+within their allowance, and later commits saved 33 more bytes and made no row
+larger.
+
+APNG Max: one paired rerun of the 86 grown rows at their recorded allowances,
+alternating `b831d49` and this build:
+
+- 37 do not grow: 32 reach their earlier size, and five are no larger than
+  `b831d49` in the same conditions.
+- 49 grow again, by 1,210 bytes in all; 34 of them by at most 15 bytes and
+  18 by at most 2. `268910_80058…`, recorded 3 bytes larger, varies by 232
+  bytes between runs of one build.
+- `1604030_190919…`, the one prior-result annotation (16.7% of its savings),
+  is deadline-limited. At its 10 seconds, builds up to `e79a60a` end at
+  123,003–123,158 bytes; from `bab3748`, whose M14 closes take part of the
+  allowance, runs also end at 123,143–123,340, and from `2c702f5` mostly at
+  123,324–123,340. Given more time this build is smaller: 122,948 bytes
+  against `b831d49`'s 123,305 at 40 seconds, and 122,899 against 123,172 at
+  60. `b831d49` itself ends above its 10-second sizes there.
+- The next six largest that grow again, by 40 to 129 bytes, are smaller with
+  this build than with `b831d49` when both get three times their allowances;
+  `680420_122369…`, `1451190_209704…` and `837470_100787…` also beat their
+  recorded earlier sizes (240,033, 294,197 and 247,125 bytes).
+
+The APNG guard (`work/deft4j-apng-regression-guard.json`), created by this
+run, keeps `1604030_190919…`'s 10-second floor of 123,097 bytes.
 
 <a id="terminal-sweep-replacements-25-october"></a>
 
