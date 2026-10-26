@@ -2015,7 +2015,8 @@ fn run_deferred_source_max_split(
 }
 
 /// Apply the terminal tree floors (Max only), then the terminal methods, then
-/// the tree floors once more (R18), then, for `ApngDefault`, R2–R5.
+/// the tree floors once more (R18), then, for `ApngDefault`, R2–R5. Max then
+/// closes with the tree floors each candidate the terminal sweeps replaced.
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -2061,9 +2062,32 @@ fn finish_terminal_searches(
         }
     }
     let mut finished = finish_closed_candidate(context, deadlines, candidate)?;
+    let mut swept = std::mem::take(&mut finished.replaced_parents);
     if let Some(parent) = best_parent.filter(|_| deadline.can_start_route()) {
-        let parent = finish_closed_candidate(context, deadlines, parent)?;
+        let mut parent = finish_closed_candidate(context, deadlines, parent)?;
+        swept.append(&mut parent.replaced_parents);
         finished.replace_if_smaller(parent);
+    }
+    // The terminal sweeps keep each candidate a method that needs a route
+    // start replaced: a deadline just before that method would have handed it
+    // to the finishing steps, which end with the tree floors, and those are
+    // not monotone in their starting size. Both endpoints are complete, so
+    // closing these with the floors, as linear finalization until the hard
+    // stop, can only make the result smaller; a tie keeps the endpoint.
+    let mut distinct: Vec<Candidate> = Vec::new();
+    for replaced in swept {
+        if replaced.data != finished.data && distinct.iter().all(|kept| kept.data != replaced.data)
+        {
+            distinct.push(replaced);
+        }
+    }
+    for replaced in distinct {
+        if !terminal_work.can_finalize() {
+            break;
+        }
+        let replaced =
+            improve_with_terminal_tree_floors(source, options, terminal_work, progress, replaced)?;
+        finished.replace_if_smaller(replaced);
     }
     finished.replaced_parents.clear();
     Ok(finished)
@@ -2094,6 +2118,7 @@ fn finish_closed_candidate(
     } else {
         HeaderFit::InSweep
     };
+    // Max keeps what the sweeps replace for `finish_terminal_searches`.
     let candidate = improve_with_terminal_searches(
         source,
         options,
@@ -2101,6 +2126,7 @@ fn finish_closed_candidate(
         terminal_work,
         progress,
         header_fit,
+        options.exhaustive,
         candidate,
     )?;
     // R18: the blocks R13–R17 cut, merged or re-spelled have not had the

@@ -1826,6 +1826,21 @@ fn improve_with_original_match_restoration(
     options: &Options,
     floor_work: DefaultFloorWork<'_>,
     progress: Progress,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    improve_with_original_match_restoration_keeping(
+        source, options, floor_work, progress, false, candidate,
+    )
+}
+
+/// [`improve_with_original_match_restoration`], keeping the candidate a win
+/// replaces among its `replaced_parents` when `keep_replaced`.
+fn improve_with_original_match_restoration_keeping(
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    keep_replaced: bool,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     if !floor_work.can_start_route()
@@ -1852,7 +1867,7 @@ fn improve_with_original_match_restoration(
         )
     }));
     if let Some(restored) = restored {
-        candidate.replace_if_smaller(restored);
+        candidate.replace_keeping_parent(restored, keep_replaced);
     }
     Ok(candidate)
 }
@@ -2149,6 +2164,12 @@ impl TerminalHeaderSearch {
 /// Default runs one sweep. Every accepted candidate strictly decreases (bytes,
 /// meaningful bits), so a method's input score identifies an unchanged
 /// candidate, and the sweep skips methods already tried on it.
+///
+/// With `keep_replaced`, each candidate a method replaces that may start only
+/// while routes may (R1, R1b–R11) is kept among the result's
+/// `replaced_parents`: a deadline before that method would have handed it to
+/// the finishing steps.
+#[allow(clippy::too_many_arguments)]
 fn improve_with_terminal_searches(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2156,8 +2177,15 @@ fn improve_with_terminal_searches(
     max_work: DefaultFloorWork<'_>,
     progress: Progress,
     header_fit: HeaderFit,
+    keep_replaced: bool,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
+    // Moved here after each method, so a later replacement that keeps
+    // nothing cannot drop them.
+    let mut kept = Vec::new();
+    if keep_replaced {
+        kept.append(&mut candidate.replaced_parents);
+    }
     let mut visited = [None; 16];
     let mut merged = None;
     let mut first_sweep = true;
@@ -2171,13 +2199,17 @@ fn improve_with_terminal_searches(
             visited[0] = Some(before);
             // Restoration parses its own model; do not hold a second one.
             parse_cache.clear();
-            candidate = improve_with_original_match_restoration(
+            candidate = improve_with_original_match_restoration_keeping(
                 source,
                 options,
                 ordinary_work,
                 progress,
+                keep_replaced,
                 candidate,
             )?;
+            if keep_replaced {
+                kept.append(&mut candidate.replaced_parents);
+            }
         }
         for (index, search) in [
             TerminalHeaderSearch::StrictDistanceCompletion,
@@ -2243,16 +2275,20 @@ fn improve_with_terminal_searches(
                     candidate,
                 )?
             } else {
-                improve_with_terminal_header_search(
+                improve_with_terminal_header_search_keeping(
                     search,
                     source,
                     options,
                     work,
                     progress,
                     &mut parse_cache,
+                    keep_replaced,
                     candidate,
                 )?
             };
+            if keep_replaced {
+                kept.append(&mut candidate.replaced_parents);
+            }
             // A win re-slides the blocks, which can expose another R13, R14 or
             // R15 win; repeat here when no later sweep can revisit them.
             let finish_changed = matches!(search, TerminalHeaderSearch::EntropyCuts)
@@ -2293,6 +2329,9 @@ fn improve_with_terminal_searches(
                 || (candidate.data.len(), candidate.bits) == score
                 || !max_work.can_start_route()
             {
+                if keep_replaced {
+                    candidate.replaced_parents = kept;
+                }
                 return Ok(candidate);
             }
         }
@@ -2309,13 +2348,40 @@ fn improve_with_terminal_header_search(
     floor_work: DefaultFloorWork<'_>,
     progress: Progress,
     parse_cache: &mut TerminalParseCache,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    improve_with_terminal_header_search_keeping(
+        search,
+        source,
+        options,
+        floor_work,
+        progress,
+        parse_cache,
+        false,
+        candidate,
+    )
+}
+
+/// [`improve_with_terminal_header_search`]. With `keep_replaced`, a method
+/// that may start only while routes may (not R1c or R13–R17) keeps the
+/// candidate its win replaces among its `replaced_parents`.
+#[allow(clippy::too_many_arguments)]
+fn improve_with_terminal_header_search_keeping(
+    search: TerminalHeaderSearch,
+    source: CandidateInput<'_>,
+    options: &Options,
+    floor_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    keep_replaced: bool,
     mut candidate: Candidate,
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
     // R1c and R13–R16 are linear finalization: they may start until the hard
     // stop, not only before the soft deadline.
-    let may_start = if search == TerminalHeaderSearch::BoundarySlide || search.is_tree_finish() {
+    let finalization = search == TerminalHeaderSearch::BoundarySlide || search.is_tree_finish();
+    let may_start = if finalization {
         floor_work.can_finalize()
     } else {
         floor_work.can_start_route()
@@ -2345,7 +2411,7 @@ fn improve_with_terminal_header_search(
         )
     }));
     if let Some(refined) = refined {
-        candidate.replace_if_smaller(refined);
+        candidate.replace_keeping_parent(refined, keep_replaced && !finalization);
     }
     Ok(candidate)
 }

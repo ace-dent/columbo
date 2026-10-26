@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 25 October 2026 entry and the three of 24 October are the current state. Entries from 30 September keep
+The two 25 October 2026 entries and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,63 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="terminal-sweep-replacements-25-october"></a>
+
+## Terminal sweep replacements on 25 October 2026
+
+### Starting state
+
+The [`2c702f5` efficiency review](research/efficiency-review.md#2c702f5-25-october-2026)
+found `css-ig-net/drive-blue-disk-fs8.png` 1 byte larger in a faster build at
+10 seconds, 15,699 instead of 15,698. The baseline itself gave 15,698 bytes at
+10 seconds, 15,699 at 11 and 15,696 at 12: given one more second, Max ended
+larger.
+
+### Cause
+
+Both verbose runs reach the same 117,959-bit state when R17's win lets R12
+start another sweep. In the shorter run, the soft deadline stops R3–R5 from
+starting; R1c and R13–R17 find nothing, and R18's bounded-depth floor takes
+the stream to 117,920 bits. In the longer run R4 (117,957 bits), R5 (117,923)
+and R17 (117,922) run first, and R18 then finds nothing. The tree floors are
+not monotone in their starting size, and M14 kept only what lineage steps and
+routes replace, not what the terminal sweep's own methods replace.
+
+### Accepted change
+
+M14 now also covers the terminal sweeps. In Max, a win by R1, R1b or R2–R11,
+the methods that need G0 to start, keeps the candidate it replaced, bytes
+only. Once the incumbent's endpoint, and the finished M14 parent's, is
+complete, each distinct kept candidate is closed with the tree floors, as
+linear finalization until the hard stop, and a strictly smaller result
+replaces the endpoint; a tie keeps the endpoint. A deadline just before such a
+method would have handed its candidate to the finishing steps, which end with
+those floors. M14's rejected variant closed candidates after the deadline
+before finishing the incumbent, whose own last floor then met the hard stop;
+here the endpoints are complete first, so a close can only lower the result.
+It uses the grace period, which only the stream that runs until the file's
+deadline has. The close applies only the floors, not R1c and R13–R17, which a
+shorter run would also have given the candidate.
+
+| Check | Result |
+| --- | --- |
+| `drive-blue-disk-fs8.png`, six runs of each build at 10 and 11 seconds | Before: 15,699 bytes four times and 15,698 twice at 10 seconds; 15,698 twice and 15,696 four times at 11. After: 15,698 every run at 10 seconds and 15,696 every run at 11 |
+| Every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating builds) | 55 identical; `sample_20.png` 5 bytes smaller; `monarch.png` 2 and `interlaced_rgba_8_should_be_grayscale_alpha_8.png` 12 larger. Four more runs of each: `monarch.png` 840,885–840,887 bytes before and 840,882–840,885 after; the interlaced file 132,264–132,266 before and 132,264 every run after; `sample_20.png` 9,697 three times before and 9,692 three times after |
+| `monarch.png` at 16 seconds, three runs of each build | 840,882 bytes every run, 18.1 seconds |
+| Completing Max runs (`036-Clefable-0.png` at 150 seconds, `114-Tangela-1.png`) | Identical bytes; instructions within 0.2% |
+| Hundred-file guard | 94 of 100, the same six failures at the same sizes |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+
+The final build, which deduplicates the kept candidates before closing them,
+gave 15,696 bytes in three runs each at 10 and 11 seconds. A new test checks
+that the Max sweep keeps exactly the candidates its route-gated methods
+replace, in order and strictly decreasing, with no other effect on the sweep,
+and that the plain sweep keeps none. Default is unchanged. Rust tests,
+including the private corpus, passed in release and debug modes, with
+documentation and Python tests, formatting and all-feature Clippy with
+warnings denied. `__text` grew from 861,676 to 863,888 bytes; the shipped
+executable keeps its 942,064 bytes.
 
 <a id="replaced-candidates-25-october"></a>
 

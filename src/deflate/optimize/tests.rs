@@ -1114,6 +1114,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
         DefaultFloorWork::Timed(&deadline),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -1236,6 +1237,7 @@ fn terminal_merges_follow_the_settled_finish() {
         DefaultFloorWork::Timed(&deadline),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -3881,6 +3883,81 @@ fn coupled_swaps_do_not_change_zero_budget_default_floor() {
 }
 
 #[test]
+fn max_terminal_sweep_keeps_what_route_gated_methods_replace() {
+    // The same generated stream, whose R1–R9 sweep wins.
+    let input = super::super::header::test_support::coupled_swap_test_stream();
+    let parsed = parse_stream(&input, 16384).unwrap();
+    let identity = StreamIdentity {
+        decoded_size: parsed.decoded_size,
+        crc32: parsed.crc32,
+        adler32: parsed.adler32,
+    };
+    let source = CandidateInput {
+        compressed: &input,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 16384,
+        identity,
+    };
+    let parent = Candidate {
+        data: input.clone(),
+        bits: parsed.meaningful_bits,
+        output_max_distance: Some(parsed.max_distance),
+        plans: Vec::new(),
+        block_report: None,
+        route: "generated terminal parent",
+        max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
+    };
+    let options = Options {
+        exhaustive: true,
+        timeout: Duration::MAX,
+        ..Options::default()
+    };
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
+    let progress = Progress::begin(
+        &options,
+        deadline.started,
+        StreamProgress {
+            blocks: parsed.source_block_count,
+            compressed_bytes: input.len(),
+            decoded_bytes: parsed.decoded_size,
+            empty_blocks: parsed.source_empty_block_count,
+            meaningful_bits: parsed.meaningful_bits,
+            parse_elapsed: Duration::ZERO,
+        },
+    );
+    let work = DefaultFloorWork::Timed(&deadline);
+    let sweep = |keep_replaced| {
+        improve_with_terminal_searches(
+            source,
+            &options,
+            work,
+            work,
+            progress,
+            HeaderFit::InSweep,
+            keep_replaced,
+            parent.clone(),
+        )
+        .unwrap()
+    };
+    let plain = sweep(false);
+    let kept = sweep(true);
+    // Keeping the replaced candidates changes no step.
+    assert_eq!((&kept.data, kept.bits), (&plain.data, plain.bits));
+    assert!(plain.replaced_parents.is_empty());
+    assert!(!kept.replaced_parents.is_empty());
+    assert_eq!(kept.replaced_parents[0].data, parent.data);
+    for pair in kept.replaced_parents.windows(2) {
+        assert!(pair[1].is_strictly_smaller_than(&pair[0]));
+    }
+    for replaced in &kept.replaced_parents {
+        assert!(kept.is_strictly_smaller_than(replaced));
+        assert!(replaced.plans.is_empty() && replaced.block_report.is_none());
+    }
+}
+
+#[test]
 fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
     // Generated frequencies and source-certified matches, with a stored
     // history prefix. One R1–R9 sweep stops at 36,729 bits: its alphabet
@@ -3934,6 +4011,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&deadline),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -3958,6 +4036,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&deadline),
         progress,
         HeaderFit::InSweep,
+        false,
         closed.clone(),
     )
     .unwrap();
@@ -3978,6 +4057,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&expired),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -3988,6 +4068,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&expired),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -4000,6 +4081,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         DefaultFloorWork::Timed(&expired),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
@@ -4066,6 +4148,7 @@ fn default_sweep_finishes_with_the_distance_ladder() {
         DefaultFloorWork::Timed(&deadline),
         progress,
         HeaderFit::InSweep,
+        false,
         parent.clone(),
     )
     .unwrap();
