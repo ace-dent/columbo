@@ -1298,7 +1298,7 @@ fn package_merge_can_win_the_code_length_alphabet() {
         &lengths[..286],
         &lengths[286..],
         &lengths,
-        rle,
+        (rle.clone(), rle_frequencies(&rle)),
         false,
         &mut search,
     );
@@ -2457,17 +2457,32 @@ fn run_list_spellings_match_the_scanning_spellers() {
         for mask in 0..8_u8 {
             let (no_16, no_17, no_18) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
             assert_eq!(
-                greedy_rle_from_runs(&runs, count, no_16, no_17, no_18),
+                {
+                    let (rle, frequencies) =
+                        greedy_rle_from_runs(&runs, count, no_16, no_17, no_18);
+                    assert_eq!(frequencies, rle_frequencies(&rle));
+                    rle
+                },
                 reference_greedy_rle(&lengths, no_16, no_17, no_18),
                 "case {case} mask {mask}"
             );
             assert_eq!(
-                balanced_repeat_rle_from_runs(&runs, count, no_17, no_18),
+                {
+                    let (rle, frequencies) =
+                        balanced_repeat_rle_from_runs(&runs, count, no_17, no_18);
+                    assert_eq!(frequencies, rle_frequencies(&rle));
+                    rle
+                },
                 reference_balanced_repeat_rle(&lengths, no_17, no_18),
                 "case {case} mask {mask}"
             );
             assert_eq!(
-                columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18),
+                {
+                    let (rle, frequencies) =
+                        columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18);
+                    assert_eq!(frequencies, rle_frequencies(&rle));
+                    rle
+                },
                 reference_columbo_zero_repeat_rle(&lengths, no_17, no_18),
                 "case {case} mask {mask}"
             );
@@ -2523,6 +2538,80 @@ fn kept_run_spellings_match_fresh_searches() {
         }
     }
     assert!(dropped, "the searches never reached the entry limit");
+}
+
+#[test]
+fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
+    // The feedback pass prices only its first tree when that tree is an
+    // unrepaired Huffman tree: every other builder's usable code, reordered
+    // or not, must cost at least as many RLE bits and header bits.
+    let mut state = 0x510e_527f_ade6_82d1_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let builders = (0..4)
+        .flat_map(|variant| {
+            [
+                CodeLengthBuilder::DefloptHeap(variant),
+                CodeLengthBuilder::OrderHeap(variant),
+                CodeLengthBuilder::Columbo(variant),
+            ]
+        })
+        .chain([
+            CodeLengthBuilder::Deft4jJavaHeap,
+            CodeLengthBuilder::DefluffLimited,
+            CodeLengthBuilder::DefluffExact,
+        ]);
+    let builders: Vec<_> = builders.collect();
+    let header_bits = |frequencies: &[u32; 19], lengths: &[u8; 19]| {
+        let cost = rle_frequency_cost(frequencies, lengths);
+        (cost != INF).then(|| 17 + 3 * trim_code_lengths(lengths) as u64 + cost)
+    };
+    let mut scratch = TreeBuildScratch::default();
+    let mut shortcuts = 0;
+    for case in 0..20_000 {
+        // Sparse, skewed and tied counts; some cases need repair.
+        let mut frequencies = [0_u32; 19];
+        for frequency in &mut frequencies {
+            *frequency = match next() % 4 {
+                0 => 0,
+                1 => (next() % 4) as u32,
+                2 => (next() % [16, 64, 200][case % 3]) as u32,
+                _ => 1 << (next() % [4, 8, 12][case % 3]),
+            };
+        }
+        let first = CodeLengthBuilder::OrderHeap(0).build(&frequencies, &mut scratch);
+        if !first.huffman || !code_length_tree_shape_is_valid(&first.lengths) {
+            continue;
+        }
+        shortcuts += 1;
+        assert!(code_lengths_follow_frequencies(
+            &first.lengths,
+            &frequencies
+        ));
+        let first_cost = rle_frequency_cost(&frequencies, &first.lengths);
+        let first_bits = header_bits(&frequencies, &first.lengths).unwrap();
+        for &builder in &builders {
+            let mut lengths = builder.build(&frequencies, &mut scratch).lengths;
+            if !code_length_tree_shape_is_valid(&lengths) {
+                continue;
+            }
+            for _ in 0..2 {
+                if let Some(bits) = header_bits(&frequencies, &lengths) {
+                    assert!(
+                        rle_frequency_cost(&frequencies, &lengths) >= first_cost
+                            && bits >= first_bits,
+                        "{builder:?} {frequencies:?}",
+                    );
+                }
+                reorder_code_length_lengths(&mut lengths, &frequencies);
+            }
+        }
+    }
+    assert!(shortcuts > 10_000, "{shortcuts} shortcut cases");
 }
 
 #[test]

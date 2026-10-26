@@ -1797,26 +1797,32 @@ pub(crate) fn make_lengths_deflopt_heap_into(
     );
 }
 
+/// Return whether the Huffman tree was deeper than `max_bits` and needed
+/// repair.
 pub(crate) fn make_lengths_deflopt_heap_into_with_scratch(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
     scratch: &mut TreeBuildScratch,
-) {
-    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false, scratch);
+) -> bool {
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, false, scratch)
 }
 
+/// Return whether the Huffman tree was deeper than `max_bits` and needed
+/// repair.
 pub(crate) fn make_lengths_order_heap_into_with_scratch(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     variant: u32,
     scratch: &mut TreeBuildScratch,
-) {
-    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true, scratch);
+) -> bool {
+    make_lengths_variant_heap_inner(frequencies, lengths, max_bits, variant, true, scratch)
 }
 
+/// Return whether the Huffman tree was deeper than `max_bits` and needed
+/// repair.
 fn make_lengths_variant_heap_inner(
     frequencies: &[u32],
     lengths: &mut [u8],
@@ -1824,7 +1830,7 @@ fn make_lengths_variant_heap_inner(
     variant: u32,
     use_order_tie: bool,
     scratch: &mut TreeBuildScratch,
-) {
+) -> bool {
     assert_eq!(frequencies.len(), lengths.len());
     lengths.fill(0);
 
@@ -1857,10 +1863,10 @@ fn make_lengths_variant_heap_inner(
     }
     let leaf_count = symbols.len();
     match leaf_count {
-        0 => return,
+        0 => return false,
         1 => {
             lengths[symbols[0] as usize] = 1;
-            return;
+            return false;
         }
         _ => {}
     }
@@ -1895,7 +1901,7 @@ fn make_lengths_variant_heap_inner(
         max_depth = max_depth.max(depth as usize);
     }
     if max_depth <= usize::from(max_bits) {
-        return;
+        return false;
     }
     // Each branch's children are the two entries removed before creating
     // it, so the branches in reverse, right child first, give the leaves in
@@ -1909,6 +1915,7 @@ fn make_lengths_variant_heap_inner(
         }
     }
     repair_deflopt_overflow(leaf_order, lengths, max_bits, max_depth);
+    true
 }
 
 /// Merge the two least entries until one remains, recording each branch's

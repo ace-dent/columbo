@@ -774,7 +774,13 @@ lengths often share a histogram. Each thread keeps a direct-mapped cache of
 the complete histogram and emptied with the header-plan store. Builders that
 must agree share one code: the DeflOpt and order-key heaps' frequency-only
 variant, and Defluff's limited builder with Columbo's variant 0 whenever their
-common Huffman tree fits 7 bits. The four heap variants of the DeflOpt local
+common Huffman tree fits 7 bits. A feedback pass's first code, the order-key
+heap's variant 0, is often a complete Huffman tree that fits 7 bits without
+repair. No code then spells the RLE in fewer bits, and every usable code gives
+the same symbols a length, so none sends fewer code-length codes either. The
+pass then prices and follows that code alone, still pricing deft4j's pruned
+header: every other builder's code, reordered or not, could at best tie it,
+and a tie keeps the first. The four heap variants of the DeflOpt local
 rewrite share a record of the steps taken from one RLE seed: a variant that
 reaches an explored step, the same RLE and tree, moves to its recorded outcome
 instead of offering the same prices again. The DeflOpt and deft4j repeat
