@@ -157,8 +157,7 @@ legal way for two ranges to share one tree.
 Reserved symbols and oversubscribed codes are invalid Deflate, and every output
 is reparsed by the same validating parser. The single-code and empty forms and
 the alias decode in common decoders, but conservative decoders may reject them,
-so strict rewrites never use them. An unchecked `Established` source copy can
-still carry them into strict output
+so strict output never uses them
 ([Strict and relaxed output](#strict-and-relaxed-output)).
 
 Some inputs fall outside Columbo's supported formats rather than its methods:
@@ -265,8 +264,7 @@ and Defluff emits that spelling. It costs 5 extra bits per match more than
 symbol 285, but can remove symbol 285 from the alphabet
 ([Defluff analysis](research/defluff-methods.md#length-258-symbol-handling)).
 Columbo's parser accepts the alias as its only extension to RFC 1951. Strict
-rewrites never use it, but an unchecked `Established` source copy can carry it
-into strict output ([Strict and relaxed output](#strict-and-relaxed-output)).
+output never uses it ([Strict and relaxed output](#strict-and-relaxed-output)).
 
 ## Core concepts
 
@@ -771,13 +769,14 @@ Otherwise the source joins the candidate pool in only two cases:
 - Under the `Established` floor policy, used by ZIP direct Max, PNG metadata
   Max, and the Max refinement of PNG's quick single-image Default floor, the
   caller's input stream is copied in as the "Normal floor" candidate
-  ([Floor policies](#floor-policies)). This copy is neither normalized nor
-  checked for strict compatibility. ZIP direct Max and PNG metadata Max pass the
-  original member or chunk stream. In strict mode, a source that uses the
-  length-258 alias or a Huffman code that is not strictly compatible is
-  therefore returned unchanged when no route beats it. It can then win the
-  container's dominance test. The refinement of PNG's quick floor passes a
-  strict rewrite, so it is not affected.
+  ([Floor policies](#floor-policies)). In strict mode the copy is made only
+  when every source block could be copied verbatim: no block was rewritten by
+  [length-258 normalization](#block-representation), every dynamic block's
+  codes are strictly compatible, and the blocks cover the whole stream, with no
+  dropped empty block whose header went unchecked. Otherwise no copy is made
+  and the bounded phase builds its own floor. This matters for ZIP direct Max
+  and PNG metadata Max, which pass the original member or chunk stream; the
+  refinement of PNG's quick floor passes a strict rewrite.
 - In relaxed mode, a planner that returns no plan yields a copy of the source as
   its candidate. This happens when the planner starts with its stop already
   reached (below) or the plan list cannot be allocated. Strict mode reports that
@@ -833,7 +832,7 @@ flowchart TD
     NORMALIZE --> MODEL
 
     MODEL --> SCHEDULE["Route scheduler<br/>mode + floor policy + gates + deadline"]
-    SCHEDULE -- "Established policy" --> ESTABLISHED["Copy the caller's validated stream<br/>in as the floor"]
+    SCHEDULE -- "Established policy" --> ESTABLISHED["Copy the caller's validated stream<br/>in as the floor, if strict mode allows"]
     SCHEDULE --> BLOCK["Block representation and header methods"]
     SCHEDULE --> TOKEN["Token-preserving and proven-token methods"]
     SCHEDULE --> STRUCTURE["Merge, group, split, and boundary methods"]
@@ -888,7 +887,8 @@ What happens to one stream:
    strictly compatible stay in the model and are refused at reuse
    ([Strict and relaxed output](#strict-and-relaxed-output)). From here on,
    routes only read the model; the one exception is the `Established` floor copy
-   (step 4), which skips this normalization.
+   (step 4), which strict mode makes only when no block needed this
+   normalization and every source header is strictly compatible.
 3. **Schedule.** The scheduler combines the mode
    ([Default and Max](#default-and-max)), the floor policy (the wrapper's choice
    of how this stream secures its Default floor and which Max route families it
@@ -918,10 +918,10 @@ What happens to one stream:
    - **`Established`** (Max only): the caller already holds a complete stream,
      so Columbo copies its input in unchanged as the "Normal floor" candidate.
      Descendants reparse that copy, so the usual identity checks still apply.
-     The copy itself is not normalized or checked for strict compatibility. In
-     strict mode, an input with the length-258 alias or codes that are not
-     strictly compatible can therefore survive when no route beats it
-     ([Strict and relaxed output](#strict-and-relaxed-output)).
+     In strict mode Columbo makes the copy only when every source block could
+     be copied verbatim; an input with the length-258 alias or codes that are
+     not strictly compatible gets no copy, and the bounded phase builds its own
+     floor ([Strict and relaxed output](#strict-and-relaxed-output)).
 5. **Build candidates.** Each route builds a complete candidate from the model
    with the method families in the diagram; the
    [Method catalog](#method-catalog) lists their methods and speeds. The
@@ -1453,10 +1453,11 @@ can, and it may replace that result only by winning against it:
   ([strict completion as a final competitor](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor)).
 - **APNG.** For a multi-image APNG, each `ApngMax` frame keeps the complete APNG
   Default endpoint and, when smaller, the exact endpoint of `ApngDefault`'s
-  finish as a final competitor ([Floor policies](#floor-policies)). Neither
-  includes the source topology lineage (D4), which leaves the gap described in
-  **The D4 exception** below. Per-frame floors cannot guarantee the Default
-  result when Max splits its time across frames. Where the
+  finish as a final competitor ([Floor policies](#floor-policies)). Both
+  include the source topology lineage (D4) as mandatory work, as `ApngDefault`
+  runs it, so each frame keeps its Default result even when the file skips the
+  whole-file race below. Per-frame floors cannot guarantee the Default result
+  when Max splits its time across frames. Where the
   [APNG whole-file race](#wrapper-and-floor-policy-routing) applies, Max
   therefore also races a complete Default pass of the whole file, each side with
   the full allowance. The Max file is kept only if it is no larger in file bytes
@@ -1470,25 +1471,6 @@ can, and it may replace that result only by winning against it:
   dominance. Larger metadata is optimized under `SharedExact`, which keeps the
   complete Default endpoint as for a GZIP member
   ([PNG and APNG](#png-and-apng)).
-
-**The D4 exception.** One class of APNG frames falls outside the construction
-above:
-
-- **When:** the file skips the APNG whole-file race because its image data
-  exceed 8 MiB compressed or 64 MiB decoded in total, or because fewer than 2
-  CPUs are available. A zero timeout also skips the race, but then Default's
-  frames cannot start D4 either.
-- **What differs:** each `ApngMax` frame keeps Default endpoints built without
-  the source topology lineage (D4), and Max runs neither D4 nor the no-split
-  source route (M2) on those frames. Default's `ApngDefault` frames do run D4
-  when G0 allows.
-- **Which frames:** D4 applies only to frames that decode to at least 128 KiB,
-  are at most 1 MiB compressed and have 2–128 nonempty blocks, all of them fixed
-  or dynamic.
-- **Status:** for those frames, nothing in the construction keeps Max no worse
-  than Default. No benchmark row shows Max above Default, but the benchmark
-  reports do not record which APNG files skip the race, so they may not cover
-  this case.
 
 **Short timeouts.** The guarantee assumes enough time. Mandatory floors always
 finish, even past the deadline, but under a short deadline that overrun takes
@@ -2515,7 +2497,7 @@ sample of 25 PNGs at 60 seconds saved 244 bytes on 7 files; two files grew by
   Default's exact finish inside Max's mandatory floors, so that this endpoint
   ends with R18 just as Default does
   ([Floors and the Max guarantee](#floors-and-the-max-guarantee) gives what Max
-  guarantees, with its D4 exception). D4's lineage gets it as part of its
+  guarantees). D4's lineage gets it as part of its
   finish. In Max, M14 then closes the candidates the sweeps replaced with the
   same floors ([M14](#m14-replaced-candidate-close)).
 - **Eligible:** the gates of the two floors: mandatory work or a nonzero
@@ -4599,10 +4581,10 @@ length-258 match spelled with symbol 284 and extra value 31 is rewritten to
 symbol 285, and the block's counts are recounted. The block also loses its
 source bit range, source code lengths and source header, so no block copy or
 header rescoring can bring the alias back
-([Overall pipeline](#overall-pipeline)). Only the `Established` floor, a copy of
-the caller's whole stream, skips this normalization
-([Strict and relaxed output](#strict-and-relaxed-output)). Relaxed mode prices
-the alias as one more spelling instead
+([Overall pipeline](#overall-pipeline)). The `Established` floor, a copy of the
+caller's whole stream, is made in strict mode only when no block needed this
+rewrite ([Strict and relaxed output](#strict-and-relaxed-output)). Relaxed mode
+prices the alias as one more spelling instead
 ([Per-block token search](#per-block-token-search)).
 
 **All-stored repack.** 🟢 When every block is stored, with at least 2 blocks and
@@ -4671,9 +4653,9 @@ only with strictly fewer total bits, so on a tie the earlier step's plan stays.
 4. **Decide regrouping.** Cross-source layout work ("regroup") is allowed when
    time remains and the mode is Max or the encoded source is 16,000–100,000
    bytes, the common encoder-flush case; the upper bound keeps Default's work
-   from growing quadratically. The encoded size counts only blocks that still
-   carry their source bits, so a block rewritten by strict length-258
-   normalization adds nothing
+   from growing quadratically. The encoded size is the blocks' source bits, or
+   the stream's byte length once strict length-258 normalization has dropped a
+   block's source bits
    ([Inner stream-planner gates](#inner-stream-planner-gates)).
 5. **Regroup floors.** With regrouping on, build the
    [source-aligned floor](#boundary-graphs) (2–8 prepared blocks),
@@ -5814,7 +5796,7 @@ discard that list ([M14](#m14-replaced-candidate-close)).
 
 | Route | Starts from | Search | Modes |
 | --- | --- | --- | --- |
-| [D4](#source-topology-d4) | Source block layout | Per-block chain and re-spell seeds, narrow search; no merges | Default; mandatory in Max's complete Default floor |
+| [D4](#source-topology-d4) | Source block layout | Per-block chain and re-spell seeds, narrow search; no merges | Default; mandatory in Max's complete Default floors, APNG's included |
 | [M1](#deft4j-source-route-m1) | Source blocks | deft4j's per-block state graph, then greedy merges | Max |
 | [M2, M2c](#no-split-source-route-m2-m2c) | Source blocks | deft4j seed and narrow search per block, then source-order merges | Max (`CompleteThenBounded`) |
 | [Source max](#source-max-route) | Original source | Full Max stream planner, replayed until a round stops improving | Max |
@@ -5935,12 +5917,13 @@ with the chains, from 18,635 to 3,392 with the narrow search, and from 3,423 to
   ([Floor policies](#floor-policies)); after D1–D3 and the first terminal tree
   floors, just before the finish. It starts only under
   [G0](#g0-timed-route-start) and stops at the hard stop, even under
-  `MandatoryComplete`. In Max it runs only inside the complete Default floor of
-  `Complete`, `CompleteThenBounded` and `SharedExact`, as mandatory work with no
-  G0 check and no stop. `ApngMax`'s APNG Default endpoint has no D4, and no Max
-  route runs it, so a frame that D4 improves can end above Default outside the
-  APNG whole-file race
-  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)).
+  `MandatoryComplete`. In Max it runs only inside the complete Default floors of
+  `Complete`, `CompleteThenBounded` and `SharedExact` and the APNG Default
+  endpoint of `ApngMax`, as mandatory work with no G0 check and no stop, so Max
+  keeps Default's D4 result
+  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)). Under
+  `ApngMax`, the topology competes with the APNG planner's candidate, and both
+  lineages get the APNG finish.
 - **Eligible:** the stream decodes to ≥128 KiB (131,072 bytes) and is in M2's
   class: ≤1 MiB compressed, 2–128 nonempty blocks, every nonempty block fixed or
   dynamic.
@@ -6380,8 +6363,9 @@ after strict replays, so M11 replays it as its own lineage.
 
 1. The stream must have ≥64 parsed blocks, none stored, and an encoded source of
    16,000–100,000 bytes, counted as for
-   [regrouping](#stream-planner-phase-order): the source bits of the blocks that
-   still carry them, rounded up to bytes.
+   [regrouping](#stream-planner-phase-order): the blocks' source bits, rounded
+   up to bytes, or the stream's byte length once strict normalization has
+   dropped a block's source bits.
 2. One source-order pass appends adjacent Huffman blocks into runs of at most
    4,096 tokens and 512 KiB decoded. The collection must have fewer blocks than
    the source and 2–8 blocks. It is planned with the direct structural plan.
@@ -6598,9 +6582,7 @@ Rules shared by the wrappers:
   wrapper returns its source data when the rebuilt result is larger: a whole
   GZIP file, a ZIP archive lineage, a PNG datastream (without a repairable
   `tRNS`), or a zlib stream (with a normalized header). Strict output may grow,
-  since strict rewrites complete codes and replace the length-258 alias. In Max,
-  though, an unchecked `Established` source copy can still carry an incompatible
-  code or the alias into a ZIP member or PNG metadata stream
+  since strict rewrites complete codes and replace the length-258 alias
   ([Strict and relaxed output](#strict-and-relaxed-output)).
 - **`--strip`.** Each wrapper removes its own metadata and extraneous payload,
   as listed below, and every selected Deflate stream gets zeroed padding bits
@@ -6792,9 +6774,7 @@ whole-file race** in
   otherwise build exact Default serially.
 - **APNG file race.** An APNG run races the whole Max file against a complete
   Default pass of the whole file. Per-stream floors cannot guarantee the Default
-  result when Max splits its time across APNG streams. They also leave out the
-  source topology lineage (D4), so a file outside the race can end above Default
-  on a frame that D4 improves
+  result when Max splits its time across APNG streams
   ([Floors and the Max guarantee](#floors-and-the-max-guarantee)).
 
 **Invalid-exporter `tRNS` repair.** Some exporters convert an indexed image to
@@ -7563,8 +7543,8 @@ and `Established` occur only in Max.
 | `Shared` | Default GZIP members and PNG metadata streams; ZIP Max's refinement of the completed Default archive | Default: identical to `Complete`. Max: a bounded floor only; no complete endpoint, no G0t, no M10d | A container member must not use the time that later members need |
 | `SharedExact` | GZIP members in Max; PNG metadata in Max when the file's compressed metadata exceeds 64 MiB | Max: builds the complete Default endpoint first (M0), then runs the bounded phase; no G0t, no M10d | Keeps each member of a serial multi-stream wrapper no worse than Default |
 | `ApngDefault` | Each unique image job of a multi-image APNG in Default | Default: runs the planner once without replay; skips D1–D3 and the first tree floors; moves R2–R5 after R18 | Default cost would otherwise grow with every frame's route count |
-| `ApngMax` | Each unique image job of a multi-image APNG in Max | Max: keeps the APNG Default endpoint and its exact competitor beside a replay-bounded seed; no single-image PNG families | Keeps each frame's APNG Default result (without D4); the seed is a separate lineage, because a smaller seed does not dominate its terminal children |
-| `Established` | Max only: ZIP direct Max, the PNG early lineage's refinement, PNG metadata refinements | Takes the caller-validated input as the floor and builds no Default floor | The caller already keeps that floor, so rebuilding Default would repeat its work |
+| `ApngMax` | Each unique image job of a multi-image APNG in Max | Max: keeps the APNG Default endpoint and its exact competitor beside a replay-bounded seed; no single-image PNG families | Keeps each frame's APNG Default result, D4 included; the seed is a separate lineage, because a smaller seed does not dominate its terminal children |
+| `Established` | Max only: ZIP direct Max, the PNG early lineage's refinement, PNG metadata refinements | Takes the caller-validated input as the floor (in strict mode only a strictly compatible one) and builds no Default floor | The caller already keeps that floor, so rebuilding Default would repeat its work |
 | `MandatoryComplete` | Default-option branches inside a Max run: ZIP Max's Default archive and PNG Max's cached metadata floors | Runs the Default route without a deadline, except D4 and R18; never reports a timeout | Max must never end above this Default result, even when Max's clock runs out |
 
 The **exact policies** are the four that keep a complete Default endpoint in
@@ -7625,18 +7605,22 @@ allowance, or a shorter part of it when the stream reserves a G0t terminal share
   Max's sweep when it would win), then R6–R9 under the frame's primary deadline.
   When smaller, it also keeps the exact `ApngDefault` endpoint as a final
   competitor, built in `ApngDefault`'s order
-  ([Terminal sweep order](#terminal-sweep-order)). Neither includes D1–D4 or the
-  first tree floors, so a frame that D4 can improve has no Max counterpart
-  outside the APNG whole-file race
-  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)). Its Max seed
-  is the ordinary planner with at most 3 replays, built without a deadline.
+  ([Terminal sweep order](#terminal-sweep-order)). When D4 is eligible, its
+  topology, built without a deadline, gets the same R1 and finish if it is
+  smaller than the planner's candidate, and the lineage with the smaller exact
+  endpoint is kept, so Max keeps `ApngDefault`'s D4 result
+  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)). Like
+  `ApngDefault`, neither endpoint includes D1–D3 or the first tree floors. Its
+  Max seed is the ordinary planner with at most 3 replays, built without a
+  deadline.
 - `ApngMax` builds its M7 descendant as the bounded grouping and runs
   original-source Max beside the M7a continuation; the table below gives its
   other routes.
 - `Established` copies the raw optimizer's own input, already validated by the
   caller, as the floor candidate, with the source's meaningful bits; it builds
-  no Default floor and runs no D4. The copy is not normalized or checked for
-  strict compatibility
+  no Default floor and runs no D4. In strict mode it copies the input only when
+  every block could be copied verbatim, and otherwise leaves the bounded phase
+  to build the bounded floor
   ([Strict and relaxed output](#strict-and-relaxed-output)). Every selected
   rewrite is still reparsed and identity-checked, and the caller compares the
   result against the floor it keeps. In relaxed mode the floor is never strictly
@@ -7660,7 +7644,7 @@ and M11–M14 run under every Max policy.
 | `Shared` | Bounded floor | Yes | No | No | No | None |
 | `SharedExact` | Complete endpoint and Max seed | Yes | No | No | No | None |
 | `ApngMax` | APNG Default endpoint and bounded floor | Yes | No | Yes | No | Search (primary 19/20) in the class, else Finalization |
-| `Established` | Copies the input | Yes | No | No | No | Finalization outside the class only |
+| `Established` | Copies the input; in strict mode only a strictly compatible one | Yes | No | No | No | Finalization outside the class only |
 
 [G0t: Max terminal share](#g0t-max-terminal-share) defines the two shares. M10d
 runs only under the two policies that own the stream's terminal time, `Complete`
@@ -8001,7 +7985,8 @@ the relaxed-mode check in step 15 do work; every other step runs only in Max.
 
 1. Guaranteed floor (M0): in Max, `Shared`, `SharedExact` and `ApngMax` prebuild
    their floor, `CompleteThenBounded` does so in the cases that
-   [M0](#m0-bounded-floor-prebuild) lists, and `Established` copies the input.
+   [M0](#m0-bounded-floor-prebuild) lists, and `Established` copies the input
+   (in strict mode, only a strictly compatible one).
 2. Bounded phase: the floor lineage and its M7 descendant on the caller thread,
    with eligible M1, M2, source-max and M3 workers under M5 and M6.
 3. M3 after the phase, if not already built, then S0; M3's candidate merges into
@@ -8690,7 +8675,7 @@ terminal methods and S for the source-max state order
 | D1 | Match-preserving Default feedback | Default (not `ApngDefault`); mandatory in Max's complete Default floors (`Complete`, `CompleteThenBounded`, `SharedExact`) | Default floor pass, first after the ordinary route | [Proven-submatch resegmentation and feedback (D1, D2)](#proven-submatch-resegmentation-and-feedback-d1-d2) |
 | D2 | Integrated Default feedback | As D1 | After D1 | [Proven-submatch resegmentation and feedback (D1, D2)](#proven-submatch-resegmentation-and-feedback-d1-d2) |
 | D3 | Strict literal-only balanced tree | As D1; strict mode only | After D2, before the first terminal tree floors | [Tree lengthening and balanced-tree cleanup (D3)](#tree-lengthening-and-balanced-tree-cleanup-d3) |
-| D4 | Source topology | Default, every policy, under G0; mandatory in Max's complete Default floors (not `ApngMax`) | After the Default floor pass; finished after the incumbent | [Source topology (D4)](#source-topology-d4) |
+| D4 | Source topology | Default, every policy, under G0; mandatory in Max's complete Default floors, `ApngMax`'s APNG endpoint included | After the Default floor pass; finished after the incumbent | [Source topology (D4)](#source-topology-d4) |
 | G0 | Timed-route start | Both modes, every policy | Wherever an optional timed route would start | [G0: timed-route start](#g0-timed-route-start) |
 | G0t | Max terminal share | Max, nonzero timeout: `Complete`, `CompleteThenBounded`, `ApngMax`; `Established` outside the 1 MiB class | Sets the primary deadline when the stream starts | [G0t: Max terminal share](#g0t-max-terminal-share) |
 | M0 | Bounded-floor prebuild | Max: `Shared`, `SharedExact`, `ApngMax`, `Established`; `CompleteThenBounded` in some size bands | Before the bounded phase | [M0](#m0-bounded-floor-prebuild) |
@@ -8970,14 +8955,13 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
     window. That phase then uses the complete endpoint as its floor and seeds
     only the floor descendant (M7) from the Max seed.
   - `ApngMax`: builds the complete APNG Default endpoint (the APNG initial
-    planner once, R1, R2–R5, then R6–R9 under the primary deadline, with R1b and
-    Default's exact finish kept only as a final competitor) and, separately, the
-    bounded floor with no stop. Neither endpoint includes D4, so a frame that D4
-    improves can end above Default outside the APNG whole-file race
-    ([Floors and the Max guarantee](#floors-and-the-max-guarantee)).
+    planner once, mandatory D4 when eligible, R1, R2–R5, then R6–R9 under the
+    primary deadline, with R1b and Default's exact finish kept only as a final
+    competitor) and, separately, the bounded floor with no stop.
   - `Established`: copies the caller's validated stream in as the floor and
-    builds no Default floor. The copy is not normalized or checked for strict
-    compatibility, so in strict mode it can survive when no route beats it
+    builds no Default floor. In strict mode it copies only a stream whose
+    every block could be copied verbatim; otherwise it prebuilds nothing, and
+    the bounded phase builds the bounded floor
     ([Strict and relaxed output](#strict-and-relaxed-output)).
   - `Complete` prebuilds nothing and has no bounded phase. It builds its
     complete Default floor when the comparison floor is set.
@@ -9675,8 +9659,10 @@ Five conventions apply to every row:
 - **Regroup family.** Default's window of 16,000–100,000 encoded bytes targets
   the common encoder-flush case, and the upper bound avoids quadratic work (code
   comment). The encoded size is the sum of the source blocks' original bit
-  lengths, rounded up to bytes; a block whose source bit range was dropped, as
-  strict length-258 normalization does, adds nothing.
+  lengths, rounded up to bytes, which leaves out the empty blocks the parser
+  drops. Strict length-258 normalization drops a block's source bit range, so
+  once any block has lost it, the stream's byte length is used instead,
+  dropped empty blocks included.
 - **Whole-stream merged replay.** A seed is replayed only when it is fixed or
   dynamic and priced at most B + 256 bits, where B is the cheapest seed or the
   range's ordinary or shared-tree plan. The extended-floor replay is limited to

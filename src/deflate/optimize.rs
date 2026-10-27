@@ -1576,13 +1576,21 @@ fn build_bounded_floor_candidate(
 }
 
 /// Copy a caller-retained `Established` stream into the local candidate set.
-/// Descendants reparse it, so the normal identity checks still apply.
-fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> {
+/// Descendants reparse it, so the normal identity checks still apply. Strict
+/// mode returns `None` unless the copy is strictly compatible, so the routes
+/// build a bounded floor instead.
+fn established_floor_candidate(
+    source: CandidateInput<'_>,
+    strict: bool,
+) -> Result<Option<Candidate>> {
+    if strict && !source_is_strictly_reusable(source) {
+        return Ok(None);
+    }
     let mut data = Vec::new();
     data.try_reserve_exact(source.compressed.len())
         .map_err(|_| Error::allocation("Deflate output"))?;
     data.extend_from_slice(source.compressed);
-    Ok(Candidate {
+    Ok(Some(Candidate {
         data,
         bits: source.meaningful_bits,
         output_max_distance: None,
@@ -1591,7 +1599,21 @@ fn established_floor_candidate(source: CandidateInput<'_>) -> Result<Candidate> 
         route: "Normal floor",
         max_planner_is_stable: false,
         replaced_parents: Vec::new(),
-    })
+    }))
+}
+
+/// Whether every source block may be copied verbatim in strict mode, with no
+/// gap where the parser dropped an empty block. Strict normalization clears
+/// `original` from blocks that used the 258 alias.
+fn source_is_strictly_reusable(source: CandidateInput<'_>) -> bool {
+    let mut position = 0;
+    source.blocks.iter().all(|block| {
+        block.original.is_some_and(|original| {
+            let contiguous = original.start == position;
+            position = original.start + original.len;
+            contiguous && reusable_original_bits(block, original.alignment, true).is_some()
+        })
+    }) && position == source.meaningful_bits
 }
 
 /// Whether Default comparison work may be interrupted. Max uses `Mandatory`
@@ -2937,6 +2959,7 @@ fn finish_complete_default_lineage(
     progress: Progress,
     parse_cache: &mut TerminalParseCache,
     base: Candidate,
+    header_fit: HeaderFit,
 ) -> Result<(Candidate, Option<Candidate>)> {
     let restored = improve_with_original_match_restoration(
         source,
@@ -2951,7 +2974,63 @@ fn finish_complete_default_lineage(
         progress,
         parse_cache,
         restored,
-        HeaderFit::InSweep,
+        header_fit,
+    )
+}
+
+/// [`finish_complete_default_lineage`] for `base` and, when D4 applies and its
+/// source topology is strictly smaller than `base`, for that topology too,
+/// keeping the lineage whose exact endpoint is smaller. D4 is mandatory here,
+/// as in Default, so Max never ends above Default.
+fn finish_complete_default_lineages(
+    source: CandidateInput<'_>,
+    floor_options: &Options,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    base: Candidate,
+    header_fit: HeaderFit,
+) -> Result<(Candidate, Option<Candidate>)> {
+    let topology = if default_source_topology_eligible(
+        source.blocks,
+        source.compressed.len(),
+        source.identity.decoded_size,
+    ) {
+        build_source_family_candidate(source, floor_options, &mut SearchStop::never())?
+            .filter(|topology| topology.is_strictly_smaller_than(&base))
+    } else {
+        None
+    };
+    let (complete, slid) = finish_complete_default_lineage(
+        source,
+        floor_options,
+        progress,
+        parse_cache,
+        base,
+        header_fit,
+    )?;
+    let Some(mut topology) = topology else {
+        return Ok((complete, slid));
+    };
+    topology.plans.clear();
+    let (topology, topology_slid) = finish_complete_default_lineage(
+        source,
+        floor_options,
+        progress,
+        parse_cache,
+        topology,
+        header_fit,
+    )?;
+    let endpoint = slid.as_ref().unwrap_or(&complete);
+    Ok(
+        if topology_slid
+            .as_ref()
+            .unwrap_or(&topology)
+            .is_strictly_smaller_than(endpoint)
+        {
+            (topology, topology_slid)
+        } else {
+            (complete, slid)
+        },
     )
 }
 
@@ -3004,50 +3083,16 @@ fn build_complete_default_floor_candidate(
         progress,
         candidate,
     )?;
-    // D4 as in Default, but mandatory, so Max never ends above Default.
-    let topology = if default_source_topology_eligible(
-        source.blocks,
-        source.compressed.len(),
-        source.identity.decoded_size,
-    ) {
-        build_source_family_candidate(source, &floor_options, &mut SearchStop::never())?
-            .filter(|topology| topology.is_strictly_smaller_than(&complete))
-    } else {
-        None
-    };
     let mut parse_cache = TerminalParseCache::default();
-    let (complete, slid) = finish_complete_default_lineage(
+    let (mut complete, slid) = finish_complete_default_lineages(
         source,
         &floor_options,
         progress,
         &mut parse_cache,
         complete,
+        HeaderFit::InSweep,
     )?;
-    let (complete, slid) = match topology {
-        Some(mut topology) => {
-            topology.plans.clear();
-            let (topology, topology_slid) = finish_complete_default_lineage(
-                source,
-                &floor_options,
-                progress,
-                &mut parse_cache,
-                topology,
-            )?;
-            let endpoint = slid.as_ref().unwrap_or(&complete);
-            if topology_slid
-                .as_ref()
-                .unwrap_or(&topology)
-                .is_strictly_smaller_than(endpoint)
-            {
-                (topology, topology_slid)
-            } else {
-                (complete, slid)
-            }
-        }
-        None => (complete, slid),
-    };
     // R6–R9 run under the caller's Max allowance, not as mandatory work.
-    let mut complete = complete;
     for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
         TerminalHeaderSearch::HeaderTree,
@@ -3072,8 +3117,9 @@ fn build_complete_default_floor_candidate(
     })
 }
 
-/// Build APNG's complete Default endpoint and its slid form, then run R6–R9
-/// on the endpoint within this frame's Max allowance.
+/// Build APNG's complete Default endpoint, with D4 as `ApngDefault` runs it, and
+/// its slid form, then run R6–R9 on the endpoint within this frame's Max
+/// allowance.
 fn build_complete_apng_default_floor_candidate(
     source: CandidateInput<'_>,
     options: &Options,
@@ -3085,20 +3131,13 @@ fn build_complete_apng_default_floor_candidate(
         ..options.clone()
     };
     let initial = build_apng_default_candidate(source, &floor_options, &mut SearchStop::never())?;
-    let restored = improve_with_original_match_restoration(
-        source,
-        &floor_options,
-        DefaultFloorWork::Mandatory,
-        progress,
-        initial,
-    )?;
     let mut parse_cache = TerminalParseCache::default();
-    let (mut complete, slid) = finish_mandatory_default_endpoint(
+    let (mut complete, slid) = finish_complete_default_lineages(
         source,
         &floor_options,
         progress,
         &mut parse_cache,
-        restored,
+        initial,
         HeaderFit::AfterTreeFloors,
     )?;
     for search in [
@@ -4244,7 +4283,8 @@ fn build_apng_default_candidate(
     options: &Options,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
-    let Some(plans) = plan_stream(source.blocks, 0, options, expired) else {
+    let Some(plans) = plan_stream(source.blocks, source.compressed.len(), 0, options, expired)
+    else {
         return source_candidate(source, options);
     };
     build_candidate_from_plans(source, plans, options, 0, ReplayPlanner::Full, expired)
@@ -4411,7 +4451,13 @@ fn build_candidate_with_proven_policy(
     run_proven_lineage: bool,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
-    let Some(plans) = plan_stream(source.blocks, 0, options, &mut *expired) else {
+    let Some(plans) = plan_stream(
+        source.blocks,
+        source.compressed.len(),
+        0,
+        options,
+        &mut *expired,
+    ) else {
         return source_candidate(source, options);
     };
     let mut candidate = build_candidate_from_plans(
@@ -4467,6 +4513,7 @@ fn build_candidate_from_established_floor(
 ) -> Result<Candidate> {
     let Some(plans) = plan_stream_from_established_floor(
         source.blocks,
+        source.compressed.len(),
         0,
         options,
         integrated_compact_proven,
@@ -4498,6 +4545,7 @@ fn build_candidate_with_progress(
 ) -> Result<Candidate> {
     let Some(plans) = plan_stream_with_progress(
         source.blocks,
+        source.compressed.len(),
         0,
         options,
         true,
@@ -4640,6 +4688,7 @@ fn build_candidate_and_parse(
             ReplayPlanner::Full => match progress {
                 Some(progress) => plan_stream_with_progress(
                     &replayed.blocks,
+                    data.len(),
                     0,
                     options,
                     options.exhaustive,
@@ -4649,12 +4698,13 @@ fn build_candidate_and_parse(
                 ),
                 None if options.exhaustive => plan_stream_from_established_floor(
                     &replayed.blocks,
+                    data.len(),
                     0,
                     options,
                     false,
                     &mut *expired,
                 ),
-                None => plan_stream(&replayed.blocks, 0, options, &mut *expired),
+                None => plan_stream(&replayed.blocks, data.len(), 0, options, &mut *expired),
             },
             ReplayPlanner::IntegratedProven => {
                 if let [block] = replayed.blocks.as_slice() {

@@ -1037,7 +1037,7 @@ fn stored_only_floor_repacks_without_copying_literal_tokens() {
         strict: false,
         ..Options::default()
     };
-    let after_deadline = plan_stream(&blocks, 0, &relaxed, &mut SearchStop::always()).unwrap();
+    let after_deadline = plan_stream(&blocks, 0, 0, &relaxed, &mut SearchStop::always()).unwrap();
     assert_eq!(total_bits(&after_deadline), total_bits(&plans));
     assert_eq!(after_deadline.len(), plans.len());
 }
@@ -1075,6 +1075,7 @@ fn source_aligned_floor_prices_short_huffman_groups_before_search() {
     };
     let deadline_safe = plan_stream(
         &blocks,
+        0,
         0,
         &exhaustive,
         &mut SearchStop::callback(&mut expires),
@@ -1269,7 +1270,7 @@ fn fragmented_collection_uses_the_independent_4096_token_limit() {
         ..Options::default()
     };
 
-    let seed = fragmented_collect_seed(&blocks, 0, &options).unwrap();
+    let seed = fragmented_collect_seed(&blocks, 16_384, 0, &options).unwrap();
     assert_eq!(seed.len(), 2);
     assert_eq!(seed[0].tokens.len(), 4_000);
     assert_eq!(seed[1].tokens.len(), 2_400);
@@ -1282,6 +1283,39 @@ fn fragmented_collection_uses_the_independent_4096_token_limit() {
         .flat_map(|block| block.plain.iter().copied())
         .collect();
     assert_eq!(decoded, source);
+}
+
+#[test]
+fn encoded_source_size_survives_strict_alias_normalization() {
+    // 64 source blocks of 2,008 bits encode 16,064 bytes, just inside the
+    // regroup window; the stream adds 5 bytes of dropped empty blocks.
+    let mut source_start = 0_u64;
+    let mut blocks: Vec<_> = (0..FRAGMENTED_COLLECT_MIN_SOURCE_BLOCKS)
+        .map(|index| {
+            let mut block = literal_block(&[index as u8; 100], SourceBlockType::Dynamic);
+            block.original = Some(OriginalBits {
+                start: source_start,
+                len: 2_008,
+                alignment: (source_start & 7) as u8,
+                block_type: SourceBlockType::Dynamic,
+            });
+            source_start += 2_008;
+            block
+        })
+        .collect();
+    let stream_bytes = 16_069;
+    // While every block keeps its source bits, they alone decide.
+    assert_eq!(encoded_source_bytes(&blocks, stream_bytes), 16_064);
+
+    // Strict length-258 normalization clears a block's source bits. The rest
+    // encode 15,813 bytes, below the window, so the stream length stands in.
+    blocks[0].original = None;
+    assert_eq!(encoded_source_bytes(&blocks, stream_bytes), 16_069);
+    let options = Options {
+        exhaustive: true,
+        ..Options::default()
+    };
+    assert!(fragmented_collect_seed(&blocks, stream_bytes, 0, &options).is_some());
 }
 
 #[test]
@@ -1514,7 +1548,10 @@ fn collected_floor_is_not_hidden_by_an_unrelated_strong_adjacent_win() {
         None,
     )
     .unwrap();
-    assert!(encoded_source_bytes(&blocks) > total_bits(&adjacent).div_ceil(8).saturating_add(512));
+    assert!(
+        encoded_source_bytes(&blocks, 18_000)
+            > total_bits(&adjacent).div_ceil(8).saturating_add(512)
+    );
     let collected_blocks = collect_huffman_runs(&blocks, false).unwrap();
     let collected = sequential_plan(
         &collected_blocks,
@@ -1528,7 +1565,7 @@ fn collected_floor_is_not_hidden_by_an_unrelated_strong_adjacent_win() {
     .unwrap();
     assert!(total_bits(&collected) < total_bits(&adjacent));
 
-    let planned = plan_stream(&blocks, 0, &options, &mut SearchStop::never()).unwrap();
+    let planned = plan_stream(&blocks, 18_000, 0, &options, &mut SearchStop::never()).unwrap();
     assert_eq!(total_bits(&planned), total_bits(&collected));
 }
 

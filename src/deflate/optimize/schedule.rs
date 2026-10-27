@@ -566,8 +566,9 @@ fn build_default_source_topology(
 }
 
 /// Build the comparison floor that some policies need before the bounded
-/// routes (M0). `Established` copies the caller's stream; for
-/// `CompleteThenBounded`, see [`super::PREBUILD_BOUNDED_FLOOR_MAX_DECODED`].
+/// routes (M0). `Established` copies the caller's stream unless strict mode
+/// must repair it; for `CompleteThenBounded`, see
+/// [`super::PREBUILD_BOUNDED_FLOOR_MAX_DECODED`].
 fn build_guaranteed_floor(
     context: &RouteContext<'_>,
     state: &mut RouteState,
@@ -596,7 +597,7 @@ fn build_guaranteed_floor(
         };
     let step = prebuild_floor_first.then(|| progress.start("Normal comparison floor"));
     let floor = if default_floor == DefaultFloor::Established {
-        Some(established_floor_candidate(source)?)
+        established_floor_candidate(source, options.strict)?
     } else if prebuild_floor_first {
         Some(match default_floor {
             DefaultFloor::CompleteThenBounded | DefaultFloor::SharedExact => {
@@ -1706,7 +1707,7 @@ fn run_fragmented_collection(
     let run = options.exhaustive && deadline.can_start_route();
     let step = run.then(|| progress.start("Columbo fragmented collection"));
     let mut fragmented = if run {
-        fragmented_collect_seed(source.blocks, 0, options)
+        fragmented_collect_seed(source.blocks, source.compressed.len(), 0, options)
             .map(|plans| {
                 let mut replay_options = options.clone();
                 replay_options.exhaustive = false;

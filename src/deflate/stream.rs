@@ -230,12 +230,14 @@ fn cheapest_grouped_layout(
         .map(|(kind, blocks, _)| (kind, blocks))
 }
 
-/// Plan all blocks in a raw Deflate stream, beginning at `start_alignment`.
+/// Plan all blocks in a raw Deflate stream of `stream_bytes` encoded bytes,
+/// beginning at `start_alignment`.
 ///
 /// Splits and merges become ordinary [`PlannedBlock`] values, so the emitter
 /// needs no stream-level logic.
 pub(crate) fn plan_stream(
     blocks: &[ParsedBlock],
+    stream_bytes: usize,
     start_alignment: u8,
     options: &Options,
     stop: &mut SearchStop<'_>,
@@ -243,6 +245,7 @@ pub(crate) fn plan_stream(
     let progress = RouteProgress::disabled();
     plan_stream_with_progress(
         blocks,
+        stream_bytes,
         start_alignment,
         options,
         false,
@@ -257,6 +260,7 @@ pub(crate) fn plan_stream(
 /// covers, but still builds a structural fallback.
 pub(crate) fn plan_stream_from_established_floor(
     blocks: &[ParsedBlock],
+    stream_bytes: usize,
     start_alignment: u8,
     options: &Options,
     integrated_compact_proven: bool,
@@ -265,6 +269,7 @@ pub(crate) fn plan_stream_from_established_floor(
     let progress = RouteProgress::disabled();
     plan_stream_with_progress(
         blocks,
+        stream_bytes,
         start_alignment,
         options,
         true,
@@ -276,8 +281,10 @@ pub(crate) fn plan_stream_from_established_floor(
 
 /// Plan a stream while reporting coarse progress for one long Max route.
 /// Progress reporting does not change the search path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_stream_with_progress(
     blocks: &[ParsedBlock],
+    stream_bytes: usize,
     start_alignment: u8,
     options: &Options,
     comparison_floor_secured: bool,
@@ -304,7 +311,7 @@ pub(crate) fn plan_stream_with_progress(
     if !floor_time_available && !options.strict {
         return stored_floor.map(|floor| finish_plan(floor, options));
     }
-    let source_bytes = encoded_source_bytes(blocks);
+    let source_bytes = encoded_source_bytes(blocks, stream_bytes);
     let reuse_established_floor = comparison_floor_secured;
     let prepared = prepare_blocks(blocks);
     let blocks = prepared.as_deref().unwrap_or(blocks);
@@ -2544,16 +2551,18 @@ fn collect_huffman_runs_with_limits(
 
 /// Build the 4,096-token collected candidate (M11). It is replayed as its own
 /// lineage because on highly fragmented streams it can overtake the 8,192-token
-/// floor after several replays.
+/// floor after several replays. `stream_bytes` is the encoded length of the
+/// stream `blocks` came from.
 pub(crate) fn fragmented_collect_seed(
     blocks: &[ParsedBlock],
+    stream_bytes: usize,
     start_alignment: u8,
     options: &Options,
 ) -> Option<Vec<PlannedBlock>> {
     if !options.exhaustive
         || blocks.len() < FRAGMENTED_COLLECT_MIN_SOURCE_BLOCKS
         || !(DEFAULT_LONG_MERGE_MIN..=DEFAULT_LONG_MERGE_MAX)
-            .contains(&encoded_source_bytes(blocks))
+            .contains(&encoded_source_bytes(blocks, stream_bytes))
         || blocks
             .iter()
             .any(|block| block.source_type == SourceBlockType::Stored)
@@ -5250,11 +5259,17 @@ fn merged_source_type(left: SourceBlockType, right: SourceBlockType) -> SourceBl
     }
 }
 
-fn encoded_source_bytes(blocks: &[ParsedBlock]) -> u64 {
-    let bits: u64 = blocks
-        .iter()
-        .filter_map(|block| block.original.map(|original| original.len))
-        .sum();
+/// The source bits of `blocks`, rounded up to bytes. Strict length-258
+/// normalization clears a block's source bits, so once any block has lost them,
+/// `stream_bytes`, the encoded length of their stream, is used instead.
+fn encoded_source_bytes(blocks: &[ParsedBlock], stream_bytes: usize) -> u64 {
+    let mut bits = 0_u64;
+    for block in blocks {
+        let Some(original) = block.original else {
+            return stream_bytes as u64;
+        };
+        bits += original.len;
+    }
     bits.div_ceil(8)
 }
 

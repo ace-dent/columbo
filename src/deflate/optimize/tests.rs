@@ -2185,6 +2185,54 @@ fn established_floor_is_a_complete_strict_max_candidate() {
 }
 
 #[test]
+fn established_floor_is_rebuilt_when_strict_mode_must_repair_the_source() {
+    // The input of `strict_mode_repairs_alias_and_single_distance_code_inputs`.
+    // Every strict rewrite costs bits, so no route could strictly beat a
+    // copied floor, and strict output would return the source unchanged.
+    let input = [
+        0xe5, 0xc0, 0x81, 0x00, 0x00, 0x00, 0x00, 0x80, 0x20, 0xb6, 0xfd, 0xa5, 0x06, 0xa9, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbe, 0x01,
+    ];
+    for timeout in [Duration::ZERO, Duration::from_secs(10)] {
+        let options = Options {
+            exhaustive: true,
+            timeout,
+            ..Options::default()
+        };
+        let maximum = optimize_raw_prefix_with_floor(
+            &input,
+            &options,
+            options.max_decoded_bytes,
+            DefaultFloor::Established,
+        )
+        .unwrap();
+        let stream = parse_stream(&maximum.data, 2_302).unwrap();
+        assert!(!stream_uses_258_alias(&stream));
+        assert!(stream.blocks.iter().all(|block| {
+            block.original_dynamic.as_ref().map_or(true, |dynamic| {
+                dynamic.has_strictly_compatible_huffman_codes()
+            })
+        }));
+    }
+
+    // Relaxed mode still takes the source as its floor.
+    let relaxed_options = Options {
+        exhaustive: true,
+        timeout: Duration::ZERO,
+        strict: false,
+        ..Options::default()
+    };
+    let relaxed = optimize_raw_prefix_with_floor(
+        &input,
+        &relaxed_options,
+        relaxed_options.max_decoded_bytes,
+        DefaultFloor::Established,
+    )
+    .unwrap();
+    assert_eq!(relaxed.data, input);
+}
+
+#[test]
 fn bounded_parallel_floors_preserve_a_complete_stream() {
     // Two nonempty Huffman blocks activate both phase-one routes, which
     // rejoin before any deft4j refinement.
@@ -2797,6 +2845,141 @@ fn strict_completion_competes_only_after_max_searches_its_parent() {
             || (max.data.len() == ordinary.data.len()
                 && max.info.deflate_bits <= ordinary.info.deflate_bits)
     );
+}
+
+/// One dynamic block of `decoded` bytes, 90% zeros and the rest 1–3, greedily
+/// matched against the latest earlier position with the same three bytes.
+fn skewed_greedy_block(mut state: u64, decoded: usize) -> ParsedBlock {
+    use crate::deflate::distance_band::test_support::{matched, token_block};
+    let data: Vec<u8> = (0..decoded)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state % 100 {
+                0..=89 => 0,
+                90..=95 => 1,
+                96..=98 => 2,
+                _ => 3,
+            }
+        })
+        .collect();
+    let key = |index: usize| {
+        (usize::from(data[index]) << 4)
+            | (usize::from(data[index + 1]) << 2)
+            | usize::from(data[index + 2])
+    };
+    let mut latest = [usize::MAX; 64];
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < data.len() {
+        let candidate = if index + 3 <= data.len() {
+            latest[key(index)]
+        } else {
+            usize::MAX
+        };
+        let length = if candidate == usize::MAX {
+            0
+        } else {
+            (0..(data.len() - index).min(258))
+                .take_while(|&offset| data[candidate + offset] == data[index + offset])
+                .count()
+        };
+        let length = if length >= 3 {
+            tokens.push(matched(length as u16, (index - candidate) as u16));
+            length
+        } else {
+            tokens.push(Token::Literal(data[index]));
+            1
+        };
+        for position in index..(index + length).min(data.len().saturating_sub(2)) {
+            latest[key(position)] = position;
+        }
+        index += length;
+    }
+    token_block(tokens)
+}
+
+#[test]
+fn apng_max_endpoint_keeps_default_source_topology() {
+    // Above the planner's compact search size, its 85,000-byte blocks keep
+    // most of their short scattered matches, which D4's chains drop. D4 thus
+    // wins under `ApngDefault`, and the APNG endpoint must keep that result.
+    let mut writer = BitWriter::default();
+    let mut alignment = 0_u8;
+    for (index, state) in [0x9e37_79b9_7f4a_7c15_u64, 0xd1b5_4a32_d192_ed03]
+        .into_iter()
+        .enumerate()
+    {
+        let block = skewed_greedy_block(state, 85_000);
+        let plan = plan_block(
+            &block,
+            alignment,
+            &Options::default(),
+            &mut SearchStop::never(),
+        );
+        alignment = ((u64::from(alignment) + plan.bits) & 7) as u8;
+        emit_block(&mut writer, &[], &plan, index == 1).unwrap();
+    }
+    let input = writer.into_bytes();
+    let parsed = parse_stream(&input, 170_000).unwrap();
+    assert!(default_source_topology_eligible(
+        &parsed.blocks,
+        input.len(),
+        parsed.decoded_size
+    ));
+    let default = optimize_raw_prefix_with_floor(
+        &input,
+        &Options::default(),
+        170_000,
+        DefaultFloor::ApngDefault,
+    )
+    .unwrap();
+
+    let source = CandidateInput {
+        compressed: &input,
+        blocks: &parsed.blocks,
+        meaningful_bits: parsed.meaningful_bits,
+        decoded_limit: 170_000,
+        identity: StreamIdentity {
+            decoded_size: parsed.decoded_size,
+            crc32: parsed.crc32,
+            adler32: parsed.adler32,
+        },
+    };
+    let options = Options {
+        exhaustive: true,
+        timeout: Duration::MAX,
+        ..Options::default()
+    };
+    let deadline = deadline_with_grace(Instant::now(), Duration::MAX);
+    let (complete, slid) = build_complete_apng_default_floor_candidate(
+        source,
+        &options,
+        Progress::begin(
+            &options,
+            deadline.started,
+            StreamProgress {
+                blocks: parsed.source_block_count,
+                compressed_bytes: input.len(),
+                decoded_bytes: parsed.decoded_size,
+                empty_blocks: parsed.source_empty_block_count,
+                meaningful_bits: parsed.meaningful_bits,
+                parse_elapsed: Duration::ZERO,
+            },
+        ),
+        DefaultFloorWork::Timed(&deadline),
+    )
+    .unwrap();
+    let endpoint = slid
+        .filter(|slid| slid.is_strictly_smaller_than(&complete))
+        .unwrap_or(complete);
+    assert!(!is_strictly_better(
+        default.data.len(),
+        default.info.deflate_bits,
+        endpoint.data.len(),
+        endpoint.bits,
+    ));
 }
 
 #[test]
