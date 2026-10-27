@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 26 October 2026 entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 27 October 2026 entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,55 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="deflopt-defluff-refresh-27-october"></a>
+
+## DeflOpt and Defluff refresh on 27 October 2026
+
+### Benchmark state
+
+The DeflOpt and Defluff reports come from executable `5153aa02…` (`9f36bdb`),
+which adds every change since `f12cf8b`: the method and route changes of
+`1f021ca`, the Default and Max speedups (`e79a60a`, `b23274b`, `d96ab5c`,
+`2c702f5`, `e25d20d`, `51d1f75`), the replaced-candidate closes (`bab3748`,
+`5a40906`), R14 and R17 after a late APNG R5 win (`4f77b01`) and the dead-path
+removal (`9f36bdb`). Against the DeflOpt state of 24 October (1,914 rows from
+`18ba70c5…`, `f12cf8b`):
+
+| Benchmark | Result |
+| --- | --- |
+| DeflOpt Default, 957 rows | Byte- and bit-identical; runtime 519.3 → 346.6 s |
+| DeflOpt Max, 946 rows with unchanged allowances | 105 smaller, 819 identical, 22 larger (16 in bytes); net −1,428 bytes / −11,375 bits; runtime 8,007.1 → 7,360.0 s |
+| DeflOpt Max, all 957 rows | 108 smaller, 22 larger; net −2,441 bytes / −19,473 bits; 11 allowances fell by 1 to 9 seconds with the faster Default |
+| Defluff, 66 pairs | Unchanged: −109 bytes and −938 bits against Defluff, no misses |
+
+Every Max row is no larger than its Default row. The largest gains,
+`IMG_8555.png` (−987 bytes, allowance 14 → 11 seconds), `Cherry512.png` (−261)
+and `nerd.png` (−191), are in the Deflate stream, not metadata. The
+`crossroads.png` annotation is carried from `3ceab7ae…`; its row is unchanged,
+and the `107-Hitmonchan-2.png` annotation of 24 October is resolved.
+
+### Reference misses
+
+Unchanged: DeflOpt keeps the four strict-policy floors of 23 October
+(`sample-green-400x300.png` and `T_Grass.png`, both modes), each at parity in
+the relaxed audit.
+
+### Rows that grew
+
+Quiet serial reruns of the 22 DeflOpt Max rows that grew, at their 10-second
+allowances, alternating builds of `f12cf8b` and `9f36bdb` twice each: 12
+repeat, by 1 to 20 bytes (127 bytes over both rounds of all 22); the other 10
+tie or vary between runs. Given 30 seconds, the earlier build reaches or passes
+the current build's 10-second sizes on nine of the twelve, so the current
+build gets there sooner. On `dossier-green-normal-fs8.png`, for example, the
+earlier build gives 16,343 bytes at 10 seconds and 16,347 at 30, the current
+build's 10-second size. The three still larger at 30 seconds (`OwlAlpha-0.5.png`
++35, `images.png` +7, `sample-hut-400x300.png` +4) are no larger at 60 seconds
+(194,694 against 194,695, 9,299 against 9,307, 269,718 against 269,719). These
+are deadline cuts. One is a non-monotonic step in the current build:
+`sample-hut-400x300.png` gives 269,714 bytes at 10 seconds and 269,718 at 30
+and 60. Reruns are in `work/deflopt-9f36bdb-reruns/`.
 
 <a id="apng-refresh-26-october"></a>
 
