@@ -6,7 +6,9 @@ Date: 16 October 2026. Baseline: `6c81dfa`. Under `ApngDefault`, R2–R4 now run
 after R18 instead of in the terminal sweep; the
 [route catalog](../routes-and-methods.md#terminal-sweep-order) describes the
 order. On 17 October R5 moved with them, after the full APNG benchmark showed R5
-acting on the unfitted parent ([R5 follows the fit](#r5-follows-the-fit)).
+acting on the unfitted parent ([R5 follows the fit](#r5-follows-the-fit)). On
+27 October R14 and R17 began to follow a late R5 win
+([R14 and R17 follow a late R5 win](#r14-and-r17-follow-a-late-r5-win)).
 
 ## Why it saves bits
 
@@ -193,3 +195,63 @@ Validation:
 Harness, lists, arm crates and logs: `work/apng-r5-validation/`; the
 three-executable sticker run's per-file results are kept with its scratch
 data.
+
+## R14 and R17 follow a late R5 win
+
+The [26 October APNG refresh](../benchmark-miss-regression-audit.md#apng-refresh-26-october)
+placed all 272 Default rows that grew against `b831d49` at `04d63bd`, the
+move above. Stream 11 of `683320_79814…` shows what the move lost. Under
+`b831d49` R5 runs early (39,934 → 39,643 bits). The slide, R14 and R17's token
+replay then save 527 bits, 282 of them in R17, and the late fit ends at
+39,095. Moved last, R5 saves 51 bits after the fit and nothing follows its
+rewrite: the stream ends at 39,595.
+
+R5 rewrites tokens. In every other order the steps that respond to new tokens
+follow it: R14 chooses trees for the changed counts, R17 replays the token
+floor under the block's codes, then R18 and, in Max, a later sweep's fit.
+Variants run after a late R5 win, against `5a40906` on every eighth sticker by
+name (304 files, Default, paired):
+
+| After a late R5 win | Saved | Process CPU (median) | Saved per 1% CPU |
+| --- | ---: | ---: | ---: |
+| R1c, R13–R17 and R18, then R2–R4 | 0.0037% (2,470 bytes) | +5.0% (+3.0%) | 0.00074% |
+| R2–R4, the refit rejected above | 0.0023% (1,569) | +3.7% (+2.3%) | 0.00062% |
+| R1c, R13–R17 and R18 | 0.0012% (824) | +1.2% (+1.0%) | 0.0010% |
+| **R14, then R17, each sliding once more after a win** | **0.0009% (587)** | **+0.5% (+0.8%)** | **0.0018%** |
+
+No variant made a file larger: each step keeps only a strictly smaller result.
+The refit gains most, at the ratio already rejected. R14 and R17 answer R5's
+change itself, new counts and new tokens, at about three times that ratio, and
+are accepted. Max's APNG Default endpoint follows the same order. On stream
+11 above, R17 now takes R5's 39,595 bits to 39,098, and the file is 190,425
+bytes instead of 190,601 (`b831d49`: 190,412).
+
+Paired serial runs, `5a40906` against the change (`work/apng-r5-replay/`):
+
+| Set | Smaller / larger | Bytes saved | Process CPU |
+| --- | --- | ---: | --- |
+| All 2,431 stickers, Default | 611 / 0 | 5,225 (0.0010%) | 11,079.6 → 11,150.3 s (+0.6%) |
+| 202 GZIP, zlib, ZIP and APNG containers, Default | 6 / 0, all APNG | 63 | 187.2 → 187.8 s |
+| 58 APNGs (28 container APNGs, 30 stickers), Max at 10 seconds | 21 / 12 | 72 | 3,362.7 → 3,368.7 s |
+
+Rerun twice more, the 12 larger Max files were 28 bytes smaller in total with
+the change. Only `steam-shop_apng/bored.png` (2 to 5 bytes) and
+`apng-medium/clock.png` (0 or 1) stayed larger; at 30 seconds `bored.png` was
+5 bytes smaller and then 2 larger, `clock.png` equal both times, and neither's
+Default output changes, so these are deadline variance.
+
+Validation:
+
+- Python's decoders read back every output of both executables, 4,862 +
+  388 + 116, with no mismatch; as before, eight container sources that Python
+  cannot read were skipped, and both executables reject two malformed ZIPs
+  among them.
+- API comparisons on 52 inputs, in Default with the 180-second budget and in
+  zero-budget Max, matched in all 104 runs; neither APNG among them has a late
+  R5 win.
+- A private-corpus test pins `1355220_79873…` at 12,288 bytes; without R17
+  after its late R5 win it is 12,291.
+- Formatting, Clippy and all 683 Rust tests, including the private-corpus
+  regressions, pass in debug and release, with the documentation and Python
+  tests and a locked build. `__text` shrank from 863,888 to 863,880 bytes; the
+  shipped executable keeps its 942,064 bytes.

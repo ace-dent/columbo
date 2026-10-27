@@ -133,3 +133,21 @@ fn literal_span_reaches_png_output_and_the_mandatory_max_floor() {
     // final HLIT choice, even when the byte count ties.
     assert_eq!(max.data, ordinary.data);
 }
+
+#[test]
+#[ignore = "requires the private tests/fixtures corpus"]
+fn apng_default_replays_tokens_after_a_late_symbol_set_removal() {
+    let optimized = optimize(
+        &corpus_file(
+            "png/steam-stickers_apng/1355220_79873_e7e722996d19544a155b9e985b92ac2984707d2e.png",
+        ),
+        Format::Png,
+        &Options::default(),
+    )
+    .unwrap();
+
+    // APNG Default runs R2–R5 after R18. In one frame R5 rewrites tokens for
+    // 3,502 bits, and the token replay that follows reaches 3,477; without it
+    // the file is 12,291 bytes.
+    assert!(optimized.data.len() <= 12_288);
+}

@@ -2813,7 +2813,10 @@ fn slid_default_endpoint(
     Ok(slid.is_strictly_smaller_than(complete).then_some(slid))
 }
 
-/// R2–R5 after R18, for [`HeaderFit::AfterTreeFloors`].
+/// R2–R5 after R18, for [`HeaderFit::AfterTreeFloors`]. R5 rewrites tokens,
+/// which in every other order the tree finish and the token replay then see;
+/// here, after an R5 win, R14 chooses trees for the new counts and R17 replays
+/// the token floor under them, each sliding once more after a win.
 fn improve_with_final_header_fit(
     source: CandidateInput<'_>,
     options: &Options,
@@ -2828,6 +2831,7 @@ fn improve_with_final_header_fit(
         TerminalHeaderSearch::JointTreeRle,
         TerminalHeaderSearch::SymbolSets,
     ] {
+        let before = (candidate.data.len(), candidate.bits);
         candidate = improve_with_terminal_header_search(
             search,
             source,
@@ -2837,6 +2841,24 @@ fn improve_with_final_header_fit(
             parse_cache,
             candidate,
         )?;
+        if search == TerminalHeaderSearch::SymbolSets
+            && (candidate.data.len(), candidate.bits) != before
+        {
+            for finish in [
+                TerminalHeaderSearch::SmoothedTrees,
+                TerminalHeaderSearch::TokenReplay,
+            ] {
+                candidate = improve_with_tree_finish(
+                    finish,
+                    source,
+                    options,
+                    work,
+                    progress,
+                    parse_cache,
+                    candidate,
+                )?;
+            }
+        }
     }
     Ok(candidate)
 }

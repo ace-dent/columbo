@@ -2451,7 +2451,9 @@ container and 1,034 relaxed bytes, none larger.
 - **Runs:** in each sweep after the distance-alphabet ladder (R13) and before
   entropy cuts (R15), in both modes and in Max's slid Default endpoint,
   Default's exact finish inside Max's mandatory floors
-  ([Terminal sweep order](#terminal-sweep-order)). In Max it runs only when
+  ([Terminal sweep order](#terminal-sweep-order)). Under `ApngDefault`, and in
+  `ApngMax`'s exact endpoint, it also runs once after a late R5 win, before R17.
+  In Max it runs only when
   nothing earlier in the sweep changed the candidate, or once no further sweep
   can start. Linear finalization: may start until the hard stop, without G0. In
   Max's slid Default endpoint, and in Default under `MandatoryComplete`, it is
@@ -2494,6 +2496,9 @@ candidate. A result is kept only if strictly smaller.
   PNGs), so none runs.
 - Under `ApngDefault`, R2–R5 run once after R18, so they fit the codes that R14
   and R18 choose ([Payload/header tradeoff (R2)](#payloadheader-tradeoff-r2)).
+  R18 does not run again after a late R5 win: R14 and R17 alone saved 0.0009%
+  for 0.5% more CPU, and R1c, R13–R17 and R18 together saved 0.0012% for 1.2%,
+  a lower ratio.
 
 **Measured.** Against `4af8ff1`, Default at the 180-second allowance: 96 bytes
 on 18 of 365 raw streams, 2,768 bytes on 174 of 1,052 PNGs, 2,091 bytes on 71 of
@@ -4142,6 +4147,12 @@ match.
   moving only R2–R4 late made 216 files larger by 3,072 bytes; moving R5 with
   them left 58 larger by 1,059 bytes while 2,338 got smaller
   ([APNG header fit](research/apng-header-fit-validation.md)).
+- A late R5 win is followed by R14 and R17, which in every other order see its
+  rewrite: R14 chooses trees for the new counts and R17 replays the token floor
+  under them. Against `5a40906` this made 611 of 2,431 stickers smaller by 5,225
+  bytes, none larger, for 0.6% more CPU; refitting with R2–R4 instead saved more
+  at a lower ratio and stays rejected
+  ([R14 and R17 follow a late R5 win](research/apng-header-fit-validation.md#r14-and-r17-follow-a-late-r5-win)).
 
 **Measured.** On 365 raw streams (baseline `287c02d`): 27 improved, 860 bits and
 113 bytes, no regressions; 9 streams kept 49 bits and 8 bytes beyond the union
@@ -4152,7 +4163,7 @@ streams and 12.3% on containers.
 **Columbo's gates and bounds**
 
 - **Runs:** after R4 in each sweep, in Default and Max. Under `ApngDefault` it
-  runs once after R18, with R2–R4
+  runs once after R18, with R2–R4, and a win there is followed by R14 and R17
   ([Terminal sweep order](#terminal-sweep-order)). It needs
   [G0](#g0-timed-route-start), except in Max's mandatory Default endpoints and
   in the first sweep under `MandatoryComplete`. In Max, a candidate it replaces
@@ -4462,7 +4473,8 @@ not reproduce.
   changed since they last ran. It is linear finalization: it may start until the
   hard stop and needs no G0, and a candidate it replaces is not kept for M14.
   Default and Max use the same gate, and Max's slid Default endpoint ends the
-  same way.
+  same way. Under `ApngDefault`, and in `ApngMax`'s exact endpoint, it also runs
+  once after a late R5 win, after R14, with one more R1c after a win.
 - **Eligible:** no stream size or block-count limit; parsing drops no empty
   block; per block as in steps 1 and 2; a block must also be reusable as encoded
   at its alignment (in strict mode, with strictly compatible codes), and
@@ -8447,7 +8459,9 @@ both checks ([Shared terminal rules](#shared-terminal-rules)).
    compact tree families, nor have `ApngDefault` frames or the D4 lineage, which
    skip the first floors.
 6. `ApngDefault` only: R2–R5, once and in order, after R18 instead of in the
-   sweep.
+   sweep. After an R5 win, R14 and then R17 run on its rewrite, each with one
+   more R1c after a win, because R5 changes the counts and tokens that those two
+   see in every other order.
 
 **Max** runs the same sweep repeatedly:
 
@@ -8489,9 +8503,9 @@ splits it into two candidates, and only the first then gets the timed R6–R9:
   [Floors and the Max guarantee](#floors-and-the-max-guarantee). Max's own sweep
   applies R1b, R1c and R13–R18 to its final incumbent instead.
 - `ApngMax`'s exact endpoint follows `ApngDefault`'s order: R1, R1b, R1c, up to
-  two R13–R15 passes, R16, R17, R18, then R2–R5, and it is kept only when
-  strictly smaller than the parent. Its parent keeps R2–R5 in sweep order: R1,
-  R2–R5, then R6–R9.
+  two R13–R15 passes, R16, R17, R18, then R2–R5 with R14 and R17 after an R5
+  win, and it is kept only when strictly smaller than the parent. Its parent
+  keeps R2–R5 in sweep order: R1, R2–R5, then R6–R9.
 - R6–R9 run on the parent under the primary deadline when the endpoint is built
   before the Max routes, or under the bounded phase's route window when
   `CompleteThenBounded` builds it inside the phase. Max's own sweeps never
@@ -8513,7 +8527,11 @@ serial runs; every other policy stayed byte-identical. The move is limited to
 where the floor phase has already chosen the trees
 ([Design principles](#design-principles), rule 8). R5 later moved with R2–R4,
 because against an unfitted parent it kept rewrites that blocked the fit
-([APNG header fit](research/apng-header-fit-validation.md)).
+([APNG header fit](research/apng-header-fit-validation.md)). Moved last, though,
+R5's rewrite was followed by nothing that responds to new tokens; R14 and R17
+after a late R5 win restore that, and against `5a40906` made 611 of 2,431
+stickers smaller by 5,225 bytes, none larger, for 0.6% more CPU
+([R14 and R17 follow a late R5 win](research/apng-header-fit-validation.md#r14-and-r17-follow-a-late-r5-win)).
 
 #### Sweep repetition (R12)
 
@@ -8711,10 +8729,10 @@ terminal methods and S for the source-max state order
 | R11 | Length-symbol exchange | Max's own sweeps only | After R10, when R1–R10 changed nothing in the sweep | [Header-directed match response and length exchange (R10, R11)](#header-directed-match-response-and-length-exchange-r10-r11) |
 | R12 | Sweep repetition | Max | Repeats the sweep after a strict improvement while G0 allows | [Sweep repetition (R12)](#sweep-repetition-r12) |
 | R13 | Distance-alphabet ladder | Both modes | After R1c | [Distance-alphabet ladder (R13)](#distance-alphabet-ladder-r13) |
-| R14 | Smoothed-tree finish | Both modes | After R13 | [Smoothed-tree finish (R14)](#smoothed-tree-finish-r14) |
+| R14 | Smoothed-tree finish | Both modes | After R13; under `ApngDefault` also after a late R5 win | [Smoothed-tree finish (R14)](#smoothed-tree-finish-r14) |
 | R15 | Entropy cuts | Both modes | After R14; again after an R16 win | [Entropy cuts (R15)](#entropy-cuts-r15) |
 | R16 | Terminal merges | Both modes | Once the sweeps settle | [Terminal merges (R16)](#terminal-merges-r16) |
-| R17 | Terminal token replay | Both modes | After R16 | [Terminal token replay (R17)](#terminal-token-replay-r17) |
+| R17 | Terminal token replay | Both modes | After R16; under `ApngDefault` also after R14 following a late R5 win | [Terminal token replay (R17)](#terminal-token-replay-r17) |
 | R18 | Late tree floor | Both modes | Last in every finish, except that `ApngDefault` runs R2–R5 after it | [Late tree floor (R18)](#late-tree-floor-r18) |
 | S0 | Source-max state order | Max, `CompleteThenBounded` | Set after M3; read by later source-max starts | [S0](#s0-source-max-state-order); [method](#source-max-route) |
 
