@@ -9785,10 +9785,8 @@ Five conventions apply to every row:
   - All-stored cross-source edge: it must cover whole sources and at most 65,535
     decoded bytes.
   - All-Huffman cross-source edge: always legal in Max; in Default it must start
-    at its first source's start or end at its last source's end.
-  - The code also allows Default whole-source edges of at most 512 decoded
-    bytes, or of fixed sources only, when regroup is off or there are more than
-    8 sources, but Default never builds the graph in those cases.
+    at its first source's start or end at its last source's end. Default builds
+    the graph only with regroup and at most 8 sources.
 
   Each edge is prepared once and priced from every reachable start residue: only
   stored padding and the reuse of a stored source block vary with alignment.

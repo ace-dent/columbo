@@ -916,7 +916,6 @@ fn optimize_image_streams(
         && (options.exhaustive
             || thread::available_parallelism().is_ok_and(|cpus| cpus.get() >= 2));
     let mut results = if parallel_multi_image {
-        let phase_fraction = if has_later_streams { 0.86 } else { 0.96 };
         // Default gives each job the serial schedule's size-weighted timeout,
         // so running in parallel does not change its search.
         let mut default_timeouts = Vec::new();
@@ -952,9 +951,10 @@ fn optimize_image_streams(
             options,
             image_floor,
             (!options.exhaustive).then_some(default_timeouts.as_slice()),
-            // Margin beyond the raw optimizer's grace for parsing, joining
-            // workers and reconstruction.
-            scale_duration(budget.deadline.remaining(), phase_fraction),
+            // Only Max uses the phase timeout, and Max reserves no time for
+            // later streams. The margin beyond the raw optimizer's grace is for
+            // parsing, joining workers and reconstruction.
+            scale_duration(budget.deadline.remaining(), 0.96),
         )?;
         // Workers only cap each stream at its IHDR/fcTL size; require the exact
         // size here. Charge all frames, duplicates included, after the join so

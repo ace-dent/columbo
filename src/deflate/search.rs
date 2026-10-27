@@ -77,7 +77,6 @@ const PROVEN_COMPOSITION_MAX_TARGETS: usize = 8;
 const PROVEN_COMPOSITION_MAX_SPELLINGS: usize = 4;
 const PROVEN_COMPOSITION_BEAM_WIDTH: usize = 16;
 const PROVEN_COMPOSITION_PAYLOAD_WINDOW: i64 = 24;
-const PROVEN_COMPOSITION_EXACT_LIMIT: usize = 32;
 const PROVEN_CLOSED_LOOP_MAX_PLAIN: usize = 1_024;
 /// The second round runs only after a strict win and shares the exact-price
 /// limit, so a block without a gain is priced at most fifteen times.
@@ -708,7 +707,7 @@ fn consider_proven_submatches(
             .saturating_mul(2)
             .saturating_add(3)
             .saturating_add(if options.exhaustive {
-                PROVEN_COMPOSITION_EXACT_LIMIT
+                PROVEN_COMPOSITION_BEAM_WIDTH
             } else {
                 0
             });
@@ -822,7 +821,7 @@ pub(crate) fn improve_plan_with_header_aware_proven_composition(
     };
     let mut priced_candidates = Vec::new();
     if priced_candidates
-        .try_reserve_exact(PROVEN_COMPOSITION_EXACT_LIMIT)
+        .try_reserve_exact(PROVEN_COMPOSITION_BEAM_WIDTH)
         .is_err()
     {
         return best;
@@ -1061,12 +1060,9 @@ fn consider_header_aware_proven_composition(
         states = next;
     }
 
-    // `states` is the root or a beam step sorted by `proven_composition_state_key`.
-    for state in states
-        .iter()
-        .filter(|state| state.rewrite_count >= 2)
-        .take(PROVEN_COMPOSITION_EXACT_LIMIT)
-    {
+    // `states` is the root or a beam step sorted by `proven_composition_state_key`,
+    // so the beam width bounds the exact prices.
+    for state in states.iter().filter(|state| state.rewrite_count >= 2) {
         if stop.reached() {
             break;
         }
@@ -4340,6 +4336,7 @@ struct MatchGroup {
     delta: i64,
 }
 
+/// Max only: the one caller checks `options.exhaustive`.
 fn match_group_search(
     block: &ParsedBlock,
     alignment: u8,
@@ -4366,8 +4363,7 @@ fn match_group_search(
             &literal_lengths,
             &distance_lengths,
         );
-        let cap = if options.exhaustive { 20 } else { 8 };
-        for group in groups.iter().take(cap) {
+        for group in groups.iter().take(20) {
             if stop.reached() {
                 return;
             }
@@ -4379,8 +4375,7 @@ fn match_group_search(
         }
 
         // Also expand the first few prefixes of the ranked groups together.
-        let combined_cap = if options.exhaustive { 5 } else { 3 };
-        for count in 2..=combined_cap.min(groups.len()) {
+        for count in 2..=groups.len().min(5) {
             if stop.reached() {
                 return;
             }

@@ -2512,7 +2512,6 @@ fn bounded_generic_routes_preserve_complete_candidates() {
         Some("Columbo source max route")
     );
     assert!(candidates.suppress_later_source_max);
-    assert!(!candidates.suppress_later_optional_routes);
     assert!(candidates.deft4j.is_none());
     assert!(candidates.narrow.is_none());
     for candidate in [

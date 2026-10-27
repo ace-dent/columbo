@@ -58,7 +58,7 @@ pub(crate) use schedule::optimize_raw_prefix_with_floor_and_grace;
 /// One round groups adjacent source blocks; two more settle the new layout's
 /// boundaries and tables.
 const DEFAULT_RAW_REPLAY_LIMIT: usize = 3;
-/// Extra R13/R14 passes after a winning pass when no later R12 sweep can
+/// Extra R13–R15 passes after a winning pass when no later R12 sweep can
 /// revisit them.
 const TREE_FINISH_REPEATS: usize = 1;
 /// Default's size limit for R1b–R5, also used by Max's mandatory Default floor.
@@ -157,10 +157,10 @@ pub(crate) enum HeaderFit {
     /// In the sweep, after R1b: the floor phase has already run the terminal
     /// tree floors.
     InSweep,
-    /// After R18: `ApngDefault` skips the first tree floors, so only R14 and
-    /// R18 choose the codes, and a fit made before them is replaced. R5 moves
-    /// with the fit, since against an unfitted parent it keeps rewrites that
-    /// block the fit.
+    /// After R18: `ApngDefault` skips the first tree floors, so the finishing
+    /// steps (R1c, R13–R17) and R18 still replace its codes, and a fit made
+    /// before them is replaced too. R5 moves with the fit, since against an
+    /// unfitted parent it keeps rewrites that block the fit.
     AfterTreeFloors,
 }
 
@@ -181,12 +181,13 @@ pub(crate) enum DefaultFloor {
     SharedExact,
     /// Multi-image APNG Default; leaves replay and feedback lineages to Max.
     ApngDefault,
-    /// Multi-image APNG Max; shared scheduling with the full Max route set.
+    /// Multi-image APNG Max; shared scheduling that keeps the APNG Default
+    /// endpoint, without the single-image PNG route families.
     ApngMax,
     /// The caller already retains the complete input as its floor.
     Established,
     /// A container-level Default branch built for Max, which Max's clock
-    /// cannot interrupt.
+    /// cannot interrupt, except that D4 and R18 stay timed.
     MandatoryComplete,
 }
 
@@ -248,7 +249,7 @@ enum TerminalShare {
     /// (an APNG child nineteen twentieths) of its slice.
     Search,
     /// Outside that limit only linear finalization (the bounded-depth tree
-    /// floor, R1c and R13–R16) uses terminal time, so primary work keeps
+    /// floor, R1c and R13–R17) uses terminal time, so primary work keeps
     /// nineteen twentieths.
     Finalization,
 }
@@ -392,10 +393,10 @@ fn deft4j_source_route_eligible(blocks: &[ParsedBlock]) -> bool {
     nonempty >= 2 || (nonempty == 1 && huffman == 1)
 }
 
-/// D4: Default prices the source's own block layout, re-spelled by
-/// length-family chains, for multi-block sources in the no-split route's
-/// class (M2) that decode to at least [`DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED`]
-/// bytes.
+/// D4: Default prices the source's own block layout, each block searched from
+/// the smallest of its ordinary plan, length-family chain and re-spell from
+/// literals, for multi-block sources in the no-split route's class (M2) that
+/// decode to at least [`DEFAULT_SOURCE_TOPOLOGY_MIN_DECODED`] bytes.
 fn default_source_topology_eligible(
     blocks: &[ParsedBlock],
     compressed_len: usize,
@@ -1060,8 +1061,7 @@ fn refine_bounded_deft4j_lineage(
 /// Completed candidates produced by the bounded first phase.
 ///
 /// `suppress_later_source_max` marks source max as already run or omitted by
-/// policy. `suppress_later_optional_routes` skips the later fragmented
-/// collection and rewritten-seed routes; no route sets it.
+/// policy.
 #[derive(Default)]
 struct BoundedPhaseCandidates {
     floor: Option<Candidate>,
@@ -1073,7 +1073,6 @@ struct BoundedPhaseCandidates {
     source_max: Option<Candidate>,
     proven_feedback: Option<Candidate>,
     suppress_later_source_max: bool,
-    suppress_later_optional_routes: bool,
     completed_compact_split_parent: Option<Vec<u8>>,
 }
 
@@ -1909,7 +1908,7 @@ fn refine_with_original_match_restoration(
 }
 
 /// Terminal methods R1b–R11, R1c and R13–R15, run in that order after R1 by
-/// [`improve_with_terminal_searches`], and R16 once the sweep settles.
+/// [`improve_with_terminal_searches`], and R16 and R17 once the sweep settles.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TerminalHeaderSearch {
     StrictDistanceCompletion,
@@ -1967,7 +1966,7 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // R1c and R13–R16 are linear and parse one candidate, costing no more
+        // R1c and R13–R17 are linear and parse one candidate, costing no more
         // than a replay round, so they have no size limit.
         if self == Self::BoundarySlide || self.is_tree_finish() {
             return usize::MAX;
@@ -2007,7 +2006,7 @@ impl TerminalHeaderSearch {
         )
     }
 
-    /// R13–R16: linear finishing steps, each followed by R1c after a win.
+    /// R13–R17: linear finishing steps, each followed by R1c after a win.
     fn is_tree_finish(self) -> bool {
         matches!(
             self,
@@ -2159,7 +2158,7 @@ impl TerminalHeaderSearch {
     }
 }
 
-/// Run the terminal methods (R1, R1b–R11, R1c, R13–R16) on the final
+/// Run the terminal methods (R1, R1b–R11, R1c, R13–R17) on the final
 /// candidate. Max repeats the sweep while it improves and time remains (R12);
 /// Default runs one sweep. Every accepted candidate strictly decreases (bytes,
 /// meaningful bits), so a method's input score identifies an unchanged
@@ -2192,7 +2191,7 @@ fn improve_with_terminal_searches(
     let mut parse_cache = TerminalParseCache::default();
     loop {
         let ordinary_work = if first_sweep { default_work } else { max_work };
-        // The score before the first R13/R14 step this sweep runs.
+        // The score before the first R13–R15 step this sweep runs.
         let mut finish_start = None;
         let before = (candidate.data.len(), candidate.bits);
         if visited[0] != Some(before) {
@@ -2378,7 +2377,7 @@ fn improve_with_terminal_header_search_keeping(
 ) -> Result<Candidate> {
     // Relaxed output may omit or halve a degenerate distance tree instead.
     let strict_only = matches!(search, TerminalHeaderSearch::StrictDistanceCompletion);
-    // R1c and R13–R16 are linear finalization: they may start until the hard
+    // R1c and R13–R17 are linear finalization: they may start until the hard
     // stop, not only before the soft deadline.
     let finalization = search == TerminalHeaderSearch::BoundarySlide || search.is_tree_finish();
     let may_start = if finalization {
@@ -2440,8 +2439,8 @@ fn plan_smoothed_tree_finish(
     })
 }
 
-/// Run R13 or R14. A win replaces the trees that R1c fitted its cuts to, so
-/// the result is slid once more under its new trees.
+/// Run one of R13–R17. A win replaces the trees that R1c fitted its cuts to,
+/// so the result is slid once more under its new trees.
 // Out of line: each call runs a terminal header search or two.
 #[inline(never)]
 fn improve_with_tree_finish(
@@ -2750,14 +2749,16 @@ struct CompleteDefaultFloor {
     /// The complete Default endpoint, which R6–R9 may strengthen within the
     /// Max allowance.
     complete: Candidate,
-    /// Default's exact endpoint when it differs from `complete` (after R1c,
-    /// R13–R16, or with R1b), kept only as a final competitor.
+    /// Default's exact endpoint when it differs from `complete` (after its
+    /// final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`], R2–R5, or
+    /// with R1b), kept only as a final competitor.
     slid: Option<Candidate>,
 }
 
-/// Default's final R1c and R13–R16 on `complete`, returned only when strictly
-/// smaller. It is only a final competitor: boundaries fitted to the current
-/// trees can hide an improvement that Max's own tree floors would find.
+/// Default's final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`], R2–R5
+/// on `complete`, returned only when strictly smaller. It is only a final
+/// competitor: boundaries fitted to the current trees can hide an improvement
+/// that Max's own tree floors would find.
 fn slid_default_endpoint(
     source: CandidateInput<'_>,
     floor_options: &Options,

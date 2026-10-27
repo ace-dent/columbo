@@ -24,14 +24,14 @@ use crate::progress::{
 use crate::{Error, Options, Result};
 
 use super::{
-    bounded_parallel_source_max_work_class, bounded_png_max_policy, build_apng_default_candidate,
-    build_bounded_floor_candidate, build_bounded_generic_max_candidates,
-    build_bounded_phase_candidates, build_candidate, build_candidate_from_plans,
-    build_compact_proven_feedback_candidate, build_complementary_narrow_source_candidate,
-    build_complete_apng_default_floor_candidate, build_complete_default_floor_candidate,
-    build_deft4j_source_candidate, build_prepared_compact_source_split_floors,
-    build_source_family_candidate, build_source_max_candidate, candidate_exposes_new_parent,
-    candidate_progress, capture_source_block_report, changed_narrow_parent_should_continue,
+    bounded_png_max_policy, build_apng_default_candidate, build_bounded_floor_candidate,
+    build_bounded_generic_max_candidates, build_bounded_phase_candidates, build_candidate,
+    build_candidate_from_plans, build_compact_proven_feedback_candidate,
+    build_complementary_narrow_source_candidate, build_complete_apng_default_floor_candidate,
+    build_complete_default_floor_candidate, build_deft4j_source_candidate,
+    build_prepared_compact_source_split_floors, build_source_family_candidate,
+    build_source_max_candidate, candidate_exposes_new_parent, candidate_progress,
+    capture_source_block_report, changed_narrow_parent_should_continue,
     compact_balanced_tree_source_eligible, compact_dependent_deft4j_work_class,
     compact_split_parent_is_completed, complete_png_parallel_source_max_work_class,
     default_source_topology_eligible, deft4j_source_route_eligible, established_floor_candidate,
@@ -371,8 +371,9 @@ struct RouteState {
     /// The exact Default endpoint that Max must never lose.
     complete_default: Option<Candidate>,
     /// Default's exact endpoint where it differs from `complete_default`
-    /// (after its final R1c, R13 and R14, or with R1b). It is compared only
-    /// after Max's terminal searches, so it never becomes their parent.
+    /// (after its final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`],
+    /// R2–R5, or with R1b). It is compared only after Max's terminal searches,
+    /// so it never becomes their parent.
     slid_default: Option<Candidate>,
     /// The Default comparison floor, which also seeds Max's routes.
     floor: Option<Candidate>,
@@ -390,7 +391,6 @@ struct RouteState {
     weak_deft4j: bool,
     integrated_compact_source_max: bool,
     suppress_later_source_max: bool,
-    suppress_later_optional_routes: bool,
     compact_split_attempted: bool,
     deft4j_refinement_completed: bool,
 }
@@ -536,12 +536,12 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
 }
 
 /// Build Default's source topology (D4), returned only when it is already
-/// strictly smaller than the selected candidate. The source's own blocks,
-/// each re-spelled by a length-family chain and searched from it, can reach a
-/// different basin from the planner's, whose match-by-match expansion stops
-/// where every remaining match is cheaper than its literals alone. Both
-/// endpoints are then finished and the smaller kept, so the planner's endpoint
-/// is never lost.
+/// strictly smaller than the selected candidate. The source's own blocks, each
+/// searched from the smallest of its ordinary plan, length-family chain and
+/// re-spell from literals, can reach a different basin from the planner's,
+/// whose match-by-match expansion stops where every remaining match is cheaper
+/// than its literals alone. Both endpoints are then finished and the smaller
+/// kept, so the planner's endpoint is never lost.
 fn build_default_source_topology(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -679,13 +679,10 @@ fn run_bounded_phase(
             BoundedPngMaxPolicy::Standard | BoundedPngMaxPolicy::FloorExpansion => {
                 let run_deft4j = eligibility.deft4j && deadline.can_start_route();
                 let floor_expansion = png_policy == BoundedPngMaxPolicy::FloorExpansion;
-                let run_source_max = eligibility.parallel_routes
-                    && floor_expansion
-                    && if default_floor.uses_bounded_png_routes() {
-                        complete_png_parallel_source_max_work_class(source)
-                    } else {
-                        bounded_parallel_source_max_work_class(source)
-                    };
+                // Only the single-image PNG policy above, with parallel routes,
+                // chooses floor expansion.
+                let run_source_max =
+                    floor_expansion && complete_png_parallel_source_max_work_class(source);
                 let routes = BoundedRoutes {
                     preserve_complete_default: default_floor == DefaultFloor::CompleteThenBounded,
                     seeded_max: floor_expansion,
@@ -719,7 +716,6 @@ fn run_bounded_phase(
     state.source_max = candidates.source_max;
     state.proven_feedback = candidates.proven_feedback;
     state.suppress_later_source_max = candidates.suppress_later_source_max;
-    state.suppress_later_optional_routes = candidates.suppress_later_optional_routes;
     state.completed_compact_split_parent = candidates.completed_compact_split_parent;
     if let Some(step) = step {
         step.finish_phase();
@@ -921,7 +917,8 @@ fn continue_floor_seeded(
             .all(|other| !other.is_strictly_smaller_than(seeded))
     }) && deadline.can_start_route();
     // Run the deft4j refinement beside the continuation, which could otherwise
-    // use up any longer deadline. This stays within three workers.
+    // use up any longer deadline. This spawns at most two workers beside this
+    // thread.
     let overlap_deft4j = independent_deft4j_refinement_can_overlap(
         continue_best,
         default_floor.uses_bounded_png_routes(),
@@ -1225,8 +1222,8 @@ fn run_bounded_refinement(
         || (state.weak_deft4j && !state.compact_split_attempted && !deadline.expired());
     let compact_split_step =
         compact_split_work_possible.then(|| progress.start("Columbo compact split floor"));
-    // M2c takes the source-max worker's slot, keeping the bounded phase within
-    // three workers; source max remains eligible later.
+    // M2c takes the source-max worker's slot, so the follow-up spawns at most
+    // two workers beside this thread; source max remains eligible later.
     let continue_best_narrow = run_bounded_refinement
         && state.narrow.as_ref().is_some_and(|narrow| {
             changed_narrow_parent_should_continue(
@@ -1623,7 +1620,8 @@ fn establish_comparison_floor(
         step.finish(Some(context.report(&candidate)));
     }
     // Default adds D1–D3 and the terminal tree floors, except for
-    // `ApngDefault`, for the same per-frame reason; Max runs them for APNG.
+    // `ApngDefault`, for the same per-frame reason. Max skips D1–D3 for APNG
+    // too, but closes its final incumbent with the tree floors.
     if !options.exhaustive && default_floor != DefaultFloor::ApngDefault {
         let floor_work = if default_floor == DefaultFloor::MandatoryComplete {
             DefaultFloorWork::Mandatory
@@ -1705,8 +1703,7 @@ fn run_fragmented_collection(
         progress,
         ..
     } = *context;
-    let run =
-        options.exhaustive && !state.suppress_later_optional_routes && deadline.can_start_route();
+    let run = options.exhaustive && deadline.can_start_route();
     let step = run.then(|| progress.start("Columbo fragmented collection"));
     let mut fragmented = if run {
         fragmented_collect_seed(source.blocks, 0, options)
@@ -1892,10 +1889,7 @@ fn refine_rewritten_seed(
             "exact max-planner fixed point already established",
         );
     }
-    let run_seeded = seed_selected
-        && !max_seed_is_stable
-        && !state.suppress_later_optional_routes
-        && deadline.can_start_route();
+    let run_seeded = seed_selected && !max_seed_is_stable && deadline.can_start_route();
     if !run_seeded {
         return Ok(());
     }

@@ -4819,23 +4819,15 @@ fn edge_allowed(
         return false;
     }
 
-    // Cross-source partial ranges are the regroup search; bound it to short
-    // source lists. Otherwise allow only cheap whole-source joins.
-    if exhaustive || (allow_regroup && composite.sources.len() <= MAX_REGROUP_SOURCE_BLOCKS) {
-        if exhaustive {
-            return true;
-        }
-        return sources
-            .iter()
-            .any(|source| start.plain == source.plain_start || end.plain == source.plain_end);
-    }
-    if whole_sources && plain_count <= 512 {
-        return true;
-    }
-    whole_sources
-        && sources
-            .iter()
-            .all(|source| source.source_type == SourceBlockType::Fixed)
+    // Cross-source partial ranges are the regroup search. Default builds the
+    // graph only with regroup on short source lists, and keeps one end of each
+    // edge on a source boundary.
+    exhaustive
+        || (allow_regroup
+            && composite.sources.len() <= MAX_REGROUP_SOURCE_BLOCKS
+            && sources
+                .iter()
+                .any(|source| start.plain == source.plain_start || end.plain == source.plain_end))
 }
 
 fn overlapping_source_range(composite: &Composite, start: Cut, end: Cut) -> std::ops::Range<usize> {

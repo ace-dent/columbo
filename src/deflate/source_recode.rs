@@ -8,7 +8,7 @@
 //! greedily from left to right. The route stays separate from the main search
 //! so its order and tie rules stay visible.
 //!
-//! Columbo adds state deduplication, memory and work budgets, deadlines, a
+//! Columbo adds state deduplication, byte-charged memory budgets, deadlines, a
 //! second seed from the best plan's code lengths, the two-leaf distance-code
 //! rebuild of deft4j's C implementation, and fixes to empty-block traversal
 //! and alignment accounting; deft4j's operations keep their order.

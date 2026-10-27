@@ -3,13 +3,14 @@
 
 //! Merge adjacent blocks after the terminal finish (R16).
 //!
-//! Default merges two blocks during its main search only when they decode to
-//! at most 512 bytes together, and the boundary slide (R1c) moves a boundary
-//! but never removes one. Once the finish has settled, two neighbors may cost
-//! more apart than as one block, which saves a header and its end-of-block
-//! code. One left-to-right pass prices each pair merged, at its real bit
-//! alignment, and keeps the merged block, which may absorb its next neighbor
-//! too, only when it is strictly smaller than the pair as encoded.
+//! The main search merges blocks only in bounded forms: pairs that decode to
+//! at most 512 bytes together, long runs, short source-aligned ranges and
+//! boundary-graph edges. The boundary slide (R1c) moves a boundary but never
+//! removes one. Once the finish has settled, two neighbors may cost more apart
+//! than as one block, which saves a header and its end-of-block code. One
+//! left-to-right pass prices each pair merged, at its real bit alignment, and
+//! keeps the merged block, which may absorb its next neighbor too, only when
+//! it is strictly smaller than the pair as encoded.
 
 use super::super::block::{plan_reusable_block, stored_block_bits};
 use super::*;

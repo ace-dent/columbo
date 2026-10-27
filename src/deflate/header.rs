@@ -1551,7 +1551,7 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     let mut heap_scratch = TreeBuildScratch::default();
     // Family order matters: of two equal complete plans, the earlier wins.
     // Without `exhaustive`, only the DeflOpt and order-key heaps run (at most
-    // 64 pairs).
+    // seven trees per alphabet, so 49 pairs).
     for variant in 0..4 {
         let mut lengths = vec![0_u8; frequencies.len()];
         make_lengths_deflopt_heap_into_with_scratch(

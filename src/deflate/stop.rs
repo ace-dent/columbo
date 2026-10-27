@@ -191,12 +191,12 @@ impl<'a> SearchStop<'a> {
         Self::Callback(callback)
     }
 
-    /// Whether a started route may use the file's grace period for one small,
+    /// Whether a started route may use its stream's grace period for one small,
     /// deterministic finalization step.
     ///
-    /// Only the embedded stream that runs until the file's own deadline gets
-    /// grace (earlier streams have zero grace), so many streams cannot each take
-    /// the one file-wide allowance.
+    /// Each raw optimizer call has its own grace, 1 second plus 10% of a nonzero
+    /// timeout, except that ZIP members share the file's grace so that together
+    /// their graces stay within it.
     pub(crate) fn permits_bounded_finalization(&self) -> bool {
         match self {
             Self::Deadline {
