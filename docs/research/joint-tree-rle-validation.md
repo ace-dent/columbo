@@ -5,7 +5,7 @@
 Date: 6 September 2026. Baseline: `9a74a21`, which includes restoration,
 payload/header tradeoffs, advertised literal-span search and the efficiency
 changes. **Accepted and implemented** as R4; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
+[route catalog](../routes-and-methods.md#joint-tree-and-rle-r4) describes the
 current method. Implements proposal 3 in
 [the research memo](new-byte-saving-methods.md).
 
@@ -28,8 +28,8 @@ codes.
 ## Exactness boundary
 
 [`joint.rs`](../../src/deflate/joint.rs) implements the
-[R4 route row](../routes-and-methods.md#route-gate-reference). A depth below
-nine is exact when the fixed CL tree has no direct symbol for a larger length,
+[R4 entry](../routes-and-methods.md#joint-tree-and-rle-r4). A depth below nine
+is exact when the fixed CL tree has no direct symbol for a larger length,
 because repeat codes cannot introduce a positive length for the first time. The
 suffix bounds are admissible, so pruning cannot discard a strict improvement:
 with sufficient budget the solver finds the minimum fixed-CL cost. It does not

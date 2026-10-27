@@ -5,9 +5,9 @@
 Date: 15 October 2026. Baseline: `5b16e33`. Extends D4: each source block,
 seeded by its length-family chain, now gets the no-split route's narrow
 whole-block search. The
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-method; [source family chains](source-family-chain-validation.md) describes
-the chain.
+[route catalog](../routes-and-methods.md#source-topology-d4) describes the
+method; [source family chains](source-family-chain-validation.md) describes the
+chain.
 
 ## Why it saves bits
 

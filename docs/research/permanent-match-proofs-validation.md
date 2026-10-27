@@ -7,7 +7,7 @@ This validates a small, practical form of the first [alternative formulation](no
 
 ## Production follow-up
 
-The implementation is in [`src/deflate/restore.rs`](../../src/deflate/restore.rs), with terminal scheduling in [`optimize.rs`](../../src/deflate/optimize.rs). It runs in Default and Max, in strict and relaxed modes; [R1 in the route catalog](../routes-and-methods.md#route-gate-reference) gives the current method, eligibility rules and work bounds.
+The implementation is in [`src/deflate/restore.rs`](../../src/deflate/restore.rs), with terminal scheduling in [`optimize.rs`](../../src/deflate/optimize.rs). It runs in Default and Max, in strict and relaxed modes; [R1 in the route catalog](../routes-and-methods.md#original-match-restoration-r1) gives the current method, eligibility rules and work bounds.
 
 The production A/B comparison reproduced **all 365 reference outputs exactly**: 48 improved streams, 18 bytes and 156 meaningful bits saved, with no regressions. The 11 complete-container cases reproduced the prototype's ten improvements, totaling six bytes and 63 meaningful bits. Independent zlib, PNG, GZIP and ZIP checks passed, including advertised-window validation.
 

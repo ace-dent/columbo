@@ -4,7 +4,8 @@
 
 Date: 6 September 2026. Baseline: `ee6ff1d` with its committed original-match
 restoration implementation. **Accepted and implemented** as the bounded R2
-terminal pass; [the route catalog](../routes-and-methods.md#route-gate-reference)
+terminal pass;
+[the route catalog](../routes-and-methods.md#payloadheader-tradeoff-r2)
 describes the current method.
 
 ## Why it saves bits

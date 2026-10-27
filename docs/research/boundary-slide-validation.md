@@ -2,8 +2,8 @@
 
 # Fixed-tree boundary slide: validation
 
-Date: 2 October 2026. Baseline: `a2a4c7a`. **Accepted and implemented** as
-R1c; the [route catalog](../routes-and-methods.md#route-gate-reference)
+Date: 2 October 2026. Baseline: `a2a4c7a`. **Accepted and implemented** as R1c;
+the [route catalog](../routes-and-methods.md#fixed-tree-boundary-slide-r1c)
 describes the current method. It came out of testing length-threshold cuts
 inside matches, rejected below.
 

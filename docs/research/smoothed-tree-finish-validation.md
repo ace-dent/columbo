@@ -2,9 +2,9 @@
 
 # Smoothed-tree finish: validation
 
-Date: 11 October 2026. Baseline: `c28f1ad`. **Prototype**, implemented as
-R14; the [route catalog](../routes-and-methods.md#route-gate-reference)
-describes the method.
+Date: 11 October 2026. Baseline: `c28f1ad`. **Prototype**, implemented as R14;
+the [route catalog](../routes-and-methods.md#smoothed-tree-finish-r14) describes
+the method.
 
 ## Why it saves bits
 

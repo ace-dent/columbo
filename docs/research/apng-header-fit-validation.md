@@ -2,11 +2,11 @@
 
 # APNG header fit: validation
 
-Date: 16 October 2026. Baseline: `6c81dfa`. Under `ApngDefault`, R2–R4 now
-run after R18 instead of in the terminal sweep; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-order. On 17 October R5 moved with them, after the full APNG benchmark showed
-R5 acting on the unfitted parent ([R5 follows the fit](#r5-follows-the-fit)).
+Date: 16 October 2026. Baseline: `6c81dfa`. Under `ApngDefault`, R2–R4 now run
+after R18 instead of in the terminal sweep; the
+[route catalog](../routes-and-methods.md#terminal-sweep-order) describes the
+order. On 17 October R5 moved with them, after the full APNG benchmark showed R5
+acting on the unfitted parent ([R5 follows the fit](#r5-follows-the-fit)).
 
 ## Why it saves bits
 

@@ -3,8 +3,9 @@
 # Coupled literal/length and distance swaps
 
 Date: 10 September 2026. Baseline: `b931212`, which includes R8 and the exact
-positive-run pricing optimization. **Accepted and implemented in Max only**
-as R9; the [route catalog](../routes-and-methods.md#route-gate-reference)
+positive-run pricing optimization. **Accepted and implemented in Max only** as
+R9; the
+[route catalog](../routes-and-methods.md#code-length-rotations-and-coupled-swaps-r8-r9)
 describes the current method. Implements the paired literal/distance extension
 proposed in
 [new byte-saving methods](new-byte-saving-methods.md#1-spend-payload-bits-on-better-code-length-permutations).
@@ -27,10 +28,11 @@ bytes are embedded.
 ## Bounds
 
 [`header/coupled.rs`](../../src/deflate/header/coupled.rs) implements the
-[R9 route row](../routes-and-methods.md#route-gate-reference). Its menu filters
-and rankings are heuristics, not lower bounds; every retained pair is fully
-repriced from the unchanged parent. The common gate allows at most 1 MiB each
-of compressed and decoded data, 128 parsed blocks and no discarded wire blocks.
+[R9 entry](../routes-and-methods.md#code-length-rotations-and-coupled-swaps-r8-r9).
+Its menu filters and rankings are heuristics, not lower bounds; every retained
+pair is fully repriced from the unchanged parent. The common gate allows at most
+1 MiB each of compressed and decoded data, 128 parsed blocks and no discarded
+wire blocks.
 
 A loose full-block generation bound is 42,846 units for 286 literal/length and
 30 usable distance symbols. On the measured 64-bit platform, the swap and pair

@@ -2,11 +2,11 @@
 
 # Distance-alphabet ladder: validation
 
-Date: 8 October 2026. Baseline: `7212d6b`. **Accepted and implemented** as
-R13, after
+Date: 8 October 2026. Baseline: `7212d6b`. **Accepted and implemented** as R13,
+after
 [rebasing onto the fixed-point slide](#rebased-onto-the-fixed-point-slide); the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-current method.
+[route catalog](../routes-and-methods.md#distance-alphabet-ladder-r13) describes
+the current method.
 
 ## Why it saves bits
 
@@ -29,7 +29,7 @@ groups last, and the cumulative band routes act only on length symbols.
 ## Method
 
 [`distance_band.rs`](../../src/deflate/distance_band.rs) implements the
-[R13 route row](../routes-and-methods.md#route-gate-reference).
+[R13 entry](../routes-and-methods.md#distance-alphabet-ladder-r13).
 
 ### Placement
 

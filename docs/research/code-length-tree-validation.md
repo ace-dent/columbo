@@ -3,9 +3,10 @@
 # Joint code-length tree and RLE search
 
 Date: 9 September 2026. Baseline: `aa7888b`, which includes R6 and the later
-joint-search and short-range performance changes. **Accepted and implemented
-in Max only** as R7; the [route catalog](../routes-and-methods.md#route-gate-reference)
-describes the current method. Implements the header-tree proposal in
+joint-search and short-range performance changes. **Accepted and implemented in
+Max only** as R7; the
+[route catalog](../routes-and-methods.md#code-length-tree-r7) describes the
+current method. Implements the header-tree proposal in
 [new byte-saving methods](new-byte-saving-methods.md#6-search-the-header-tree-directly)
 for the full seven-bit code-length alphabet, not only tiny support sets.
 
@@ -27,11 +28,11 @@ from 259 to 255 header bits and from 91 to 90 stream bytes.
 ## Exactness
 
 [`header/tree.rs`](../../src/deflate/header/tree.rs) implements the
-[R7 route row](../routes-and-methods.md#route-gate-reference). The cost of a
-nonzero run depends only on the CL lengths of its value and of repeat 16, so
-for each repeat-16 choice a Kraft DP over 128 units assigns the positive
-values, and enumerating the CL lengths of 0, 17 and 18 selects the matching DP
-result. Zero runs are then priced exactly.
+[R7 entry](../routes-and-methods.md#code-length-tree-r7). The cost of a nonzero
+run depends only on the CL lengths of its value and of repeat 16, so for each
+repeat-16 choice a Kraft DP over 128 units assigns the positive values, and
+enumerating the CL lengths of 0, 17 and 18 selects the matching DP result. Zero
+runs are then priced exactly.
 
 A completed search is exact **for these fixed payload trees and advertised
 spans**, not over tokens, payload trees, spans or partitions. It omits no

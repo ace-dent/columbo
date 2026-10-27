@@ -3,7 +3,7 @@
 # Terminal merges: validation
 
 Date: 14 October 2026. Baseline: `3d3f198`. Implemented as R16; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
+[route catalog](../routes-and-methods.md#terminal-merges-r16) describes the
 method.
 
 ## Why it saves bits

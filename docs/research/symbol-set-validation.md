@@ -2,9 +2,9 @@
 
 # Payload symbol-set removal: validation
 
-Date: 8 September 2026. Baseline: `287c02d`, including the completed R4
-joint tree/RLE pass. **Accepted and implemented** as R5; the
-[route catalog](../routes-and-methods.md#route-gate-reference) gives the
+Date: 8 September 2026. Baseline: `287c02d`, including the completed R4 joint
+tree/RLE pass. **Accepted and implemented** as R5; the
+[route catalog](../routes-and-methods.md#symbol-set-removal-r5) gives the
 current method, gates and budgets. Implements proposal 4 in
 [the research memo](new-byte-saving-methods.md).
 

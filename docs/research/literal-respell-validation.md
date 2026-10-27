@@ -2,11 +2,11 @@
 
 # Re-spell from literals: validation
 
-Date: 15 October 2026. Baseline: `d4a6960`. Adds a third seed to D4's
-per-block search; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-method, and the [source-layout search](source-layout-search-validation.md)
-the search it seeds.
+Date: 15 October 2026. Baseline: `d4a6960`. Adds a third seed to D4's per-block
+search; the
+[route catalog](../routes-and-methods.md#length-family-chain-and-re-spell-from-literals)
+describes the method, and the
+[source-layout search](source-layout-search-validation.md) the search it seeds.
 
 ## Why it saves bits
 

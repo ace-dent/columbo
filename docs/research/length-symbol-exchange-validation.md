@@ -5,8 +5,8 @@
 13 September 2026. Baseline: `2a2df1f236b6d572ee757d6b41d72463ceea24b4`,
 including header-directed match response and the existing terminal closure.
 **Accepted and implemented in Max only** as
-[R11](../routes-and-methods.md#route-gate-reference), whose row gives the
-current method, gates and budgets.
+[R11](../routes-and-methods.md#header-directed-match-response-and-length-exchange-r10-r11),
+whose entry gives the current method, gates and budgets.
 
 ## Why it helps
 

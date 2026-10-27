@@ -3,8 +3,8 @@
 # Terminal token replay: validation
 
 Date: 14 October 2026. Baseline: `d3550e1`. Implemented as R17; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-method.
+[route catalog](../routes-and-methods.md#terminal-token-replay-r17) describes
+the method.
 
 ## Why it saves bits
 

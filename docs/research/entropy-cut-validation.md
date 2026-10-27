@@ -3,8 +3,7 @@
 # Entropy cuts: validation
 
 Date: 14 October 2026. Baseline: `2b40fb0`. Implemented as R15; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
-method.
+[route catalog](../routes-and-methods.md#entropy-cuts-r15) describes the method.
 
 ## Why it saves bits
 

@@ -3,7 +3,7 @@
 # Late tree floor: validation
 
 Date: 16 October 2026. Baseline: `4af8ff1`. Implemented as R18; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
+[route catalog](../routes-and-methods.md#late-tree-floor-r18) describes the
 method.
 
 ## Why it saves bits

@@ -4,7 +4,7 @@
 
 Date: 15 October 2026. Baseline: `8463a1d`. Implemented as D4 with the
 length-family chain; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
+[route catalog](../routes-and-methods.md#source-topology-d4) describes the
 method.
 
 ## Why it saves bits

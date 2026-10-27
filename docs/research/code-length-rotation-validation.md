@@ -2,10 +2,10 @@
 
 # Three-symbol code-length rotations
 
-Date: 10 September 2026. Baseline: `81effe5`, which includes the R7
-code-length tree/RLE solver. **Accepted and implemented in Max only** as R8;
-the [route catalog](../routes-and-methods.md#route-gate-reference) describes
-the current method. Implements the three-symbol extension proposed in
+Date: 10 September 2026. Baseline: `81effe5`, which includes the R7 code-length
+tree/RLE solver. **Accepted and implemented in Max only** as R8; the
+[route catalog](../routes-and-methods.md#code-length-rotations-and-coupled-swaps-r8-r9)
+describes the current method. Implements the three-symbol extension proposed in
 [new byte-saving methods](new-byte-saving-methods.md#1-spend-payload-bits-on-better-code-length-permutations).
 
 ## Why a rotation can save bits
@@ -26,11 +26,11 @@ exact fixed-tree header solver cannot improve it.
 ## Bounds and instrumentation
 
 [`header/rotate.rs`](../../src/deflate/header/rotate.rs) implements the
-[R8 route row](../routes-and-methods.md#route-gate-reference). The ranking
-score `payload_delta − 3 × transitions_removed` is a heuristic; every retained
-proposal is fully repriced before it can replace the parent. The common gate
-allows at most 1 MiB each of compressed and decoded data, 128 parsed blocks and
-no discarded wire blocks.
+[R8 entry](../routes-and-methods.md#code-length-rotations-and-coupled-swaps-r8-r9).
+The ranking score `payload_delta − 3 × transitions_removed` is a heuristic;
+every retained proposal is fully repriced before it can replace the parent. The
+common gate allows at most 1 MiB each of compressed and decoded data, 128 parsed
+blocks and no discarded wire blocks.
 
 The loose worst-case generation bound for one full literal/length and distance
 alphabet is 11,628,422 units, so a single block fits the 2^24-unit allowance

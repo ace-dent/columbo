@@ -5,7 +5,7 @@
 Date: 6 September 2026. Baseline: `e4400b5`, including original-match
 restoration, payload/header tradeoffs and the subsequent efficiency changes.
 **Accepted and implemented** as R3;
-[the route catalog](../routes-and-methods.md#route-gate-reference) describes
+[the route catalog](../routes-and-methods.md#literallength-span-r3) describes
 the current method.
 
 ## Why adding unused entries can save bits

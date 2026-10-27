@@ -7,9 +7,10 @@ terminal-method closure and its larger Max size class. Route numbers below are t
 this snapshot, in which terminal closure was R11 with ten input-score slots; closure is
 now R12, with one slot per terminal method, and length-symbol exchange is R11.
 
-**Accepted and implemented in Max only** as R10, with the deadline variation documented
-below; the [route catalog](../routes-and-methods.md#route-gate-reference) describes the
-current method.
+**Accepted and implemented in Max only** as R10, with the deadline variation
+documented below; the
+[route catalog](../routes-and-methods.md#header-directed-match-response-and-length-exchange-r10-r11)
+describes the current method.
 
 ## Why the joint move helps
 
@@ -34,12 +35,13 @@ literal/length positions 7 and 267 and adapting matches gives:
 ## Exactness and limits
 
 [`header/response.rs`](../../src/deflate/header/response.rs) implements the
-[R10 route row](../routes-and-methods.md#route-gate-reference). For a fixed proposed tree
-and the disjoint match intervals, its per-match DP gives the exact minimum payload cost.
-It proves no optimum over other trees, certificates, token ties, layouts or header-search
-families, and the header uses the existing full repricer, not an exact CL-tree search.
-The 128-bit tax limit and the transition filter are heuristics: a response might repay a
-larger tax. The pass does not recover certificates lost by earlier literalization; R1
+[R10 entry](../routes-and-methods.md#header-directed-match-response-and-length-exchange-r10-r11).
+For a fixed proposed tree and the disjoint match intervals, its per-match DP
+gives the exact minimum payload cost. It proves no optimum over other trees,
+certificates, token ties, layouts or header-search families, and the header uses
+the existing full repricer, not an exact CL-tree search. The 128-bit tax limit
+and the transition filter are heuristics: a response might repay a larger tax.
+The pass does not recover certificates lost by earlier literalization; R1
 handles restoration.
 
 ## Frozen-parent controls

@@ -4,7 +4,7 @@
 
 Date: 9 September 2026. Baseline: `3a314d1`, including the completed R5
 symbol-set pass. **Accepted and implemented in Max only** as R6; the
-[route catalog](../routes-and-methods.md#route-gate-reference) describes the
+[route catalog](../routes-and-methods.md#alphabet-boundaries-r6) describes the
 current method. Implements proposal 5 of
 [the research memo](new-byte-saving-methods.md).
 
@@ -23,13 +23,13 @@ saving 44 bits.
 ## Bounds and instrumentation
 
 [`alphabet.rs`](../../src/deflate/stream/alphabet.rs) implements the
-[R6 route row](../routes-and-methods.md#route-gate-reference). The interval menu
+[R6 entry](../routes-and-methods.md#alphabet-boundaries-r6). The interval menu
 has at most 1,580 entries. The shortlist, window and eligibility rules are
 heuristics, not an exhaustive partition search. Beyond the route row's limits,
 the pass accepts at most 1 MiB each of compressed and decoded data, 128 parsed
-blocks and no discarded wire blocks. Eighty cuts bound the graph to 3,160
-edges, after at most 24 direct range prices. R6 adds no history search, new
-distance, cross-block merge or Default work.
+blocks and no discarded wire blocks. Eighty cuts bound the graph to 3,160 edges,
+after at most 24 direct range prices. R6 adds no history search, new distance,
+cross-block merge or Default work.
 
 The header-plan cache preserved all 365 Default-parent and 25 frozen-Max
 outputs exactly. Instrumentation observed at most 666 retained range entries
