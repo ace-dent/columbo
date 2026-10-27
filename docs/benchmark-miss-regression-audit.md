@@ -175,9 +175,9 @@ method would have handed its candidate to the finishing steps, which end with
 those floors. M14's rejected variant closed candidates after the deadline
 before finishing the incumbent, whose own last floor then met the hard stop;
 here the endpoints are complete first, so a close can only lower the result.
-It uses the grace period, which only the stream that runs until the file's
-deadline has. The close applies only the floors, not R1c and R13–R17, which a
-shorter run would also have given the candidate.
+It uses the stream's grace period, which every raw optimizer call has (ZIP
+members share the file's). The close applies only the floors, not R1c and
+R13–R17, which a shorter run would also have given the candidate.
 
 | Check | Result |
 | --- | --- |

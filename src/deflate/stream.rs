@@ -1869,12 +1869,15 @@ fn parsed_from_generated_huffman_plan(plan: &PlannedBlock) -> Option<ParsedBlock
     })
 }
 
+/// `timed` selects the deadline form: each block starts from its original bits
+/// when they can be reused, and token-boundary cuts, then inside-match cuts,
+/// are tried nearest the 7/8 point first.
 fn plan_compact_source_split_floor_cached(
     blocks: &[ParsedBlock],
     start_alignment: u8,
     options: &Options,
     plan_cache: &mut CanonicalPlanCache,
-    prioritize_inside_match_cuts: bool,
+    timed: bool,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let mut output = Vec::new();
@@ -1885,7 +1888,7 @@ fn plan_compact_source_split_floor_cached(
         // Timed finalization reuses the parent's valid original bits: repeating
         // the Max route's table search could use the whole grace period before
         // the first split.
-        let base = if prioritize_inside_match_cuts {
+        let base = if timed {
             reusable_original_bits(block, alignment, options.strict).map(|original| PlannedBlock {
                 tokens: Arc::clone(&block.tokens),
                 plain: Arc::clone(&block.plain),
@@ -1917,7 +1920,7 @@ fn plan_compact_source_split_floor_cached(
             )?;
             cuts.sort_unstable_by_key(|&cut| {
                 let token_boundary = composite.cut_is_token_boundary(cut);
-                if prioritize_inside_match_cuts {
+                if timed {
                     (
                         usize::from(!token_boundary),
                         cut.plain.abs_diff(block.plain.len().saturating_mul(7) / 8),

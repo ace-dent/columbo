@@ -10,7 +10,8 @@ method.
 
 Joining two blocks saves one dynamic header and one end-of-block code, but
 codes both regions with one compromise table. Default's main search merges
-neighbors only when they decode to at most 512 bytes together, and once the
+blocks only in bounded forms (pairs that decode to at most 512 bytes together,
+long runs, short source-aligned ranges and boundary-graph edges), and once the
 terminal sweep has begun, nothing removes a boundary: the slide (R1c) moves
 boundaries under fixed trees, and R15 only adds them. Blocks whose boundaries
 came from earlier layouts, or whose statistics converged after R13–R15

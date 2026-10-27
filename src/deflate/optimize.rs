@@ -3372,7 +3372,8 @@ fn build_deft4j_source_candidate(
 /// is seeded with the smallest of its ordinary plan, its length-family chain
 /// and its re-spell from literals, then searched from that seed with the
 /// no-split route's narrow whole-block search, which adds the large-source
-/// length bands. A reached stop leaves no candidate.
+/// length bands. A stop reached before a block starts leaves no candidate; a
+/// block whose search the stop cuts short keeps its best plan so far.
 fn build_source_family_candidate(
     source: CandidateInput<'_>,
     options: &Options,
