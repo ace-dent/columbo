@@ -1401,7 +1401,6 @@ fn build_bounded_phase_candidates(
             proven_feedback,
             suppress_later_source_max: run_source_max,
             completed_compact_split_parent,
-            ..BoundedPhaseCandidates::default()
         })
     })
 }

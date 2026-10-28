@@ -546,11 +546,11 @@ zero-budget Max, matched in all 104 runs, and every timing run and both
 completing Max runs matched byte for byte. Rust tests, including the private
 corpus, passed in release and debug modes, with documentation and Python tests,
 a locked build, formatting and a package list without private fixtures or
-scratch artifacts. All-feature Clippy with warnings denied reported only the
-three errors already present at `3b5fa64`: two unused `state` parameters in
-`schedule.rs` and a needless struct update in `optimize.rs`. `__text` grew
-from 864,312 to 867,336 bytes; the shipped executable keeps its 942,064 bytes,
-and the final source builds the tested executable byte for byte.
+scratch artifacts. All-feature Clippy with warnings denied passed once three
+errors present at `3b5fa64` were fixed separately: two `state` parameters and
+a struct update that `9f36bdb` left unused. `__text` grew from 864,312 to
+867,336 bytes; the shipped executable keeps its 942,064 bytes, and the final
+source builds the tested executable byte for byte.
 
 Measured and rejected in the same review:
 

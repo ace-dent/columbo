@@ -506,7 +506,7 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
 
     let mut candidate = establish_comparison_floor(context, &mut state)?;
     merge_independent_topologies(context, &eligibility, &mut state, &mut candidate)?;
-    run_fragmented_collection(context, &state, &mut candidate)?;
+    run_fragmented_collection(context, &mut candidate)?;
     let deferred_split_parent = if context.options.exhaustive {
         run_max_source_routes(context, &eligibility, &mut state, &mut candidate)?
     } else {
@@ -1692,11 +1692,7 @@ fn merge_independent_topologies(
 
 /// Run the fragmented collection route (M11). A 4,096-token collection can
 /// start slightly larger but reach a better layout after strict replays.
-fn run_fragmented_collection(
-    context: &RouteContext<'_>,
-    state: &RouteState,
-    candidate: &mut Candidate,
-) -> Result<()> {
+fn run_fragmented_collection(context: &RouteContext<'_>, candidate: &mut Candidate) -> Result<()> {
     let RouteContext {
         source,
         options,
@@ -1750,7 +1746,7 @@ fn run_max_source_routes(
     let (deferred_split_parent, source_max_stabilized_incumbent) =
         merge_source_max(context, eligibility, state, candidate)?;
     candidate.plans.clear();
-    refine_rewritten_seed(context, state, candidate, source_max_stabilized_incumbent)?;
+    refine_rewritten_seed(context, candidate, source_max_stabilized_incumbent)?;
     Ok(deferred_split_parent)
 }
 
@@ -1871,7 +1867,6 @@ fn close_source_max_topology(
 /// and boundaries can expose further Max transformations.
 fn refine_rewritten_seed(
     context: &RouteContext<'_>,
-    state: &RouteState,
     candidate: &mut Candidate,
     source_max_stabilized_incumbent: bool,
 ) -> Result<()> {
