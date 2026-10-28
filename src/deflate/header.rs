@@ -2713,29 +2713,70 @@ struct HeaderPlanSearch {
     best: Option<DynamicPlan>,
     /// This plan's runs of equal code lengths, which every RLE spells.
     runs: Vec<LengthRun>,
-    /// Shortest RLEs of this plan's code lengths, with their symbol
-    /// frequencies, by code-length code: RLE seeds often reach the same
-    /// feedback tree.
-    shortest_rles: Vec<([u8; 19], Option<CountedRle>)>,
+    /// Shortest RLEs of this plan's code lengths, by code-length code: RLE
+    /// seeds often reach the same feedback tree. Only the first
+    /// `shortest_rle_count` are this plan's; the rest keep their buffers for
+    /// later plans.
+    shortest_rles: Vec<ShortestRleEntry>,
+    shortest_rle_count: usize,
     shortest_rle_scratch: ShortestRleScratch,
+    /// Buffers for a feedback pass's rewrites, which are priced and mostly
+    /// discarded: two for deft4j's pruned header, the first also for the
+    /// DeflOpt rewrite that follows it.
+    rewrites: [Vec<RleToken>; 2],
+    /// Each seed's local rewrite steps and candidate code-length codes, kept
+    /// for the next seed's.
+    local_rewrite_steps: LocalRewriteSteps,
+    code_length_candidates: Vec<[u8; 19]>,
+    /// RLE buffers a finished seed returns, for the next plan's seeds.
+    spare_rles: Vec<Vec<RleToken>>,
+}
+
+/// A code-length code's shortest RLE in a [`HeaderPlanSearch`].
+struct ShortestRleEntry {
+    tree: [u8; 19],
+    rle: Vec<RleToken>,
+    /// The RLE's symbol frequencies, or `None` when there is no RLE.
+    frequencies: Option<[u32; 19]>,
 }
 
 impl HeaderPlanSearch {
-    fn shortest_rle(&mut self, length_count: usize, tree: &[u8; 19]) -> Option<&CountedRle> {
-        let index = match self.shortest_rles.iter().position(|(seen, _)| seen == tree) {
+    fn shortest_rle(
+        &mut self,
+        length_count: usize,
+        tree: &[u8; 19],
+    ) -> Option<(&[RleToken], &[u32; 19])> {
+        let found = self.shortest_rles[..self.shortest_rle_count]
+            .iter()
+            .position(|entry| entry.tree == *tree);
+        let index = match found {
             Some(index) => index,
             None => {
-                let rle = shortest_rle_from_runs(
+                if self.shortest_rle_count == self.shortest_rles.len() {
+                    self.shortest_rles.push(ShortestRleEntry {
+                        tree: [0; 19],
+                        rle: Vec::new(),
+                        frequencies: None,
+                    });
+                }
+                let entry = &mut self.shortest_rles[self.shortest_rle_count];
+                entry.tree = *tree;
+                entry.frequencies = shortest_rle_from_runs_into(
                     &self.runs,
                     length_count,
                     tree,
                     &mut self.shortest_rle_scratch,
+                    &mut entry.rle,
                 );
-                self.shortest_rles.push((*tree, rle));
-                self.shortest_rles.len() - 1
+                self.shortest_rle_count += 1;
+                self.shortest_rle_count - 1
             }
         };
-        self.shortest_rles[index].1.as_ref()
+        let entry = &self.shortest_rles[index];
+        entry
+            .frequencies
+            .as_ref()
+            .map(|frequencies| (entry.rle.as_slice(), frequencies))
     }
 }
 
@@ -2782,10 +2823,16 @@ fn plan_for_trimmed_lengths_uncached(
         .flatten()
         .unwrap_or_default();
     search.best = None;
-    search.shortest_rles.clear();
+    search.shortest_rle_count = 0;
     // Every RLE spells the same runs, so find them once.
     length_runs_into(decoded_lengths, &mut search.runs);
-    for seed in rle_seed_candidates_from_runs(&search.runs, decoded_length_count, rle_mask) {
+    let seeds = rle_seed_candidates_from_runs(
+        &search.runs,
+        decoded_length_count,
+        rle_mask,
+        &mut search.spare_rles,
+    );
+    for seed in seeds {
         consider_rle(
             data_bits,
             literal_lengths,
@@ -2858,6 +2905,7 @@ fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken
         &length_runs(decoded_lengths),
         decoded_lengths.len(),
         rle_mask,
+        &mut Vec::new(),
     )
     .into_iter()
     .map(|(rle, _)| rle)
@@ -2870,6 +2918,7 @@ fn rle_seed_candidates_from_runs(
     runs: &[LengthRun],
     count: usize,
     rle_mask: u8,
+    spare: &mut Vec<Vec<RleToken>>,
 ) -> Vec<CountedRle> {
     let opportunities = rle_seed_opportunities(runs);
     // Always keep bit 0: it also decides whether the balanced and zero-repeat
@@ -2898,19 +2947,38 @@ fn rle_seed_candidates_from_runs(
             | usize::from(no_17 && opportunities.greedy_17[usize::from(no_18)]) << 1
             | usize::from(no_18) << 2;
         if !std::mem::replace(&mut seen_greedy[greedy], true) {
-            let rle = greedy_rle_from_runs(runs, count, no_16, no_17, no_18);
+            let rle = greedy_rle_from_runs(
+                runs,
+                count,
+                no_16,
+                no_17,
+                no_18,
+                spare.pop().unwrap_or_default(),
+            );
             push_unique(&mut candidates, rle);
         }
 
         if !no_16 && opportunities.balanced_repeat {
-            let balanced = balanced_repeat_rle_from_runs(runs, count, no_17, no_18);
+            let balanced = balanced_repeat_rle_from_runs(
+                runs,
+                count,
+                no_17,
+                no_18,
+                spare.pop().unwrap_or_default(),
+            );
             push_unique(&mut candidates, balanced);
         }
 
         if !no_16 {
             let zero_variant = usize::from(no_17) | (usize::from(no_18) << 1);
             if opportunities.zero_repeat[zero_variant] {
-                let zero_repeat = columbo_zero_repeat_rle_from_runs(runs, count, no_17, no_18);
+                let zero_repeat = columbo_zero_repeat_rle_from_runs(
+                    runs,
+                    count,
+                    no_17,
+                    no_18,
+                    spare.pop().unwrap_or_default(),
+                );
                 push_unique(&mut candidates, zero_repeat);
             }
         }
@@ -3408,7 +3476,8 @@ fn consider_rle(
     let mut frequencies = initial_frequencies;
     debug_assert_eq!(frequencies, rle_frequencies(&rle));
     let mut prescored_deflopt_trees = [None; 4];
-    let mut local_rewrite_steps = LocalRewriteSteps::default();
+    let mut local_rewrite_steps = std::mem::take(&mut search.local_rewrite_steps);
+    local_rewrite_steps.clear();
     for (variant, tree) in prescored_deflopt_trees.iter_mut().enumerate() {
         *tree = consider_columbo_deflopt_local_rewrite(
             data_bits,
@@ -3421,13 +3490,13 @@ fn consider_rle(
             search,
         );
     }
+    search.local_rewrite_steps = local_rewrite_steps;
 
     // Up to four feedback passes: price every candidate code-length code,
     // then respell the RLE under the cheapest one and repeat. The pass count
     // follows Defluff, which always emits its fourth pass.
     let passes = 4;
-    let candidate_capacity = if exhaustive { 18 } else { 6 };
-    let mut code_length_candidates = Vec::with_capacity(candidate_capacity);
+    let mut code_length_candidates = std::mem::take(&mut search.code_length_candidates);
     for pass in 0..passes {
         let variants = 4;
         code_length_candidates.clear();
@@ -3447,6 +3516,7 @@ fn consider_rle(
             &deft4j_lengths,
             &mut search.heap_scratch,
             &mut search.best,
+            &mut search.rewrites,
         );
         // A complete, unrepaired Huffman tree, the first candidate, prices
         // this RLE in the fewest bits: no code spells its symbols more
@@ -3560,27 +3630,64 @@ fn consider_rle(
         let Some(tree) = feedback_tree else {
             break;
         };
-        let mut rewritten = rewrite_rle_deflopt_local(&rle, &frequencies, &tree);
-        if exhaustive {
-            if let Some(shortest) = search.shortest_rle(decoded_lengths.len(), &tree) {
-                // Both carry their exact symbol counts, which price them as
-                // their tokens would.
-                if rewritten.as_ref().map_or(true, |(_, local)| {
-                    rle_frequency_cost(&shortest.1, &tree) < rle_frequency_cost(local, &tree)
-                }) {
-                    rewritten = Some(shortest.clone());
-                }
+        // The shortest RLE is the cheapest spelling of these lengths under
+        // `tree`, and every change the DeflOpt rewrite makes is strictly
+        // cheaper, so an RLE that already costs the shortest's has nothing to
+        // rewrite.
+        let rle_is_shortest = exhaustive && {
+            let cost = rle_frequency_cost(&frequencies, &tree);
+            cost != INF
+                && search
+                    .shortest_rle(decoded_lengths.len(), &tree)
+                    .is_some_and(|(_, shortest)| rle_frequency_cost(shortest, &tree) == cost)
+        };
+        // The DeflOpt rewrite goes to a search buffer, which a winning
+        // rewrite swaps with this pass's.
+        let local = if rle_is_shortest {
+            debug_assert!(rewrite_rle_deflopt_local_into(
+                &rle,
+                &frequencies,
+                &tree,
+                &mut Vec::new()
+            )
+            .is_none());
+            None
+        } else {
+            rewrite_rle_deflopt_local_into(&rle, &frequencies, &tree, &mut search.rewrites[0])
+        };
+        let shortest = if exhaustive {
+            search.shortest_rle(decoded_lengths.len(), &tree)
+        } else {
+            None
+        };
+        // Both carry their exact symbol counts, which price them as their
+        // tokens would. A chosen shortest RLE is copied into this pass's
+        // buffer, not cloned from the plan's memo.
+        let shortest = shortest.filter(|(_, shortest)| {
+            local.as_ref().map_or(true, |local| {
+                rle_frequency_cost(shortest, &tree) < rle_frequency_cost(local, &tree)
+            })
+        });
+        if let Some((shortest, shortest_frequencies)) = shortest {
+            if shortest == rle.as_slice() {
+                break;
             }
+            rle.clear();
+            rle.extend_from_slice(shortest);
+            frequencies = *shortest_frequencies;
+            continue;
         }
-        let Some((rewritten, rewritten_frequencies)) = rewritten else {
+        let Some(rewritten_frequencies) = local else {
             break;
         };
-        if rewritten == rle {
+        if search.rewrites[0] == rle {
             break;
         }
-        rle = rewritten;
+        std::mem::swap(&mut rle, &mut search.rewrites[0]);
         frequencies = rewritten_frequencies;
     }
+    search.code_length_candidates = code_length_candidates;
+    search.spare_rles.push(rle);
 }
 
 /// Price a header using deft4j's code-length tree and equal-cost RLE prune,
@@ -3596,6 +3703,7 @@ fn consider_deft4j_pruned_header(
     deft4j_lengths: &[u8],
     heap_scratch: &mut TreeBuildScratch,
     best: &mut Option<DynamicPlan>,
+    [pruned, optimized]: &mut [Vec<RleToken>; 2],
 ) {
     if deft4j_lengths.len() != 19 || !code_length_tree_shape_is_valid(deft4j_lengths) {
         return;
@@ -3610,8 +3718,8 @@ fn consider_deft4j_pruned_header(
         return;
     }
 
-    let Some((pruned, frequencies)) =
-        rewrite_rle_deft4j_literals(rle, frequencies, &code_length_lengths, true)
+    let Some(frequencies) =
+        rewrite_rle_deft4j_literals_into(rle, frequencies, &code_length_lengths, true, pruned)
     else {
         return;
     };
@@ -3635,7 +3743,7 @@ fn consider_deft4j_pruned_header(
         data_bits,
         literal_lengths,
         distance_lengths,
-        &pruned,
+        pruned,
         &frequencies,
         code_length_lengths,
         best,
@@ -3643,14 +3751,18 @@ fn consider_deft4j_pruned_header(
 
     // deft4j's final `optimiseHeader` step expands only strictly dearer
     // repeats under the rebuilt tree and keeps that tree unchanged.
-    if let Some((optimized, optimized_frequencies)) =
-        rewrite_rle_deft4j_literals(&pruned, &frequencies, &code_length_lengths, false)
-    {
+    if let Some(optimized_frequencies) = rewrite_rle_deft4j_literals_into(
+        pruned,
+        &frequencies,
+        &code_length_lengths,
+        false,
+        optimized,
+    ) {
         consider_dynamic_header(
             data_bits,
             literal_lengths,
             distance_lengths,
-            &optimized,
+            optimized,
             &optimized_frequencies,
             code_length_lengths,
             best,
@@ -3667,9 +3779,19 @@ fn consider_deft4j_pruned_header(
 #[derive(Default)]
 struct LocalRewriteSteps {
     /// RLEs reached from the seed and their symbol frequencies; state 0, the
-    /// seed itself, is not stored.
+    /// seed itself, is not stored. Only the first `reached` belong to this
+    /// seed; the rest are buffers from earlier seeds, rewritten in place.
     states: Vec<CountedRle>,
+    reached: usize,
     steps: Vec<(usize, [u8; 19], LocalRewriteOutcome)>,
+}
+
+impl LocalRewriteSteps {
+    /// Start a new seed, keeping the buffers.
+    fn clear(&mut self) {
+        self.reached = 0;
+        self.steps.clear();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3680,11 +3802,11 @@ enum LocalRewriteOutcome {
     Next(usize),
 }
 
-/// One step's result, before the next RLE is stored.
+/// One step's result; a next RLE is in the buffer the step was given.
 enum LocalRewriteStep {
     Invalid,
     Stop,
-    Next(Vec<RleToken>, [u32; 19]),
+    Next([u32; 19]),
 }
 
 /// Price DeflOpt-style local rewrite/rebuild candidates from one RLE seed.
@@ -3728,10 +3850,15 @@ fn consider_columbo_deflopt_local_rewrite(
         let outcome = match explored {
             Some(outcome) => outcome,
             None => {
+                if steps.reached == steps.states.len() {
+                    steps.states.push((Vec::new(), [0; 19]));
+                }
+                let (reached, spare) = steps.states.split_at_mut(steps.reached);
                 let rle = match state {
                     0 => initial_rle,
-                    _ => &steps.states[state - 1].0,
+                    _ => &reached[state - 1].0,
                 };
+                let next = &mut spare[0];
                 let outcome = match local_rewrite_step(
                     data_bits,
                     literal_lengths,
@@ -3740,12 +3867,14 @@ fn consider_columbo_deflopt_local_rewrite(
                     &frequencies,
                     code_length_lengths,
                     search,
+                    &mut next.0,
                 ) {
                     LocalRewriteStep::Invalid => LocalRewriteOutcome::Invalid,
                     LocalRewriteStep::Stop => LocalRewriteOutcome::Stop,
-                    LocalRewriteStep::Next(rle, frequencies) => {
-                        steps.states.push((rle, frequencies));
-                        LocalRewriteOutcome::Next(steps.states.len())
+                    LocalRewriteStep::Next(frequencies) => {
+                        next.1 = frequencies;
+                        steps.reached += 1;
+                        LocalRewriteOutcome::Next(steps.reached)
                     }
                 };
                 steps.steps.push((state, code_length_lengths, outcome));
@@ -3769,6 +3898,7 @@ fn consider_columbo_deflopt_local_rewrite(
 /// One step of the DeflOpt local rewrite: price the RLE under the tree (and its
 /// frequency-ordered form), then rewrite the RLE under the tree and price the
 /// rewrite if it lowers `repeat_rank`. Returns the rewrite to continue from.
+#[allow(clippy::too_many_arguments)]
 fn local_rewrite_step(
     data_bits: u64,
     literal_lengths: &[u8],
@@ -3777,6 +3907,7 @@ fn local_rewrite_step(
     frequencies: &[u32; 19],
     code_length_lengths: [u8; 19],
     search: &mut HeaderPlanSearch,
+    rewritten: &mut Vec<RleToken>,
 ) -> LocalRewriteStep {
     if consider_dynamic_header(
         data_bits,
@@ -3811,8 +3942,8 @@ fn local_rewrite_step(
     if rank == 0 {
         return LocalRewriteStep::Stop;
     }
-    let Some((rewritten, rewritten_frequencies)) =
-        rewrite_rle_deflopt_local(rle, frequencies, &code_length_lengths)
+    let Some(rewritten_frequencies) =
+        rewrite_rle_deflopt_local_into(rle, frequencies, &code_length_lengths, rewritten)
     else {
         return LocalRewriteStep::Stop;
     };
@@ -3826,24 +3957,40 @@ fn local_rewrite_step(
         data_bits,
         literal_lengths,
         distance_lengths,
-        &rewritten,
+        rewritten,
         &rewritten_frequencies,
         code_length_lengths,
         &mut search.best,
     );
-    LocalRewriteStep::Next(rewritten, rewritten_frequencies)
+    LocalRewriteStep::Next(rewritten_frequencies)
 }
 
-/// Expand a repeat code only when its explicit spelling is strictly cheaper
-/// under the given tree. A code 17 of 3 to 6 zeros after a zero becomes code
-/// 16 when code 16's length is no longer. `frequencies` are the input's symbol
-/// frequencies. Returns `None` if nothing changes; otherwise the rewrite and
-/// its symbol frequencies, the input's adjusted at each change.
+/// [`rewrite_rle_deflopt_local_into`] into a new buffer, returning the rewrite
+/// with its symbol frequencies.
+#[cfg(test)]
 fn rewrite_rle_deflopt_local(
     input: &[RleToken],
     frequencies: &[u32; 19],
     code_length_lengths: &[u8; 19],
 ) -> Option<CountedRle> {
+    let mut output = Vec::new();
+    let frequencies =
+        rewrite_rle_deflopt_local_into(input, frequencies, code_length_lengths, &mut output)?;
+    Some((output, frequencies))
+}
+
+/// Expand a repeat code only when its explicit spelling is strictly cheaper
+/// under the given tree. A code 17 of 3 to 6 zeros after a zero becomes code
+/// 16 when code 16's length is no longer. `frequencies` are the input's symbol
+/// frequencies. The rewrite goes to `output`, which this clears; returns its
+/// symbol frequencies, the input's adjusted at each change, or `None` when
+/// nothing changes, leaving `output` unspecified.
+fn rewrite_rle_deflopt_local_into(
+    input: &[RleToken],
+    frequencies: &[u32; 19],
+    code_length_lengths: &[u8; 19],
+    output: &mut Vec<RleToken>,
+) -> Option<[u32; 19]> {
     debug_assert_eq!(*frequencies, rle_frequencies(input));
     // The last rewrite of a search usually changes nothing; this finds most
     // such rewrites without reading the RLE.
@@ -3854,7 +4001,8 @@ fn rewrite_rle_deflopt_local(
     }
     // Built from the first change on: a rewrite that passes the check above
     // can still change nothing.
-    let mut output: Option<Vec<RleToken>> = None;
+    output.clear();
+    let mut started = false;
     // Input before this index is already in `output`; unchanged runs are
     // copied whole at the next change or the end.
     let mut copied = 0;
@@ -3907,17 +4055,13 @@ fn rewrite_rle_deflopt_local(
         if replacement.is_none() && repeated.is_none() {
             continue;
         }
-        let output = match output.as_mut() {
-            Some(output) => output,
-            None => {
-                let mut started = Vec::new();
-                // Expansions can outgrow the input, but not a header's lengths.
-                started
-                    .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
-                    .ok()?;
-                output.insert(started)
-            }
-        };
+        if !started {
+            // Expansions can outgrow the input, but not a header's lengths.
+            output
+                .try_reserve(input.len().max(MAX_DYNAMIC_CODE_LENGTH_COUNT))
+                .ok()?;
+            started = true;
+        }
         output.extend_from_slice(&input[copied..index]);
         copied = index + 1;
         rewritten_frequencies[usize::from(token.symbol)] -= 1;
@@ -3936,11 +4080,12 @@ fn rewrite_rle_deflopt_local(
         }
     }
 
-    output.map(|mut output| {
-        output.extend_from_slice(&input[copied..]);
-        debug_assert_eq!(rewritten_frequencies, rle_frequencies(&output));
-        (output, rewritten_frequencies)
-    })
+    if !started {
+        return None;
+    }
+    output.extend_from_slice(&input[copied..]);
+    debug_assert_eq!(rewritten_frequencies, rle_frequencies(output));
+    Some(rewritten_frequencies)
 }
 
 /// Whether spelling out some repeat code of an RLE with these symbol
@@ -3989,6 +4134,26 @@ fn rewrite_rle_deft4j_literals(
     code_length_lengths: &[u8; 19],
     include_equal: bool,
 ) -> Option<CountedRle> {
+    let mut output = Vec::new();
+    let frequencies = rewrite_rle_deft4j_literals_into(
+        input,
+        frequencies,
+        code_length_lengths,
+        include_equal,
+        &mut output,
+    )?;
+    Some((output, frequencies))
+}
+
+/// [`rewrite_rle_deft4j_literals`] into `output`, which this clears, as
+/// [`rewrite_rle_deflopt_local_into`] writes its rewrite.
+fn rewrite_rle_deft4j_literals_into(
+    input: &[RleToken],
+    frequencies: &[u32; 19],
+    code_length_lengths: &[u8; 19],
+    include_equal: bool,
+    output: &mut Vec<RleToken>,
+) -> Option<[u32; 19]> {
     debug_assert_eq!(*frequencies, rle_frequencies(input));
     if !some_repeat_expands(frequencies, code_length_lengths, include_equal) {
         return None;
@@ -3996,7 +4161,8 @@ fn rewrite_rle_deft4j_literals(
     let mut rewritten_frequencies = *frequencies;
     // Built from the first change on, like the DeflOpt rewrite's, with
     // unchanged runs copied whole.
-    let mut output: Option<Vec<RleToken>> = None;
+    output.clear();
+    let mut started = false;
     let mut copied = 0;
     let mut previous = None;
 
@@ -4014,14 +4180,10 @@ fn rewrite_rle_deft4j_literals(
         let explicit = explicit_rle_cost(code_length_lengths, value, count);
         let repeat = rle_symbol_cost(code_length_lengths, token.symbol);
         if explicit < repeat || (include_equal && explicit == repeat) {
-            let output = match output.as_mut() {
-                Some(output) => output,
-                None => {
-                    let mut started = Vec::new();
-                    started.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
-                    output.insert(started)
-                }
-            };
+            if !started {
+                output.try_reserve(MAX_DYNAMIC_CODE_LENGTH_COUNT).ok()?;
+                started = true;
+            }
             output.extend_from_slice(&input[copied..index]);
             copied = index + 1;
             if output.len().checked_add(count)? > MAX_DYNAMIC_CODE_LENGTH_COUNT {
@@ -4039,10 +4201,11 @@ fn rewrite_rle_deft4j_literals(
         }
         previous = Some(value);
     }
-    output.map(|mut output| {
-        output.extend_from_slice(&input[copied..]);
-        (output, rewritten_frequencies)
-    })
+    if !started {
+        return None;
+    }
+    output.extend_from_slice(&input[copied..]);
+    Some(rewritten_frequencies)
 }
 
 fn explicit_rle_cost(lengths: &[u8; 19], symbol: u8, count: usize) -> u64 {
@@ -4157,7 +4320,15 @@ fn length_runs_into(lengths: &[u8], runs: &mut Vec<LengthRun>) {
 }
 
 fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
-    greedy_rle_from_runs(&length_runs(lengths), lengths.len(), no_16, no_17, no_18).0
+    greedy_rle_from_runs(
+        &length_runs(lengths),
+        lengths.len(),
+        no_16,
+        no_17,
+        no_18,
+        Vec::new(),
+    )
+    .0
 }
 
 fn greedy_rle_from_runs(
@@ -4166,9 +4337,11 @@ fn greedy_rle_from_runs(
     no_16: bool,
     no_17: bool,
     no_18: bool,
+    mut output: Vec<RleToken>,
 ) -> CountedRle {
     // Each token spells at least one length.
-    let mut output = Vec::with_capacity(length_count);
+    output.clear();
+    output.reserve(length_count);
     // Counted as spelled: each run's explicit lengths, and the repeat codes.
     let mut frequencies = [0_u32; 19];
     let mut repeats = [0_u32; 3];
@@ -4224,7 +4397,14 @@ fn greedy_rle_from_runs(
 
 #[cfg(test)]
 fn balanced_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
-    balanced_repeat_rle_from_runs(&length_runs(lengths), lengths.len(), no_17, no_18).0
+    balanced_repeat_rle_from_runs(
+        &length_runs(lengths),
+        lengths.len(),
+        no_17,
+        no_18,
+        Vec::new(),
+    )
+    .0
 }
 
 /// Generalize deft4j's balanced code-16 splits (4+3 and 4+4 for seven and
@@ -4235,9 +4415,11 @@ fn balanced_repeat_rle_from_runs(
     length_count: usize,
     no_17: bool,
     no_18: bool,
+    mut output: Vec<RleToken>,
 ) -> CountedRle {
     // Each token spells at least one length.
-    let mut output = Vec::with_capacity(length_count);
+    output.clear();
+    output.reserve(length_count);
     // Counted as spelled: each run's explicit lengths, and the repeat codes.
     let mut frequencies = [0_u32; 19];
     let mut repeats = [0_u32; 3];
@@ -4297,7 +4479,14 @@ fn balanced_repeat_rle_from_runs(
 
 #[cfg(test)]
 fn columbo_zero_repeat_rle(lengths: &[u8], no_17: bool, no_18: bool) -> Vec<RleToken> {
-    columbo_zero_repeat_rle_from_runs(&length_runs(lengths), lengths.len(), no_17, no_18).0
+    columbo_zero_repeat_rle_from_runs(
+        &length_runs(lengths),
+        lengths.len(),
+        no_17,
+        no_18,
+        Vec::new(),
+    )
+    .0
 }
 
 /// Like `balanced_repeat_rle_from_runs`, but four or more zeros left after the
@@ -4308,9 +4497,11 @@ fn columbo_zero_repeat_rle_from_runs(
     length_count: usize,
     no_17: bool,
     no_18: bool,
+    mut output: Vec<RleToken>,
 ) -> CountedRle {
     // Each token spells at least one length.
-    let mut output = Vec::with_capacity(length_count);
+    output.clear();
+    output.reserve(length_count);
     // Counted as spelled: each run's explicit lengths, and the repeat codes.
     let mut frequencies = [0_u32; 19];
     let mut repeats = [0_u32; 3];
@@ -4790,8 +4981,22 @@ fn shortest_rle_from_runs(
     costs: &[u8; 19],
     scratch: &mut ShortestRleScratch,
 ) -> Option<CountedRle> {
-    // Each token spells at least one length.
     let mut output = Vec::new();
+    let frequencies = shortest_rle_from_runs_into(runs, length_count, costs, scratch, &mut output)?;
+    Some((output, frequencies))
+}
+
+/// [`shortest_rle_from_runs`] into `output`, which this clears; returns the
+/// RLE's symbol frequencies, or `None`, leaving `output` unspecified.
+fn shortest_rle_from_runs_into(
+    runs: &[LengthRun],
+    length_count: usize,
+    costs: &[u8; 19],
+    scratch: &mut ShortestRleScratch,
+    output: &mut Vec<RleToken>,
+) -> Option<[u32; 19]> {
+    // Each token spells at least one length.
+    output.clear();
     output.try_reserve_exact(length_count).ok()?;
     // Counted as spelled: each run's explicit lengths, and the repeat codes.
     let mut frequencies = [0_u32; 19];
@@ -4852,8 +5057,8 @@ fn shortest_rle_from_runs(
         frequencies[usize::from(value)] += explicit;
     }
     frequencies[16..].copy_from_slice(&repeats);
-    debug_assert_eq!(frequencies, rle_frequencies(&output));
-    Some((output, frequencies))
+    debug_assert_eq!(frequencies, rle_frequencies(output));
+    Some(frequencies)
 }
 
 #[cfg(test)]

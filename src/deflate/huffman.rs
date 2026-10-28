@@ -701,10 +701,27 @@ fn node_less(nodes: &[Node], a: usize, b: usize, variant: u32) -> bool {
     }
 }
 
-/// A heap entry: a node and its [`node_key`], so comparisons need not read the
-/// node. Equal keys compare as [`node_less`] does, so the heap moves exactly as
-/// one of node indices would.
-type KeyedNode = (u64, usize);
+/// A heap entry in one word: the node's frequency and a 16-bit order, ordered
+/// as [`node_key`] orders them, in the top 48 bits, and the node in the low 16,
+/// so comparisons need not read the node. Equal keys compare as [`node_less`]
+/// does, so the heap moves exactly as one of node indices would.
+type KeyedNode = u64;
+
+fn keyed_node(nodes: &[Node], node: usize, variant: u32) -> KeyedNode {
+    debug_assert!(node < 1 << 16 && nodes[node].order < 1 << 16);
+    let order = nodes[node].order as u16;
+    let order = if variant & 1 != 0 { !order } else { order };
+    u64::from(nodes[node].frequency) << 32 | u64::from(order) << 16 | node as u64
+}
+
+/// A [`KeyedNode`]'s key, without the node.
+fn keyed_rank(entry: KeyedNode) -> u64 {
+    entry >> 16
+}
+
+fn keyed_index(entry: KeyedNode) -> usize {
+    (entry & 0xffff) as usize
+}
 
 /// Reusable buffers for the generic builder's heap merges.
 #[derive(Default)]
@@ -717,11 +734,7 @@ pub(crate) struct KeyedHeaps {
 /// Fill `heap` with `members` keyed for `variant`, in heap order.
 fn fill_keyed_heap(heap: &mut Vec<KeyedNode>, nodes: &[Node], members: &[usize], variant: u32) {
     heap.clear();
-    heap.extend(
-        members
-            .iter()
-            .map(|&node| (node_key(&nodes[node], variant), node)),
-    );
+    heap.extend(members.iter().map(|&node| keyed_node(nodes, node, variant)));
     for start in (0..heap.len() / 2).rev() {
         keyed_heap_sift_down(heap, start);
     }
@@ -733,10 +746,10 @@ fn keyed_heap_sift_down(heap: &mut [KeyedNode], mut root: usize) {
         if child >= heap.len() {
             return;
         }
-        if child + 1 < heap.len() && heap[child + 1].0 < heap[child].0 {
+        if child + 1 < heap.len() && keyed_rank(heap[child + 1]) < keyed_rank(heap[child]) {
             child += 1;
         }
-        if heap[child].0 >= heap[root].0 {
+        if keyed_rank(heap[child]) >= keyed_rank(heap[root]) {
             return;
         }
         heap.swap(root, child);
@@ -745,7 +758,7 @@ fn keyed_heap_sift_down(heap: &mut [KeyedNode], mut root: usize) {
 }
 
 fn keyed_heap_pop(heap: &mut Vec<KeyedNode>) -> Option<usize> {
-    let result = heap.first()?.1;
+    let result = keyed_index(*heap.first()?);
     let last = heap.pop().expect("the heap is non-empty");
     if !heap.is_empty() {
         heap[0] = last;
@@ -759,7 +772,7 @@ fn keyed_heap_push(heap: &mut Vec<KeyedNode>, entry: KeyedNode) {
     heap.push(entry);
     while position != 0 {
         let parent = (position - 1) / 2;
-        if heap[position].0 >= heap[parent].0 {
+        if keyed_rank(heap[position]) >= keyed_rank(heap[parent]) {
             break;
         }
         heap.swap(position, parent);
@@ -780,10 +793,10 @@ fn merge_generic_nodes_heap(
         let index = nodes.len();
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
-        keyed_heap_push(heap, (node_key(&nodes[index], variant), index));
+        keyed_heap_push(heap, keyed_node(nodes, index, variant));
     }
     active.clear();
-    active.extend(heap.first().map(|&(_, root)| root));
+    active.extend(heap.first().map(|&root| keyed_index(root)));
 }
 
 fn keyed_heap_pop_active(heap: &mut Vec<KeyedNode>, active: &[bool]) -> Option<usize> {
@@ -839,8 +852,8 @@ fn merge_generic_nodes_dual_heap(
         let frequency = nodes[left].frequency.wrapping_add(nodes[right].frequency);
         nodes.push(Node::branch(frequency, left, right, index));
         is_active.push(true);
-        keyed_heap_push(increasing_order, (node_key(&nodes[index], 0), index));
-        keyed_heap_push(decreasing_order, (node_key(&nodes[index], 1), index));
+        keyed_heap_push(increasing_order, keyed_node(nodes, index, 0));
+        keyed_heap_push(decreasing_order, keyed_node(nodes, index, 1));
         remaining -= 1;
     }
 
@@ -1140,6 +1153,11 @@ fn make_lengths_inner(
     scratch: &mut TreeBuildScratch,
 ) -> bool {
     assert_eq!(frequencies.len(), lengths.len());
+    // Every node index and order fits a keyed heap entry's 16 bits.
+    assert!(
+        frequencies.len() <= MAX_PACKED_HEAP_LEAVES,
+        "alphabet fits the heap"
+    );
     lengths.fill(0);
 
     let TreeBuildScratch {

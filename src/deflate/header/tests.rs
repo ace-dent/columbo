@@ -2482,12 +2482,22 @@ fn run_list_spellings_match_the_scanning_spellers() {
         lengths.truncate((next() % 320) as usize);
         let runs = length_runs(&lengths);
         let count = lengths.len();
+        // A recycled buffer still holds an earlier spelling.
+        let stale = || {
+            vec![
+                RleToken {
+                    symbol: 18,
+                    extra: 9
+                };
+                3
+            ]
+        };
         for mask in 0..8_u8 {
             let (no_16, no_17, no_18) = (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0);
             assert_eq!(
                 {
                     let (rle, frequencies) =
-                        greedy_rle_from_runs(&runs, count, no_16, no_17, no_18);
+                        greedy_rle_from_runs(&runs, count, no_16, no_17, no_18, stale());
                     assert_eq!(frequencies, rle_frequencies(&rle));
                     rle
                 },
@@ -2497,7 +2507,7 @@ fn run_list_spellings_match_the_scanning_spellers() {
             assert_eq!(
                 {
                     let (rle, frequencies) =
-                        balanced_repeat_rle_from_runs(&runs, count, no_17, no_18);
+                        balanced_repeat_rle_from_runs(&runs, count, no_17, no_18, stale());
                     assert_eq!(frequencies, rle_frequencies(&rle));
                     rle
                 },
@@ -2507,7 +2517,7 @@ fn run_list_spellings_match_the_scanning_spellers() {
             assert_eq!(
                 {
                     let (rle, frequencies) =
-                        columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18);
+                        columbo_zero_repeat_rle_from_runs(&runs, count, no_17, no_18, stale());
                     assert_eq!(frequencies, rle_frequencies(&rle));
                     rle
                 },

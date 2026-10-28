@@ -463,3 +463,68 @@ fn distinct_least_family_choices_reuse_analysis_but_keep_route_order() {
     assert_eq!(queue.states[least_expensive.state].tokens.len(), 7);
     assert_eq!(queue.states[least_seen.state].tokens.len(), 6);
 }
+
+#[test]
+fn early_stopping_expansion_marks_match_the_full_delta() {
+    let mut state = 0x510e_527f_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut marked = 0;
+    for case in 0..20_000 {
+        let lengths = |count: usize, next: &mut dyn FnMut() -> u32| -> Vec<u8> {
+            (0..count)
+                .map(|_| {
+                    if next() % 6 == 0 {
+                        0
+                    } else {
+                        (next() % 15 + 1) as u8
+                    }
+                })
+                .collect()
+        };
+        let mut literal_lengths: [u8; 286] = lengths(286, &mut next).try_into().unwrap();
+        let distance_lengths: [u8; 30] = lengths(30, &mut next).try_into().unwrap();
+        // Cheap literals and short matches make expansions pay, ties included.
+        if case % 2 == 0 {
+            for length in &mut literal_lengths[..8] {
+                *length = (next() % 4) as u8;
+            }
+        }
+        let length_symbol = 257 + (next() % 29) as u16;
+        let length = if case % 3 == 0 {
+            3 + (next() % 255) as u16
+        } else {
+            3 + (next() % 4) as u16
+        };
+        let token = if case % 5 == 0 {
+            Token::Literal((next() % 8) as u8)
+        } else {
+            match_token(length, length_symbol, (next() % 30) as u8)
+        };
+        let decoded: Vec<u8> = (0..token.decoded_len())
+            .map(|_| (next() % 8) as u8)
+            .collect();
+        for include_equal in [false, true] {
+            let expected =
+                match_expansion_delta(token, &decoded, &literal_lengths, &distance_lengths)
+                    .is_some_and(|delta| delta < 0 || (include_equal && delta == 0));
+            assert_eq!(
+                expansion_pays(
+                    token,
+                    &decoded,
+                    &literal_lengths,
+                    &distance_lengths,
+                    include_equal
+                ),
+                expected,
+                "case {case}, include_equal {include_equal}"
+            );
+            marked += usize::from(expected);
+        }
+    }
+    assert!(marked > 1_000, "only {marked} marks");
+}

@@ -82,6 +82,7 @@ gains where established.
 | 28 Oct 2026 | [`3b5fa64`](#3b5fa64-28-october-2026) | Block sums, heap trees and package-merge (`block.rs`, `header.rs`, `huffman.rs`, `search.rs`) | A block's extra bits, fixed-code price and source-header payload from its symbol counts; a variant-0 heap build that finds no comparison a tie rule could decide gives its tree to every variant sharing those rules, in the code-length tree cache and the payload tree lists; package-merge's buffers kept per thread | Default CPU 1.07× (33 inputs, 6.7% fewer cycles); replayed header plans 1.04×; a completing Max run 3.2% fewer instructions; peak memory −0.4 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 tracked-heap and 20,000 shuffled tree-cache comparisons; 688 Rust, 7 Python tests |
 | 28 Oct 2026 | [`a6f67cd`](#a6f67cd-28-october-2026) | Heap entries, match expansion and RLE seeds (`huffman.rs`, `search.rs`, `header.rs`) | The DeflOpt-style heap packs frequency, tie field and index into one word; match expansion keeps its first walk's answers and spells the result out of line; a greedy RLE seed that only repeats an earlier mask's is not spelled | Default CPU 1.04× (33 inputs, 3.0% fewer cycles); replayed header plans 1.04×; a completing Max run 4.6% fewer instructions; `__text` 4.2 KB smaller | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 expansion and 5,000 long-run seed comparisons; 689 Rust, 7 Python tests |
 | 28 Oct 2026 | [`46b7c44`](#46b7c44-28-october-2026) | Boundary slide, Huffman decoding and paired match expansions (`slide.rs`, `bitstream.rs`, `huffman.rs`, `search.rs`) | The slide's cut search walks the pair once, pricing each token once; decoding takes each code and its extra bits from one 32-bit window; the strict and tie-including expansions under the same codes share one walk | Default CPU 1.02× (33 inputs, 2.1% fewer cycles); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 cut-search and 20,000 paired-expansion comparisons; 691 Rust, 7 Python tests |
+| 28 Oct 2026 | [`c2aa4ba`](#c2aa4ba-28-october-2026) | Max header-plan buffers, expansion marks and generic heap entries (`header.rs`, `source_recode.rs`, `huffman.rs`) | The header planner's rewrites, local-rewrite steps, candidate trees, shortest-RLE memo and seed spellings use buffers kept per thread; the DeflOpt rewrite is skipped when the RLE already costs the shortest RLE's; source recode's expansion marks stop their literal sums at the match's cost; the generic builder's heap entries take one word | Replayed header plans 1.10× (5.5% fewer instructions); a completing Max run 7.1% fewer instructions; Default CPU 1.02× (33 inputs, 1.8% fewer cycles); peak memory −0.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 expansion-mark comparisons; 692 Rust, 7 Python tests |
 
 ## Entries
 
@@ -478,6 +479,113 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `c2aa4ba`, 28 October 2026
+
+Batches: three alternating runs of the header-plan replay; two alternating
+runs of each completing Max run; retired instructions and cycles from
+`time -l` over the 33 stratified Default inputs, two alternating rounds;
+whole-file Default CPU (user plus system) and peak resident memory over the
+same inputs, two rounds alternating the builds; one paired run of each build
+on every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds,
+alternating order).
+
+A sampled profile of ten inputs in Max at 20 seconds at `c2aa4ba` (230,775 CPU
+samples) put 54% under `consider_rle`, which follows each RLE seed through the
+local rewrite and up to four feedback passes. The heap builder took 14.3% of
+self time, the shortest-RLE search 9.6%, the DeflOpt local rewrite 5.4% and the
+greedy seeds 3.9%; allocation took about 6%, as macOS's `free` reads the clock.
+Source recode's expansion marks took 2.1% and the generic builder's heap pops
+1.8%.
+
+- **Header-plan buffers kept.** The feedback pass cloned the shortest RLE it
+  chose and allocated every DeflOpt and deft4j rewrite, its local-rewrite step
+  record, the step states and its candidate code-length trees; the
+  shortest-RLE memo allocated an entry per tree and each seed spelling a new
+  RLE. The per-thread header-plan search now keeps them all: rewrites write
+  into two buffers, one swapped with the pass's RLE when it wins; the chosen
+  shortest RLE is copied into the pass's buffer; the step record, its states
+  and the candidate list are reused; the memo's entries stay allocated across
+  plans and are refilled; and the seed spellers take the RLEs that finished
+  seeds hand back.
+- **Rewrite skipped at the shortest cost.** In the exhaustive search each
+  feedback pass also finds the shortest RLE under the feedback tree, the
+  cheapest spelling of those lengths. Every change the DeflOpt local rewrite
+  makes is strictly cheaper, so when the pass's RLE already costs what the
+  shortest does, and that cost is finite, the rewrite cannot change it and is
+  not run. A debug assertion runs it anyway and checks that it finds nothing.
+- **Expansion marks stop early.** Source recode marks the matches whose
+  literals cost less than the match, or no more. The literal sum now stops once
+  it exceeds the match's cost, after which no later byte can mark the match,
+  as the block search's sums have done since `71ecf9f`.
+- **One-word generic heap entries.** The generic builder's two keyed heaps
+  held a 64-bit key and an index. As in the DeflOpt-style heap since
+  `a6f67cd`, the frequency now takes the top 32 bits, the order, inverted for
+  odd variants, the next 16 and the node the low 16; comparisons use the top
+  48 bits. Alphabets are asserted to fit.
+
+| Step | Replay instructions against `c2aa4ba` |
+| --- | ---: |
+| Shortest RLE copied, not cloned | −1.3% |
+| Plus rewrites into kept buffers | −1.8% |
+| Plus kept step record and candidate list | −2.6% |
+| Plus pooled step states | −2.8% |
+| Plus shortest-RLE memo kept across plans | −4.1% |
+| Plus recycled seed buffers | −4.7% |
+| Plus rewrite skipped at the shortest cost | −5.5% |
+
+Each row is measured against the baseline in the same alternating run. The
+replay does not reach source recode or the generic builder's heaps; in the
+ten-input profile their shares fell from 2.05% to 1.68% for the marks and from
+1.79% to 1.63% for the heap pops.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed (median) | 2.110 s | 1.924 s | 1.10× |
+| Same replay, instructions retired | 30.01–30.07 billion | 28.37–28.39 billion | −5.5% |
+| Same replay, cycles | 7.90–7.98 billion | 7.33–7.42 billion | −7.1% |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 21.76–21.81 billion | 20.20–20.25 billion | −7.1% |
+| Same run, user CPU | 1.90–2.04 s | 1.64–1.72 s | 1.17× |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.45 billion | 2.41–2.42 billion | −1.3% |
+| 33 Default inputs, instructions retired over two rounds | 1,214.8 billion | 1,194.9 billion | −1.64% |
+| Same inputs, cycles over two rounds | 303.4 billion | 297.8 billion | −1.84% |
+| Same inputs, CPU over two rounds | 95.7 s | 93.7 s | 1.02× |
+
+Median Default peak memory fell 0.2 MiB. The largest input,
+`Partnership_Card___John_Lewis_Finance.png`, peaked 11.0 MiB higher in one
+round and 7.6 MiB lower in the other, around 950 MiB.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating
+builds), 54 outputs were identical, in 438.9 instead of 443.5 seconds. Four
+runs that reached the deadline differed: two smaller, by 3 bytes and 1 byte,
+one the same size and `Nutcracker.png` 1 byte larger. Run twice more, the
+baseline gave `Nutcracker.png` in 47,731 and then 47,732 bytes, and the
+candidate in 47,731 bytes both times, the second byte for byte as the
+baseline's first.
+
+Equivalence: a new test compares the early-stopping marks with the full
+expansion delta on 20,000 random tokens, codes and decoded bytes, with cheap
+literals and short matches in half of them so that more than 1,000 marks
+are set, uncodable literals included; the seed-speller test now hands the
+spellers stale buffers; and the existing comparisons of the generic builder's
+heap merges with their reference implementations pass with the packed entries.
+Debug tests run the skipped rewrite's assertion. The 89,255 replayed header
+plans matched plan for plan. API comparisons on the 52 inputs, in Default with
+the 180-second budget and in zero-budget Max, matched in all 104 runs, and
+every Default timing run and both completing Max runs matched byte for byte.
+Rust tests, including the private corpus, passed in release and debug modes,
+with documentation and Python tests, a locked build, formatting, all-feature
+Clippy with warnings denied and a package list without private fixtures or
+scratch artifacts. `__text` grew from 865,300 to 866,440 bytes; the shipped
+executable keeps its 942,064 bytes, and the final source builds the tested
+executable byte for byte.
+
+Not changed in the same review: the heap builder, still the largest share,
+whose variants diverge at about the first merge and whose branch-free and
+bottom-up sift-downs earlier reviews measured and rejected.
+
+Artifacts: `work/efficiency-review-max4-20261028/`.
 
 ### `46b7c44`, 28 October 2026
 

@@ -669,17 +669,64 @@ fn mark_cost_expansions(
     for &token in tokens {
         let end = offset.checked_add(token.decoded_len())?;
         let decoded = plain.get(offset..end)?;
-        let mark = match token {
-            Token::Literal(_) => false,
-            Token::Match { .. } => {
-                match_expansion_delta(token, decoded, literal_lengths, distance_lengths)
-                    .is_some_and(|delta| delta < 0 || (include_equal && delta == 0))
-            }
-        };
+        let mark = expansion_pays(
+            token,
+            decoded,
+            literal_lengths,
+            distance_lengths,
+            include_equal,
+        );
         marks.push(u8::from(mark));
         offset = end;
     }
     (offset == plain.len()).then_some(marks)
+}
+
+/// Whether [`match_expansion_delta`] is negative, or zero with
+/// `include_equal`: the literal sum stops once it exceeds the match's cost,
+/// since no later byte, priced or uncodable, can then mark the match.
+fn expansion_pays(
+    token: Token,
+    decoded: &[u8],
+    literal_lengths: &[u8; 286],
+    distance_lengths: &[u8; 30],
+    include_equal: bool,
+) -> bool {
+    let Token::Match {
+        length_symbol,
+        distance_symbol,
+        length_extra_bits,
+        distance_extra_bits,
+        ..
+    } = token
+    else {
+        return false;
+    };
+    let (Some(&match_literal), Some(&match_distance)) = (
+        literal_lengths.get(usize::from(length_symbol)),
+        distance_lengths.get(usize::from(distance_symbol)),
+    ) else {
+        return false;
+    };
+    if match_literal == 0 || match_distance == 0 {
+        return false;
+    }
+    let match_bits = u64::from(match_literal)
+        + u64::from(match_distance)
+        + u64::from(length_extra_bits)
+        + u64::from(distance_extra_bits);
+    let mut literal_bits = 0_u64;
+    for &byte in decoded {
+        let length = literal_lengths[usize::from(byte)];
+        if length == 0 {
+            return false;
+        }
+        literal_bits += u64::from(length);
+        if literal_bits > match_bits {
+            return false;
+        }
+    }
+    literal_bits < match_bits || (include_equal && literal_bits == match_bits)
 }
 
 fn match_expansion_delta(

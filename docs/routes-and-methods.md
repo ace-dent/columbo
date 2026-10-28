@@ -2608,8 +2608,10 @@ keep the parent's spans.
 6. The feedback code is the one that spells the current spelling most cheaply,
    the first on ties. Except after the last pass, the spelling is rewritten
    under it with the DeflOpt rewrite or, in the exhaustive search, with the
-   shortest spelling when that is strictly cheaper. A pass whose spelling does
-   not change ends the seed.
+   shortest spelling when that is strictly cheaper. The exhaustive search skips
+   the DeflOpt rewrite when the spelling already costs what the shortest
+   spelling does: every change the rewrite makes is strictly cheaper, so it
+   would find none. A pass whose spelling does not change ends the seed.
 7. In every pass, deft4j's pruned header: under deft4j's code-length code for
    the current spelling (complete, coding every used symbol), expand every
    repeat whose explicit lengths cost no more, rebuild deft4j's code from the
