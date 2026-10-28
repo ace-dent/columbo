@@ -84,6 +84,7 @@ gains where established.
 | 28 Oct 2026 | [`46b7c44`](#46b7c44-28-october-2026) | Boundary slide, Huffman decoding and paired match expansions (`slide.rs`, `bitstream.rs`, `huffman.rs`, `search.rs`) | The slide's cut search walks the pair once, pricing each token once; decoding takes each code and its extra bits from one 32-bit window; the strict and tie-including expansions under the same codes share one walk | Default CPU 1.02× (33 inputs, 2.1% fewer cycles); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 cut-search and 20,000 paired-expansion comparisons; 691 Rust, 7 Python tests |
 | 28 Oct 2026 | [`c2aa4ba`](#c2aa4ba-28-october-2026) | Max header-plan buffers, expansion marks and generic heap entries (`header.rs`, `source_recode.rs`, `huffman.rs`) | The header planner's rewrites, local-rewrite steps, candidate trees, shortest-RLE memo and seed spellings use buffers kept per thread; the DeflOpt rewrite is skipped when the RLE already costs the shortest RLE's; source recode's expansion marks stop their literal sums at the match's cost; the generic builder's heap entries take one word | Replayed header plans 1.10× (5.5% fewer instructions); a completing Max run 7.1% fewer instructions; Default CPU 1.02× (33 inputs, 1.8% fewer cycles); peak memory −0.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 expansion-mark comparisons; 692 Rust, 7 Python tests |
 | 28 Oct 2026 | [`4013a14`](#4013a14-28-october-2026) | Code-length trees and feedback passes (`huffman.rs`, `header.rs`, `search.rs`) | Heap builds note tie turns per sift-down, and every variant whose rules agree shares the tree; the code-length tree cache tracks every heap build; an exhaustive pass prices a repaired first tree alone at exact Defluff's cost; seeds stop at a shortest RLE already followed; code-length heaps on stack arrays, a 19-length completeness check and exact Defluff on kept scratch | Replayed header plans 1.16× (9.4% fewer instructions, 11.0% fewer cycles); Default CPU 1.05× (33 inputs, 4.3% fewer cycles); a completing Max run 3.6% fewer instructions; executable one 16 KiB page larger | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 stack-array, 20,000 completeness and 20,000 first-tree comparisons; 694 Rust, 7 Python tests |
+| 28 Oct 2026 | [`6e6a0c4`](#6e6a0c4-28-october-2026) | Per-thread header-plan store (`header.rs`) | Each generation's plans appended to one byte arena with an offset index; one byte per RLE token, code lengths checked by decoding the RLE instead of stored; 16 MiB budget | 177 completing Max runs 1.06× (6.0% fewer instructions); Default CPU 1.03× (33 inputs, 3.1% fewer cycles); peak memory −1.1 MiB median Default, −4 MiB median Max, +39 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 177 completing and 2 long completing Max runs; 89,255 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 65,536 token-encoding checks; 695 Rust, 7 Python tests |
 
 ## Entries
 
@@ -480,6 +481,106 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `6e6a0c4`, 28 October 2026
+
+Batches: one paired run of each build on the 177 sprites whose Max search
+completes within 10 seconds, alternating order; two alternating runs of each
+completing Max run; retired instructions and cycles from `time -l` over the 33
+stratified Default inputs, two alternating rounds; whole-file Default CPU (user
+plus system) and peak resident memory over the same inputs, two rounds
+alternating the builds; one paired run of each build on every sixteenth
+DeflOpt PNG by name (58 files, Max at 10 seconds, alternating order); three
+rotating runs of the header-plan replay.
+
+A sampled profile of ten inputs in Max at 20 seconds at `6e6a0c4` (226,561 CPU
+samples) put the shortest-RLE search first (10.0% of self time), then the heap
+builder's tracked merge (4.9%), the greedy RLE seeds (4.8%) and the DeflOpt
+local rewrite (4.6%). Counters in test builds showed that seeds and shortest
+RLEs were not repeated: every seed spelling was distinct, and 354,163 of the
+366,901 shortest RLEs computed in the replay were adopted. Counters on the
+per-thread header-plan store were another matter. In Max runs of 20
+seconds, 72–93% of its lookups missed, and 6–44% of uncached header-planning
+time went to plans the same thread had already made: 10.7 of 24.6 seconds on
+`crossroads.png`, 5.8 of 30.4 on `OwlAlpha-0.5.png`. Most were 16,000 to 64,000
+misses after the first, while the store, at 400–790 charged bytes a plan,
+held 8,000 to 16,000. An unbounded store cut the repeated time on
+`crossroads.png` from 10.7 to 1.3 seconds but took peak memory to 1.17 GB.
+
+- **Compact header-plan store.** Each generation of the store now appends its
+  plans to one byte arena, found through an index of offsets, instead of a
+  packed allocation per plan in a table of plan records. An entry is 22 bytes
+  of fields and one byte per RLE token: lengths 0–15 as themselves, then codes
+  16, 17 and 18 from 16, 20 and 28 plus their extra values. The code lengths,
+  half of the old entry, are not stored, since the RLE spells them: a hit
+  decodes the RLE and compares the lengths it spells, and the policy, with the
+  lookup's. The arena grows in steps bounded by half the budget, so the charge
+  is its used bytes and the index's slots, with no per-entry allocator
+  overhead. The budget is now 16 MiB.
+
+| Store | 24 heaviest completing sprites, instructions | Default cycles | Default peak memory, largest rise |
+| --- | ---: | ---: | ---: |
+| Compact, 8 MiB | −4.7% | −1.2% | not measured |
+| Compact, 16 MiB | −7.1% | −2.4% | +23.1 MiB |
+| Compact, 32 MiB | −9.0% | −2.5% | +50.6 MiB |
+
+Each row is measured against `6e6a0c4`. A compact entry took 155 charged bytes
+on `crossroads.png` and 296 on `OwlAlpha-0.5.png`, against 528 and 788 before,
+so a 16 MiB generation held 54,000 and 28,000 plans.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 177 sprites, Max completing its search, instructions retired | 3,237.2 billion | 3,043.7 billion | −6.0% |
+| Same runs, user CPU | 251.8 s | 237.0 s | 1.06× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 19.45–19.46 billion | 18.57 billion | −4.6% |
+| Same run, user CPU | 1.52–1.53 s | 1.45 s | 1.05× |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.41 billion | 2.37 billion | −1.6% |
+| 33 Default inputs, instructions retired over two rounds | 1,168.5 billion | 1,140.3 billion | −2.41% |
+| Same inputs, cycles over two rounds | 282.7 billion | 273.9 billion | −3.10% |
+| Same inputs, CPU over two rounds | 89.8 s | 87.0 s | 1.03× |
+
+Median Default peak memory fell 1.1 MiB. `y2rc2_large.png`, 1.19× faster,
+peaked 20–22 MiB higher, near 70 MiB, `ss1.png` 11 MiB and the largest input
+11–14 MiB, near 960 MiB. In Max, the 177 sprites' median peak fell 4 MiB;
+`112-Rhydon-0.png`, the longest at 12 seconds and 1.14× faster, rose from 65 to
+104 MiB, while `036-Clefable-0.png` fell from about 41 to 27 MiB.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating
+builds), 57 outputs were identical and `monarch.png`, which reached the
+deadline, came out the same size with different bytes, in 436.7 instead of
+438.9 seconds.
+
+Equivalence: a new test round-trips every RLE token through its byte and checks
+that every other symbol and extra value is refused; the store's turnover and
+collision tests run against the compact store, and the per-thread store test
+compares every stored plan with uncached planning. Header plans take no stop,
+so a stored plan is complete, and every hit compares the complete code lengths
+and policy. The 89,255 replayed header plans, which bypass the store, matched
+plan for plan. API comparisons on the 52 inputs, in Default with the
+180-second budget and in zero-budget Max, matched in all 104 runs, and every
+Default timing run and every completing Max run matched byte for byte.
+Rust tests, including the private corpus, passed in release and debug modes,
+with documentation and Python tests, a locked build, formatting, all-feature
+Clippy with warnings denied and a package list without private fixtures or
+scratch artifacts. `__text` grew from 872,548 to 875,640 bytes; the shipped
+executable keeps its 958,512 bytes, and the final source builds the tested
+executable byte for byte.
+
+Measured and not kept in the same review:
+
+- A 32 MiB store: on the 24 heaviest completing sprites, 2.1% fewer
+  instructions than 16 MiB, but Default peak memory up to 50.6 MiB higher
+  instead of 23.1.
+- No route-local header-plan caches, leaving the per-thread store to find every
+  repeat: 0.8% fewer instructions on the 24 sprites and 0.4% fewer in Default,
+  but removing them reaches through five modules' signatures; left for a
+  separate change.
+- The block-plan store showed few repeats in Max: none on `crossroads.png`,
+  65 milliseconds of 39 seconds on `Banana512.png`, and 2.45 of 37 seconds on
+  `OwlAlpha-0.5.png`, 4,000 to 8,000 misses after the first.
+
+Artifacts: `work/efficiency-review-max6-20261028/`.
 
 ### `4013a14`, 28 October 2026
 

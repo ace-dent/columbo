@@ -1862,18 +1862,41 @@ fn stored_header_plans_round_trip_through_generation_turnover() {
             None => {
                 evictions += usize::from(inserted[index]);
                 inserted[index] = true;
-                store.insert(
-                    fingerprint,
-                    StoredHeaderPlan::pack(false, 0xff, &plans[index]).unwrap(),
-                );
+                store.insert(fingerprint, false, 0xff, &plans[index]);
             }
         }
-        assert!(store.current.bytes < store.max_bytes / 2);
+        assert!(store.current.charge() < store.max_bytes / 2);
     }
     assert!(
         hits > 0 && evictions > 0,
         "{hits} hits, {evictions} evictions"
     );
+}
+
+#[test]
+fn stored_rle_tokens_round_trip_through_one_byte() {
+    let mut encoded = 0;
+    for symbol in 0..=u8::MAX {
+        for extra in 0..=u8::MAX {
+            let token = RleToken { symbol, extra };
+            let valid = match symbol {
+                0..=15 => extra == 0,
+                16 => extra <= 3,
+                17 => extra <= 7,
+                18 => extra <= 127,
+                _ => false,
+            };
+            match rle_token_byte(token) {
+                Some(byte) => {
+                    assert!(valid, "{token:?}");
+                    assert_eq!(rle_token_from_byte(byte), token);
+                    encoded += 1;
+                }
+                None => assert!(!valid, "{token:?}"),
+            }
+        }
+    }
+    assert_eq!(encoded, 16 + 4 + 8 + 128);
 }
 
 #[test]
@@ -1890,7 +1913,7 @@ fn stored_header_plan_rejects_a_fingerprint_collision() {
     let plan = plan_for_trimmed_lengths_uncached(&literal, &distance, 0, false, 0xff).unwrap();
     for move_to_previous in [false, true] {
         let mut store = HeaderPlanStore::with_budget(usize::MAX);
-        store.insert(7, StoredHeaderPlan::pack(false, 0xff, &plan).unwrap());
+        store.insert(7, false, 0xff, &plan);
         if move_to_previous {
             store.previous = std::mem::take(&mut store.current);
         }
@@ -1929,7 +1952,7 @@ fn thread_header_plans_match_uncached_planning() {
         }
     }
     release_thread_header_plans();
-    assert!(HEADER_PLAN_STORE.with(|store| store.borrow().current.plans.is_empty()));
+    assert!(HEADER_PLAN_STORE.with(|store| store.borrow().current.offsets.is_empty()));
     assert!(HEADER_PLAN_SEARCH.with(Cell::take).is_none());
 }
 

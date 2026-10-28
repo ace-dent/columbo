@@ -21,7 +21,6 @@ use super::model::{
     count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token,
     CODE_LENGTH_ORDER, MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
 };
-use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
 use crate::sort::SortShared;
 
@@ -166,10 +165,10 @@ impl HeaderPlanCache {
     }
 }
 
-/// Charged bytes of completed header plans each thread keeps across routes.
-/// Allocator overhead roughly doubles the resident cost: on the Default
-/// benchmark sample, peak memory rose by at most 20 MiB.
-const MAX_THREAD_HEADER_PLAN_BYTES: usize = 8 << 20;
+/// Bytes of completed header plans each thread keeps across routes: the
+/// arenas' used bytes and the indexes' slots. On the Default benchmark sample,
+/// 16 MiB raised peak memory by at most 23 MiB and lowered the median.
+const MAX_THREAD_HEADER_PLAN_BYTES: usize = 16 << 20;
 
 /// A dynamic plan packed into one allocation: the code lengths two per byte,
 /// then each RLE token as its symbol and extra-bits value.
@@ -297,47 +296,81 @@ impl PackedDynamicPlan {
     }
 }
 
-/// A completed header plan priced with zero payload bits, and its policy.
-struct StoredHeaderPlan {
-    exhaustive: bool,
-    rle_mask: u8,
-    plan: PackedDynamicPlan,
+/// One generation of a [`HeaderPlanStore`]: each plan's bytes appended to one
+/// arena and found by fingerprint.
+#[derive(Default)]
+struct HeaderPlanGeneration {
+    offsets: HashMap<u64, u32>,
+    arena: Vec<u8>,
 }
 
-impl StoredHeaderPlan {
-    fn pack(exhaustive: bool, rle_mask: u8, kernel: &DynamicPlan) -> Option<Self> {
-        Some(Self {
-            exhaustive,
-            rle_mask,
-            plan: PackedDynamicPlan::pack(kernel)?,
-        })
-    }
-
-    fn matches(
-        &self,
-        literal_lengths: &[u8],
-        distance_lengths: &[u8],
-        exhaustive: bool,
-        rle_mask: u8,
-    ) -> bool {
-        self.exhaustive == exhaustive
-            && self.rle_mask == rle_mask
-            && self.plan.lengths_match(literal_lengths, distance_lengths)
-    }
-}
-
-impl Charged for StoredHeaderPlan {
-    /// A table slot with growth slack, and the packed allocation.
+impl HeaderPlanGeneration {
+    /// The bytes this generation holds, its index slots included. The arena
+    /// grows in steps bounded by the budget, so its length stands for it.
     fn charge(&self) -> usize {
-        2 * std::mem::size_of::<(u64, Self)>() + self.plan.heap_charge()
+        self.arena.len() + self.offsets.capacity() * (std::mem::size_of::<(u64, u32)>() + 1)
     }
+
+    /// Make room for `additional` arena bytes and one index slot: double the
+    /// arena, from 64 KiB, but not past `limit` bytes beyond the new entry.
+    fn reserve(&mut self, additional: usize, limit: usize) -> bool {
+        let length = self.arena.len();
+        if self.arena.capacity() - length < additional {
+            let target = (2 * self.arena.capacity())
+                .max(1 << 16)
+                .min(limit)
+                .max(length)
+                + additional;
+            if self.arena.try_reserve_exact(target - length).is_err() {
+                return false;
+            }
+        }
+        self.offsets.try_reserve(1).is_ok()
+    }
+}
+
+/// A stored plan's fixed fields: HLIT (2 bytes), HDIST, HCLEN, the
+/// `exhaustive` flag, the RLE mask, the 19 code-length code lengths two per
+/// byte (10), the bits (4) and the RLE token count (2). One byte per token
+/// follows.
+const STORED_HEADER_PLAN_FIELDS: usize = 22;
+
+/// A code-length symbol and its extra bits in one byte: lengths 0 to 15 as
+/// themselves, then code 16 from 16, code 17 from 20 and code 18 from 28.
+fn rle_token_byte(token: RleToken) -> Option<u8> {
+    let (base, extra_limit) = match token.symbol {
+        0..=15 => return (token.extra == 0).then_some(token.symbol),
+        16 => (16, 3),
+        17 => (20, 7),
+        18 => (28, 127),
+        _ => return None,
+    };
+    (token.extra <= extra_limit).then(|| base + token.extra)
+}
+
+fn rle_token_from_byte(byte: u8) -> RleToken {
+    let (symbol, extra) = match byte {
+        0..=15 => (byte, 0),
+        16..=19 => (16, byte - 16),
+        20..=27 => (17, byte - 20),
+        _ => (18, byte - 28),
+    };
+    RleToken { symbol, extra }
 }
 
 /// Completed header plans shared by every route on one thread. Routes replan
 /// the same code lengths from different token states, and each route-local
-/// [`HeaderPlanCache`] starts empty. Every hash hit compares the complete code
-/// lengths and policy before reuse.
-type HeaderPlanStore = PlanStore<StoredHeaderPlan>;
+/// [`HeaderPlanCache`] starts empty. Two generations within a byte budget, as
+/// in [`PlanStore`](super::plan_store::PlanStore): when the current generation
+/// reaches half the budget it replaces the previous one, and a hit in the
+/// previous generation moves forward. A plan is stored compactly, without its
+/// code lengths, which its RLE spells: every hash hit decodes the RLE and
+/// compares the complete code lengths and policy before reuse.
+struct HeaderPlanStore {
+    current: HeaderPlanGeneration,
+    previous: HeaderPlanGeneration,
+    max_bytes: usize,
+}
 
 impl Default for HeaderPlanStore {
     fn default() -> Self {
@@ -350,6 +383,14 @@ thread_local! {
 }
 
 impl HeaderPlanStore {
+    fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            current: HeaderPlanGeneration::default(),
+            previous: HeaderPlanGeneration::default(),
+            max_bytes,
+        }
+    }
+
     fn get(
         &mut self,
         fingerprint: u64,
@@ -358,12 +399,175 @@ impl HeaderPlanStore {
         exhaustive: bool,
         rle_mask: u8,
     ) -> Option<DynamicPlan> {
-        self.lookup(
-            fingerprint,
-            |entry| entry.matches(literal_lengths, distance_lengths, exhaustive, rle_mask),
-            |entry| entry.plan.unpack(),
-        )
+        let read = |arena: &[u8], offset: u32| {
+            read_stored_header_plan(
+                arena.get(offset as usize..)?,
+                literal_lengths,
+                distance_lengths,
+                exhaustive,
+                rle_mask,
+            )
+        };
+        if let Some(&offset) = self.current.offsets.get(&fingerprint) {
+            return read(&self.current.arena, offset).map(|(plan, _)| plan);
+        }
+        let offset = self.previous.offsets.remove(&fingerprint)?;
+        let (plan, length) = read(&self.previous.arena, offset)?;
+        // The entry moves forward; its old bytes go with the previous
+        // generation.
+        let start = offset as usize;
+        if let Some(new_offset) = self.make_room(length) {
+            self.current
+                .arena
+                .extend_from_slice(&self.previous.arena[start..start + length]);
+            self.index(fingerprint, new_offset);
+        }
+        Some(plan)
     }
+
+    /// Store `plan`, planned for its own code lengths under this policy.
+    fn insert(&mut self, fingerprint: u64, exhaustive: bool, rle_mask: u8, plan: &DynamicPlan) {
+        let mut entry = [0_u8; STORED_HEADER_PLAN_FIELDS];
+        let (Ok(hlit), Ok(hdist), Ok(hclen), Ok(bits), Ok(tokens)) = (
+            u16::try_from(plan.hlit),
+            u8::try_from(plan.hdist),
+            u8::try_from(plan.hclen),
+            u32::try_from(plan.bits),
+            u16::try_from(plan.rle.len()),
+        ) else {
+            return;
+        };
+        if plan.literal_lengths.len() != plan.hlit
+            || plan.distance_lengths.len() != plan.hdist
+            || plan.code_length_lengths.iter().any(|&length| length > 15)
+        {
+            return;
+        }
+        debug_assert!(rle_spells(
+            &plan.rle,
+            plan.literal_lengths.iter().chain(&plan.distance_lengths)
+        ));
+        entry[0..2].copy_from_slice(&hlit.to_le_bytes());
+        entry[2] = hdist;
+        entry[3] = hclen;
+        entry[4] = u8::from(exhaustive);
+        entry[5] = rle_mask;
+        for (byte, pair) in entry[6..16]
+            .iter_mut()
+            .zip(plan.code_length_lengths.chunks(2))
+        {
+            *byte = pair[0] | pair.get(1).map_or(0, |&high| high << 4);
+        }
+        entry[16..20].copy_from_slice(&bits.to_le_bytes());
+        entry[20..22].copy_from_slice(&tokens.to_le_bytes());
+        let Some(offset) = self.make_room(STORED_HEADER_PLAN_FIELDS + plan.rle.len()) else {
+            return;
+        };
+        let arena = &mut self.current.arena;
+        arena.extend_from_slice(&entry);
+        for &token in &plan.rle {
+            let Some(byte) = rle_token_byte(token) else {
+                arena.truncate(offset as usize);
+                return;
+            };
+            arena.push(byte);
+        }
+        self.index(fingerprint, offset);
+    }
+
+    /// Reserve `length` bytes at the end of the current generation, returning
+    /// their offset.
+    fn make_room(&mut self, length: usize) -> Option<u32> {
+        let offset = u32::try_from(self.current.arena.len()).ok()?;
+        self.current
+            .reserve(length, self.max_bytes / 2)
+            .then_some(offset)
+    }
+
+    /// Index the entry written at `offset`, then start a new generation once
+    /// this one reaches half the budget.
+    fn index(&mut self, fingerprint: u64, offset: u32) {
+        self.current.offsets.insert(fingerprint, offset);
+        if self.current.charge() >= self.max_bytes / 2 {
+            self.previous = std::mem::take(&mut self.current);
+        }
+    }
+}
+
+/// Whether `rle` spells exactly `lengths`.
+fn rle_spells<'a>(rle: &[RleToken], lengths: impl IntoIterator<Item = &'a u8>) -> bool {
+    let mut lengths = lengths.into_iter().copied();
+    let mut previous = None;
+    for token in rle {
+        let (value, count) = match token.symbol {
+            0..=15 => (token.symbol, 1),
+            16 => match previous {
+                Some(value) => (value, usize::from(token.extra) + 3),
+                None => return false,
+            },
+            17 => (0, usize::from(token.extra) + 3),
+            18 => (0, usize::from(token.extra) + 11),
+            _ => return false,
+        };
+        if !(0..count).all(|_| lengths.next() == Some(value)) {
+            return false;
+        }
+        previous = Some(value);
+    }
+    lengths.next().is_none()
+}
+
+/// The plan stored at the start of `entry` if it was planned for these code
+/// lengths under this policy, and the entry's length.
+fn read_stored_header_plan(
+    entry: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    exhaustive: bool,
+    rle_mask: u8,
+) -> Option<(DynamicPlan, usize)> {
+    let fields = entry.get(..STORED_HEADER_PLAN_FIELDS)?;
+    let hlit = usize::from(u16::from_le_bytes([fields[0], fields[1]]));
+    let hdist = usize::from(fields[2]);
+    if hlit != literal_lengths.len()
+        || hdist != distance_lengths.len()
+        || fields[4] != u8::from(exhaustive)
+        || fields[5] != rle_mask
+    {
+        return None;
+    }
+    let token_count = usize::from(u16::from_le_bytes([fields[20], fields[21]]));
+    let length = STORED_HEADER_PLAN_FIELDS + token_count;
+    let tokens = entry.get(STORED_HEADER_PLAN_FIELDS..length)?;
+    let mut rle = Vec::new();
+    rle.try_reserve_exact(token_count).ok()?;
+    rle.extend(tokens.iter().map(|&byte| rle_token_from_byte(byte)));
+    if !rle_spells(&rle, literal_lengths.iter().chain(distance_lengths)) {
+        return None;
+    }
+    let mut code_length_lengths = [0_u8; 19];
+    for (index, length) in code_length_lengths.iter_mut().enumerate() {
+        *length = (fields[6 + index / 2] >> (4 * (index % 2))) & 15;
+    }
+    let mut literal = Vec::new();
+    literal.try_reserve_exact(hlit).ok()?;
+    literal.extend_from_slice(literal_lengths);
+    let mut distance = Vec::new();
+    distance.try_reserve_exact(hdist).ok()?;
+    distance.extend_from_slice(distance_lengths);
+    let plan = DynamicPlan {
+        literal_lengths: literal,
+        distance_lengths: distance,
+        code_length_lengths,
+        rle,
+        hlit,
+        hdist,
+        hclen: usize::from(fields[3]),
+        bits: u64::from(u32::from_le_bytes([
+            fields[16], fields[17], fields[18], fields[19],
+        ])),
+    };
+    Some((plan, length))
 }
 
 /// Plan a header for trimmed code lengths with zero payload bits, reusing this
@@ -397,10 +601,12 @@ fn stored_header_plan_kernel(
         exhaustive,
         rle_mask,
     )?;
-    if let Some(entry) = StoredHeaderPlan::pack(exhaustive, rle_mask, &plan) {
+    // The planner keeps the code lengths it is given, which the store then
+    // need not hold.
+    if plan.literal_lengths == literal_lengths && plan.distance_lengths == distance_lengths {
         let _ = HEADER_PLAN_STORE.try_with(|store| {
             if let Ok(mut store) = store.try_borrow_mut() {
-                store.insert(fingerprint, entry);
+                store.insert(fingerprint, exhaustive, rle_mask, &plan);
             }
         });
     }

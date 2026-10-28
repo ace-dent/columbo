@@ -7184,9 +7184,10 @@ seconds re-planned a token state the run had already planned.
    APNG Default lanes that kept their stores across frames raised the largest
    APNG files' peak memory by 20 to 42 MiB.
 
-**Two-generation store** (`PlanStore`). The block and header stores share one
-container that approximates least-recently-used eviction in a fixed byte budget,
-with constant-time hash operations and no per-entry recency bookkeeping:
+**Two-generation store** (`PlanStore`). The block store uses a container that
+approximates least-recently-used eviction in a fixed byte budget, with
+constant-time hash operations and no per-entry recency bookkeeping; the header
+store follows the same policy over compact entries:
 
 - Entries go into the current generation. When its charge reaches half the
   budget, 4 MiB of 8 MiB, it becomes the previous generation and the older one
@@ -7245,12 +7246,21 @@ and policy of a plan already completed earlier on the same thread, and they took
 explicit-length header plans such as those of greedy length swaps, consult a
 per-thread store with the same key and verification.
 
-- Each entry packs the code lengths two per byte and the RLE tokens as symbol
-  and extra-value byte pairs in one allocation. Plans whose lengths exceed 15 or
-  disagree with HLIT and HDIST do not pack and are not stored.
-- The store holds two generations within an 8 MiB charge. Allocator overhead
-  roughly doubles the resident cost: on the Default benchmark sample, peak
-  memory rose by at most 20 MiB.
+- Each generation appends its entries to one byte arena, found through an
+  index of offsets by fingerprint, so storing a plan allocates nothing of its
+  own. An entry is 22 bytes of fields (HLIT, HDIST, HCLEN, the policy, the 19
+  code-length code lengths two per byte, the bits and the token count) and one
+  byte per RLE token: lengths 0–15 as themselves, then code 16 from 16, code 17
+  from 20 and code 18 from 28, each plus its extra value.
+- The code lengths are not stored: the RLE spells them. A hit decodes the RLE
+  and compares the lengths it spells, HLIT, HDIST and the policy with the
+  lookup's. A plan is stored only when the planner kept the code lengths it was
+  given.
+- The store holds two generations within 16 MiB: each arena's used bytes, which
+  grow in steps bounded by half the budget, and each index's slots. An entry
+  takes about a third of the old packed form's charge, without its allocator
+  overhead: 155 bytes a plan on `crossroads.png` and 296 on `OwlAlpha-0.5.png`,
+  against 528 and 788 before.
 - Header plans take no stop, so every stored plan is complete.
 - The store is emptied when the top-level `optimize` call returns, and freed
   when a worker thread exits. It is not emptied per stream, so a lane thread
@@ -7273,6 +7283,13 @@ to 130.8 seconds (1.38×), with peak memory 3.8 MiB higher at the median and 20.
 MiB at most. A 16 MiB unpacked store gave 1.46× but up to 72.1 MiB more peak
 memory and was rejected
 ([efficiency review `dc68b5f`](research/efficiency-review.md#dc68b5f-13-october-2026)).
+Max replans far more than Default: in Max runs of 20 seconds, 72–93% of store
+lookups missed, and up to 44% of uncached header-planning time recomputed plans
+the thread had made before, most of them 16,000 to 64,000 misses earlier, while
+the packed store held 8,000 to 16,000. The compact 16 MiB store holds 28,000 to
+54,000 in each generation, and took 177 completing Max runs 1.06× faster and 33
+Default inputs 1.03×
+([efficiency review `6e6a0c4`](research/efficiency-review.md#6e6a0c4-28-october-2026)).
 
 ### Code-length codes and RLE run tables
 
