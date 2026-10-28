@@ -85,7 +85,49 @@ build's 10-second size. The three still larger at 30 seconds (`OwlAlpha-0.5.png`
 (194,694 against 194,695, 9,299 against 9,307, 269,718 against 269,719). These
 are deadline cuts. One is a non-monotonic step in the current build:
 `sample-hut-400x300.png` gives 269,714 bytes at 10 seconds and 269,718 at 30
-and 60. Reruns are in `work/deflopt-9f36bdb-reruns/`.
+and 60 ([traced below](#sample-hut-step-27-october)). Reruns are in
+`work/deflopt-9f36bdb-reruns/`.
+
+<a id="sample-hut-step-27-october"></a>
+
+### The non-monotonic step on `sample-hut-400x300.png`
+
+Traced on 28 October at `ef24dbd`, whose executable gives the same sizes. Each
+allowance gave the same bytes twice:
+
+| Allowance | Bytes |
+| --- | ---: |
+| 10–14 seconds | 269,714 |
+| 15 and 20 seconds | 269,719 |
+| 30, 45 and 60 seconds | 269,718 |
+| 120 seconds | 269,707 |
+
+The winning lineage is the floor-seeded continuation
+([M7a](routes-and-methods.md#m7a-best-first-floor-continuation)). It starts
+from the floor-seeded candidate at 2,157,539 bits and stops at the primary hard
+stop in every run, even at 60 seconds. Its Max plan reaches 2,157,532 bits by
+12 seconds and 2,157,522 by 15; from 30 seconds the plan completes at
+2,157,517 and its first replay is cut. Near 14 seconds the cut falls either
+way: a traced build took the 15-second path there. The terminal stage then
+settles completely from each start, but not in the order of the starts:
+
+| Terminal start | Endpoint | Bytes |
+| ---: | ---: | ---: |
+| 2,157,532 bits | 2,156,886 bits | 269,714 |
+| 2,157,522 bits | 2,156,921 bits | 269,719 |
+| 2,157,517 bits | 2,156,918 bits | 269,718 |
+
+No candidate is lost. The 2,157,532-bit plan exists only in the shorter run,
+cut part way through the planner rather than between replay rounds, so a longer
+run never holds it for [M14](routes-and-methods.md#m14-replaced-candidate-close)
+to keep. M14's kept list, the continuation's input and an earlier normal-floor
+candidate, was not closed in any traced run from 12 to 60 seconds, because
+[G0](routes-and-methods.md#g0-timed-route-start) had closed before the
+terminal stage; finishing the continuation's input regardless ends at
+2,156,939 bits, larger still. Recovering the shorter run's endpoint would mean
+finishing several nearby starts with no way to tell which wins, so nothing
+changes; with 120 seconds Max ends below every shorter run. Traces are in
+`work/sample-hut-nonmonotonic/`.
 
 <a id="apng-refresh-26-october"></a>
 
