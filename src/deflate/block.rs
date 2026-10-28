@@ -10,13 +10,16 @@ use std::sync::Arc;
 use crate::{Error, Options, Result};
 
 use super::bitstream::BitWriter;
-use super::header::{best_dynamic_plan_cached, token_bits, HeaderPlanCache, PackedDynamicPlan};
+use super::header::{
+    best_dynamic_plan_cached, token_bits, token_bits_from_frequencies, HeaderPlanCache,
+    PackedDynamicPlan,
+};
 use super::huffman::{
     fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    same_tokens, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock,
-    Representation, SourceBlockType, Token, CODE_LENGTH_ORDER,
+    frequency_extra_bits, same_tokens, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock,
+    PlannedBlock, Representation, SourceBlockType, Token, CODE_LENGTH_ORDER,
 };
 use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
@@ -193,10 +196,9 @@ pub(crate) fn plan_reusable_block_with_header_cache(
             return plan;
         }
     }
-    // The key's extra bits spare the planner another pass over the tokens.
     let extra_bits = key
         .as_ref()
-        .map_or_else(|| token_extra_bits(&block.tokens), |key| key.extra_bits);
+        .map_or_else(|| block_extra_bits(block), |key| key.extra_bits);
     let plan = plan_reusable_block_uncached(block, options, stop, header_cache, extra_bits);
     // Stops only move forward, so one that is not reached now was not reached
     // while planning: the plan is complete.
@@ -219,7 +221,7 @@ fn plan_reusable_block_uncached(
     header_cache: &mut HeaderPlanCache,
     extra_bits: u64,
 ) -> ReusableBlockPlan {
-    let fixed_bits = fixed_block_bits(&block.tokens).unwrap_or(u64::MAX);
+    let fixed_bits = fixed_block_bits_from_frequencies(block, extra_bits).unwrap_or(u64::MAX);
     let dynamic = best_dynamic_plan_cached(
         &block.tokens,
         &block.literal_frequencies,
@@ -249,6 +251,13 @@ fn plan_reusable_block_uncached(
     }
 }
 
+/// The extra bits of the block's tokens, from its symbol counts.
+fn block_extra_bits(block: &ParsedBlock) -> u64 {
+    let extra_bits = frequency_extra_bits(&block.literal_frequencies, &block.distance_frequencies);
+    debug_assert_eq!(extra_bits, token_extra_bits(&block.tokens));
+    extra_bits
+}
+
 /// The inputs of a block plan besides its symbol counts. Planning reads the
 /// tokens only through their symbol counts and extra bits, so two blocks with
 /// equal counts, extra bits, source header and policy get the same plan in
@@ -264,7 +273,7 @@ struct BlockPlanKey {
 impl BlockPlanKey {
     fn new(block: &ParsedBlock, options: &Options) -> Self {
         let token_count = block.tokens.len();
-        let extra_bits = token_extra_bits(&block.tokens);
+        let extra_bits = block_extra_bits(block);
         let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
         for counts in [&block.literal_frequencies[..], &block.distance_frequencies] {
             mix_plan_fingerprint_lanes(&mut fingerprint, counts, |lane, count| {
@@ -764,6 +773,21 @@ pub(crate) fn fixed_block_bits(tokens: &[Token]) -> Option<u64> {
         &FIXED_DISTANCE_CODE_LENGTHS,
     )?
     .checked_add(3)
+}
+
+/// [`fixed_block_bits`] from the block's symbol counts and the extra bits of
+/// its tokens, without visiting the tokens.
+fn fixed_block_bits_from_frequencies(block: &ParsedBlock, extra_bits: u64) -> Option<u64> {
+    let bits = token_bits_from_frequencies(
+        &block.literal_frequencies,
+        &block.distance_frequencies,
+        &FIXED_LITERAL_CODE_LENGTHS,
+        &FIXED_DISTANCE_CODE_LENGTHS,
+        extra_bits,
+    )?
+    .checked_add(3);
+    debug_assert_eq!(bits, fixed_block_bits(&block.tokens));
+    bits
 }
 
 pub(crate) fn stored_block_bits(mut alignment: u8, plain_size: usize) -> u64 {

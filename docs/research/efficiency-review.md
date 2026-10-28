@@ -79,6 +79,7 @@ gains where established.
 | 25 Oct 2026 | [`d96ab5c`](#d96ab5c-25-october-2026) | Max header search and ordered queue (`header.rs`, `huffman.rs`, `search.rs`) | The generic builder's heap merges reuse their buffers; the shortest RLE picks its earliest minimum without branches, is counted in four tables and compared with the local rewrite from counts; the code-length tree slot is hashed in four lanes; the ordered queue's visited token sequences use a multiply-rotate hash instead of SipHash | Completing Max runs 3.4% and 10.5% fewer instructions; captured header plans 1.03×; Default CPU unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 20,000 minimum and 20,000 cost comparisons; 679 Rust, 7 Python tests |
 | 25 Oct 2026 | [`2c702f5`](#2c702f5-25-october-2026) | Max shortest RLE and header caches (`header.rs`, `huffman.rs`) | Each run of equal code lengths spelled from per-thread tables by run length and costs; a plan's runs found once for its seeds and shortest RLEs; eight code lengths per fingerprint step; one tree-cache slot per feedback pass, histograms compared without `memcmp`; merge and best-plan buffers reused; plans packed in pairs | Captured shortest-RLE calls 3.2×; captured header plans 1.19×; completing Max runs 46.2% and 12.8% fewer instructions; Default CPU 1.03× | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 403,865 captured shortest-RLE calls; 2 completing Max runs; 58 Max runs at 10 seconds; 6,000 kept-scratch and 2,000 packing comparisons; 680 Rust, 7 Python tests |
 | 25 Oct 2026 | [`e25d20d`](#e25d20d-25-october-2026) | Header feedback passes (`header.rs`, `huffman.rs`) | A pass whose first code-length tree is a complete Huffman tree that fits 7 bits unrepaired prices and follows it alone, since every other code can at best tie; seeds and shortest RLEs counted as spelled | Captured header plans 1.44× (24.8% fewer instructions); completing Max runs 22.7% and 4.3% fewer instructions; Default CPU 1.08× | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 20,000 histogram comparisons; 681 Rust, 7 Python tests |
+| 28 Oct 2026 | [`3b5fa64`](#3b5fa64-28-october-2026) | Block sums, heap trees and package-merge (`block.rs`, `header.rs`, `huffman.rs`, `search.rs`) | A block's extra bits, fixed-code price and source-header payload from its symbol counts; a variant-0 heap build that finds no comparison a tie rule could decide gives its tree to every variant sharing those rules, in the code-length tree cache and the payload tree lists; package-merge's buffers kept per thread | Default CPU 1.07× (33 inputs, 6.7% fewer cycles); replayed header plans 1.04×; a completing Max run 3.2% fewer instructions; peak memory −0.4 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 tracked-heap and 20,000 shuffled tree-cache comparisons; 688 Rust, 7 Python tests |
 
 ## Entries
 
@@ -475,6 +476,101 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `3b5fa64`, 28 October 2026
+
+Batches: whole-file CPU (user plus system) and peak resident memory over the
+33 stratified Default inputs, two rounds alternating the builds; retired
+instructions and cycles from `time -l` over the same inputs, two alternating
+rounds per comparison; three alternating runs of the header-plan replay; two
+alternating runs of each completing Max run.
+
+A sampled Default profile of the 33 inputs at `3b5fa64` (47,669 CPU samples)
+put 27% of self time in the DeflOpt and order-key heap builder, 57% of it on
+code-length codes and 32% on payload trees. Counters in a test build found 21.7
+million code-length heap builds and 1.6 million payload builds behind 774,253
+uncached header plans. The block planner also scanned every token for the
+extra-bit total of the block-plan key (1.8% of samples) and again for the
+fixed-code price.
+
+- **Block sums from counts.** Each length and distance symbol carries a fixed
+  number of extra bits, so a block's extra-bit total comes from its 316 symbol
+  counts. So do the fixed-code price and, in the dynamic planner, the payload
+  of the source header. Debug builds check each against the token scan.
+- **Shared heap trees.** Every variant of the DeflOpt and order-key heaps
+  starts from the same frequency-ordered heap; they differ only in the tie rule
+  of each merge sift-down. A comparison asks whether one entry is strictly less
+  than another, so it turns on a rule only when the frequencies are equal and
+  the entry that would move up has the smaller height (DeflOpt) or creation
+  order (order-key). A build that notes no such comparison follows the
+  frequency-only steps, as every variant of its heap then does; with neither
+  kind, every variant of both heaps does, and all build and repair the same
+  tree. The code-length tree cache stores that tree for each of them, and the
+  payload tree lists and the short-family floor's variant loops skip builds
+  that would only repeat it. On the 33 inputs the DeflOpt variants agree on
+  21.8% of code-length builds and all seven trees on 10.5%. Noting adds work
+  to every comparison, so only a histogram's first heap tree and the first
+  build in each list track, and only variant 0, which they all ask for first,
+  has a tracking merge.
+- **Package-merge buffers.** Defluff's limited code-length builder runs
+  package-merge when its tree is deeper than 7 bits; the seven buffers it
+  allocated per call are kept in the thread's tree-build scratch.
+
+| Candidate | Instructions | Cycles |
+| --- | ---: | ---: |
+| Block sums from counts, against `3b5fa64` | −5.28% | |
+| Shared heap trees and package-merge buffers, against the block sums | +0.38% | −2.72% |
+| Package-merge buffers alone, with an earlier form of the sharing | −0.16% | −0.32% |
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, CPU over two rounds | 106.7 s | 99.7 s | 1.07× |
+| Same inputs, cycles over two rounds | 335.3 billion | 312.9 billion | −6.66% |
+| Same inputs, instructions retired | 1,351.3 billion | 1,285.1 billion | −4.90% |
+| 89,255 header plans captured from ten Max runs, replayed (median) | 2.264 s | 2.179 s | 1.04× |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.50 billion | 2.42 billion | −3.2% |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 22.89–22.90 billion | 22.91–22.92 billion | +0.1% |
+
+The largest inputs gained 1.05–1.07×, `Banana512.png` 1.23×. Median peak memory
+fell 0.4 MiB, and the largest rise was 4.7 MiB.
+
+Equivalence: a new test builds 20,000 random alphabets of code-length,
+distance and literal/length size, mostly of small, tied counts, and checks
+every tracked build of both heaps, all variants, at limits 7 and 15, against
+the untracked builds, and every tree a build reports as shared against that
+variant's own. Another asks 20,000 random histograms for all 15 code-length
+builders in shuffled order through the tree cache and compares each with the
+builder's own tree. The 89,255 replayed header plans matched plan for plan. API
+comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs, and every timing run and both
+completing Max runs matched byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python tests,
+a locked build, formatting and a package list without private fixtures or
+scratch artifacts. All-feature Clippy with warnings denied reported only the
+three errors already present at `3b5fa64`: two unused `state` parameters in
+`schedule.rs` and a needless struct update in `optimize.rs`. `__text` grew
+from 864,312 to 867,336 bytes; the shipped executable keeps its 942,064 bytes,
+and the final source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Tracking ties in every heap build: 1.006× over the block sums alone, the
+  noting about as costly as the builds it saved.
+- A tracking copy of all four merges: about 2.5% fewer cycles than the block
+  sums, but `__text` reached 869,504 bytes and the shipped executable crossed
+  a 16 KiB page, from 942,064 to 958,480 bytes. A runtime switch kept the size
+  but retired 2.56% more instructions for 1.95% fewer cycles.
+- Weaker conditions for sharing: only 11% of code-length builds compare no
+  equal counts with different tie fields at all; requiring the second-least
+  count below the third at every merge, which would also share deft4j's and the
+  generic builder's trees, held for 15.1%, and 11.5% unrepaired.
+- Reusing work across a header plan's RLE seeds: 214,408 of 1.7 million later
+  feedback passes, and 6.8% of 9.55 million local-rewrite steps, repeat an RLE
+  or step an earlier seed explored, and most seeds stop after their first pass.
+- Skipping provably duplicate greedy RLE seeds: 14% of 5.0 million greedy
+  spellings are dropped as duplicates, about 0.6% of CPU.
+
+Artifacts: `work/efficiency-review-default4-20261027/`.
 
 ### `e25d20d`, 25 October 2026
 

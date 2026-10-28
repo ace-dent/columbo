@@ -14,12 +14,12 @@ use super::huffman::{
     make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into,
     make_lengths_order_heap_into_with_scratch, make_lengths_zopfli_package_from,
-    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, TreeBuildScratch,
+    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, HeapBuild, TreeBuildScratch,
     FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
-    MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
+    count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token,
+    CODE_LENGTH_ORDER, MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
 };
 use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
@@ -457,68 +457,88 @@ impl CodeLengthBuilder {
         Some(index as usize)
     }
 
-    /// Build this builder's tree.
+    /// Build this builder's tree. `track_ties` asks a heap builder which
+    /// other heap variants build the same tree.
     fn build(
         self,
         frequencies: &[u32; 19],
+        track_ties: bool,
         heap_scratch: &mut TreeBuildScratch,
     ) -> BuiltCodeLengthTree {
         let mut lengths = [0_u8; 19];
-        let mut unlimited = false;
+        let mut shared = 0;
         let mut huffman = false;
+        let mut heap_build = |build: HeapBuild| {
+            huffman = !build.repaired;
+            if build.all_deflopt_variants {
+                shared |= DEFLOPT_HEAP_TREES;
+            }
+            if build.all_order_variants {
+                shared |= ORDER_HEAP_TREES;
+            }
+        };
         match self {
-            Self::DefloptHeap(variant) => {
-                huffman = !make_lengths_deflopt_heap_into_with_scratch(
-                    frequencies,
-                    &mut lengths,
-                    7,
-                    variant,
-                    heap_scratch,
-                );
-            }
-            Self::OrderHeap(variant) => {
-                huffman = !make_lengths_order_heap_into_with_scratch(
-                    frequencies,
-                    &mut lengths,
-                    7,
-                    variant,
-                    heap_scratch,
-                );
-            }
+            Self::DefloptHeap(variant) => heap_build(make_lengths_deflopt_heap_into_with_scratch(
+                frequencies,
+                &mut lengths,
+                7,
+                variant,
+                track_ties,
+                heap_scratch,
+            )),
+            Self::OrderHeap(variant) => heap_build(make_lengths_order_heap_into_with_scratch(
+                frequencies,
+                &mut lengths,
+                7,
+                variant,
+                track_ties,
+                heap_scratch,
+            )),
             Self::Deft4jJavaHeap => {
                 make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7, heap_scratch)
             }
             Self::DefluffLimited => {
-                unlimited = !make_lengths_columbo_defluff_limited_into(
+                if !make_lengths_columbo_defluff_limited_into(
                     frequencies,
                     &mut lengths,
                     7,
                     0,
                     heap_scratch,
-                );
+                ) {
+                    shared = UNLIMITED_TREES;
+                }
             }
             Self::Columbo(variant) => {
                 let repaired =
                     make_lengths_into(frequencies, &mut lengths, 7, variant, heap_scratch);
-                unlimited = variant == 0 && !repaired;
+                if variant == 0 && !repaired {
+                    shared = UNLIMITED_TREES;
+                }
             }
             Self::DefluffExact => make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0),
         }
         BuiltCodeLengthTree {
             lengths,
-            unlimited,
+            shared,
             huffman,
         }
     }
 }
 
+/// The [`CodeLengthBuilder::index`] bits of every DeflOpt heap variant.
+const DEFLOPT_HEAP_TREES: u16 = 0b1111;
+/// The [`CodeLengthBuilder::index`] bits of every order-key heap variant.
+const ORDER_HEAP_TREES: u16 = 0b111_1000;
+/// `DefluffLimited` and `Columbo(0)` start from the same variant-0 Huffman
+/// tree and differ only in how they limit one deeper than 7 bits.
+const UNLIMITED_TREES: u16 = 1 << 8 | 1 << 9;
+
 /// A code-length code a builder gave one RLE histogram.
 struct BuiltCodeLengthTree {
     lengths: [u8; 19],
-    /// Whether this is also the tree of both `DefluffLimited` and `Columbo(0)`:
-    /// they start from the same variant-0 Huffman tree and differ only in how
-    /// they limit one deeper than 7 bits.
-    unlimited: bool,
+    /// The [`CodeLengthBuilder::index`] bits of other builders known to build
+    /// the same tree for this histogram.
+    shared: u16,
     /// Whether a heap builder's Huffman tree fit 7 bits unrepaired, so no
     /// prefix code spells the histogram's symbols in fewer bits.
     huffman: bool,
@@ -621,14 +641,20 @@ impl<'a> CodeLengthTrees<'a> {
     ) -> ([u8; 19], bool) {
         let Self { frequencies, slot } = *self;
         let Some(index) = builder.index() else {
-            let built = builder.build(frequencies, heap_scratch);
+            let built = builder.build(frequencies, false, heap_scratch);
             return (built.lengths, built.huffman);
         };
+        // The heap trees this thread holds for the histogram, if any.
+        let mut heap_trees = 0;
         let cached = CODE_LENGTH_TREES
             .try_with(|cache| {
                 let cache = cache.try_borrow().ok()?;
                 let entry = cache.as_ref()?.get(slot)?;
-                (entry.built & (1 << index) != 0 && same_histogram(&entry.frequencies, frequencies))
+                if !same_histogram(&entry.frequencies, frequencies) {
+                    return None;
+                }
+                heap_trees = entry.built & (DEFLOPT_HEAP_TREES | ORDER_HEAP_TREES);
+                (entry.built & (1 << index) != 0)
                     .then_some((entry.lengths[index], entry.huffman & (1 << index) != 0))
             })
             .ok()
@@ -637,11 +663,14 @@ impl<'a> CodeLengthTrees<'a> {
             return cached;
         }
 
+        // Tracking adds work to every comparison, so only a histogram's first
+        // heap tree learns which variants share it. When it finds a tie that
+        // could turn, the variants asked for next mostly build other trees.
         let BuiltCodeLengthTree {
             lengths,
-            unlimited,
+            shared,
             huffman,
-        } = builder.build(frequencies, heap_scratch);
+        } = builder.build(frequencies, heap_trees == 0, heap_scratch);
         let _ = CODE_LENGTH_TREES.try_with(|cache| {
             let Ok(mut cache) = cache.try_borrow_mut() else {
                 return;
@@ -668,15 +697,10 @@ impl<'a> CodeLengthTrees<'a> {
                 entry.built = 0;
                 entry.huffman = 0;
             }
-            let shared: &[CodeLengthBuilder] = if unlimited {
-                &[
-                    CodeLengthBuilder::DefluffLimited,
-                    CodeLengthBuilder::Columbo(0),
-                ]
-            } else {
-                &[builder]
-            };
-            for index in shared.iter().filter_map(|builder| builder.index()) {
+            let mut indices = shared | 1 << index;
+            while indices != 0 {
+                let index = indices.trailing_zeros() as usize;
+                indices &= indices - 1;
                 entry.lengths[index] = lengths;
                 entry.built |= 1 << index;
                 entry.huffman = (entry.huffman & !(1 << index)) | (u16::from(huffman) << index);
@@ -846,6 +870,36 @@ pub(crate) fn score_existing_dynamic(
     source: &DynamicPlan,
     strict: bool,
 ) -> Option<DynamicPlan> {
+    score_existing_dynamic_with(source, strict, |literal_lengths, distance_lengths| {
+        token_bits(tokens, literal_lengths, distance_lengths)
+    })
+}
+
+/// [`score_existing_dynamic`] for the tokens these symbol counts and extra
+/// bits describe, without visiting the tokens.
+fn score_existing_dynamic_from_frequencies(
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    extra_bits: u64,
+    source: &DynamicPlan,
+    strict: bool,
+) -> Option<DynamicPlan> {
+    score_existing_dynamic_with(source, strict, |literal_lengths, distance_lengths| {
+        token_bits_from_frequencies(
+            literal_frequencies,
+            distance_frequencies,
+            literal_lengths,
+            distance_lengths,
+            extra_bits,
+        )
+    })
+}
+
+fn score_existing_dynamic_with(
+    source: &DynamicPlan,
+    strict: bool,
+    data_bits: impl FnOnce(&[u8], &[u8]) -> Option<u64>,
+) -> Option<DynamicPlan> {
     if strict && !source.has_strictly_compatible_huffman_codes() {
         return None;
     }
@@ -867,7 +921,7 @@ pub(crate) fn score_existing_dynamic(
         return None;
     }
     let mut plan = source.clone();
-    let data_bits = token_bits(tokens, &plan.literal_lengths, &plan.distance_lengths)?;
+    let data_bits = data_bits(&plan.literal_lengths, &plan.distance_lengths)?;
     plan.bits = dynamic_bits(data_bits, &plan)?;
     Some(plan)
 }
@@ -887,7 +941,21 @@ pub(crate) fn best_dynamic_plan_cached(
     header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
     debug_assert_eq!(extra_bits, token_extra_bits(tokens));
-    let source_exact = original.and_then(|plan| score_existing_dynamic(tokens, plan, strict));
+    // The source header is priced from the counts; an all-literal caller
+    // passes counts without tokens, and no source header.
+    debug_assert!(
+        original.is_none()
+            || (*literal_frequencies, *distance_frequencies) == count_frequencies(tokens)
+    );
+    let source_exact = original.and_then(|plan| {
+        score_existing_dynamic_from_frequencies(
+            literal_frequencies,
+            distance_frequencies,
+            extra_bits,
+            plan,
+            strict,
+        )
+    });
     let source_is_compatible = source_exact.is_some();
     let mut best = source_exact;
 
@@ -1551,30 +1619,42 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     let mut heap_scratch = TreeBuildScratch::default();
     // Family order matters: of two equal complete plans, the earlier wins.
     // Without `exhaustive`, only the DeflOpt and order-key heaps run (at most
-    // seven trees per alphabet, so 49 pairs).
+    // seven trees per alphabet, so 49 pairs). A build that shows the other
+    // variants of a heap build its lengths ends that heap's list: their trees
+    // are copies, which `push_unique` would discard.
+    let mut order_trees_listed = false;
     for variant in 0..4 {
         let mut lengths = vec![0_u8; frequencies.len()];
-        make_lengths_deflopt_heap_into_with_scratch(
+        let build = make_lengths_deflopt_heap_into_with_scratch(
             frequencies,
             &mut lengths,
             max_bits,
             variant,
+            variant == 0,
             &mut heap_scratch,
         );
         push_unique(&mut candidates, lengths);
+        order_trees_listed |= build.all_order_variants;
+        if build.all_deflopt_variants {
+            break;
+        }
     }
     // Variant 3 breaks both ties by frequency alone, so its order-key tree is
     // the DeflOpt tree already listed, which `push_unique` would discard.
-    for variant in 0..FREQUENCY_ONLY_HEAP_VARIANT {
+    for variant in (0..FREQUENCY_ONLY_HEAP_VARIANT).filter(|_| !order_trees_listed) {
         let mut lengths = vec![0_u8; frequencies.len()];
-        make_lengths_order_heap_into_with_scratch(
+        let build = make_lengths_order_heap_into_with_scratch(
             frequencies,
             &mut lengths,
             max_bits,
             variant,
+            variant == 0,
             &mut heap_scratch,
         );
         push_unique(&mut candidates, lengths);
+        if build.all_order_variants {
+            break;
+        }
     }
 
     if exhaustive {
@@ -2112,6 +2192,7 @@ pub(crate) fn estimate_boundary_block_bits(
         &mut literal_lengths,
         15,
         0,
+        false,
         &mut heap_scratch,
     );
     make_lengths_deflopt_heap_into_with_scratch(
@@ -2119,6 +2200,7 @@ pub(crate) fn estimate_boundary_block_bits(
         &mut distance_lengths,
         15,
         0,
+        false,
         &mut heap_scratch,
     );
     let data_bits = token_bits_from_frequencies(

@@ -2583,7 +2583,7 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
                 _ => 1 << (next() % [4, 8, 12][case % 3]),
             };
         }
-        let first = CodeLengthBuilder::OrderHeap(0).build(&frequencies, &mut scratch);
+        let first = CodeLengthBuilder::OrderHeap(0).build(&frequencies, false, &mut scratch);
         if !first.huffman || !code_length_tree_shape_is_valid(&first.lengths) {
             continue;
         }
@@ -2595,7 +2595,7 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
         let first_cost = rle_frequency_cost(&frequencies, &first.lengths);
         let first_bits = header_bits(&frequencies, &first.lengths).unwrap();
         for &builder in &builders {
-            let mut lengths = builder.build(&frequencies, &mut scratch).lengths;
+            let mut lengths = builder.build(&frequencies, false, &mut scratch).lengths;
             if !code_length_tree_shape_is_valid(&lengths) {
                 continue;
             }
@@ -2612,6 +2612,55 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
         }
     }
     assert!(shortcuts > 10_000, "{shortcuts} shortcut cases");
+}
+
+#[test]
+fn shared_code_length_trees_match_each_builders_own_tree() {
+    // A histogram's first heap tree is cached for every heap variant known to
+    // build it; whatever order the builders ask in, each gets its own tree.
+    let mut state = 0x1f83_d9ab_fb41_bd6b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut builders: Vec<_> = (0..4)
+        .flat_map(|variant| {
+            [
+                CodeLengthBuilder::DefloptHeap(variant),
+                CodeLengthBuilder::OrderHeap(variant),
+                CodeLengthBuilder::Columbo(variant),
+            ]
+        })
+        .chain([
+            CodeLengthBuilder::Deft4jJavaHeap,
+            CodeLengthBuilder::DefluffLimited,
+            CodeLengthBuilder::DefluffExact,
+        ])
+        .collect();
+    let mut scratch = TreeBuildScratch::default();
+    for case in 0..20_000 {
+        let mut frequencies = [0_u32; 19];
+        for frequency in &mut frequencies {
+            *frequency = match next() % 3 {
+                0 => 0,
+                _ => (next() % [2, 4, 9, 64, 1 << 12][case % 5]) as u32,
+            };
+        }
+        for index in (1..builders.len()).rev() {
+            builders.swap(index, (next() % (index as u64 + 1)) as usize);
+        }
+        let trees = CodeLengthTrees::new(&frequencies);
+        for &builder in &builders {
+            let built = builder.build(&frequencies, false, &mut scratch);
+            assert_eq!(
+                trees.get_with_huffman(builder, &mut scratch),
+                (built.lengths, built.huffman),
+                "{builder:?} {frequencies:?}"
+            );
+        }
+    }
 }
 
 #[test]

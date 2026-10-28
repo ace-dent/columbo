@@ -1997,7 +1997,10 @@ otherwise it keeps the builder's fallback tree.
 2. Build trees per alphabet from the counts, strict dummy counts included:
    DeflOpt heap variants 0–3, then order-key heap variants 0–2, at most 7.
    Variant 3 of both heaps compares counts only, so the two would build the same
-   tree, and it is built once. Max planning adds generic variants 0–3,
+   tree, and it is built once. When a heap's variant 0 shows that the other
+   variants of that heap, or of both heaps, build its tree
+   ([code-length tree cache](#code-length-codes-and-rle-run-tables)), their
+   copies are not built; step 3 would drop them. Max planning adds generic variants 0–3,
    Columbo/Defluff limited, exact Defluff, the deft4j Java heap, and the
    package-first tree started from the exact Defluff tree, at most 15.
 3. Drop duplicates, invalid shapes, trees that leave a used symbol without a
@@ -7160,7 +7163,10 @@ seconds re-planned a token state the run had already planned.
    still returns the plan its deadline allows.
 2. Otherwise the key is a fingerprint of the counts, the token count, the
    extra-bit total, the flags and the source header (its bits, all code lengths,
-   code-length code lengths and RLE).
+   code-length code lengths and RLE). Each length and distance symbol carries a
+   fixed number of extra bits, so the total comes from the counts, as do the
+   fixed-code price and the source header's payload on a miss; no step visits
+   the tokens.
 3. A hit verifies the token count, extra bits and flags, the set of used
    symbols, every nonzero count in symbol order, and the packed source header
    field by field.
@@ -7292,6 +7298,16 @@ lengths often share a histogram, and repeats come close together.
   alone. Defluff's limited builder and Columbo's variant 0 start from the same
   Huffman tree and differ only in how they limit one deeper than 7 bits, so when
   neither needs limiting, one tree is stored for both.
+- A histogram's first heap tree, when it is a variant 0, also learns which other
+  heap variants build it. Every variant of both heaps starts from the same
+  frequency-ordered heap and differs only in the tie rule of its merge
+  sift-downs, and a comparison turns on a rule only when the frequencies are
+  equal and the entry that would move up has the smaller height (DeflOpt) or
+  creation order (order-key). The build notes such comparisons. Without any,
+  every variant of its heap takes the same steps and builds, and repairs, the
+  same tree; without either kind, so does every variant of both heaps. The tree
+  is then stored for all of them. Later builds of a histogram do not track,
+  since noting adds work to every comparison.
 - Storing each histogram once with all its trees holds more trees in less memory
   than one slot per builder and histogram: in a completing Max run, 4,096
   entries built 10% fewer trees than 16,384 per-builder slots (1.7 MiB), and

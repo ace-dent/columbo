@@ -310,6 +310,23 @@ pub(crate) fn token_extra_bits(tokens: &[Token]) -> u64 {
         .sum()
 }
 
+/// [`token_extra_bits`] of the tokens that `literal` and `distance` count:
+/// each length and distance symbol carries a fixed number of extra bits, so
+/// the counts give the total without visiting the tokens.
+pub(crate) fn frequency_extra_bits(literal: &[u32; 286], distance: &[u32; 30]) -> u64 {
+    let length_bits = literal[257..]
+        .iter()
+        .zip(LENGTH_EXTRA_BITS)
+        .map(|(&count, bits)| u64::from(count) * u64::from(bits))
+        .sum::<u64>();
+    let distance_bits = distance
+        .iter()
+        .zip(DISTANCE_EXTRA_BITS)
+        .map(|(&count, bits)| u64::from(count) * u64::from(bits))
+        .sum::<u64>();
+    length_bits + distance_bits
+}
+
 pub(crate) fn try_clone_slice<T: Copy>(source: &[T]) -> Option<Vec<T>> {
     let mut output = Vec::new();
     output.try_reserve_exact(source.len()).ok()?;

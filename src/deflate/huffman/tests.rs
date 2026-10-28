@@ -141,6 +141,7 @@ fn make_lengths_order_heap_into(
         max_bits,
         variant,
         true,
+        false,
         &mut TreeBuildScratch::default(),
     );
 }
@@ -234,9 +235,13 @@ fn hole_heap_sift_matches_the_swapping_reference() {
                     let mut actual = heap.clone();
                     swapping_heap_sift_down(&mut expected, start, frequency_only);
                     if frequency_only {
-                        heap_sift_down::<true>(&mut actual, start);
+                        heap_sift_down::<true, false>(&mut actual, start, &mut TieTurns::default());
                     } else {
-                        heap_sift_down::<false>(&mut actual, start);
+                        heap_sift_down::<false, false>(
+                            &mut actual,
+                            start,
+                            &mut TieTurns::default(),
+                        );
                     }
                     let index =
                         |heap: &[HeapEntry]| heap.iter().map(|e| e.index).collect::<Vec<_>>();
@@ -1098,6 +1103,7 @@ fn shared_tree_scratch_matches_fresh_builds() {
                 &mut lengths,
                 max_bits,
                 variant,
+                false,
                 &mut scratch,
             );
             assert_eq!(
@@ -1139,6 +1145,7 @@ fn reused_deflopt_heap_scratch_matches_standalone_builds() {
                 &mut actual,
                 7,
                 variant,
+                false,
                 &mut scratch,
             );
             assert_eq!(actual, expected);
@@ -1149,6 +1156,7 @@ fn reused_deflopt_heap_scratch_matches_standalone_builds() {
                 &mut actual,
                 7,
                 variant,
+                false,
                 &mut scratch,
             );
             assert_eq!(actual, expected);
@@ -1429,6 +1437,7 @@ fn compact_variant_heap_matches_the_reference_builder() {
                         max_bits,
                         variant,
                         use_order_tie,
+                        case % 2 == 0,
                         &mut scratch,
                     );
                     reference_variant_heap(
@@ -1447,6 +1456,86 @@ fn compact_variant_heap_matches_the_reference_builder() {
             }
         }
     }
+}
+
+#[test]
+fn heap_builds_without_tie_turns_match_every_variant_they_share() {
+    // Tree candidate lists and the code-length tree cache skip the builds of
+    // the variants a tracked build reports as sharing its lengths.
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut scratch = TreeBuildScratch::default();
+    let mut shared = [0_usize; 2];
+    for case in 0..20_000 {
+        let size = match case % 4 {
+            0 | 1 => 19,
+            2 => 30,
+            _ => 286,
+        };
+        // Small counts tie often; some cases need repair.
+        let range = [2, 3, 5, 9, 40, 1 << 16][case % 6];
+        let frequencies: Vec<u32> = (0..size)
+            .map(|_| {
+                if next() % 3 == 0 {
+                    0
+                } else {
+                    (next() % range) as u32
+                }
+            })
+            .collect();
+        for max_bits in [7_u8, 15] {
+            let untracked = |use_order_tie: bool, scratch: &mut TreeBuildScratch| {
+                (0..4)
+                    .map(|variant| {
+                        let mut lengths = vec![0; size];
+                        let build = make_lengths_variant_heap_inner(
+                            &frequencies,
+                            &mut lengths,
+                            max_bits,
+                            variant,
+                            use_order_tie,
+                            false,
+                            scratch,
+                        );
+                        (lengths, build.repaired)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let deflopt = untracked(false, &mut scratch);
+            let order = untracked(true, &mut scratch);
+            for variant in 0..4 {
+                for use_order_tie in [false, true] {
+                    let mut lengths = vec![0; size];
+                    let build = make_lengths_variant_heap_inner(
+                        &frequencies,
+                        &mut lengths,
+                        max_bits,
+                        variant,
+                        use_order_tie,
+                        true,
+                        &mut scratch,
+                    );
+                    let own = (lengths, build.repaired);
+                    let heap = if use_order_tie { &order } else { &deflopt };
+                    assert_eq!(own, heap[variant as usize], "case {case}");
+                    if build.all_deflopt_variants {
+                        assert!(deflopt.iter().all(|tree| *tree == own), "case {case}");
+                        shared[0] += 1;
+                    }
+                    if build.all_order_variants {
+                        assert!(order.iter().all(|tree| *tree == own), "case {case}");
+                        shared[1] += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(shared.iter().all(|&count| count > 10_000), "{shared:?}");
 }
 
 #[test]
@@ -1480,6 +1569,7 @@ fn frequency_only_heap_variant_ignores_the_tie_key() {
                 &mut deflopt,
                 max_bits,
                 3,
+                false,
                 &mut scratch,
             );
             make_lengths_order_heap_into_with_scratch(
@@ -1487,6 +1577,7 @@ fn frequency_only_heap_variant_ignores_the_tie_key() {
                 &mut order,
                 max_bits,
                 3,
+                false,
                 &mut scratch,
             );
             assert_eq!(deflopt, order, "case {case}, limit {max_bits}");

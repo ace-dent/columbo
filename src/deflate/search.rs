@@ -3068,39 +3068,43 @@ pub(crate) fn score_short_family_frequencies(
         let mut build_distance = distance;
         ensure_floor_distance_symbols(&mut build_distance, min_distance_codes);
         for variant in 0..4 {
-            make_lengths_deflopt_heap_into_with_scratch(
+            let literal_build = make_lengths_deflopt_heap_into_with_scratch(
                 &literal,
                 &mut literal_lengths,
                 15,
                 variant,
+                variant == 0,
                 &mut heap_scratch,
             );
-            make_lengths_deflopt_heap_into_with_scratch(
+            let distance_build = make_lengths_deflopt_heap_into_with_scratch(
                 &build_distance,
                 &mut distance_lengths,
                 15,
                 variant,
+                variant == 0,
                 &mut heap_scratch,
             );
-            let Some(data_bits) = token_bits_from_frequencies(
+            let plan = token_bits_from_frequencies(
                 &literal,
                 &distance,
                 &literal_lengths,
                 &distance_lengths,
                 remaining_extra_bits,
-            ) else {
-                continue;
-            };
-            let Some(plan) = plan_for_explicit_lengths_with_cost(
-                &literal_lengths,
-                &distance_lengths,
-                data_bits,
-                false,
-            ) else {
-                continue;
-            };
-            if best.map_or(true, |bits| plan.bits < bits) {
+            )
+            .and_then(|data_bits| {
+                plan_for_explicit_lengths_with_cost(
+                    &literal_lengths,
+                    &distance_lengths,
+                    data_bits,
+                    false,
+                )
+            });
+            if let Some(plan) = plan.filter(|plan| best.map_or(true, |bits| plan.bits < bits)) {
                 best = Some(plan.bits);
+            }
+            // The later variants would price these same trees again.
+            if literal_build.all_deflopt_variants && distance_build.all_deflopt_variants {
+                break;
             }
         }
     }
@@ -3124,21 +3128,23 @@ fn consider_short_family_tokens(
     let mut distance_lengths = [0_u8; 30];
     let mut heap_scratch = TreeBuildScratch::default();
     for variant in 0..4 {
-        make_lengths_deflopt_heap_into_with_scratch(
+        let literal_build = make_lengths_deflopt_heap_into_with_scratch(
             &literal_frequencies,
             &mut literal_lengths,
             15,
             variant,
+            variant == 0,
             &mut heap_scratch,
         );
-        make_lengths_deflopt_heap_into_with_scratch(
+        let distance_build = make_lengths_deflopt_heap_into_with_scratch(
             &distance_frequencies,
             &mut distance_lengths,
             15,
             variant,
+            variant == 0,
             &mut heap_scratch,
         );
-        let Some(dynamic) = token_bits_from_frequencies(
+        let dynamic = token_bits_from_frequencies(
             &literal_frequencies,
             &token_distance_frequencies,
             &literal_lengths,
@@ -3152,14 +3158,17 @@ fn consider_short_family_tokens(
                 data_bits,
                 options.exhaustive,
             )
-        }) else {
-            continue;
-        };
-        if best_dynamic
-            .as_ref()
-            .map_or(true, |current: &DynamicPlan| dynamic.bits < current.bits)
-        {
+        });
+        if let Some(dynamic) = dynamic.filter(|dynamic| {
+            best_dynamic
+                .as_ref()
+                .map_or(true, |current: &DynamicPlan| dynamic.bits < current.bits)
+        }) {
             best_dynamic = Some(dynamic);
+        }
+        // The later variants would price these same trees again.
+        if literal_build.all_deflopt_variants && distance_build.all_deflopt_variants {
+            break;
         }
     }
 
