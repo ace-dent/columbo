@@ -80,6 +80,7 @@ gains where established.
 | 25 Oct 2026 | [`2c702f5`](#2c702f5-25-october-2026) | Max shortest RLE and header caches (`header.rs`, `huffman.rs`) | Each run of equal code lengths spelled from per-thread tables by run length and costs; a plan's runs found once for its seeds and shortest RLEs; eight code lengths per fingerprint step; one tree-cache slot per feedback pass, histograms compared without `memcmp`; merge and best-plan buffers reused; plans packed in pairs | Captured shortest-RLE calls 3.2×; captured header plans 1.19×; completing Max runs 46.2% and 12.8% fewer instructions; Default CPU 1.03× | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 403,865 captured shortest-RLE calls; 2 completing Max runs; 58 Max runs at 10 seconds; 6,000 kept-scratch and 2,000 packing comparisons; 680 Rust, 7 Python tests |
 | 25 Oct 2026 | [`e25d20d`](#e25d20d-25-october-2026) | Header feedback passes (`header.rs`, `huffman.rs`) | A pass whose first code-length tree is a complete Huffman tree that fits 7 bits unrepaired prices and follows it alone, since every other code can at best tie; seeds and shortest RLEs counted as spelled | Captured header plans 1.44× (24.8% fewer instructions); completing Max runs 22.7% and 4.3% fewer instructions; Default CPU 1.08× | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 20,000 histogram comparisons; 681 Rust, 7 Python tests |
 | 28 Oct 2026 | [`3b5fa64`](#3b5fa64-28-october-2026) | Block sums, heap trees and package-merge (`block.rs`, `header.rs`, `huffman.rs`, `search.rs`) | A block's extra bits, fixed-code price and source-header payload from its symbol counts; a variant-0 heap build that finds no comparison a tie rule could decide gives its tree to every variant sharing those rules, in the code-length tree cache and the payload tree lists; package-merge's buffers kept per thread | Default CPU 1.07× (33 inputs, 6.7% fewer cycles); replayed header plans 1.04×; a completing Max run 3.2% fewer instructions; peak memory −0.4 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 tracked-heap and 20,000 shuffled tree-cache comparisons; 688 Rust, 7 Python tests |
+| 28 Oct 2026 | [`a6f67cd`](#a6f67cd-28-october-2026) | Heap entries, match expansion and RLE seeds (`huffman.rs`, `search.rs`, `header.rs`) | The DeflOpt-style heap packs frequency, tie field and index into one word; match expansion keeps its first walk's answers and spells the result out of line; a greedy RLE seed that only repeats an earlier mask's is not spelled | Default CPU 1.04× (33 inputs, 3.0% fewer cycles); replayed header plans 1.04×; a completing Max run 4.6% fewer instructions; `__text` 4.2 KB smaller | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 expansion and 5,000 long-run seed comparisons; 689 Rust, 7 Python tests |
 
 ## Entries
 
@@ -476,6 +477,98 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `a6f67cd`, 28 October 2026
+
+Batches: whole-file CPU (user plus system) and peak resident memory over the
+33 stratified Default inputs, two rounds alternating the builds; retired
+instructions and cycles from `time -l` over the same inputs, two alternating
+rounds per comparison; three alternating runs of the header-plan replay; two
+alternating runs of each completing Max run.
+
+A sampled Default profile of the 33 inputs at `a6f67cd` (42,503 CPU samples)
+still put 28.0% of self time in the DeflOpt and order-key heap builder, then
+the boundary slide (4.9%), match expansion (4.7%) and the greedy RLE seeds
+(3.9%). Earlier reviews had ruled out sharing steps between the heap variants,
+which diverge at about the first merge, and branch-free and bottom-up
+sift-downs.
+
+- **One-word heap entries.** An entry held a 64-bit key, the frequency and the
+  tie field, and a 32-bit index: 16 bytes with padding. The frequency now takes
+  the top 32 bits, the tie field the next 16 and the index the low 16, so every
+  sift step moves half the bytes. Whole-key comparisons use the top 48 bits and
+  frequency-only ones the top 32, so the index never takes part, as before.
+  Alphabets of up to 32,768 symbols fit, far more than Deflate's.
+- **Match expansion answers once.** Expanding selected matches walks the
+  tokens twice, counting the output and then spelling it, and asked the
+  caller's predicate in both walks. Every predicate is pure, so the first walk
+  records the expanded matches' indices and the second reads them. The second
+  walk, which no longer needs the predicate, is one out-of-line function
+  instead of a copy per caller.
+- **Repeated greedy seeds skipped.** The greedy RLE spelling uses code 16 only
+  for a nonzero run of at least 4, and code 17 only where a zero run leaves at
+  least 3 after code 18's repeats. A mask that disables only codes the spelling
+  would not use repeats an earlier mask's seed, which the planner discarded
+  after spelling it; 14% of 5.0 million greedy spellings did.
+
+| Candidate | Instructions | Cycles |
+| --- | ---: | ---: |
+| One-word heap entries | −2.16% | −3.38% |
+| Plus match expansion answers, in line | −0.16% | −0.63% |
+| Plus repeated greedy seeds skipped | −0.60% | −0.72% |
+| Second expansion walk out of line, against the in-line form | −0.30% | −0.09% |
+
+Each row is measured against the build before it; the first three were
+measured with the slide buffer rejected below also in place.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, CPU over two rounds | 102.9 s | 98.9 s | 1.04× |
+| Same inputs, cycles over two rounds | 322.3 billion | 312.5 billion | −3.03% |
+| Same inputs, instructions retired | 1,286.3 billion | 1,248.6 billion | −2.93% |
+| 89,255 header plans captured from ten Max runs, replayed (median) | 2.272 s | 2.190 s | 1.04× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 22.88 billion | 21.81–21.84 billion | −4.6% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.42 billion | 2.44 billion | +0.9% |
+
+Median peak memory was unchanged and the largest rise 3.0 MiB. The rows above
+were measured while other work loaded the machine; each comparison alternates
+the builds input by input.
+
+Equivalence: a new test compares match expansion with its two-walk form on
+20,000 random token lists and pure predicates, with token limits and short
+decoded buffers; the seed test now also compares every mask set with the
+unpruned spellings on 5,000 random code-length lists with zero runs up to 300
+and nonzero runs up to 12; the existing heap tests, which compare the builder
+with its reference on 40,000 alphabets, and the sift-down test cover the packed
+entries. The 89,255 replayed header plans matched plan for plan. API
+comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs, and every timing run and both
+completing Max runs matched byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting, all-feature Clippy with warnings denied and
+a package list without private fixtures or scratch artifacts. `__text` fell
+from 867,336 to 863,120 bytes; the shipped executable keeps its 942,064 bytes,
+and the final source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Pricing each boundary-slide token once into a buffer: 0.28% fewer cycles,
+  but at 32 bytes a token the buffer raised peak memory by up to 42 MiB on
+  large inputs (`Apricot512.png` 83.8 to 118.4 MiB); 32-bit prices, a quarter
+  the size, were no faster. The slide's 11,264 cut searches walk 326 million
+  tokens on the 33 inputs, and the first walk alone takes 1.16 of its 2.5
+  seconds.
+- Expansion answers kept in the generic function: one copy per predicate grew
+  `__text` by 4,240 bytes and the executable across a 16 KiB page.
+- Skipping boundary-graph edges whose lower bound (entropy-coded payload,
+  fixed and stored prices) reaches all eight destination states: 73 of 37,237
+  edges qualified, 0.01 of the 8.03 seconds spent preparing edges; 29,980 edges
+  improve some destination state.
+- Pricing each payload tree once per alphabet instead of once per pair, at
+  most 0.45% of samples, and the repeated shape check of the header-plan
+  kernel, 0.25%.
+
+Artifacts: `work/efficiency-review-default5-20261028/`.
 
 ### `3b5fa64`, 28 October 2026
 

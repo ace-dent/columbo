@@ -2305,3 +2305,90 @@ fn early_stopping_literal_sums_match_full_sums() {
         );
     }
 }
+
+/// Match expansion before it kept the first walk's answers: both walks ask
+/// `should_expand`.
+fn expand_selected_matches_reference<F>(
+    source: &[Token],
+    plain: &[u8],
+    token_limit: usize,
+    should_expand: F,
+) -> Option<Vec<Token>>
+where
+    F: Fn(usize, Token, &[u8]) -> bool,
+{
+    let mut output_count = 0_usize;
+    let mut plain_offset = 0_usize;
+    let mut changed = false;
+    for (index, &token) in source.iter().enumerate() {
+        let end = plain_offset.checked_add(token.decoded_len())?;
+        let decoded = plain.get(plain_offset..end)?;
+        let expand = matches!(token, Token::Match { .. }) && should_expand(index, token, decoded);
+        output_count = output_count.checked_add(if expand { decoded.len() } else { 1 })?;
+        if output_count > token_limit {
+            return None;
+        }
+        changed |= expand;
+        plain_offset = end;
+    }
+    if !changed || plain_offset != plain.len() {
+        return None;
+    }
+    let mut output = Vec::new();
+    plain_offset = 0;
+    for (index, &token) in source.iter().enumerate() {
+        let end = plain_offset.checked_add(token.decoded_len())?;
+        let decoded = plain.get(plain_offset..end)?;
+        if matches!(token, Token::Match { .. }) && should_expand(index, token, decoded) {
+            output.extend(decoded.iter().copied().map(Token::Literal));
+        } else {
+            output.push(token);
+        }
+        plain_offset = end;
+    }
+    Some(output)
+}
+
+#[test]
+fn match_expansion_reuses_its_first_walk_answers() {
+    let mut state = 0x1b87_3593_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut expanded = 0;
+    for case in 0..20_000 {
+        let (tokens, mut plain, _, _) = random_literal_sum_case(&mut next);
+        // A short decoded buffer makes a token overrun.
+        if case % 40 == 0 {
+            plain.pop();
+        }
+        let salt = next();
+        let should_expand = |index: usize, token: Token, decoded: &[u8]| {
+            let Token::Match { length_symbol, .. } = token else {
+                return false;
+            };
+            let mixed = (index as u32 ^ salt)
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(
+                    u32::from(length_symbol) + decoded.first().copied().unwrap_or(0) as u32,
+                );
+            mixed % [2, 3, 7][case % 3] == 0
+        };
+        let token_limit = [usize::MAX, 40, 300][case % 3];
+        let expected =
+            expand_selected_matches_reference(&tokens, &plain, token_limit, should_expand);
+        let actual = expand_selected_matches_with_limits(
+            &tokens,
+            &plain,
+            MAX_TOKEN_CANDIDATE_BYTES,
+            token_limit,
+            should_expand,
+        );
+        assert_eq!(actual, expected, "case {case}");
+        expanded += usize::from(expected.is_some());
+    }
+    assert!(expanded > 5_000, "only {expanded} cases expanded a match");
+}

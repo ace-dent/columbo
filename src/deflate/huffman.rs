@@ -1745,31 +1745,37 @@ fn package_lengths_are_valid(frequencies: &[u32], lengths: &[u8], max_bits: u8) 
     used == slots
 }
 
-/// One live subtree in the DeflOpt-style heap. Leaves take indices
-/// `0..leaf_count` in symbol order and each branch the next index, so `index`
-/// is also the node's creation order. `key` holds the frequency in its high
-/// half and the tie field in its low half: the height for the DeflOpt heap,
-/// `index` for the order-key heap. One comparison of keys orders entries by
-/// frequency, then by the tie field; comparing only the high halves ignores
-/// ties.
+/// Leaves a [`HeapEntry`] heap can hold: with their branches, at most
+/// 65,535 nodes.
+const MAX_PACKED_HEAP_LEAVES: usize = 1 << 15;
+
+/// One live subtree in the DeflOpt-style heap, in one word. Leaves take
+/// indices `0..leaf_count` in symbol order and each branch the next index, so
+/// the index is also the node's creation order. The top 32 bits hold the
+/// frequency, the next 16 the tie field (the height for the DeflOpt heap, the
+/// index for the order-key heap) and the low 16 the index. Comparing the top
+/// 48 bits orders entries by frequency, then by the tie field; the top 32
+/// ignore ties.
 #[derive(Debug, Clone, Copy)]
-struct HeapEntry {
-    key: u64,
-    index: u32,
-}
+struct HeapEntry(u64);
 
 impl HeapEntry {
+    fn new(frequency: u32, tie: u32, index: u32) -> Self {
+        debug_assert!(tie <= u32::from(u16::MAX) && index <= u32::from(u16::MAX));
+        Self(u64::from(frequency) << 32 | u64::from(tie) << 16 | u64::from(index))
+    }
+
     fn frequency(self) -> u32 {
-        (self.key >> 32) as u32
+        (self.0 >> 32) as u32
     }
 
     fn tie(self) -> u32 {
-        self.key as u32
+        u32::from((self.0 >> 16) as u16)
     }
-}
 
-fn heap_key(frequency: u32, tie: u32) -> u64 {
-    u64::from(frequency) << 32 | u64::from(tie)
+    fn index(self) -> u32 {
+        u32::from(self.0 as u16)
+    }
 }
 
 /// Reusable buffers for the DeflOpt-style heap builder, deft4j's Java heap,
@@ -1817,7 +1823,7 @@ impl<const TRACK: bool> TieTurns<TRACK> {
         if TRACK {
             let tied = rising.frequency() == staying.frequency();
             self.tie |= tied & (rising.tie() < staying.tie());
-            self.order |= tied & (rising.index < staying.index);
+            self.order |= tied & (rising.index() < staying.index());
         }
     }
 }
@@ -1833,9 +1839,9 @@ fn heap_sift_down<const FREQUENCY_ONLY: bool, const TRACK: bool>(
 ) {
     let rank = |entry: HeapEntry| {
         if FREQUENCY_ONLY {
-            entry.key >> 32
+            entry.0 >> 32
         } else {
-            entry.key
+            entry.0 >> 16
         }
     };
     let entry = heap[start];
@@ -1951,6 +1957,11 @@ fn make_lengths_variant_heap_inner(
     scratch: &mut TreeBuildScratch,
 ) -> HeapBuild {
     assert_eq!(frequencies.len(), lengths.len());
+    // Every node index and height fits a packed entry's 16 bits.
+    assert!(
+        frequencies.len() <= MAX_PACKED_HEAP_LEAVES,
+        "alphabet fits the heap"
+    );
     lengths.fill(0);
     // Fewer than two leaves take the same early return in every variant.
     let mut build = HeapBuild {
@@ -1979,10 +1990,7 @@ fn make_lengths_variant_heap_inner(
             let index = u32::try_from(symbols.len()).expect("alphabet fits u32");
             // Leaves have height 0.
             let tie = if use_order_tie { index } else { 0 };
-            heap.push(HeapEntry {
-                key: heap_key(frequency, tie),
-                index,
-            });
+            heap.push(HeapEntry::new(frequency, tie, index));
             symbols.push(u32::try_from(symbol).expect("alphabet fits u32"));
         }
     }
@@ -2098,17 +2106,14 @@ fn merge_heap<
 
         let right = heap[0];
         let index = leaves + u32::try_from(children.len()).expect("alphabet fits u32");
-        children.push([left.index, right.index]);
+        children.push([left.index(), right.index()]);
         let frequency = left.frequency().wrapping_add(right.frequency());
         let tie = if use_order_tie {
             index
         } else {
             left.tie().max(right.tie()) + 1
         };
-        heap[0] = HeapEntry {
-            key: heap_key(frequency, tie),
-            index,
-        };
+        heap[0] = HeapEntry::new(frequency, tie, index);
         heap_sift_down::<SECOND_FREQUENCY_ONLY, TRACK>(heap, 0, turns);
     }
 }

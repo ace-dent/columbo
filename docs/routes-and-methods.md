@@ -7419,7 +7419,10 @@ for every combination of costs, removes those rebuilds
 [`d72c937`](research/efficiency-review.md#d72c937-23-october-2026)).
 
 **Smaller controls.** The header planner also spells each distinct RLE-seed mask
-once, after collapsing masks that differ only in a code no run could use;
+once, after collapsing masks that differ only in a code no run could use, and
+skips a mask's greedy seed when the codes it disables are ones the greedy
+spelling would not use (code 16 with no nonzero run of 4, code 17 with no zero
+run leaving 3 after code 18), since that seed repeats an earlier one;
 deduplicates tree candidates in insertion order and never builds order-key
 variant 3, which equals DeflOpt's; and skips code-length reordering when the
 lengths already follow the frequencies, which optimal trees always do.

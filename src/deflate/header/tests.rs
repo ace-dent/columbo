@@ -907,6 +907,34 @@ fn rle_opportunity_gates_preserve_every_distinct_seed() {
             unpruned_rle_seed_candidates(&lengths, 0xff),
         );
     }
+
+    // Long zero runs leave remainders after code 18 that code 17 may or may
+    // not need, and long nonzero runs code 16, so masks repeat greedy seeds.
+    let mut state = 0x9b05_688c_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    for case in 0..5_000 {
+        let mut lengths = Vec::new();
+        while lengths.len() < 20 + case % 300 {
+            let (value, run) = if next() % 2 == 0 {
+                (0, 1 + next() % [3, 14, 150, 300][case % 4])
+            } else {
+                (1 + (next() % 15) as u8, 1 + next() % [3, 6, 12][case % 3])
+            };
+            lengths.extend(std::iter::repeat(value).take(run as usize));
+        }
+        for mask in masks {
+            assert_eq!(
+                rle_seed_candidates(&lengths, mask),
+                unpruned_rle_seed_candidates(&lengths, mask),
+                "case {case}, mask {mask:#x}"
+            );
+        }
+    }
 }
 
 #[test]

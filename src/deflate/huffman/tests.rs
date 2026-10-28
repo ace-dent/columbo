@@ -213,10 +213,7 @@ fn swapping_heap_sift_down(heap: &mut [HeapEntry], start: usize, frequency_only:
 fn hole_heap_sift_matches_the_swapping_reference() {
     // The tie field stands for a height or a creation order alike.
     let entries: Vec<HeapEntry> = (0..64_u32)
-        .map(|index| HeapEntry {
-            key: heap_key((index * 17 + 5) % 13, (index * 7 + 3) % 11),
-            index,
-        })
+        .map(|index| HeapEntry::new((index * 17 + 5) % 13, (index * 7 + 3) % 11, index))
         .collect();
 
     for len in 1..=entries.len() {
@@ -244,7 +241,7 @@ fn hole_heap_sift_matches_the_swapping_reference() {
                         );
                     }
                     let index =
-                        |heap: &[HeapEntry]| heap.iter().map(|e| e.index).collect::<Vec<_>>();
+                        |heap: &[HeapEntry]| heap.iter().map(|e| e.index()).collect::<Vec<_>>();
                     assert_eq!(index(&actual), index(&expected));
                 }
             }

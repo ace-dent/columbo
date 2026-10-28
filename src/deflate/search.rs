@@ -4740,7 +4740,9 @@ where
 {
     let mut output_count = 0_usize;
     let mut plain_offset = 0_usize;
-    let mut changed = false;
+    // The expanded matches' indices: `should_expand` is pure, so the second
+    // walk reuses its answers instead of asking again.
+    let mut expanded = Vec::new();
     for (index, &token) in source.iter().enumerate() {
         let end = plain_offset.checked_add(token.decoded_len())?;
         let decoded = plain.get(plain_offset..end)?;
@@ -4750,20 +4752,36 @@ where
         if output_count > token_limit {
             return None;
         }
-        changed |= expand;
+        if expand {
+            expanded.try_reserve(1).ok()?;
+            expanded.push(index);
+        }
         plain_offset = end;
     }
-    if !changed || plain_offset != plain.len() {
+    if expanded.is_empty() || plain_offset != plain.len() {
         return None;
     }
+    spell_expanded_matches(source, plain, &expanded, output_count, byte_limit)
+}
 
+/// Spell `source` with the matches at `expanded`, ascending token indices, as
+/// literals, `output_count` tokens in all. Out of line, so each caller's
+/// `should_expand` copy keeps only the first walk.
+#[inline(never)]
+fn spell_expanded_matches(
+    source: &[Token],
+    plain: &[u8],
+    expanded: &[usize],
+    output_count: usize,
+    byte_limit: usize,
+) -> Option<Vec<Token>> {
     let mut output = new_token_candidate_with_limit(output_count, plain.len(), byte_limit)?;
-    plain_offset = 0;
+    let mut expanded = expanded.iter().copied().peekable();
+    let mut plain_offset = 0_usize;
     for (index, &token) in source.iter().enumerate() {
         let end = plain_offset.checked_add(token.decoded_len())?;
         let decoded = plain.get(plain_offset..end)?;
-        let expand = matches!(token, Token::Match { .. }) && should_expand(index, token, decoded);
-        if expand {
+        if expanded.next_if_eq(&index).is_some() {
             output.extend(decoded.iter().copied().map(Token::Literal));
         } else {
             output.push(token);

@@ -2812,6 +2812,11 @@ struct RleSeedOpportunities {
     zero_repeat: [bool; 4],
     zero_17: bool,
     zero_18: bool,
+    /// The greedy spelling uses code 16: some nonzero run has at least 4.
+    greedy_16: bool,
+    /// By whether code 18 is disabled: the greedy spelling uses code 17, as
+    /// some zero run keeps at least 3 after its code-18 repeats.
+    greedy_17: [bool; 2],
 }
 
 fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
@@ -2820,6 +2825,7 @@ fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
         if value != 0 {
             let repeated = run.saturating_sub(1);
             opportunities.balanced_repeat |= repeated >= 7 && matches!(repeated % 6, 1 | 2);
+            opportunities.greedy_16 |= run >= 4;
             continue;
         }
 
@@ -2831,6 +2837,7 @@ fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
                 while !no_18 && remaining >= 11 {
                     remaining -= remaining.min(138);
                 }
+                opportunities.greedy_17[usize::from(no_18)] |= remaining >= 3;
                 while !no_17 && remaining >= 3 {
                     remaining -= remaining.min(10);
                 }
@@ -2871,6 +2878,9 @@ fn rle_seed_candidates_from_runs(
     let relevant_mask =
         1 | (u8::from(opportunities.zero_17) << 1) | (u8::from(opportunities.zero_18) << 2);
     let mut seen_masks = [false; 8];
+    // The greedy spellings already made, by the codes they actually leave out:
+    // disabling a code the greedy spelling would not use repeats one.
+    let mut seen_greedy = [false; 8];
     let mut candidates = Vec::new();
     for mask in 0..8 {
         if rle_mask & (1 << mask) == 0 {
@@ -2884,8 +2894,13 @@ fn rle_seed_candidates_from_runs(
         let no_16 = mask & 1 != 0;
         let no_17 = mask & 2 != 0;
         let no_18 = mask & 4 != 0;
-        let rle = greedy_rle_from_runs(runs, count, no_16, no_17, no_18);
-        push_unique(&mut candidates, rle);
+        let greedy = usize::from(no_16 && opportunities.greedy_16)
+            | usize::from(no_17 && opportunities.greedy_17[usize::from(no_18)]) << 1
+            | usize::from(no_18) << 2;
+        if !std::mem::replace(&mut seen_greedy[greedy], true) {
+            let rle = greedy_rle_from_runs(runs, count, no_16, no_17, no_18);
+            push_unique(&mut candidates, rle);
+        }
 
         if !no_16 && opportunities.balanced_repeat {
             let balanced = balanced_repeat_rle_from_runs(runs, count, no_17, no_18);
