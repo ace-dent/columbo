@@ -2579,10 +2579,12 @@ fn kept_run_spellings_match_fresh_searches() {
 }
 
 #[test]
-fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
+fn a_first_tree_at_the_least_cost_prices_no_worse_than_any_builder() {
     // The feedback pass prices only its first tree when that tree is an
-    // unrepaired Huffman tree: every other builder's usable code, reordered
-    // or not, must cost at least as many RLE bits and header bits.
+    // unrepaired Huffman tree or, in the exhaustive search, a repaired tree
+    // that costs what Defluff's exact package-merge code does: every other
+    // builder's usable code, reordered or not, must cost at least as many RLE
+    // bits and header bits.
     let mut state = 0x510e_527f_ade6_82d1_u64;
     let mut next = move || {
         state ^= state << 13;
@@ -2609,7 +2611,7 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
         (cost != INF).then(|| 17 + 3 * trim_code_lengths(lengths) as u64 + cost)
     };
     let mut scratch = TreeBuildScratch::default();
-    let mut shortcuts = 0;
+    let mut shortcuts = [0; 2];
     for case in 0..20_000 {
         // Sparse, skewed and tied counts; some cases need repair.
         let mut frequencies = [0_u32; 19];
@@ -2622,15 +2624,29 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
             };
         }
         let first = CodeLengthBuilder::OrderHeap(0).build(&frequencies, false, &mut scratch);
-        if !first.huffman || !code_length_tree_shape_is_valid(&first.lengths) {
+        if !code_length_tree_shape_is_valid(&first.lengths) {
             continue;
         }
-        shortcuts += 1;
-        assert!(code_lengths_follow_frequencies(
-            &first.lengths,
-            &frequencies
-        ));
         let first_cost = rle_frequency_cost(&frequencies, &first.lengths);
+        let exact = CodeLengthBuilder::DefluffExact.build(&frequencies, false, &mut scratch);
+        // The kept scratch builds what a fresh one does.
+        assert_eq!(
+            exact.lengths[..],
+            make_lengths_defluff_exact(&frequencies, 7, 0)[..]
+        );
+        if first.huffman {
+            shortcuts[0] += 1;
+            assert!(code_lengths_follow_frequencies(
+                &first.lengths,
+                &frequencies
+            ));
+        } else if first_cost != INF
+            && first_cost == rle_frequency_cost(&frequencies, &exact.lengths)
+        {
+            shortcuts[1] += 1;
+        } else {
+            continue;
+        }
         let first_bits = header_bits(&frequencies, &first.lengths).unwrap();
         for &builder in &builders {
             let mut lengths = builder.build(&frequencies, false, &mut scratch).lengths;
@@ -2649,7 +2665,10 @@ fn an_unrepaired_huffman_first_tree_prices_no_worse_than_any_builder() {
             }
         }
     }
-    assert!(shortcuts > 10_000, "{shortcuts} shortcut cases");
+    assert!(
+        shortcuts[0] > 10_000 && shortcuts[1] > 2_000,
+        "{shortcuts:?} shortcut cases"
+    );
 }
 
 #[test]

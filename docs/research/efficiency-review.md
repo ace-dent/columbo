@@ -83,6 +83,7 @@ gains where established.
 | 28 Oct 2026 | [`a6f67cd`](#a6f67cd-28-october-2026) | Heap entries, match expansion and RLE seeds (`huffman.rs`, `search.rs`, `header.rs`) | The DeflOpt-style heap packs frequency, tie field and index into one word; match expansion keeps its first walk's answers and spells the result out of line; a greedy RLE seed that only repeats an earlier mask's is not spelled | Default CPU 1.04× (33 inputs, 3.0% fewer cycles); replayed header plans 1.04×; a completing Max run 4.6% fewer instructions; `__text` 4.2 KB smaller | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 expansion and 5,000 long-run seed comparisons; 689 Rust, 7 Python tests |
 | 28 Oct 2026 | [`46b7c44`](#46b7c44-28-october-2026) | Boundary slide, Huffman decoding and paired match expansions (`slide.rs`, `bitstream.rs`, `huffman.rs`, `search.rs`) | The slide's cut search walks the pair once, pricing each token once; decoding takes each code and its extra bits from one 32-bit window; the strict and tie-including expansions under the same codes share one walk | Default CPU 1.02× (33 inputs, 2.1% fewer cycles); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 cut-search and 20,000 paired-expansion comparisons; 691 Rust, 7 Python tests |
 | 28 Oct 2026 | [`c2aa4ba`](#c2aa4ba-28-october-2026) | Max header-plan buffers, expansion marks and generic heap entries (`header.rs`, `source_recode.rs`, `huffman.rs`) | The header planner's rewrites, local-rewrite steps, candidate trees, shortest-RLE memo and seed spellings use buffers kept per thread; the DeflOpt rewrite is skipped when the RLE already costs the shortest RLE's; source recode's expansion marks stop their literal sums at the match's cost; the generic builder's heap entries take one word | Replayed header plans 1.10× (5.5% fewer instructions); a completing Max run 7.1% fewer instructions; Default CPU 1.02× (33 inputs, 1.8% fewer cycles); peak memory −0.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 expansion-mark comparisons; 692 Rust, 7 Python tests |
+| 28 Oct 2026 | [`4013a14`](#4013a14-28-october-2026) | Code-length trees and feedback passes (`huffman.rs`, `header.rs`, `search.rs`) | Heap builds note tie turns per sift-down, and every variant whose rules agree shares the tree; the code-length tree cache tracks every heap build; an exhaustive pass prices a repaired first tree alone at exact Defluff's cost; seeds stop at a shortest RLE already followed; code-length heaps on stack arrays, a 19-length completeness check and exact Defluff on kept scratch | Replayed header plans 1.16× (9.4% fewer instructions, 11.0% fewer cycles); Default CPU 1.05× (33 inputs, 4.3% fewer cycles); a completing Max run 3.6% fewer instructions; executable one 16 KiB page larger | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 stack-array, 20,000 completeness and 20,000 first-tree comparisons; 694 Rust, 7 Python tests |
 
 ## Entries
 
@@ -479,6 +480,137 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `4013a14`, 28 October 2026
+
+Batches: three rotating runs of the header-plan replay per comparison; two
+alternating runs of each completing Max run; retired instructions and cycles
+from `time -l` over the 33 stratified Default inputs, two alternating rounds;
+whole-file Default CPU (user plus system) and peak resident memory over the
+same inputs, two rounds alternating the builds; one paired run of each build
+on every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds,
+alternating order).
+
+A sampled profile of ten inputs in Max at 20 seconds at `4013a14` (231,511 CPU
+samples) put 22.7% under the code-length tree cache and 15.2% of self time in
+the DeflOpt and order-key heap builder, then the shortest-RLE search (9.1%),
+the DeflOpt local rewrite (4.2%) and the greedy seeds (4.1%). Counters in a
+test build of the header-plan replay found 2.45 million code-length tree
+builds, 1.26 million of them for the local rewrite's DeflOpt variants. Of the
+1.35 million heap builds made for a histogram that already had a heap tree,
+1.19 million built a tree it already had; only 169,000 builds repeated a tree
+the cache had dropped.
+
+- **Tie tracking per sift-down and per variant.** A heap build that tracks
+  ties notes the comparisons between equal frequencies another rule would
+  decide otherwise, and shared its tree with the other variants only when no
+  comparison anywhere turned. It now notes them separately for a merge's two
+  sift-downs, the one after removing the first child and the one after
+  inserting the parent, which each variant breaks by its own rule (height,
+  creation order or frequencies alone), and records where the creation order
+  disagrees with the height rather than with frequencies alone. A variant
+  whose rule for each sift-down agrees with the build's in every comparison
+  noted there takes the same steps and builds the same tree. Any variant can
+  now track, not only variant 0, and the code-length tree cache tracks every
+  heap build: noting adds instructions to each comparison, but a histogram's
+  later variants mostly follow an earlier build's steps.
+- **Repaired first trees priced alone.** A feedback pass prices only its first
+  code-length code when that is an unrepaired Huffman tree, since no code can
+  then price lower. In the exhaustive search it now does the same for a
+  repaired first tree that spells the RLE in as few bits as exact Defluff's
+  package-merge code, the cheapest within 7 bits, which that search builds
+  anyway: the heap tree codes only the used symbols, so no code sends fewer
+  code-length codes either.
+- **Seeds stop at a shortest RLE already followed.** A feedback pass depends
+  only on its RLE, and pricing a header again cannot change the best plan. Each
+  kept shortest RLE records the earliest pass a seed of the plan started from
+  it, and a seed that would start the same or a later pass from it stops.
+- **Kept buffers and fixed sizes for code-length codes.** Exact Defluff's
+  builder takes the kept tree-building scratch instead of allocating its own;
+  the code-length completeness check works on 19 lengths instead of the general
+  chunked check; and the code-length cache's heap builds run on stack arrays of
+  the alphabet's size, through the heap builder's steps inlined into both entry
+  points.
+- **Per-variant skips in tree lists.** The payload tree lists and the
+  short-family floors' variant loops skip each variant a variant-0 build shows
+  to build a tree already listed or both trees already priced, instead of
+  stopping only when every variant agrees.
+
+| Step | Replay instructions | Replay cycles |
+| --- | ---: | ---: |
+| Tie turns noted per sift-down | −1.5% | −2.0% |
+| Plus repaired first trees, and creation order against the height | −7.0% | −7.4% |
+| Plus seeds stopping at a shortest RLE already followed | −7.8% | −8.6% |
+| Plus exact Defluff's kept scratch | −8.6% | −9.4% |
+| Plus the 19-length completeness check | −9.9% | −10.5% |
+| Plus every variant tracking, every cache build tracked | +2.0% | −1.5% |
+| Plus code-length heaps on stack arrays | −1.7% | within noise |
+
+The first five rows are measured against `4013a14` in the same rotating run,
+the last two against the build before them. Tracking every build retires more
+instructions but takes fewer cycles: the builds it skips are the
+branch-mispredicting merges.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 89,255 header plans captured from ten Max runs, replayed (median) | 1.925 s | 1.661 s | 1.16× |
+| Same replay, instructions retired | 28.40 billion | 25.74–25.75 billion | −9.4% |
+| Same replay, cycles | 7.32–7.33 billion | 6.49–6.56 billion | −11.0% |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 20.18–20.19 billion | 19.45–19.46 billion | −3.6% |
+| Same run, user CPU | 1.57–1.58 s | 1.51 s | 1.04× |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.42 billion | 2.41 billion | −0.4% |
+| 33 Default inputs, instructions retired over two rounds | 1,193.6 billion | 1,167.7 billion | −2.17% |
+| Same inputs, cycles over two rounds | 288.2 billion | 275.8 billion | −4.29% |
+| Same inputs, CPU over two rounds | 91.9 s | 87.9 s | 1.05× |
+
+Median Default peak memory rose 0.1 MiB. `y2rc2_large.png` peaked 2.6 MiB
+higher in both rounds, near 50 MiB, and the largest input,
+`Partnership_Card___John_Lewis_Finance.png`, 5.6 MiB higher in one round and
+no higher in the other, near 945 MiB.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating
+builds), 57 outputs were identical and `Nutcracker.png`, which reached the
+deadline, came out 1 byte smaller, in 437.3 instead of 438.2 seconds. The
+previous review saw one build give that file both sizes.
+
+Equivalence: new tests compare the stack-array code-length builder with the
+shared-buffer builder on 20,000 random histograms, every variant of both heaps,
+tracked and untracked, after builds of a larger alphabet; and the 19-length
+completeness check with the general one on 20,000 length sets, lengths above
+15 included. The existing variant-sharing test now checks every variant a
+build reports, tracked builds of all four variants included, on 20,000
+histograms of 19, 30 and 286 symbols; the first-tree test now also covers
+4,221 repaired first trees at exact Defluff's cost, against every builder, and
+checks exact Defluff's kept scratch against a fresh one. The 89,255 replayed
+header plans matched plan for plan at every step. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched in
+all 104 runs, and every Default timing run and both completing Max runs
+matched byte for byte. Rust tests, including the private corpus, passed in
+release and debug modes, with documentation and Python tests, a locked build,
+formatting, all-feature Clippy with warnings denied and a package list without
+private fixtures or scratch artifacts. `__text` grew from 866,440 to 872,548
+bytes and the shipped executable from 942,064 to 958,512, one 16 KiB page,
+mostly the tracking merges for every variant and the stack-array builder; the
+final source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Sharing a tree with every variant when no merge's second removal tied the
+  next least entry, so every heap rule must merge the same pair: the check on
+  every merge cost more than it saved (26.81 against 26.37–26.40 billion
+  replay instructions without it).
+- deft4j's Java-heap builder on packed entries and branch children, with its
+  nodes only for padding and repair: 25.72 against 25.60 billion replay
+  instructions; its heap steps dominate, and repaired trees paid for both.
+- Tracking every variant in the payload tree lists: 4.4% more Default
+  instructions and 2.2% more cycles; on 286 symbols tracking costs more.
+- A shortest-RLE search that prices without spelling: 354,163 of the 366,901
+  shortest RLEs computed in the replay were adopted.
+- Sharing local-rewrite steps across RLE seeds: 32,000 more of 1.97 million
+  steps would repeat.
+
+Artifacts: `work/efficiency-review-max5-20261028/`.
 
 ### `c2aa4ba`, 28 October 2026
 

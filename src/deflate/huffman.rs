@@ -67,9 +67,21 @@ pub(crate) fn huffman_tree_shape_is_complete(lengths: &[u8]) -> bool {
 }
 
 /// The code-length code must be complete; there is no empty or single-code
-/// exception.
-pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8]) -> bool {
-    huffman_tree_shape_is_complete(lengths)
+/// exception. As [`huffman_tree_shape_is_complete`], on the code-length
+/// alphabet's 19 lengths, whose `u32` sum cannot overflow; wrapping additions
+/// keep release overflow checks out of the loop.
+// Out of line: it is checked in many places.
+#[inline(never)]
+pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8; 19]) -> bool {
+    let mut occupied = 0_u32;
+    let mut longest = 0_u8;
+    for &length in lengths {
+        longest = longest.max(length);
+        occupied = occupied.wrapping_add(
+            (u32::from(length != 0) << MAX_CODE_BITS) >> length.min(MAX_CODE_BITS as u8),
+        );
+    }
+    usize::from(longest) <= MAX_CODE_BITS && occupied == COMPLETE_HUFFMAN_CODE_SPACE
 }
 
 /// Accept a complete code, a single one-bit code (RFC 1951 allows this for
@@ -1510,7 +1522,13 @@ pub(crate) fn make_lengths_defluff_exact(
     variant: u32,
 ) -> Vec<u8> {
     let mut lengths = vec![0; frequencies.len()];
-    make_lengths_defluff_exact_into(frequencies, &mut lengths, max_bits, variant);
+    make_lengths_defluff_exact_into(
+        frequencies,
+        &mut lengths,
+        max_bits,
+        variant,
+        &mut TreeBuildScratch::default(),
+    );
     lengths
 }
 
@@ -1519,22 +1537,23 @@ pub(crate) fn make_lengths_defluff_exact_into(
     lengths: &mut [u8],
     max_bits: u8,
     _variant: u32,
+    scratch: &mut TreeBuildScratch,
 ) {
     assert_eq!(frequencies.len(), lengths.len());
-    let max_depth = make_lengths_defluff_unconstrained(frequencies, lengths);
+    let max_depth = make_lengths_defluff_unconstrained(frequencies, lengths, &mut scratch.nodes);
     if max_depth <= usize::from(max_bits) {
         return;
     }
 
     // Start package-merge from the `make_lengths` result, kept if it fails.
-    make_lengths_into(
+    make_lengths_into(frequencies, lengths, max_bits, 0, scratch);
+    apply_package_merge_with_scratch(
         frequencies,
         lengths,
         max_bits,
-        0,
-        &mut TreeBuildScratch::default(),
+        PackageMergeTie::LeafFirst,
+        &mut scratch.package_merge,
     );
-    apply_package_merge(frequencies, lengths, max_bits, PackageMergeTie::LeafFirst);
 }
 
 /// Run package-merge with Zopfli's package-first tie rule (Defluff takes the
@@ -1556,9 +1575,14 @@ pub(crate) fn make_lengths_zopfli_package_from(
     lengths
 }
 
-fn make_lengths_defluff_unconstrained(frequencies: &[u32], lengths: &mut [u8]) -> usize {
+fn make_lengths_defluff_unconstrained(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    nodes: &mut Vec<Node>,
+) -> usize {
     lengths.fill(0);
-    let mut nodes = Vec::with_capacity(frequencies.len().saturating_mul(2));
+    nodes.clear();
+    nodes.reserve(frequencies.len().saturating_mul(2));
     nodes.extend(
         frequencies
             .iter()
@@ -1611,7 +1635,7 @@ fn make_lengths_defluff_unconstrained(frequencies: &[u32], lengths: &mut [u8]) -
         nodes.push(Node::branch(frequency, children[0], children[1], index));
     }
 
-    assign_depths(&nodes, nodes.len() - 1, 0, lengths)
+    assign_depths(nodes, nodes.len() - 1, 0, lengths)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1869,7 +1893,8 @@ struct TieTurns<const TRACK: bool> {
     /// Some comparison turned on the heap's own tie field: the height in the
     /// DeflOpt heap, the creation order in the order-key heap.
     tie: bool,
-    /// Some comparison turned on the creation order.
+    /// Some comparison the creation order would decide otherwise than the
+    /// heap's own tie field; never in the order-key heap.
     order: bool,
 }
 
@@ -1881,7 +1906,8 @@ impl<const TRACK: bool> TieTurns<TRACK> {
         if TRACK {
             let tied = rising.frequency() == staying.frequency();
             self.tie |= tied & (rising.tie() < staying.tie());
-            self.order |= tied & (rising.index() < staying.index());
+            let by_order = rising.index() < staying.index();
+            self.order |= tied & (by_order != (rising.tie() < staying.tie()));
         }
     }
 }
@@ -1934,13 +1960,15 @@ fn heap_sift_down<const FREQUENCY_ONLY: bool, const TRACK: bool>(
 pub(crate) struct HeapBuild {
     /// The Huffman tree was deeper than `max_bits` and needed repair.
     pub(crate) repaired: bool,
-    /// Every variant of the DeflOpt heap builds the same lengths. Only a build
-    /// that tracks ties can tell.
-    pub(crate) all_deflopt_variants: bool,
-    /// Every variant of the order-key heap builds the same lengths. Only a
-    /// build that tracks ties can tell.
-    pub(crate) all_order_variants: bool,
+    /// Bit `v` is set when DeflOpt heap variant `v` builds the same lengths.
+    /// Only a build that tracks ties can tell of variants with other rules.
+    pub(crate) deflopt_variants: u8,
+    /// Bit `v` is set when order-key heap variant `v` builds the same lengths.
+    pub(crate) order_variants: u8,
 }
+
+/// Every heap variant's bit in [`HeapBuild`].
+const ALL_HEAP_VARIANTS: u8 = 0b1111;
 
 pub(crate) fn make_lengths_deflopt_heap_into(
     frequencies: &[u32],
@@ -2002,9 +2030,10 @@ pub(crate) fn make_lengths_order_heap_into_with_scratch(
 
 /// Build one heap variant's lengths. All variants of both heaps start from the
 /// same frequency-ordered heap, and each merge sift-down differs only in its
-/// tie rule. When no comparison of this build turned on a rule, every variant
-/// whose rules agree with it everywhere takes the same steps, removes the
-/// entries in the same order and so builds, and repairs, the same tree.
+/// tie rule. A variant whose rule for each of the two sift-downs of a merge
+/// decides every comparison this build made there as this build did takes the
+/// same steps, removes the entries in the same order and so builds, and
+/// repairs, the same tree.
 fn make_lengths_variant_heap_inner(
     frequencies: &[u32],
     lengths: &mut [u8],
@@ -2020,14 +2049,6 @@ fn make_lengths_variant_heap_inner(
         frequencies.len() <= MAX_PACKED_HEAP_LEAVES,
         "alphabet fits the heap"
     );
-    lengths.fill(0);
-    // Fewer than two leaves take the same early return in every variant.
-    let mut build = HeapBuild {
-        repaired: false,
-        all_deflopt_variants: true,
-        all_order_variants: true,
-    };
-
     let TreeBuildScratch {
         heap,
         symbols,
@@ -2036,23 +2057,110 @@ fn make_lengths_variant_heap_inner(
         leaf_order,
         ..
     } = scratch;
-    heap.clear();
-    symbols.clear();
-    children.clear();
-    // Grow fresh buffers once rather than by doubling.
-    heap.reserve(frequencies.len());
-    symbols.reserve(frequencies.len());
-    children.reserve(frequencies.len());
+    // Every slot a build reads, it writes first.
+    let symbol_count = frequencies.len();
+    heap.resize(symbol_count, HeapEntry(0));
+    symbols.resize(symbol_count, 0);
+    children.resize(symbol_count, [0; 2]);
+    depths.resize(2 * symbol_count, 0);
+    leaf_order.resize(symbol_count, 0);
+    build_variant_heap(
+        frequencies,
+        lengths,
+        max_bits,
+        variant,
+        use_order_tie,
+        track_ties,
+        HeapBuffers {
+            heap,
+            symbols,
+            children,
+            depths,
+            leaf_order,
+        },
+    )
+}
+
+/// The code-length alphabet's symbols.
+const CODE_LENGTH_SYMBOLS: usize = 19;
+
+/// [`make_lengths_variant_heap_inner`] for the code-length alphabet and 7
+/// bits, on stack arrays of its size: the same steps, without the shared
+/// buffers' bookkeeping.
+pub(crate) fn make_code_length_lengths_variant_heap(
+    frequencies: &[u32; CODE_LENGTH_SYMBOLS],
+    lengths: &mut [u8; CODE_LENGTH_SYMBOLS],
+    variant: u32,
+    use_order_tie: bool,
+    track_ties: bool,
+) -> HeapBuild {
+    build_variant_heap(
+        frequencies,
+        lengths,
+        7,
+        variant,
+        use_order_tie,
+        track_ties,
+        HeapBuffers {
+            heap: &mut [HeapEntry(0); CODE_LENGTH_SYMBOLS],
+            symbols: &mut [0; CODE_LENGTH_SYMBOLS],
+            children: &mut [[0; 2]; CODE_LENGTH_SYMBOLS],
+            depths: &mut [0; 2 * CODE_LENGTH_SYMBOLS],
+            leaf_order: &mut [0; CODE_LENGTH_SYMBOLS],
+        },
+    )
+}
+
+/// A heap build's buffers, each with a slot per symbol (two for depths).
+struct HeapBuffers<'a> {
+    heap: &'a mut [HeapEntry],
+    /// The symbol of each leaf, by leaf index.
+    symbols: &'a mut [u32],
+    /// The two children of each branch, by branch index minus the leaf count.
+    children: &'a mut [[u32; 2]],
+    depths: &'a mut [u32],
+    /// Leaf symbols in reverse heap-removal order, for overflow repair.
+    leaf_order: &'a mut [u32],
+}
+
+/// The steps of [`make_lengths_variant_heap_inner`], inlined into each
+/// caller so a fixed alphabet size can shape the code.
+#[inline(always)]
+fn build_variant_heap(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    variant: u32,
+    use_order_tie: bool,
+    track_ties: bool,
+    buffers: HeapBuffers,
+) -> HeapBuild {
+    let HeapBuffers {
+        heap,
+        symbols,
+        children,
+        depths,
+        leaf_order,
+    } = buffers;
+    lengths.fill(0);
+    // Fewer than two leaves take the same early return in every variant.
+    let mut build = HeapBuild {
+        repaired: false,
+        deflopt_variants: ALL_HEAP_VARIANTS,
+        order_variants: ALL_HEAP_VARIANTS,
+    };
+
+    let mut leaf_count = 0;
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
-            let index = u32::try_from(symbols.len()).expect("alphabet fits u32");
+            let index = leaf_count as u32;
             // Leaves have height 0.
             let tie = if use_order_tie { index } else { 0 };
-            heap.push(HeapEntry::new(frequency, tie, index));
-            symbols.push(u32::try_from(symbol).expect("alphabet fits u32"));
+            heap[leaf_count] = HeapEntry::new(frequency, tie, index);
+            symbols[leaf_count] = symbol as u32;
+            leaf_count += 1;
         }
     }
-    let leaf_count = symbols.len();
     match leaf_count {
         0 => return build,
         1 => {
@@ -2061,6 +2169,9 @@ fn make_lengths_variant_heap_inner(
         }
         _ => {}
     }
+    let heap = &mut heap[..leaf_count];
+    let symbols = &symbols[..leaf_count];
+    let children = &mut children[..leaf_count - 1];
 
     // Every variant orders the initial heap by frequency alone.
     for start in (0..heap.len() / 2).rev() {
@@ -2071,47 +2182,59 @@ fn make_lengths_variant_heap_inner(
     // first child, and bit 0 the one after inserting the parent; a set bit
     // compares frequencies only.
     let leaves = leaf_count as u32;
-    // Only variant 0, which every tracked caller asks for first, has a
-    // tracking merge; the others report every comparison as turned.
-    let mut untracked = TieTurns::<false>::default();
-    let (tie, order) = match (variant & 3, track_ties) {
+    // An untracked build reports every comparison as turned, so only the
+    // variants with its own rules agree with it.
+    let mut untracked = [TieTurns::<false>::default(); 2];
+    let mut tracked = [TieTurns::<true>::default(); 2];
+    match (variant & 3, track_ties) {
         (0, true) => {
-            let mut turns = TieTurns::<true>::default();
-            merge_heap::<false, false, true>(heap, children, leaves, use_order_tie, &mut turns);
-            (turns.tie, turns.order)
+            merge_heap::<false, false, true>(heap, children, leaves, use_order_tie, &mut tracked)
+        }
+        (1, true) => {
+            merge_heap::<false, true, true>(heap, children, leaves, use_order_tie, &mut tracked)
+        }
+        (2, true) => {
+            merge_heap::<true, false, true>(heap, children, leaves, use_order_tie, &mut tracked)
+        }
+        (_, true) => {
+            merge_heap::<true, true, true>(heap, children, leaves, use_order_tie, &mut tracked)
         }
         (0, false) => {
-            merge_heap::<false, false, false>(
-                heap,
-                children,
-                leaves,
-                use_order_tie,
-                &mut untracked,
-            );
-            (true, true)
+            merge_heap::<false, false, false>(heap, children, leaves, use_order_tie, &mut untracked)
         }
-        (1, _) => {
-            merge_heap::<false, true, false>(heap, children, leaves, use_order_tie, &mut untracked);
-            (true, true)
+        (1, false) => {
+            merge_heap::<false, true, false>(heap, children, leaves, use_order_tie, &mut untracked)
         }
-        (2, _) => {
-            merge_heap::<true, false, false>(heap, children, leaves, use_order_tie, &mut untracked);
-            (true, true)
+        (2, false) => {
+            merge_heap::<true, false, false>(heap, children, leaves, use_order_tie, &mut untracked)
         }
-        _ => {
-            merge_heap::<true, true, false>(heap, children, leaves, use_order_tie, &mut untracked);
-            (true, true)
+        (_, false) => {
+            merge_heap::<true, true, false>(heap, children, leaves, use_order_tie, &mut untracked)
         }
+    }
+    if !track_ties {
+        tracked = [TieTurns {
+            tie: true,
+            order: true,
+        }; 2];
+    }
+    let built = TieRule::of_variant(variant, use_order_tie);
+    let agreeing = |use_order: bool| {
+        (0..4).fold(0, |variants, other| {
+            let agrees = TieRule::of_variant(other, use_order)
+                .into_iter()
+                .zip(built)
+                .zip(tracked)
+                .all(|((rule, built), turns)| rule.agrees(built, turns, !use_order_tie));
+            variants | u8::from(agrees) << other
+        })
     };
-    // In the order-key heap the tie field is the creation order. Without
-    // turns on either field, both heaps follow the frequency-only steps.
-    build.all_deflopt_variants = !use_order_tie && !tie;
-    build.all_order_variants = !tie && !order;
+    build.deflopt_variants = agreeing(false);
+    build.order_variants = agreeing(true);
 
     // Every branch is created after both children, so one pass from the root,
     // the last branch, down to the first assigns every depth.
-    depths.clear();
-    depths.resize(leaf_count + children.len(), 0);
+    depths[2 * leaf_count - 2] = 0;
     for (branch, &[left, right]) in children.iter().enumerate().rev() {
         let depth = depths[leaf_count + branch] + 1;
         depths[left as usize] = depth;
@@ -2128,43 +2251,92 @@ fn make_lengths_variant_heap_inner(
     // Each branch's children are the two entries removed before creating
     // it, so the branches in reverse, right child first, give the leaves in
     // reverse removal order.
-    leaf_order.clear();
+    let mut leaf = 0;
     for &[left, right] in children.iter().rev() {
         for child in [right, left] {
             if child < leaves {
-                leaf_order.push(symbols[child as usize]);
+                leaf_order[leaf] = symbols[child as usize];
+                leaf += 1;
             }
         }
     }
-    repair_deflopt_overflow(leaf_order, lengths, max_bits, max_depth);
+    repair_deflopt_overflow(&leaf_order[..leaf], lengths, max_bits, max_depth);
     build.repaired = true;
     build
+}
+
+/// A merge sift-down's tie rule.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TieRule {
+    FrequencyOnly,
+    /// The DeflOpt heap's height.
+    Height,
+    /// The order-key heap's creation order.
+    Order,
+}
+
+impl TieRule {
+    /// The rules of heap variant `variant`'s sift-downs after removing the
+    /// first child and after inserting the parent.
+    fn of_variant(variant: u32, use_order_tie: bool) -> [Self; 2] {
+        let own = if use_order_tie {
+            Self::Order
+        } else {
+            Self::Height
+        };
+        let rule = |frequency_only: bool| {
+            if frequency_only {
+                Self::FrequencyOnly
+            } else {
+                own
+            }
+        };
+        [rule(variant & 2 != 0), rule(variant & 1 != 0)]
+    }
+
+    /// Whether this rule decides every comparison a build with rule `built`
+    /// made in a sift-down, noting `turns`, as that build did. The noted turns
+    /// tell where the height and frequencies alone disagree, and where the
+    /// creation order and the height do; an order-key build knows no heights.
+    fn agrees(self, built: Self, turns: TieTurns<true>, heights_known: bool) -> bool {
+        match (self, built) {
+            _ if self == built => true,
+            (Self::Height, _) | (_, Self::Height) if !heights_known => false,
+            (Self::FrequencyOnly, Self::Height) | (Self::Height, Self::FrequencyOnly) => !turns.tie,
+            (Self::Order, Self::Height) | (Self::Height, Self::Order) => !turns.order,
+            // In the order-key heap the tie field is the creation order, and
+            // `order` is never noted.
+            _ => !turns.tie && !turns.order,
+        }
+    }
 }
 
 /// Merge the two least entries until one remains, recording each branch's
 /// children. `FIRST_FREQUENCY_ONLY` and `SECOND_FREQUENCY_ONLY` choose the tie
 /// rule of the sift-downs after removing the first child and after inserting
-/// the parent.
+/// the parent, which note their comparisons in `turns[0]` and `turns[1]`.
 fn merge_heap<
     const FIRST_FREQUENCY_ONLY: bool,
     const SECOND_FREQUENCY_ONLY: bool,
     const TRACK: bool,
 >(
-    heap: &mut Vec<HeapEntry>,
-    children: &mut Vec<[u32; 2]>,
+    heap: &mut [HeapEntry],
+    children: &mut [[u32; 2]],
     leaves: u32,
     use_order_tie: bool,
-    turns: &mut TieTurns<TRACK>,
+    [first_turns, second_turns]: &mut [TieTurns<TRACK>; 2],
 ) {
-    while heap.len() > 1 {
+    // `children` has a slot for each merge.
+    for (branch, children) in children.iter_mut().enumerate() {
+        let heap = &mut heap[..leaves as usize - branch];
         let left = heap[0];
-        let last = heap.pop().expect("heap is non-empty");
-        heap[0] = last;
-        heap_sift_down::<FIRST_FREQUENCY_ONLY, TRACK>(heap, 0, turns);
+        let (last, heap) = heap.split_last_mut().expect("two entries remain");
+        heap[0] = *last;
+        heap_sift_down::<FIRST_FREQUENCY_ONLY, TRACK>(heap, 0, first_turns);
 
         let right = heap[0];
-        let index = leaves + u32::try_from(children.len()).expect("alphabet fits u32");
-        children.push([left.index(), right.index()]);
+        let index = leaves + branch as u32;
+        *children = [left.index(), right.index()];
         let frequency = left.frequency().wrapping_add(right.frequency());
         let tie = if use_order_tie {
             index
@@ -2172,7 +2344,7 @@ fn merge_heap<
             left.tie().max(right.tie()) + 1
         };
         heap[0] = HeapEntry::new(frequency, tie, index);
-        heap_sift_down::<SECOND_FREQUENCY_ONLY, TRACK>(heap, 0, turns);
+        heap_sift_down::<SECOND_FREQUENCY_ONLY, TRACK>(heap, 0, second_turns);
     }
 }
 

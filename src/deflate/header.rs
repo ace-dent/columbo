@@ -8,10 +8,10 @@ use std::collections::HashMap;
 
 use super::huffman::{
     code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
-    make_brotli_rle_pseudofrequencies, make_columbo_rle_pseudofrequencies, make_lengths,
-    make_lengths_columbo_defluff_limited, make_lengths_columbo_defluff_limited_into,
-    make_lengths_deflopt_heap_into_with_scratch, make_lengths_defluff_exact,
-    make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
+    make_brotli_rle_pseudofrequencies, make_code_length_lengths_variant_heap,
+    make_columbo_rle_pseudofrequencies, make_lengths, make_lengths_columbo_defluff_limited,
+    make_lengths_columbo_defluff_limited_into, make_lengths_deflopt_heap_into_with_scratch,
+    make_lengths_defluff_exact, make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into,
     make_lengths_order_heap_into_with_scratch, make_lengths_zopfli_package_from,
     make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, HeapBuild, TreeBuildScratch,
@@ -470,29 +470,25 @@ impl CodeLengthBuilder {
         let mut huffman = false;
         let mut heap_build = |build: HeapBuild| {
             huffman = !build.repaired;
-            if build.all_deflopt_variants {
-                shared |= DEFLOPT_HEAP_TREES;
-            }
-            if build.all_order_variants {
-                shared |= ORDER_HEAP_TREES;
-            }
+            // DeflOpt variant `v` has index `v`, order-key variants 0 to 2
+            // follow at 4, and both heaps' variant 3 is index 3.
+            let order = u16::from(build.order_variants);
+            shared |= u16::from(build.deflopt_variants) | (order & 0b111) << 4 | (order & 0b1000);
         };
         match self {
-            Self::DefloptHeap(variant) => heap_build(make_lengths_deflopt_heap_into_with_scratch(
+            Self::DefloptHeap(variant) => heap_build(make_code_length_lengths_variant_heap(
                 frequencies,
                 &mut lengths,
-                7,
                 variant,
+                false,
                 track_ties,
-                heap_scratch,
             )),
-            Self::OrderHeap(variant) => heap_build(make_lengths_order_heap_into_with_scratch(
+            Self::OrderHeap(variant) => heap_build(make_code_length_lengths_variant_heap(
                 frequencies,
                 &mut lengths,
-                7,
                 variant,
+                true,
                 track_ties,
-                heap_scratch,
             )),
             Self::Deft4jJavaHeap => {
                 make_lengths_deft4j_java_heap_into(frequencies, &mut lengths, 7, heap_scratch)
@@ -515,7 +511,9 @@ impl CodeLengthBuilder {
                     shared = UNLIMITED_TREES;
                 }
             }
-            Self::DefluffExact => make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0),
+            Self::DefluffExact => {
+                make_lengths_defluff_exact_into(frequencies, &mut lengths, 7, 0, heap_scratch)
+            }
         }
         BuiltCodeLengthTree {
             lengths,
@@ -525,10 +523,6 @@ impl CodeLengthBuilder {
     }
 }
 
-/// The [`CodeLengthBuilder::index`] bits of every DeflOpt heap variant.
-const DEFLOPT_HEAP_TREES: u16 = 0b1111;
-/// The [`CodeLengthBuilder::index`] bits of every order-key heap variant.
-const ORDER_HEAP_TREES: u16 = 0b111_1000;
 /// `DefluffLimited` and `Columbo(0)` start from the same variant-0 Huffman
 /// tree and differ only in how they limit one deeper than 7 bits.
 const UNLIMITED_TREES: u16 = 1 << 8 | 1 << 9;
@@ -644,8 +638,6 @@ impl<'a> CodeLengthTrees<'a> {
             let built = builder.build(frequencies, false, heap_scratch);
             return (built.lengths, built.huffman);
         };
-        // The heap trees this thread holds for the histogram, if any.
-        let mut heap_trees = 0;
         let cached = CODE_LENGTH_TREES
             .try_with(|cache| {
                 let cache = cache.try_borrow().ok()?;
@@ -653,7 +645,6 @@ impl<'a> CodeLengthTrees<'a> {
                 if !same_histogram(&entry.frequencies, frequencies) {
                     return None;
                 }
-                heap_trees = entry.built & (DEFLOPT_HEAP_TREES | ORDER_HEAP_TREES);
                 (entry.built & (1 << index) != 0)
                     .then_some((entry.lengths[index], entry.huffman & (1 << index) != 0))
             })
@@ -663,14 +654,15 @@ impl<'a> CodeLengthTrees<'a> {
             return cached;
         }
 
-        // Tracking adds work to every comparison, so only a histogram's first
-        // heap tree learns which variants share it. When it finds a tie that
-        // could turn, the variants asked for next mostly build other trees.
+        // Every heap build tracks which variants share its tree. Noting ties
+        // adds work to each comparison, but a histogram's later variants
+        // mostly follow an earlier build's steps, and the builds this skips
+        // cost more.
         let BuiltCodeLengthTree {
             lengths,
             shared,
             huffman,
-        } = builder.build(frequencies, heap_trees == 0, heap_scratch);
+        } = builder.build(frequencies, true, heap_scratch);
         let _ = CODE_LENGTH_TREES.try_with(|cache| {
             let Ok(mut cache) = cache.try_borrow_mut() else {
                 return;
@@ -1619,11 +1611,15 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     let mut heap_scratch = TreeBuildScratch::default();
     // Family order matters: of two equal complete plans, the earlier wins.
     // Without `exhaustive`, only the DeflOpt and order-key heaps run (at most
-    // seven trees per alphabet, so 49 pairs). A build that shows the other
-    // variants of a heap build its lengths ends that heap's list: their trees
-    // are copies, which `push_unique` would discard.
-    let mut order_trees_listed = false;
+    // seven trees per alphabet, so 49 pairs). A variant a build shows to build
+    // its lengths is skipped: its tree is a copy, which `push_unique` would
+    // discard.
+    // Variants of each heap known to build a tree already listed.
+    let mut listed = [0_u8; 2];
     for variant in 0..4 {
+        if listed[0] & 1 << variant != 0 {
+            continue;
+        }
         let mut lengths = vec![0_u8; frequencies.len()];
         let build = make_lengths_deflopt_heap_into_with_scratch(
             frequencies,
@@ -1634,14 +1630,15 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
             &mut heap_scratch,
         );
         push_unique(&mut candidates, lengths);
-        order_trees_listed |= build.all_order_variants;
-        if build.all_deflopt_variants {
-            break;
-        }
+        listed[0] |= build.deflopt_variants;
+        listed[1] |= build.order_variants;
     }
     // Variant 3 breaks both ties by frequency alone, so its order-key tree is
     // the DeflOpt tree already listed, which `push_unique` would discard.
-    for variant in (0..FREQUENCY_ONLY_HEAP_VARIANT).filter(|_| !order_trees_listed) {
+    for variant in 0..FREQUENCY_ONLY_HEAP_VARIANT {
+        if listed[1] & 1 << variant != 0 {
+            continue;
+        }
         let mut lengths = vec![0_u8; frequencies.len()];
         let build = make_lengths_order_heap_into_with_scratch(
             frequencies,
@@ -1652,9 +1649,7 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
             &mut heap_scratch,
         );
         push_unique(&mut candidates, lengths);
-        if build.all_order_variants {
-            break;
-        }
+        listed[1] |= build.order_variants;
     }
 
     if exhaustive {
@@ -2738,14 +2733,19 @@ struct ShortestRleEntry {
     rle: Vec<RleToken>,
     /// The RLE's symbol frequencies, or `None` when there is no RLE.
     frequencies: Option<[u32; 19]>,
+    /// The earliest feedback pass a seed of this plan has started from this
+    /// RLE, or `usize::MAX`.
+    first_pass: usize,
 }
 
 impl HeaderPlanSearch {
+    /// The shortest RLE under `tree`, its symbol frequencies, its entry and
+    /// the entry's [`ShortestRleEntry::first_pass`].
     fn shortest_rle(
         &mut self,
         length_count: usize,
         tree: &[u8; 19],
-    ) -> Option<(&[RleToken], &[u32; 19])> {
+    ) -> Option<(&[RleToken], &[u32; 19], usize, usize)> {
         let found = self.shortest_rles[..self.shortest_rle_count]
             .iter()
             .position(|entry| entry.tree == *tree);
@@ -2757,10 +2757,12 @@ impl HeaderPlanSearch {
                         tree: [0; 19],
                         rle: Vec::new(),
                         frequencies: None,
+                        first_pass: usize::MAX,
                     });
                 }
                 let entry = &mut self.shortest_rles[self.shortest_rle_count];
                 entry.tree = *tree;
+                entry.first_pass = usize::MAX;
                 entry.frequencies = shortest_rle_from_runs_into(
                     &self.runs,
                     length_count,
@@ -2776,7 +2778,7 @@ impl HeaderPlanSearch {
         entry
             .frequencies
             .as_ref()
-            .map(|frequencies| (entry.rle.as_slice(), frequencies))
+            .map(|frequencies| (entry.rle.as_slice(), frequencies, index, entry.first_pass))
     }
 }
 
@@ -3523,8 +3525,19 @@ fn consider_rle(
         // cheaply, and every usable code gives each of them a length, so none
         // sends fewer code-length codes. Every later candidate, reordered or
         // not, can at best tie its price and its feedback cost, and a tie keeps
-        // the earlier, so this pass need not build them.
-        let first_is_cheapest = first_is_huffman && code_length_tree_shape_is_valid(&first_lengths);
+        // the earlier, so this pass need not build them. A repaired first tree
+        // does the same when it spells the symbols as cheaply as Defluff's
+        // exact package-merge code, the cheapest within 7 bits, which the
+        // exhaustive search builds anyway; the heap gives lengths only to
+        // used symbols, so it sends no more code-length codes than any other.
+        let first_is_cheapest = code_length_tree_shape_is_valid(&first_lengths)
+            && (first_is_huffman
+                || exhaustive && {
+                    let cost = rle_frequency_cost(&frequencies, &first_lengths);
+                    let exact =
+                        trees.get(CodeLengthBuilder::DefluffExact, &mut search.heap_scratch);
+                    cost != INF && cost == rle_frequency_cost(&frequencies, &exact)
+                });
         for variant in (0..variants).filter(|_| !first_is_cheapest) {
             if variant == 0 {
                 push_unique(&mut code_length_candidates, deft4j_lengths);
@@ -3639,7 +3652,7 @@ fn consider_rle(
             cost != INF
                 && search
                     .shortest_rle(decoded_lengths.len(), &tree)
-                    .is_some_and(|(_, shortest)| rle_frequency_cost(shortest, &tree) == cost)
+                    .is_some_and(|(_, shortest, ..)| rle_frequency_cost(shortest, &tree) == cost)
         };
         // The DeflOpt rewrite goes to a search buffer, which a winning
         // rewrite swaps with this pass's.
@@ -3663,18 +3676,22 @@ fn consider_rle(
         // Both carry their exact symbol counts, which price them as their
         // tokens would. A chosen shortest RLE is copied into this pass's
         // buffer, not cloned from the plan's memo.
-        let shortest = shortest.filter(|(_, shortest)| {
+        let shortest = shortest.filter(|(_, shortest, ..)| {
             local.as_ref().map_or(true, |local| {
                 rle_frequency_cost(shortest, &tree) < rle_frequency_cost(local, &tree)
             })
         });
-        if let Some((shortest, shortest_frequencies)) = shortest {
-            if shortest == rle.as_slice() {
+        if let Some((shortest, shortest_frequencies, entry, first_pass)) = shortest {
+            // A pass depends only on its RLE, and pricing a header again
+            // cannot change the best plan. A seed that started this pass or an
+            // earlier one from this RLE has done all that would follow.
+            if shortest == rle.as_slice() || first_pass <= pass + 1 {
                 break;
             }
             rle.clear();
             rle.extend_from_slice(shortest);
             frequencies = *shortest_frequencies;
+            search.shortest_rles[entry].first_pass = pass + 1;
             continue;
         }
         let Some(rewritten_frequencies) = local else {
@@ -3700,16 +3717,15 @@ fn consider_deft4j_pruned_header(
     distance_lengths: &[u8],
     rle: &[RleToken],
     frequencies: &[u32; 19],
-    deft4j_lengths: &[u8],
+    deft4j_lengths: &[u8; 19],
     heap_scratch: &mut TreeBuildScratch,
     best: &mut Option<DynamicPlan>,
     [pruned, optimized]: &mut [Vec<RleToken>; 2],
 ) {
-    if deft4j_lengths.len() != 19 || !code_length_tree_shape_is_valid(deft4j_lengths) {
+    if !code_length_tree_shape_is_valid(deft4j_lengths) {
         return;
     }
-    let mut code_length_lengths = [0_u8; 19];
-    code_length_lengths.copy_from_slice(deft4j_lengths);
+    let code_length_lengths = *deft4j_lengths;
     if frequencies
         .iter()
         .zip(code_length_lengths)

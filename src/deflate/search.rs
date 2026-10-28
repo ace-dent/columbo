@@ -3067,7 +3067,12 @@ pub(crate) fn score_short_family_frequencies(
 
         let mut build_distance = distance;
         ensure_floor_distance_symbols(&mut build_distance, min_distance_codes);
+        // Variants known to build both trees of a variant already priced.
+        let mut repeated = 0_u8;
         for variant in 0..4 {
+            if repeated & 1 << variant != 0 {
+                continue;
+            }
             let literal_build = make_lengths_deflopt_heap_into_with_scratch(
                 &literal,
                 &mut literal_lengths,
@@ -3102,10 +3107,8 @@ pub(crate) fn score_short_family_frequencies(
             if let Some(plan) = plan.filter(|plan| best.map_or(true, |bits| plan.bits < bits)) {
                 best = Some(plan.bits);
             }
-            // The later variants would price these same trees again.
-            if literal_build.all_deflopt_variants && distance_build.all_deflopt_variants {
-                break;
-            }
+            // Those variants would price these same trees again.
+            repeated |= literal_build.deflopt_variants & distance_build.deflopt_variants;
         }
     }
     best
@@ -3127,7 +3130,12 @@ fn consider_short_family_tokens(
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
     let mut heap_scratch = TreeBuildScratch::default();
+    // Variants known to build both trees of a variant already priced.
+    let mut repeated = 0_u8;
     for variant in 0..4 {
+        if repeated & 1 << variant != 0 {
+            continue;
+        }
         let literal_build = make_lengths_deflopt_heap_into_with_scratch(
             &literal_frequencies,
             &mut literal_lengths,
@@ -3166,10 +3174,8 @@ fn consider_short_family_tokens(
         }) {
             best_dynamic = Some(dynamic);
         }
-        // The later variants would price these same trees again.
-        if literal_build.all_deflopt_variants && distance_build.all_deflopt_variants {
-            break;
-        }
+        // Those variants would price these same trees again.
+        repeated |= literal_build.deflopt_variants & distance_build.deflopt_variants;
     }
 
     let Some(dynamic) = best_dynamic else {
@@ -4161,6 +4167,8 @@ struct FeedbackTreeSeed {
 
 /// Build the two feedback seed trees: Defluff's exact builder, and Columbo's
 /// ordinary tree with only Defluff's package-merge limiter.
+// Out of line: inlined, it would be copied into each of its callers.
+#[inline(never)]
 fn feedback_tree_seeds(block: &ParsedBlock, min_distance_codes: bool) -> [FeedbackTreeSeed; 2] {
     let mut distance_frequencies = block.distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, min_distance_codes);

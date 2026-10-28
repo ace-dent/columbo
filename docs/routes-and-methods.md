@@ -2602,9 +2602,10 @@ keep the parent's spans.
    the order-key heap variants 0–3, the deft4j Java heap and Columbo/Defluff
    limited; the exhaustive header search adds DeflOpt heap variants 0–3, generic
    variants 0–3 and exact Defluff. If the first code, order-key variant 0, is an
-   unrepaired complete Huffman code within 7 bits, it alone is priced, besides
-   deft4j's pruned header: no code spells this spelling in fewer bits, and a tie
-   keeps the earlier.
+   unrepaired complete Huffman code within 7 bits, or in the exhaustive search
+   a repaired one that spells this spelling in as few bits as exact Defluff's,
+   it alone is priced, besides deft4j's pruned header: no code spells this
+   spelling in fewer bits, and a tie keeps the earlier.
 6. The feedback code is the one that spells the current spelling most cheaply,
    the first on ties. Except after the last pass, the spelling is rewritten
    under it with the DeflOpt rewrite or, in the exhaustive search, with the
@@ -7302,16 +7303,24 @@ lengths often share a histogram, and repeats come close together.
   alone. Defluff's limited builder and Columbo's variant 0 start from the same
   Huffman tree and differ only in how they limit one deeper than 7 bits, so when
   neither needs limiting, one tree is stored for both.
-- A histogram's first heap tree, when it is a variant 0, also learns which other
-  heap variants build it. Every variant of both heaps starts from the same
-  frequency-ordered heap and differs only in the tie rule of its merge
-  sift-downs, and a comparison turns on a rule only when the frequencies are
-  equal and the entry that would move up has the smaller height (DeflOpt) or
-  creation order (order-key). The build notes such comparisons. Without any,
-  every variant of its heap takes the same steps and builds, and repairs, the
-  same tree; without either kind, so does every variant of both heaps. The tree
-  is then stored for all of them. Later builds of a histogram do not track,
-  since noting adds work to every comparison.
+- Each heap build also learns which other heap variants build its tree. Every
+  variant of both heaps starts from the same frequency-ordered heap and differs
+  only in the tie rule of each of a merge's two sift-downs, the one after
+  removing the first child and the one after inserting the parent: the height
+  (DeflOpt), the creation order (order-key) or frequencies alone. A comparison
+  between equal frequencies can go differently under two rules, and the build
+  notes, separately for the two sift-downs, where the height and frequencies
+  alone would disagree and where the creation order and the height would. A
+  variant whose rule for each sift-down agrees with the build's in every
+  comparison it made there takes the same steps and builds, and repairs, the
+  same tree, which is then stored for it too. An order-key build knows no
+  heights, so it can show agreement only with frequency-only rules. Noting adds
+  work to every comparison, but a histogram's later variants mostly follow an
+  earlier build's steps, so the builds it skips cost more: in replayed Max
+  header plans, DeflOpt variant 3, which breaks both ties by frequency alone,
+  was built 99,000 times instead of 279,000. The payload tree lists track only
+  variant 0, since on payload alphabets tracking the others cost more than it
+  saved.
 - Storing each histogram once with all its trees holds more trees in less memory
   than one slot per builder and histogram: in a completing Max run, 4,096
   entries built 10% fewer trees than 16,384 per-builder slots (1.7 MiB), and
@@ -7334,7 +7343,16 @@ implies at least two coded symbols), no other code can win:
 The pass then builds and prices that code alone, besides deft4j's pruned header,
 which prices a different RLE. The heap builders report whether they repaired a
 tree, and the tree cache keeps that bit with each tree. The rule needs
-strict-less-than acceptance and the Huffman tree as first candidate. It cannot
+strict-less-than acceptance and the Huffman tree as first candidate.
+
+The exhaustive search extends the rule to a repaired first tree. Exact
+Defluff's package-merge code, which that search builds anyway, spells the
+symbols in the fewest code bits of any code within 7 bits; package-merge falls
+back to another code only when no code fits, which 19 symbols in 7 bits always
+do. A repaired heap tree that costs as much still gives lengths only to the used
+symbols, so points 2–4 hold and the pass prices it alone. In replayed Max
+header plans, 32,978 of 46,949 exhaustive passes with a repaired first tree
+qualified. It cannot
 apply to the DeflOpt local rewrite's own trees, whose path follows each tree's
 exact lengths, which a tree of equal cost can change. 89% of 731,419 replayed
 passes qualified; replayed Max header plans ran 1.44× faster with 24.8% fewer
@@ -7384,8 +7402,12 @@ each tree's shortest RLE with its symbol counts, clears the list when the next
 plan starts, and searches it linearly. In an exhaustive pass, the next RLE is
 that shortest RLE when it is strictly cheaper under the tree than the DeflOpt
 rewrite, compared from the symbol counts. The plan's runs of equal code lengths
-are found once and shared by every seed and shortest RLE. 46% of 18.6 million
-calls had repeated a tree within one plan; a memo kept per thread across plans
+are found once and shared by every seed and shortest RLE. A pass depends only
+on its RLE, so each kept shortest RLE also records the earliest pass a seed of
+the plan started from it; a seed that would start the same or a later pass from
+it stops, since an earlier seed has priced everything that would follow.
+Replayed Max header plans ran 684,458 feedback passes instead of 731,419.
+46% of 18.6 million calls had repeated a tree within one plan; a memo kept per thread across plans
 was rejected, since it raised that only to 52% and its key would need the plan's
 code lengths
 ([efficiency review `0141972`](research/efficiency-review.md#0141972-23-october-2026)).

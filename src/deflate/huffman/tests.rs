@@ -347,6 +347,39 @@ fn compact_code_length_decoder_rejects_invalid_shapes() {
 }
 
 #[test]
+fn code_length_shape_check_matches_the_general_completeness_check() {
+    let mut state = 0x9b05_688c_2b3e_6c1f_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut complete = 0;
+    for case in 0..20_000 {
+        // Mostly short lengths, so complete codes occur; some over 15.
+        let longest = [4, 6, 8, 17][case % 4];
+        let mut lengths = [0_u8; 19];
+        for length in &mut lengths {
+            *length = (next() % longest) as u8;
+        }
+        if case % 3 == 0 {
+            // A complete code: a Huffman tree's lengths.
+            let frequencies: Vec<u32> = (0..19).map(|_| (next() % 9) as u32).collect();
+            lengths.copy_from_slice(&make_lengths_deflopt_heap(&frequencies, 7, 0));
+        }
+        let expected = huffman_tree_shape_is_complete(&lengths);
+        assert_eq!(
+            code_length_tree_shape_is_valid(&lengths),
+            expected,
+            "{lengths:?}"
+        );
+        complete += usize::from(expected);
+    }
+    assert!(complete > 5_000, "{complete} complete codes");
+}
+
+#[test]
 fn compact_code_length_decoder_accepts_a_short_code_at_physical_end() {
     let mut lengths = [0_u8; 19];
     lengths[0] = 1;
@@ -1031,7 +1064,13 @@ fn caller_owned_output_matches_allocating_helpers() {
     make_lengths_deflopt_heap_into(&frequencies, &mut output, 4, 2);
     assert_eq!(output, make_lengths_deflopt_heap(&frequencies, 4, 2)[..]);
 
-    make_lengths_defluff_exact_into(&frequencies, &mut output, 4, 0);
+    make_lengths_defluff_exact_into(
+        &frequencies,
+        &mut output,
+        4,
+        0,
+        &mut TreeBuildScratch::default(),
+    );
     assert_eq!(output, make_lengths_defluff_exact(&frequencies, 4, 0)[..]);
 
     make_lengths_columbo_defluff_limited_into(
@@ -1456,9 +1495,80 @@ fn compact_variant_heap_matches_the_reference_builder() {
 }
 
 #[test]
+fn code_length_heap_on_stack_arrays_matches_the_shared_buffers() {
+    let mut state = 0x1319_8a2e_0370_7344_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // A kept scratch that last built a larger alphabet.
+    let mut scratch = TreeBuildScratch::default();
+    let mut repaired = 0;
+    for case in 0..20_000 {
+        let range = [2, 4, 9, 64, 1 << 12][case % 5];
+        let mut frequencies = [0_u32; 19];
+        for frequency in &mut frequencies {
+            if next() % 3 != 0 {
+                *frequency = (next() % range) as u32;
+            }
+        }
+        if case % 7 == 0 {
+            let wide: Vec<u32> = (0..286).map(|_| (next() % 50) as u32).collect();
+            make_lengths_deflopt_heap_into_with_scratch(
+                &wide,
+                &mut [0; 286],
+                15,
+                0,
+                true,
+                &mut scratch,
+            );
+        }
+        for variant in 0..4 {
+            for use_order_tie in [false, true] {
+                for track_ties in [false, true] {
+                    let mut expected = [0_u8; 19];
+                    let shared = make_lengths_variant_heap_inner(
+                        &frequencies,
+                        &mut expected,
+                        7,
+                        variant,
+                        use_order_tie,
+                        track_ties,
+                        &mut scratch,
+                    );
+                    let mut lengths = [9_u8; 19];
+                    let build = make_code_length_lengths_variant_heap(
+                        &frequencies,
+                        &mut lengths,
+                        variant,
+                        use_order_tie,
+                        track_ties,
+                    );
+                    assert_eq!(lengths, expected, "case {case}");
+                    assert_eq!(
+                        (build.repaired, build.deflopt_variants, build.order_variants),
+                        (
+                            shared.repaired,
+                            shared.deflopt_variants,
+                            shared.order_variants
+                        ),
+                        "case {case}"
+                    );
+                    repaired += usize::from(build.repaired);
+                }
+            }
+        }
+    }
+    assert!(repaired > 1_000, "{repaired} repaired builds");
+}
+
+#[test]
 fn heap_builds_without_tie_turns_match_every_variant_they_share() {
     // Tree candidate lists and the code-length tree cache skip the builds of
-    // the variants a tracked build reports as sharing its lengths.
+    // the variants a build reports as sharing its lengths, including those of
+    // a tracked build whose turns leave only some variants agreeing.
     let mut state = 0x3c6e_f372_fe94_f82b_u64;
     let mut next = move || {
         state ^= state << 13;
@@ -1467,7 +1577,7 @@ fn heap_builds_without_tie_turns_match_every_variant_they_share() {
         state
     };
     let mut scratch = TreeBuildScratch::default();
-    let mut shared = [0_usize; 2];
+    let mut shared = [0_usize; 3];
     for case in 0..20_000 {
         let size = match case % 4 {
             0 | 1 => 19,
@@ -1520,13 +1630,36 @@ fn heap_builds_without_tie_turns_match_every_variant_they_share() {
                     let own = (lengths, build.repaired);
                     let heap = if use_order_tie { &order } else { &deflopt };
                     assert_eq!(own, heap[variant as usize], "case {case}");
-                    if build.all_deflopt_variants {
-                        assert!(deflopt.iter().all(|tree| *tree == own), "case {case}");
+                    let own_bit = 1 << variant;
+                    let own_heap = if use_order_tie {
+                        build.order_variants
+                    } else {
+                        build.deflopt_variants
+                    };
+                    assert_ne!(own_heap & own_bit, 0, "case {case}");
+                    for (trees, variants) in [
+                        (&deflopt, build.deflopt_variants),
+                        (&order, build.order_variants),
+                    ] {
+                        for (other, tree) in trees.iter().enumerate() {
+                            if variants & 1 << other != 0 {
+                                assert_eq!(*tree, own, "case {case}, variant {other}");
+                            }
+                        }
+                    }
+                    if build.deflopt_variants == ALL_HEAP_VARIANTS {
                         shared[0] += 1;
                     }
-                    if build.all_order_variants {
-                        assert!(order.iter().all(|tree| *tree == own), "case {case}");
+                    if build.order_variants == ALL_HEAP_VARIANTS {
                         shared[1] += 1;
+                    }
+                    // Some variants, but not every one, share the lengths.
+                    let partial = |variants: u8| {
+                        variants != own_bit * u8::from(variants & own_bit != 0)
+                            && variants != ALL_HEAP_VARIANTS
+                    };
+                    if partial(build.deflopt_variants) || partial(build.order_variants) {
+                        shared[2] += 1;
                     }
                 }
             }
