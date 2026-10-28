@@ -2392,3 +2392,44 @@ fn match_expansion_reuses_its_first_walk_answers() {
     }
     assert!(expanded > 5_000, "only {expanded} cases expanded a match");
 }
+
+#[test]
+fn one_walk_expands_both_strict_and_non_larger_matches() {
+    let mut state = 0x3c6e_f372_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut both = 0;
+    for case in 0..20_000 {
+        let (tokens, mut plain, literal_lengths, distance_lengths) =
+            random_literal_sum_case(&mut next);
+        // A short decoded buffer makes a token overrun.
+        if case % 40 == 0 {
+            plain.pop();
+        }
+        let expected = [false, true].map(|include_equal| {
+            expand_matches(
+                &tokens,
+                &plain,
+                &literal_lengths,
+                &distance_lengths,
+                include_equal,
+            )
+        });
+        assert_eq!(
+            expand_matches_strict_and_non_larger(
+                &tokens,
+                &plain,
+                &literal_lengths,
+                &distance_lengths
+            ),
+            expected,
+            "case {case}"
+        );
+        both += usize::from(expected.iter().all(Option::is_some));
+    }
+    assert!(both > 2_000, "only {both} cases expanded both ways");
+}

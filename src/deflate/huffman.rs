@@ -305,6 +305,32 @@ struct DecodeTable {
     root_bits: u8,
 }
 
+impl DecodeTable {
+    /// The entry the low bits of `window` select, and its code length;
+    /// `window` must hold at least the longest code.
+    #[inline]
+    fn entry(&self, window: u32) -> Result<(DecodeEntry, u8)> {
+        if self.root_bits == 0 {
+            return Err(Error::new("invalid Huffman code in Deflate stream"));
+        }
+        let root_entry = self.entries[(window & ((1_u32 << self.root_bits) - 1)) as usize];
+        let subtable_bits = root_entry.subtable_bits();
+        let (entry, bits) = if subtable_bits == 0 {
+            (root_entry, root_entry.bits())
+        } else {
+            let subtable_mask = (1_u32 << subtable_bits) - 1;
+            let index = usize::from(root_entry.subtable_start())
+                + ((window >> self.root_bits) & subtable_mask) as usize;
+            let entry = self.entries[index];
+            (entry, self.root_bits + entry.bits())
+        };
+        if entry.bits() == 0 {
+            return Err(Error::new("invalid Huffman code in Deflate stream"));
+        }
+        Ok((entry, bits))
+    }
+}
+
 impl Huffman {
     /// Build canonical codes from code lengths. Incomplete codes are accepted;
     /// callers apply each alphabet's rule. At most `MAX_C_CODES` symbols may
@@ -408,6 +434,20 @@ impl Huffman {
             .decode_profile
             .ok_or_else(|| Error::internal("internal Huffman decoder has no value profile"))?;
         if let Some(table) = &self.decode_table {
+            // With 32 bits in hand, the longest code and its extra bits are
+            // both there, so one look decodes the value.
+            if let Some(window) = reader.peek_word() {
+                let (entry, code_bits) = table.entry(window)?;
+                let extra_bits = entry.extra_bits();
+                let extra = ((window >> code_bits) & ((1_u32 << extra_bits) - 1)) as u16;
+                reader.drop_bits(code_bits + extra_bits)?;
+                return Ok(DecodedValue {
+                    symbol: entry.symbol(),
+                    value: entry.value_base() + extra,
+                    extra,
+                    extra_bits,
+                });
+            }
             if let Some((entry, code_bits)) = self.peek_decode_table(reader, table)? {
                 let extra_bits = entry.extra_bits();
                 let total_bits = code_bits + extra_bits;

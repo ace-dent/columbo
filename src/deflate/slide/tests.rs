@@ -558,3 +558,111 @@ fn early_stopping_joining_price_matches_the_full_sum() {
         }
     }
 }
+
+/// The cut search before it walked once: three walks, pricing a token again
+/// in each.
+fn cheaper_cut_reference(pair: &Pair<'_>) -> Option<(usize, u64, u64)> {
+    let current = pair.left.len();
+    if current == 0 || pair.right.is_empty() {
+        return None;
+    }
+    let n = current.checked_add(pair.right.len())?;
+    let (mut lo, mut hi) = (1, n - 1);
+    for (index, item) in pair.walk().enumerate() {
+        let (token, bytes, from_left) = item?;
+        if from_left {
+            if pair.right_price(token, bytes, true).is_none() {
+                lo = index + 1;
+            }
+        } else if pair.left_price(token, bytes, false).is_none() {
+            hi = hi.min(index);
+            break;
+        }
+    }
+    if lo >= hi {
+        return None;
+    }
+    let (mut prefix, mut suffix) = (0_u64, 0_u64);
+    for (index, item) in pair.walk().enumerate() {
+        let (token, bytes, from_left) = item?;
+        if index < lo {
+            prefix = prefix.checked_add(pair.left_price(token, bytes, from_left)?.0)?;
+        } else {
+            suffix = suffix.checked_add(pair.right_price(token, bytes, from_left)?.0)?;
+        }
+    }
+    let mut walk = pair.walk().skip(lo);
+    let mut best: Option<(u64, usize, u64, u64)> = None;
+    for cut in lo..=hi {
+        let total = prefix.checked_add(suffix)?;
+        let better = best.map_or(true, |(bits, best_cut, _, _)| {
+            (total, cut.abs_diff(current)) < (bits, best_cut.abs_diff(current))
+        });
+        if better {
+            best = Some((total, cut, prefix, suffix));
+        }
+        if cut < hi {
+            let (token, bytes, from_left) = walk.next()??;
+            prefix = prefix.checked_add(pair.left_price(token, bytes, from_left)?.0)?;
+            suffix = suffix.checked_sub(pair.right_price(token, bytes, from_left)?.0)?;
+        }
+    }
+    let (_, cut, left_bits, right_bits) = best?;
+    (cut != current).then_some((cut, left_bits, right_bits))
+}
+
+#[test]
+fn one_walk_cut_search_matches_the_three_walk_reference() {
+    let mut seed = 0x6a09_e667_f3bc_c908_u64;
+    let mut state = 0x7f4a_7c15_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut moved = 0;
+    for case in 0..20_000 {
+        let count = 2 + (next() % 160) as usize;
+        let (tokens, plain) = random_tokens(&mut seed, count);
+        let split = 1 + (next() as usize) % (count - 1);
+        let decoded_split: usize = tokens[..split].iter().map(|t| t.decoded_len()).sum();
+        // Missing codes move the cut limits on either side, and leave tokens
+        // their own block cannot code; short decoded bytes make a token
+        // overrun its block.
+        let mut lengths = |size: usize| -> Vec<u8> {
+            let missing = [0, 3, 12][(next() % 3) as usize];
+            (0..size)
+                .map(|_| {
+                    if next() % 64 < missing {
+                        0
+                    } else {
+                        (next() % 15 + 1) as u8
+                    }
+                })
+                .collect()
+        };
+        let trees = [(lengths(286), lengths(30)), (lengths(286), lengths(30))];
+        let right_plain_end = if next() % 50 == 0 {
+            plain.len() - 1
+        } else {
+            plain.len()
+        };
+        let pair = Pair {
+            left: &tokens[..split],
+            left_plain: &plain[..decoded_split],
+            right: &tokens[split..],
+            right_plain: &plain[decoded_split..right_plain_end],
+            left_trees: (&trees[0].0, &trees[0].1),
+            right_trees: (&trees[1].0, &trees[1].1),
+        };
+        let expected = cheaper_cut_reference(&pair);
+        assert_eq!(
+            cheaper_cut(&pair, &mut SearchStop::never()),
+            expected,
+            "case {case}"
+        );
+        moved += usize::from(expected.is_some());
+    }
+    assert!(moved > 2_000, "only {moved} cases moved the cut");
+}

@@ -5409,9 +5409,11 @@ token cut against the selected trees.
 3. Price each token on each side: a token in its own block keeps its spelling,
    and a joining match costs the cheaper of its own code and its decoded bytes
    as literals, a tie keeping the match.
-4. Scan every cut in the range with running prefix and suffix sums and take the
-   cheapest; ties go to the cut nearest the current one, so an equal cut never
-   moves the boundary. Move only if the cut changes, rebuilding both blocks with
+4. Scan every cut in the range and take the cheapest, in one walk that prices
+   each token once: a cut's total differs from the range's first cut's by the
+   left minus right prices of the tokens between them, and a left token the
+   right trees cannot code restarts the comparison past it. Ties go to the cut
+   nearest the current one, so an equal cut never moves the boundary. Move only if the cut changes, rebuilding both blocks with
    each joining token spelled as priced.
 5. Repeat sweeps while any boundary moves, at most 16 per round. A pair
    unchanged since its last complete search, tracked by per-block generation

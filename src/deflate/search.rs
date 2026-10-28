@@ -3231,8 +3231,8 @@ fn consider_deft4j_trees(
     // deft4j's recode prunes matches under these trees, then rebuilds. Try both
     // the strict and the tie-including forms: a tie changes the next
     // frequencies.
-    let strict = expand_matches(&block.tokens, &block.plain, &literal, &distance, false);
-    let non_larger = expand_matches(&block.tokens, &block.plain, &literal, &distance, true);
+    let [strict, non_larger] =
+        expand_matches_strict_and_non_larger(&block.tokens, &block.plain, &literal, &distance);
     if let Some(tokens) = strict {
         let duplicate = non_larger
             .as_ref()
@@ -3788,14 +3788,18 @@ fn plan_block_with_search_policy(
         // expanding equal-cost matches too changes the frequencies and can miss
         // a smaller rebuilt table.
         let is_fixed_seed = literal_lengths == fixed_seed.0 && distance_lengths == fixed_seed.1;
+        // The first pass expands the block's own tokens under the seed codes,
+        // as the strict expansion does, so both come from one walk.
+        let mut first_pass = None;
         if !is_fixed_seed {
-            if let Some(strictly_expanded) = expand_matches(
+            let [strictly_expanded, non_larger] = expand_matches_strict_and_non_larger(
                 &block.tokens,
                 &block.plain,
                 &literal_lengths,
                 &distance_lengths,
-                false,
-            ) {
+            );
+            first_pass = Some(non_larger);
+            if let Some(strictly_expanded) = strictly_expanded {
                 consider_tokens(
                     block,
                     strictly_expanded,
@@ -3812,13 +3816,16 @@ fn plan_block_with_search_policy(
             continue;
         };
         for _ in 0..pass_limit {
-            let Some(expanded) = expand_matches(
-                &seed_tokens,
-                &block.plain,
-                &literal_lengths,
-                &distance_lengths,
-                true,
-            ) else {
+            let expanded = first_pass.take().unwrap_or_else(|| {
+                expand_matches(
+                    &seed_tokens,
+                    &block.plain,
+                    &literal_lengths,
+                    &distance_lengths,
+                    true,
+                )
+            });
+            let Some(expanded) = expanded else {
                 break;
             };
             let Some(candidate) = plan_tokens(block, expanded, alignment, options, stop) else {
@@ -4823,27 +4830,92 @@ fn expand_matches_with_token_limit(
         MAX_TOKEN_CANDIDATE_BYTES,
         token_limit,
         |_, token, decoded| {
-            let Token::Match {
-                length_symbol,
-                distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
-                ..
-            } = token
-            else {
-                return false;
-            };
-            let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
-                + u64::from(length_extra_bits)
-                + estimated_length(distance_lengths, usize::from(distance_symbol))
-                + u64::from(distance_extra_bits);
-            let Some(literal_bits) = literal_bits_up_to(decoded, literal_lengths, match_bits)
-            else {
-                return false;
-            };
-            literal_bits < match_bits || (include_equal && literal_bits == match_bits)
+            literals_against_match(token, decoded, literal_lengths, distance_lengths)
+                .is_some_and(|order| order.is_lt() || (include_equal && order.is_eq()))
         },
     )
+}
+
+/// How a match's literals compare in cost with the match under the given code
+/// lengths, or `None` when the literals cost more or the token is a literal.
+fn literals_against_match(
+    token: Token,
+    decoded: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> Option<std::cmp::Ordering> {
+    let Token::Match {
+        length_symbol,
+        distance_symbol,
+        length_extra_bits,
+        distance_extra_bits,
+        ..
+    } = token
+    else {
+        return None;
+    };
+    let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
+        + u64::from(length_extra_bits)
+        + estimated_length(distance_lengths, usize::from(distance_symbol))
+        + u64::from(distance_extra_bits);
+    let literal_bits = literal_bits_up_to(decoded, literal_lengths, match_bits)?;
+    Some(literal_bits.cmp(&match_bits))
+}
+
+/// [`expand_matches`] without and then with `include_equal`, from one walk:
+/// each match's literal sum, up to the match's own cost, decides both.
+fn expand_matches_strict_and_non_larger(
+    tokens: &[Token],
+    plain: &[u8],
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+) -> [Option<Vec<Token>>; 2] {
+    let mut expanded: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
+    let mut output_counts = [0_usize; 2];
+    let mut plain_offset = 0_usize;
+    for (index, &token) in tokens.iter().enumerate() {
+        let Some(decoded) = plain_offset
+            .checked_add(token.decoded_len())
+            .and_then(|end| plain.get(plain_offset..end))
+        else {
+            return [None, None];
+        };
+        let order = literals_against_match(token, decoded, literal_lengths, distance_lengths);
+        let expands = [
+            order.is_some_and(|order| order.is_lt()),
+            order.is_some_and(|order| order.is_le()),
+        ];
+        for ((expand, indices), count) in expands
+            .into_iter()
+            .zip(&mut expanded)
+            .zip(&mut output_counts)
+        {
+            let Some(added) = count.checked_add(if expand { decoded.len() } else { 1 }) else {
+                return [None, None];
+            };
+            *count = added;
+            if expand {
+                if indices.try_reserve(1).is_err() {
+                    return [None, None];
+                }
+                indices.push(index);
+            }
+        }
+        plain_offset += decoded.len();
+    }
+    if plain_offset != plain.len() {
+        return [None, None];
+    }
+    let spell = |indices: &[usize], count: usize| {
+        if indices.is_empty() {
+            return None;
+        }
+        spell_expanded_matches(tokens, plain, indices, count, MAX_TOKEN_CANDIDATE_BYTES)
+    };
+    [
+        spell(&expanded[0], output_counts[0]),
+        spell(&expanded[1], output_counts[1]),
+    ]
 }
 
 /// Whether any match costs strictly more than its literals under the given

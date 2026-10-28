@@ -198,6 +198,10 @@ impl<'a> Pair<'a> {
     }
 }
 
+fn signed(bits: u64) -> Option<i64> {
+    i64::try_from(bits).ok()
+}
+
 /// Find the cheapest cut of two adjacent blocks under their current trees.
 ///
 /// Returns the new left token count and both payloads only when that cut is
@@ -209,51 +213,76 @@ fn cheaper_cut(pair: &Pair<'_>, stop: &mut SearchStop<'_>) -> Option<(usize, u64
         return None;
     }
     let n = current.checked_add(pair.right.len())?;
+    // One walk prices each token once, under the trees of both blocks. A cut's
+    // total is the left prices before it plus the right prices from it on, so
+    // cuts compare by their difference from the lowest usable cut `lo`: the
+    // left minus right prices of the tokens between them. A left token the
+    // right trees cannot code moves `lo` past it and restarts the comparison;
+    // a right token the left trees cannot code is the last cut (`hi`). Every
+    // token must be codable in its own block, as before.
     let (mut lo, mut hi) = (1, n - 1);
+    let mut cuts_open = true;
+    // Left prices of every token before the walk, while cuts remain.
+    let mut prefix = 0_u64;
+    // Right prices of the tokens from `lo` on, and the cut total less `lo`'s.
+    let mut right_since_lo = 0_u64;
+    let mut difference = 0_i64;
+    // The best cut: its difference, index, prefix and right prices before it.
+    let mut best: Option<(i64, usize, u64, u64)> = None;
     for (index, item) in pair.walk().enumerate() {
         let (token, bytes, from_left) = item?;
-        if from_left {
-            if pair.right_price(token, bytes, true).is_none() {
-                lo = index + 1;
+        if cuts_open && index >= lo {
+            if index % STOP_POLL_TOKENS == 0 && stop.reached() {
+                return None;
             }
-        } else if pair.left_price(token, bytes, false).is_none() {
-            hi = hi.min(index);
-            break;
+            let better = best.map_or(true, |(best_difference, best_cut, _, _)| {
+                (difference, index.abs_diff(current))
+                    < (best_difference, best_cut.abs_diff(current))
+            });
+            if better {
+                best = Some((difference, index, prefix, right_since_lo));
+            }
+        }
+        let right = pair.right_price(token, bytes, from_left);
+        if from_left {
+            let left = pair.left_price(token, bytes, true)?.0;
+            prefix = prefix.checked_add(left)?;
+            match right {
+                Some((right, _)) => {
+                    right_since_lo = right_since_lo.checked_add(right)?;
+                    difference =
+                        difference.checked_add(signed(left)?.checked_sub(signed(right)?)?)?;
+                }
+                None => {
+                    lo = index + 1;
+                    right_since_lo = 0;
+                    difference = 0;
+                    best = None;
+                }
+            }
+        } else {
+            let right = right?.0;
+            right_since_lo = right_since_lo.checked_add(right)?;
+            if cuts_open {
+                match pair.left_price(token, bytes, false) {
+                    Some((left, _)) => {
+                        prefix = prefix.checked_add(left)?;
+                        difference =
+                            difference.checked_add(signed(left)?.checked_sub(signed(right)?)?)?;
+                    }
+                    None => {
+                        hi = index;
+                        cuts_open = false;
+                    }
+                }
+            }
         }
     }
     if lo >= hi {
         return None;
     }
-
-    let (mut prefix, mut suffix) = (0_u64, 0_u64);
-    for (index, item) in pair.walk().enumerate() {
-        let (token, bytes, from_left) = item?;
-        if index < lo {
-            prefix = prefix.checked_add(pair.left_price(token, bytes, from_left)?.0)?;
-        } else {
-            suffix = suffix.checked_add(pair.right_price(token, bytes, from_left)?.0)?;
-        }
-    }
-    let mut walk = pair.walk().skip(lo);
-    let mut best: Option<(u64, usize, u64, u64)> = None;
-    for cut in lo..=hi {
-        if cut % STOP_POLL_TOKENS == 0 && stop.reached() {
-            return None;
-        }
-        let total = prefix.checked_add(suffix)?;
-        let better = best.map_or(true, |(bits, best_cut, _, _)| {
-            (total, cut.abs_diff(current)) < (bits, best_cut.abs_diff(current))
-        });
-        if better {
-            best = Some((total, cut, prefix, suffix));
-        }
-        if cut < hi {
-            let (token, bytes, from_left) = walk.next()??;
-            prefix = prefix.checked_add(pair.left_price(token, bytes, from_left)?.0)?;
-            suffix = suffix.checked_sub(pair.right_price(token, bytes, from_left)?.0)?;
-        }
-    }
-    let (_, cut, left_bits, right_bits) = best?;
+    let (_, cut, left_bits, right_before) = best?;
+    let right_bits = right_since_lo.checked_sub(right_before)?;
     (cut != current).then_some((cut, left_bits, right_bits))
 }
 

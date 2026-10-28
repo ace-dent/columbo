@@ -31,23 +31,35 @@ impl<'a> BitReader<'a> {
         if bits > 32 {
             return Err(Error::new("cannot read more than 32 bits at once"));
         }
-        if self.buffered_bits >= bits {
-            return Ok(());
-        }
-        // With eight bytes left, load them at once and keep the whole bytes
-        // that fit: at least four, as `buffered_bits` is below 32 here.
-        if let Some(word) = self
-            .input
-            .get(self.byte_pos..self.byte_pos + 8)
-            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-        {
-            self.buffer |= u64::from_le_bytes(word) << self.buffered_bits;
-            let bytes = (64 - self.buffered_bits) / 8;
-            self.byte_pos += usize::from(bytes);
-            self.buffered_bits += bytes * 8;
+        if self.buffered_bits >= bits || self.load_word() {
             return Ok(());
         }
         self.fill_bytes(bits)
+    }
+
+    /// With eight bytes left, load them at once and keep the whole bytes that
+    /// fit: at least four, as `buffered_bits` is below 32 when called.
+    #[inline]
+    fn load_word(&mut self) -> bool {
+        let Some(word) = self
+            .input
+            .get(self.byte_pos..self.byte_pos + 8)
+            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+        else {
+            return false;
+        };
+        self.buffer |= u64::from_le_bytes(word) << self.buffered_bits;
+        let bytes = (64 - self.buffered_bits) / 8;
+        self.byte_pos += usize::from(bytes);
+        self.buffered_bits += bytes * 8;
+        true
+    }
+
+    /// The next 32 bits, when they are buffered or eight more input bytes
+    /// remain; near the end of input, `None`, and nothing is loaded.
+    #[inline]
+    pub(crate) fn peek_word(&mut self) -> Option<u32> {
+        (self.buffered_bits >= 32 || self.load_word()).then_some(self.buffer as u32)
     }
 
     /// Near the end of input, load one byte at a time.

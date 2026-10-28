@@ -81,6 +81,7 @@ gains where established.
 | 25 Oct 2026 | [`e25d20d`](#e25d20d-25-october-2026) | Header feedback passes (`header.rs`, `huffman.rs`) | A pass whose first code-length tree is a complete Huffman tree that fits 7 bits unrepaired prices and follows it alone, since every other code can at best tie; seeds and shortest RLEs counted as spelled | Captured header plans 1.44× (24.8% fewer instructions); completing Max runs 22.7% and 4.3% fewer instructions; Default CPU 1.08× | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 20,000 histogram comparisons; 681 Rust, 7 Python tests |
 | 28 Oct 2026 | [`3b5fa64`](#3b5fa64-28-october-2026) | Block sums, heap trees and package-merge (`block.rs`, `header.rs`, `huffman.rs`, `search.rs`) | A block's extra bits, fixed-code price and source-header payload from its symbol counts; a variant-0 heap build that finds no comparison a tie rule could decide gives its tree to every variant sharing those rules, in the code-length tree cache and the payload tree lists; package-merge's buffers kept per thread | Default CPU 1.07× (33 inputs, 6.7% fewer cycles); replayed header plans 1.04×; a completing Max run 3.2% fewer instructions; peak memory −0.4 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 tracked-heap and 20,000 shuffled tree-cache comparisons; 688 Rust, 7 Python tests |
 | 28 Oct 2026 | [`a6f67cd`](#a6f67cd-28-october-2026) | Heap entries, match expansion and RLE seeds (`huffman.rs`, `search.rs`, `header.rs`) | The DeflOpt-style heap packs frequency, tie field and index into one word; match expansion keeps its first walk's answers and spells the result out of line; a greedy RLE seed that only repeats an earlier mask's is not spelled | Default CPU 1.04× (33 inputs, 3.0% fewer cycles); replayed header plans 1.04×; a completing Max run 4.6% fewer instructions; `__text` 4.2 KB smaller | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 expansion and 5,000 long-run seed comparisons; 689 Rust, 7 Python tests |
+| 28 Oct 2026 | [`46b7c44`](#46b7c44-28-october-2026) | Boundary slide, Huffman decoding and paired match expansions (`slide.rs`, `bitstream.rs`, `huffman.rs`, `search.rs`) | The slide's cut search walks the pair once, pricing each token once; decoding takes each code and its extra bits from one 32-bit window; the strict and tie-including expansions under the same codes share one walk | Default CPU 1.02× (33 inputs, 2.1% fewer cycles); peak memory unchanged | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 66 Default timing runs; 20,000 cut-search and 20,000 paired-expansion comparisons; 691 Rust, 7 Python tests |
 
 ## Entries
 
@@ -477,6 +478,91 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `46b7c44`, 28 October 2026
+
+Batches: whole-file CPU (user plus system) and peak resident memory over the
+33 stratified Default inputs, two rounds alternating the builds; retired
+instructions and cycles from `time -l` over the same inputs, two alternating
+rounds per comparison; three alternating runs of the header-plan replay; two
+alternating runs of each completing Max run.
+
+A sampled Default profile of the 33 inputs at `46b7c44` (42,290 CPU samples),
+with the slide's cut search and pricing kept out of line, put 24.8% of self
+time in the heap builder and 7.2% in the boundary slide's cut search and
+prices; the rest spread over steps of 4% or less. A third of the time is the
+Default finish, whose terminal searches plan blocks the earlier sweeps have
+already changed.
+
+- **One walk per slide cut search.** The slide (R1c) found its scan limits in
+  one walk, summed prefix and suffix prices in a second and scanned the cuts in
+  a third, pricing a joining token, its literals included, up to three times.
+  A cut's total differs from the first usable cut's by the left minus right
+  prices of the tokens between them, so one walk keeps running sums and the
+  best cut relative to that first cut, starting again whenever a left token
+  the right trees cannot code moves it, and stops comparing at the first right
+  token the left trees cannot code. Memory stays constant.
+- **One window per decoded value.** Decoding peeked the root code bits, the
+  subtable bits if needed, then the code and its extra bits again, each time
+  checking and refilling the bit buffer. With 32 bits in the buffer, or eight
+  more input bytes to load, the longest code and its extra bits are all
+  there, so one window gives the entry and the value; near the end of input
+  the decoder takes its former path.
+- **Strict and tie-including expansions together.** Each seed of the block
+  search's rebuild ladder first expands the block's matches whose literals cost
+  less under the seed codes, then, as the ladder's first pass, those whose
+  literals cost no more, under the same codes; deft4j's recode does the same.
+  Each match's literal sum, taken up to the match's cost, decides both, so
+  one walk spells both expansions.
+
+| Candidate | Instructions | Cycles |
+| --- | ---: | ---: |
+| One walk per slide cut search | −1.22% | −0.98% |
+| Plus one window per decoded value | −0.97% | −0.78% |
+| Plus paired expansions | −0.50% | −0.34% |
+
+Each row is measured against the build before it.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, CPU over two rounds | 96.3 s | 94.4 s | 1.02× |
+| Same inputs, cycles over two rounds | 301.0 billion | 294.8 billion | −2.07% |
+| Same inputs, instructions retired | 1,246.8 billion | 1,213.4 billion | −2.67% |
+| 89,255 header plans captured from ten Max runs, replayed (median) | 2.114 s | 2.130 s | unchanged |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 21.77–21.82 billion | 21.78–21.79 billion | unchanged |
+
+`Partnership_Card___John_Lewis_Finance.png`, the largest input, gained 1.05×.
+Median peak memory was unchanged and the largest rise 2.7 MiB; `Apricot512.png`
+and `BNDT_on_X…png`, whose slides walk the longest pairs, kept their peaks
+within 1 MiB.
+
+Equivalence: new tests compare the one-walk cut search with the three-walk
+form on 20,000 random block pairs, with trees missing codes on either side and
+tokens overrunning their block, and the paired expansion with the two separate
+expansions on 20,000 random token lists, code lengths and short decoded
+buffers; the existing parser and decoder tests cover the decoding window. The
+89,255 replayed header plans matched plan for plan. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every timing run and both completing Max runs matched
+byte for byte. Rust tests, including the private corpus, passed in release and
+debug modes, with documentation and Python tests, a locked build, formatting,
+all-feature Clippy with warnings denied and a package list without private
+fixtures or scratch artifacts. `__text` grew from 863,120 to 865,300 bytes;
+the shipped executable keeps its 942,064 bytes, and the final source builds
+the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Remembering terminal block searches that found nothing: only 685 of 8,957
+  block searches on the 33 inputs repeated a block state already searched in
+  vain, 0.11 of their 7.25 seconds, and the searches share work budgets a skip
+  would have to charge.
+- Package-merge nodes of 16 instead of 32 bytes, with 32-bit indices: 0.03%
+  more instructions and 0.20% more cycles.
+- Pricing each payload tree once per alphabet instead of once per tree pair:
+  0.25% fewer instructions and 0.17% fewer cycles, within run-to-run spread.
+
+Artifacts: `work/efficiency-review-default6-20261028/`.
 
 ### `a6f67cd`, 28 October 2026
 
