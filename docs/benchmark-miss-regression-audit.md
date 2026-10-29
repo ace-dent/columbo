@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 27 October 2026 entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 29 October 2026 entry, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,113 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="refresh-29-october"></a>
+
+## deft4j, DeflOpt and Defluff refresh on 29 October 2026
+
+### Benchmark state
+
+All three reports come from executable `2b08abe4…` (`77353bc`). Since the
+timed deft4j state of 24 October (`23035349…`, `b23274b`), this adds the
+changes listed on [27 October](#deflopt-defluff-refresh-27-october) after
+`b23274b`, then the strict and Max-guarantee closes (`82b540a`), three Default
+efficiency rounds (`dbae999`, `46b7c44`, `c2aa4ba`) and three Max efficiency
+rounds (`4013a14`, `6e6a0c4`, `77353bc`). The DeflOpt and Defluff states of 27
+October (`5153aa02…`, `9f36bdb`) miss only the commits from `82b540a` on.
+
+| Benchmark | Result |
+| --- | --- |
+| Timed deft4j Max, 1,621 rows | 193 smaller, 1,399 identical, 29 larger (22 in bytes); net −3,586 bytes / −28,669 bits; runtime 13,872.6 → 12,084.1 s |
+| By format | PNG −3,512 bytes (173 smaller, 29 larger); ZIP −74 (20 smaller); GZIP and zlib unchanged |
+| DeflOpt Default, 957 rows | 956 identical, one iCCP chunk 9 bytes smaller ([below](#default-iccp-29-october)); runtime 346.6 → 290.7 s |
+| DeflOpt Max, 951 rows with unchanged allowances | 62 smaller, 875 identical, 14 larger (9 in bytes); net −271 bytes / −2,168 bits; runtime 7,417.6 → 7,259.7 s |
+| DeflOpt Max, all 957 rows | 63 smaller, 16 larger (11 in bytes); net −125 bytes / −1,007 bits; six allowances fell by 1 or 2 seconds with the faster Default |
+| Defluff, 66 pairs | Unchanged: −109 bytes and −938 bits against Defluff, no misses |
+
+Every DeflOpt Max row is no larger than its Default row. The largest deft4j
+gains are `Partnership_Card___John_Lewis_Finance.png` (−685 bytes),
+`Home___X.png` (−280) and `MediaWiki-2020-large-icon-spinning.png` (−181).
+The laptop slept from 09:12 to 11:10 during the DeflOpt Max pass. Columbo's
+deadlines and the benchmark's timers use clocks that stop in sleep, and no
+row's time exceeds its usual overshoot past the allowance.
+
+### Reference misses
+
+Unchanged: the same 12 timed deft4j misses, by 0–1 bytes and 2–3 bits, 11 at
+parity in the relaxed audit and the twelfth the preserved
+`oxipng/c2pa-signed.png`; DeflOpt keeps its four strict-policy floors
+(`sample-green-400x300.png` and `T_Grass.png`, both modes), each at parity in
+the relaxed audit. The prior-result annotations, crossroads in both reports and
+Squirtle, Poliwrath, Pikachu and Psyduck in deft4j, are rows identical to the
+earlier states.
+
+<a id="default-iccp-29-october"></a>
+
+### The smaller Default row
+
+`280543107-79bbbda4-b565-493b-9088-d7647e86a1ca.png` went from 5,874 to 5,865
+bytes. Only its iCCP chunk differs, 333 against 324 bytes. Default probes small
+compressed metadata streams for at most 100 milliseconds, so that chunk depends
+on speed and load, as on 24 October. Run quietly, `9f36bdb` and this build each
+give 5,865 bytes in 20 of 20 runs; the first two runs of `9f36bdb` gave 5,872
+and 5,874. With eight copies running at once, this build gives 5,874 in 24 of
+24 runs.
+
+### Rows that grew
+
+Quiet serial reruns of the 29 deft4j rows that grew, at their allowances,
+alternating builds of `b23274b` and `77353bc` twice each: 23 repeat, and the
+other 6 tie or vary between runs. Of the 23, 22 stop at their deadlines with
+both builds. Run once at their allowances, builds of `9f36bdb` and `c2aa4ba`
+show where each of those 22 first grew:
+
+| First larger at | Rows | Changes in that range |
+| --- | ---: | --- |
+| `9f36bdb` | 16 | Replaced-candidate closes and the Default and Max speedups of 25 October |
+| `c2aa4ba` | 1 | `Kiwi512.png`: strict and Max-guarantee closes, Default efficiency rounds |
+| `77353bc` | 5 | Max efficiency rounds |
+
+Given three times their allowances, this build reaches or beats the earlier
+size on nine of the 22, among them `Kiwi512.png` (388,840 bytes at 249
+seconds, against 388,872 at 83) and all three `interlaced_rgba_16` rows of the
+last range. Of the other 13:
+
+- `rgba_16_should_be_palette_8.png` completes in 18 seconds at 21,765 bytes,
+  its size at 10 seconds; the earlier build's 21,764 was a 10-second cut.
+- `PngSuite.png` gives 2,117 bytes at 30 seconds against 2,116 at 10, and
+  `sample-hut-400x300.png` gives 269,718 against 269,714, the step
+  [traced on 27 October](#sample-hut-step-27-october).
+- `Mango512.png`, the largest at +93 bytes, gives 140,005 bytes with
+  `b23274b` at 16 seconds and `9f36bdb` at 10, but 140,098 with `9f36bdb` at
+  16 seconds. Every later build gives 140,098 at 10 and 16 seconds, and this
+  build at 48. This is a non-monotonic step that the faster builds pass
+  sooner; it is not traced.
+- The other nine stop at their tripled deadlines, so where their searches
+  end is unknown. `Sock.png`, first larger at `77353bc`, gives 85,906 bytes at
+  36 seconds against the earlier build's 85,856 at 12.
+
+The 23rd, `092-Gastly-1.png`, is 1 bit larger. The earlier build stops at about
+8 of its 10 seconds, Max's closing margin, at 1,955 bits. Given 30 or 60
+seconds, it completes in 11.2 seconds at 1,956, the size that `9f36bdb`,
+`c2aa4ba` and this build reach by completing within 10 seconds (3.3 seconds
+for this build). As with `basi3p04.png` on
+[24 October](#deft4j-refresh-24-october), the cut search ended 1 bit below the
+complete one.
+
+The 16 DeflOpt Max rows that grew were rerun the same way, alternating `9f36bdb`
+and this build twice at the current allowances. Eight repeat: `Mango512.png`
+(+93 bytes, first larger at `c2aa4ba`), `sample_66-fs8.png` (+9),
+`sample_36-fs8.png` (+7), `sample_39-fs8.png` (+5),
+`interlaced_rgba_16_should_be_grayscale_8.png` (+5), `text_3.png` (+2, first
+larger at `c2aa4ba`), `interlaced_rgba_16_should_be_rgb_8.png` (+1) and
+`medium/Ball.png` (+1 bit). The others tie or are smaller with this build. The
+largest growth, `IMG_8555.png` (+152 bytes), and `y2rc2_large.png` (+2) come
+from allowances that fell from 11 and 12 seconds to 10. At 10 seconds, this
+build is smaller than `9f36bdb` on both: 846,918–846,929 bytes against
+847,118–847,141, and 46,707–46,719 against 46,738.
+
+Artifacts: `work/deft4j-refresh-20261028/` and `work/deflopt-refresh-20261029/`.
 
 <a id="deflopt-defluff-refresh-27-october"></a>
 
