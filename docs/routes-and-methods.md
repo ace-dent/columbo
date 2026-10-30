@@ -372,8 +372,8 @@ Routes and modes:
 - **Close**: run the terminal tree floors on a complete candidate. Columbo
   closes a topology contender that would lose, before comparing it, since a
   different topology may win only after the floors run. In Max it also closes
-  the replaced candidates it keeps, because a smaller candidate can close larger
-  than one it replaced
+  and finishes the replaced candidates it keeps, because a smaller candidate can
+  finish larger than one it replaced
   ([M14: replaced-candidate close](#m14-replaced-candidate-close)).
 
 Measures and limits:
@@ -964,12 +964,11 @@ What happens to one stream:
      ([Source topology (D4)](#source-topology-d4)).
    - **Max:** a deadline could have handed any candidate the incumbent replaced
      to the finish instead, and the finishing steps are not monotone in their
-     starting size. Max therefore uses the terminal tree floors to close the
-     incumbent and the replaced candidates it kept, then finishes the incumbent.
-     If a closed candidate beats the closed incumbent, Max finishes the smallest
-     such candidate too and keeps the smaller endpoint. It then closes the
-     candidates its sweeps replaced. A few route wins before the finish discard
-     the kept list, so some replaced candidates are never closed
+     starting size. Max therefore closes and finishes the incumbent, then
+     closes and finishes each replaced candidate it kept, newest first, while
+     terminal work may start, and keeps the smallest endpoint. It then closes
+     the candidates its sweeps replaced. A few route wins before the finish
+     discard the kept list, so some replaced candidates are never finished
      ([M14: replaced-candidate close](#m14-replaced-candidate-close)).
    - **Max, last:** Default's own finish of the complete Default endpoint (R1c,
      R13–R18), and any R1b win, are kept only as final competitors. They are
@@ -1111,7 +1110,7 @@ linked as evidence.
    - It runs the tree floors on a topology contender that would lose, before
      comparing it, since a different topology may win only after them (code
      comment).
-   - In Max, it keeps complete candidates that later steps replace and closes
+   - In Max, it keeps complete candidates that later steps replace and finishes
      them at the end, though a few later wins discard them
      ([M14: replaced-candidate close](#m14-replaced-candidate-close)). A
      complete Max search once ended 1 byte above the same search cut at 10
@@ -1270,9 +1269,9 @@ Four rules turn the timeout into stopping points
 - **Linear finalization.** Cheap linear steps may start after the soft deadline,
   until the hard stop: the fixed-tree boundary slide (R1c), the finishing steps
   from the distance-alphabet ladder (R13) through the terminal token replay
-  (R17), the bounded-depth tree floor, and Max's tree-floor closes of the
-  candidates its sweeps replaced. A stream whose search used its whole allowance
-  therefore still gets them. Before R1c could start late, Max never slid the
+  (R17), the bounded-depth tree floor, and Max's closes of the candidates its
+  sweeps replaced. A stream whose search used its whole allowance therefore
+  still gets them. Before R1c could start late, Max never slid the
   final incumbent of its largest streams, although Default slid them
   ([linear finalization share](benchmark-miss-regression-audit.md#linear-finalization-share-on-8-october-2026)).
 - **Clock-free work.** Some work ignores the clock:
@@ -1390,8 +1389,9 @@ per byte of the first emission ([Replay limits](#replay-limits)).
 The finishing steps are not monotone in their starting size, so a deadline that
 hands an earlier candidate to the finish can end lower than a complete search.
 Max therefore keeps the complete candidates that its lineage steps, its later
-routes and its route-gated terminal methods replace, and closes them with the
-tree floors at the end
+routes and its route-gated terminal methods replace. At the end it finishes
+those its lineage steps and routes replaced like the incumbent, and closes those
+its terminal methods replaced with the tree floors
 ([M14: replaced-candidate close](#m14-replaced-candidate-close)). Later source
 max (M12) does the same for its replay parents
 ([M12: later source max](#m12-later-source-max)). The coverage is not complete.
@@ -1399,12 +1399,13 @@ A few later wins, such as a winning M12 replay parent or the final compact
 balanced tree (M4), replace the incumbent with a candidate that keeps nothing,
 and the candidates kept until then are lost; M14 lists these cases.
 
-The closes of what lineage steps and routes replaced are optional work and start
-only under G0, since closing them late can push the incumbent's own final tree
-floor past the hard stop. The closes of what the sweeps replaced run as linear
-finalization once both endpoints are complete, so they can only lower the
-result. [M14: replaced-candidate close](#m14-replaced-candidate-close) gives the
-timing rules and the measured failure behind each.
+The finishes of what lineage steps and routes replaced are optional terminal
+work: each starts only under the G0 of the deadline that governs terminal work,
+after the incumbent's own finish, so it cannot push that finish past the hard
+stop. The closes of what the sweeps replaced run as linear finalization once the
+endpoints are complete, so they can only lower the result.
+[M14: replaced-candidate close](#m14-replaced-candidate-close) gives the timing
+rules and the measured failure behind each.
 
 **How Columbo meets rule 2.** Each pass is bounded so that the slides and merges
 after it still get time, and R12 repeats a pass that changed the stream, so the
@@ -1670,6 +1671,13 @@ against deft4j. Its measured effects:
 - **Closes:** M14 made 2 of 369 early-finishing timed deft4j rows smaller and
   none larger
   ([replaced candidates](benchmark-miss-regression-audit.md#replaced-candidates-25-october)).
+  Finishing every kept candidate under the terminal deadline then made 10 of
+  42 rows that had grown smaller and none larger, and 8 of 167 sampled
+  benchmark rows smaller for about 1% more time; closing sweep-replaced
+  candidates with R1c and R13–R18 as well made 5 more of those rows smaller,
+  by 47 bytes, and 4 of 75 deadline-bound sampled rows, with none
+  reproducibly larger
+  ([29 October](benchmark-miss-regression-audit.md#kept-candidates-29-october)).
   M12's replay-parent closes are measured under
   [Source max route](#source-max-route).
 - **Other Max routes:** Columbo's reports have no isolated incremental
@@ -2184,7 +2192,7 @@ Max time. The rerun as R18 is measured under
   each losing topology before comparing it
   ([Raw-stream route tree](#raw-stream-route-tree)). Both modes run them again
   as [R18](#late-tree-floor-r18), and Max closes replaced candidates with them
-  ([M14](#m14-replaced-candidate-close)).
+  before finishing them ([M14](#m14-replaced-candidate-close)).
 - **Eligible:** mandatory floor work or a nonzero timeout (a container child can
   receive a zero slice); only blocks parsed as dynamic are re-priced.
 - **Bounds:** depth limits from the first feasible depth through 14. Linear
@@ -2502,7 +2510,8 @@ sample of 25 PNGs at 60 seconds saved 244 bytes on 7 files; two files grew by
   ([Floors and the Max guarantee](#floors-and-the-max-guarantee) gives what Max
   guarantees). D4's lineage gets it as part of its
   finish. In Max, M14 then closes the candidates the sweeps replaced with the
-  same floors ([M14](#m14-replaced-candidate-close)).
+  same floors, and again after R1c and R13–R17 in a stream that owns its time
+  ([M14](#m14-replaced-candidate-close)).
 - **Eligible:** the gates of the two floors: mandatory work or a nonzero
   timeout; the compact floor's size, block, token and stored-block limits;
   otherwise the bounded-depth floor on dynamic blocks, with Max's rescue limits.
@@ -5573,8 +5582,8 @@ outputs.
   [G0](#g0-timed-route-start) allows. It also runs on Max's completed Default
   endpoint (`Complete`, `CompleteThenBounded`, `SharedExact`) and on the APNG
   Default endpoint, within the Max allowance rather than as mandatory work. In
-  Max's sweeps, a candidate R6 replaces is kept and later closed with the tree
-  floors ([M14](#m14-replaced-candidate-close)).
+  Max's sweeps, a candidate R6 replaces is kept and closed at the end
+  ([M14](#m14-replaced-candidate-close)).
 - **Eligible:** candidate compressed size and stream decoded size each at most 1
   MiB, also on Max's Default endpoints, where R1b–R5 keep the 128 KiB Default
   class; at most 128 parsed blocks; the parse keeps every wire block. Per block:
@@ -8075,7 +8084,7 @@ the relaxed-mode check in step 15 do work; every other step runs only in Max.
 12. `Complete` compares its retained Default endpoint; then M10d.
 13. Default only: D4 is built and kept if strictly smaller than the incumbent.
 14. The terminal stage: R1–R18 on the incumbent. Max first runs the terminal
-    tree floors and M14's closes, and afterward M14's second finish and the
+    tree floors, and afterward M14's finishes of its kept candidates and the
     closes of sweep-replaced candidates. Default then finishes the D4 lineage.
 15. Max's exact policies compare Default's slid final competitor; in relaxed
     mode the source is kept unless the result is strictly smaller.
@@ -8358,10 +8367,7 @@ flowchart TD
     M10D -- "Eligible" --> DSPLIT["Deferred bounded split finalization"]
     M10D -- "Ineligible" --> FINALFLOORS
     DSPLIT --> FINALFLOORS["Terminal tree floors on the incumbent"]
-    FINALFLOORS --> M14{"M14: kept replaced candidates<br/>+ primary G0 for each"}
-    M14 -- "Yes" --> M14RUN["Close each with the tree floors;<br/>remember the smallest that beats the incumbent"]
-    M14 -- "No" --> R1
-    M14RUN --> R1{"R1: original-match restoration + G0"}
+    FINALFLOORS --> R1{"R1: original-match restoration + G0"}
     R1 -- "Yes" --> RESTORE["Restore certified matches under unchanged trees"]
     R1 -- "No" --> R1B{"R1b: strict degenerate distance tree + G0"}
     RESTORE --> R1B
@@ -8423,20 +8429,20 @@ flowchart TD
     REPLAYMAX --> TAILWIN
     TAILWIN -- "Yes" --> R1
     TAILWIN -- "No" --> R18MAX["R18: terminal tree floors once more"]
-    R18MAX --> M14FIN{"M14: a closed candidate beat<br/>the closed incumbent + primary G0"}
-    M14FIN -- "Yes" --> M14FINRUN["Finish it through R1–R18 too;<br/>keep the smaller endpoint, ties keep the incumbent"]
-    M14FIN -- "No" --> SWEPT
-    M14FINRUN --> SWEPT["Close each candidate that R1–R11 replaced in the sweeps<br/>with the tree floors until the hard stop"]
+    R18MAX --> M14FIN{"M14: next kept candidate, newest first,<br/>+ terminal G0"}
+    M14FIN -- "Yes" --> M14FINRUN["Close it with the tree floors, finish it through R1–R18;<br/>keep the smaller endpoint, ties keep the earlier"]
+    M14FINRUN --> M14FIN
+    M14FIN -- "No" --> SWEPT["Close each candidate that R1–R11 replaced in the sweeps<br/>with the tree floors, then, when the stream owns its time,<br/>with R1c and R13–R18, until the hard stop"]
     SWEPT --> PICKMAX["Select the byte/meaningful-bit winner,<br/>including Default's final competitor,<br/>or the relaxed raw source"]
 ```
 
 Read it as three stretches. The top stretch (comparison floor to M10d) runs the
 later Max routes against one incumbent, each replacing it only with a strictly
 smaller complete candidate. The middle stretch (terminal tree floors to R18) is
-the terminal stage: the tree floors, M14's first closes, then the sweep and its
-R12 loop, detailed in [Terminal sweep order](#terminal-sweep-order). The bottom
-stretch finishes the best closed replaced candidate and closes the candidates
-the sweeps replaced.
+the terminal stage: the tree floors, then the sweep and its R12 loop, detailed
+in [Terminal sweep order](#terminal-sweep-order). The bottom stretch closes and
+finishes each kept replaced candidate in turn and closes the candidates the
+sweeps replaced.
 
 Only `Complete` still holds its complete Default endpoint at the "Complete only"
 node; the other exact policies joined theirs earlier, and every exact policy
@@ -8527,7 +8533,7 @@ both checks ([Shared terminal rules](#shared-terminal-rules)).
 4. Otherwise the sweep has settled, and R16 and R17 run as in Default.
 5. If R16 or R17 changed the stream and G0 allows, R12 sweeps again; otherwise
    R18 runs.
-6. M14 then finishes the best closed replaced candidate and closes the
+6. M14 then closes and finishes each kept replaced candidate and closes the
    candidates the sweeps replaced ([Late max sequence](#late-max-sequence)).
 
 In Max's own sweeps, each candidate that R1 or R1b–R11 replaces is kept, and M14
@@ -8560,10 +8566,10 @@ splits it into two candidates, and only the first then gets the timed R6–R9:
   be finished like any other, while Default's exact endpoint is compared
   unchanged at the end.
 
-**Which deadline.** With a G0t share, the primary routes through M10d and M14's
-starts use the primary deadline. The terminal tree floors on the incumbent,
-every sweep, R16–R18, the work inside any started M14 step and the closes of
-sweep-replaced candidates use the full allowance and its grace
+**Which deadline.** With a G0t share, the primary routes through M10d use the
+primary deadline. The terminal tree floors on the incumbent, every sweep,
+R16–R18, M14's finishes of kept candidates and the closes of sweep-replaced
+candidates use the full allowance and its grace
 ([G0t: Max terminal share](#g0t-max-terminal-share)).
 
 **`ApngDefault`'s moved fit, measured.** Against `6c81dfa`, on 120 APNG-heavy
@@ -8659,8 +8665,9 @@ added since, such as R10, R11 and R13–R18, were not part of it.
 
 **Columbo's gates and bounds**
 
-- **Runs:** Max only, in the terminal stage on the final incumbent and on M14's
-  best closed candidate. Default runs one sweep plus its single R13–R15 repeat.
+- **Runs:** Max only, in the terminal stage on the final incumbent and on each
+  candidate M14 finishes. Default runs one sweep plus its single R13–R15
+  repeat.
 - **Eligible:** another sweep starts only after the previous sweep, or the R16
   and R17 tail, strictly improved the complete stream (fewer bytes, or equal
   bytes and fewer meaningful bits), and only while G0 allows on the terminal
@@ -8760,7 +8767,7 @@ terminal methods and S for the source-max state order
 | M11 | Fragmented collection | Max, every policy | After the topology merges, before M12 | [M11](#m11-fragmented-collection); [method](#fragmented-collection-and-replay-m11) |
 | M12 | Later source max | Max, every policy | After M11, before M13 | [M12](#m12-later-source-max); [method](#source-max-route) |
 | M13 | Rewritten-seed refinement | Max, every policy | After M12, before M2 late | [M13](#m13-rewritten-seed-refinement); [method](#floor-seeded-and-rewritten-seed-refinement-m7-m7a-m13) |
-| M14 | Replaced-candidate close | Max, every policy | Terminal stage, around the R1–R18 finish | [M14](#m14-replaced-candidate-close) |
+| M14 | Replaced-candidate close | Max, every policy | Terminal stage, after the incumbent's R1–R18 finish | [M14](#m14-replaced-candidate-close) |
 | R1 | Original-match restoration | Both modes | First in every sweep | [Original-match restoration (R1)](#original-match-restoration-r1) |
 | R1b | Strict distance completion | Both modes; strict only | After R1 | [Strict distance completion (R1b)](#strict-distance-completion-r1b) |
 | R1c | Fixed-tree boundary slide | Both modes | After R5 (Default; R1b under `ApngDefault`) or R11 (Max); again after each R13–R17 win | [Fixed-tree boundary slide (R1c)](#fixed-tree-boundary-slide-r1c) |
@@ -8957,14 +8964,13 @@ routes, and the full allowance for terminal work and for the timeout report.
     M4;
   - R6–R9 on the complete Default endpoint, or the route window when the bounded
     phase builds that endpoint;
-  - M10d's stop, since M10d has no start test;
-  - M14's starts: each replaced-candidate close and the second finish start only
-    while the primary G0 allows.
+  - M10d's stop, since M10d has no start test.
 - **The full allowance governs:** the terminal tree floors on the final
-  incumbent, the whole R1–R18 finish (also inside an M14 step once that step has
-  started), and the linear-finalization closes of the candidates the sweeps
-  replaced. The timeout report reads the full allowance too, so a primary yield
-  is not a timeout and changes nothing for the other streams of a container.
+  incumbent, the whole R1–R18 finish, M14's finish of each kept candidate,
+  which starts under the full allowance's G0, and the linear-finalization closes
+  of the candidates the sweeps replaced. The timeout report reads the full
+  allowance too, so a primary yield is not a timeout and changes nothing for the
+  other streams of a container.
 - **After a primary yield:** once the primary hard stop has passed but the full
   allowance can still start routes, M10d runs only the compact-split rescue, so
   exhaustive split pricing cannot spend the terminal share (code comment). Under
@@ -9549,47 +9555,70 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   finish, R1 and R1b–R11. A losing contender's own kept list joins the
   incumbent's, but the loser itself is not kept. M12 closes its own replay
   parents.
-- **What is lost:** M14 closes only what is still on the final incumbent's list
-  when the terminal stage starts. These replacements keep nothing and discard
-  the list they overwrite: on the incumbent, a winning M12 replay parent, the
-  final M4, `Complete`'s Default endpoint and M10d; on the deft4j lineage, the
-  compact-split and no-split folds, which drop M10b's kept candidates, or M2c's
-  when the no-split candidate loses.
+- **What is lost:** M14 finishes only what is still on the final incumbent's
+  list when the terminal stage starts. These replacements keep nothing and
+  discard the list they overwrite: on the incumbent, a winning M12 replay
+  parent, the final M4, `Complete`'s Default endpoint and M10d; on the deft4j
+  lineage, the compact-split and no-split folds, which drop M10b's kept
+  candidates, or M2c's when the no-split candidate loses.
 - **Effect,** in order:
   1. Collect the kept candidates, distinct by bytes and different from the
      incumbent.
-  2. Run the terminal tree floors on the incumbent.
-  3. For each kept candidate, oldest first, while the primary G0 allows: run the
-     tree floors on it, and remember the smallest one that is strictly smaller
-     than the closed incumbent.
-  4. Finish the incumbent through R1–R18.
-  5. If a candidate was remembered and the primary G0 still allows, finish it
-     through R1–R18 too and keep the smaller endpoint; a tie keeps the
-     incumbent's.
-  6. Close each distinct candidate that R1 or R1b–R11 replaced during either
-     finish with the tree floors, as linear finalization until the full
-     allowance's hard stop. A strictly smaller result replaces the endpoint; a
-     tie keeps the endpoint.
-- **Timing:** steps 3 and 5 start only under the primary deadline's G0, also
-  under a G0t share; the work inside them and steps 2, 4 and 6 use the full
-  allowance.
+  2. Run the terminal tree floors on the incumbent, then finish it through
+     R1–R18.
+  3. For each kept candidate, newest first, while terminal work's G0 allows:
+     run the tree floors on it, finish it through R1–R18, and keep the smaller
+     endpoint; a tie keeps the earlier one.
+  4. Close each distinct candidate that R1 or R1b–R11 replaced during any of
+     these finishes, as linear finalization until the full allowance's hard
+     stop: first each with the tree floors; then, in a stream that owns its
+     time (`Complete`, `CompleteThenBounded`), each again, newest first, with
+     the finishing steps that need no G0, R1c and R13–R17 followed by the tree
+     floors (R18), under a deadline that lets no route start. A strictly
+     smaller result replaces the endpoint; a tie keeps the endpoint.
+- **Timing:** step 3 starts each candidate under the G0 of the deadline that
+  governs terminal work: the full allowance with a G0t share, the primary
+  deadline without one. The work inside a started step uses the full allowance,
+  as do steps 2 and 4.
 - **Why:** neither the tree floors nor R1–R18 is monotone in its starting size,
   and a deadline just before any replacement would have handed the replaced
-  candidate to exactly these steps. With enough time, closing the kept
-  candidates therefore keeps a longer search from ending above a shorter one
+  candidate to the floors and finish of step 2. Finishing each kept
+  candidate therefore keeps a longer search from ending above a shorter one,
+  as far as time allows
   ([replaced candidates](benchmark-miss-regression-audit.md#replaced-candidates-25-october),
-  [terminal sweep replacements](benchmark-miss-regression-audit.md#terminal-sweep-replacements-25-october)).
+  [terminal sweep replacements](benchmark-miss-regression-audit.md#terminal-sweep-replacements-25-october),
+  [29 October](benchmark-miss-regression-audit.md#kept-candidates-29-october)).
   Each step's rule has its own reason:
-  - Steps 3 and 5 wait on G0, because closing kept candidates is optional work.
-    Closing them after the deadline made one PNG 2–3 bytes larger in every run:
-    the closes took 170 ms, and the incumbent's own final bounded-depth floor
-    then met the hard stop.
-  - Steps 4 and 5 finish both the incumbent and the best closed candidate and
-    keep the smaller endpoint. Finishing only the smallest closed candidate was
-    rejected: one parent closed smaller than the incumbent, then finished 2 bits
-    above it.
-  - Step 6 runs after both endpoints are complete, so it can only lower the
-    result.
+  - Step 2 finishes the incumbent before any kept candidate, so optional closes
+    cannot push its own finish past the hard stop. Closing kept candidates
+    before that finish, after the route deadline too, made `monarch.PNG` 2–3
+    bytes larger in every run: the closes took 170 ms, and the incumbent's
+    final bounded-depth floor then met the hard stop.
+  - Step 3 finishes every kept candidate rather than the one that closes
+    smallest, because a size after the tree floors does not show which
+    candidate finishes smallest: on `dossier-green-normal-fs8.png` the
+    incumbent closes at 121,716 bits and finishes at 121,612, while a kept
+    candidate that stays at 121,753 bits after the floors finishes at 121,554.
+    Finishing only the smallest closed candidate had already failed once: one
+    parent closed smaller than the incumbent, then finished 2 bits above it.
+  - Step 3 is terminal work, so it waits on the terminal deadline's G0 rather
+    than the primary one. Under a G0t share the primary routes use their whole
+    window whenever the search is cut, so a primary gate kept exactly the
+    deadline-bound runs, where a shorter run's endpoint differs, from closing
+    anything. Newest first finishes first what the latest shorter run would
+    have handed over.
+  - Step 4 runs after the endpoints are complete, so it can only lower the
+    result. A deadline just before the replacing method would have handed the
+    candidate to R1c and R13–R18, not to the floors alone: on
+    `sample_70-fs8.png` a header-directed match response (R10) that a slower
+    build never starts wins, and the sweep ends at 114,646 bits, while those
+    steps take the candidate it replaced to 114,556. The floors-only close
+    still runs first, because the steps can also end higher: on
+    `007-Squirtle.png` the ladder (R13) takes a replaced candidate to 1,739
+    bits, where the floors alone reach 1,738. The other policies keep only the
+    floors-only close, for the reason M10d leaves them out: no ZIP member, GZIP
+    member, metadata stream or APNG frame may use time reserved for later
+    streams.
 - **See:** [Floors and the Max guarantee](#floors-and-the-max-guarantee),
   [Late max sequence](#late-max-sequence).
 

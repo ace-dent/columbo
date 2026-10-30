@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 29 October 2026 entry, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The two 29 October 2026 entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,122 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="kept-candidates-29-october"></a>
+
+## Kept candidates finished on 29 October 2026
+
+### Starting state
+
+At `85bf564`, the executable of the [refresh](#refresh-29-october), the
+hundred-file guard passes 94 of 100 floors, with the six recorded failures at
+their recorded sizes. The reference misses are the strict-policy floors. Of the
+29 timed deft4j rows that grew, a group of css-ig-net palette images keeps its
+loss at 30 seconds, and the earlier build given 30 seconds ends at the same
+larger size: its 10-second results were states that a longer search passes.
+
+### Cause
+
+On `dossier-green-normal-fs8.png` the current build ends the bounded follow-up
+sooner, so later source max (M12) starts before the primary deadline and is
+cut there. Closed with the tree floors, its candidate (121,716 bits) beats the
+incumbent (121,741) and replaces it, and the terminal stage ends at 121,612
+bits. The replaced incumbent is kept for
+[M14](routes-and-methods.md#m14-replaced-candidate-close); finished, it ends at
+121,554, the earlier build's result. M14 did not finish it, for two reasons:
+
+- M14 started its closes only under the primary deadline's G0. With a
+  [G0t](routes-and-methods.md#g0t-max-terminal-share) share, a search that is
+  cut uses its whole primary window, so the closes never started in exactly
+  the runs where a shorter run's endpoint differs, although the terminal share
+  still had time.
+- M14 finished only a kept candidate whose size after the tree floors beat the
+  closed incumbent. This one stays at 121,753 bits after the floors, above the
+  incumbent's 121,716, yet finishes 58 bits below the incumbent's endpoint.
+
+### Accepted change
+
+M14 now finishes the incumbent first, then closes and finishes each distinct
+kept candidate, newest first, while terminal work may start, and keeps the
+smaller endpoint; a tie keeps the earlier one. Terminal work is governed by the
+full allowance under a G0t share and by the primary deadline otherwise, so only
+streams with a terminal reservation gain time for it. The incumbent's own
+finish comes first, so the closes cannot push it past the hard stop, which is
+why closing after the deadline failed on 25 October (`monarch.PNG`). Default
+keeps no replaced candidates and is unchanged.
+
+| Check | Result |
+| --- | --- |
+| The 42 rows that grew (28 timed deft4j rows without `Kiwi512.png`, 14 DeflOpt Max rows with unchanged allowances), alternating builds | 10 smaller, none larger: `sample_65-fs8.png` −15 bytes, the Lotus APNG −14, `sample_36-fs8.png` −11, `dossier-green-normal-fs8.png` −4, `sample_39-fs8.png` −3, `PngSuite.png` −2, `Bullfinch.png` −2, `sample_25.png` −2, `icone_windows-fs8.png` −1, `road.png` −6 bits. Four reach the earlier build's size, five pass it, and `sample_39-fs8.png` stays 2 bytes above. `Sock.png` varies with timing on both builds (85,856, 85,906 and 85,912 bytes) |
+| Every twentieth deadline-bound row of both reports (75: PNG, ZIP, GZIP) | 5 smaller, 1 larger; net −16 bytes / −115 bits; wall time +0.8%, CPU +1.4%. The larger row, `dance.png` (+1 byte), gives 334,221–334,230 bytes on both builds |
+| Every twelfth early-finishing row (92) | 3 smaller by a byte each, none larger; wall time +1.2%, CPU +1.1% |
+| Hundred-file guard | 97 of 100: crossroads (2,121 bytes against its 2,123 floor; 8.2 → 9.5 seconds), Squirtle (1,738 bits, completing in under a second) and `test-conversion-truecoloralpha-grayscalealpha.png` (51,857–51,858 bytes against 51,859) now pass; Psyduck, Pikachu and Poliwrath fail at their old sizes |
+| `monarch.PNG` at 16 seconds, twice each | 840,882 bytes on both builds |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Identical bytes; instructions within 0.1% |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with the Python tests, formatting and all-feature Clippy with warnings denied.
+`__text` shrank from 875,640 to 875,236 bytes; the shipped executable keeps its
+958,512 bytes.
+
+### Sweep-replaced candidates
+
+Accepted on 30 October. On `sample_70-fs8.png` both builds follow the same
+lineages, and the incumbent is the comparison floor (115,353 bits). The faster
+build starts a header-directed match response (R10) in a terminal sweep, and
+its win leads to 114,646 bits. The earlier build never starts R10: its deadline
+hands the candidate R10 would have replaced to the finishing steps that need
+no route start, R1c and R13–R17, and then the tree floors (R18), which end at
+114,556. M14 kept that candidate but closed it with the tree floors alone.
+Giving each sweep-replaced candidate a full finish under the terminal G0
+instead changed nothing: the incumbent's sweeps use the whole terminal window,
+so no route can start.
+
+M14 now closes each candidate the sweeps replaced with the tree floors, as
+before, and then, in a stream that owns its time (`Complete`,
+`CompleteThenBounded`), gives each, newest first, R1c, R13–R17 and R18 under a
+deadline whose soft deadline is now and whose hard stop is the terminal one:
+the finish a run cut just before the replacing method would have given it. It
+keeps the smaller endpoint, and a tie keeps the endpoint. Both closes run,
+because either can end lower: a version with only the finish took
+`007-Squirtle.png` to 1,739 bits, where the floors alone reach its 1,738-bit
+floor, since the ladder (R13) moves the candidate to a point the floors no
+longer improve. The other
+policies keep the floors-only close for the reason
+[M10d](routes-and-methods.md#m10d-deferred-source-max-split) leaves them
+out: no ZIP member, GZIP member, metadata stream or APNG frame may use time
+reserved for later streams. Each finish is linear finalization after the
+endpoints are complete, from 4 to 400 milliseconds per candidate.
+
+| Check, against the change above | Result |
+| --- | --- |
+| The same 42 rows that grew | 5 smaller on the new path, none larger: `OwlAlpha-0.5.png` −20 bytes, `sample_70-fs8.png` −11, `interlaced_grayscale_alpha_16_should_be_grayscale_alpha_8.png` −7, `profile_srgb_allow_gray.png` −5, `text_3.png` −4. `sample_70-fs8.png` reaches the earlier build's size and the other four pass it. Net −49 bytes / −385 bits, including a 2-byte timing difference on the Lotus APNG; wall time +0.3%, CPU +1.9% |
+| The same 75 deadline-bound rows | 4 smaller on the new path: the interlaced row −7 bytes, `test-conversion-rgb-canalalpha.png` −4, `sample_68-fs8.png` −2, `slope.png` −1 bit. Net −23 bytes / −164 bits; wall time +0.2%, CPU +0.4%. Of the 3 larger rows, `clegg.PNG` (+3 bytes) and `profile_gray_disallow_color.png` (+1) were identical in two more alternating runs, and `sample_39.png` (+1) gave 16,599–16,601 bytes on both builds over four. `dance.png` (−15) is an APNG, so none of its streams takes the new path; it gives 334,225–334,276 bytes on the first build and 334,228–334,261 on this one |
+| The same 92 early-finishing rows | Identical; wall time +1.2%, CPU +0.5%. Most of the wall difference is one 1-second row, `034-Nidoking.png`, whose three reruns show none |
+| Hundred-file guard | 97 of 100, as above; Squirtle passes at 1,738 bits |
+| `monarch.PNG` at 16 seconds, twice each | 840,882 bytes on both builds |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Identical bytes; instructions −0.1% and +0.03% |
+| API comparisons, as above | 104 identical |
+
+The tests passed as above, with a new unit test of the finalization-only
+deadline. With both changes `__text` grows from 875,640 to 876,048 bytes; the
+shipped executable keeps its 958,512 bytes.
+
+### Not changed
+
+- `sample_35-fs8.png` and the `interlaced_rgba_16` rows: the earlier result of
+  `sample_35-fs8.png` is not among the kept candidates, and the interlaced rows
+  recover at three times the allowance.
+- `sample_66-fs8.png`, which ends at 9,994 or 10,003 bytes depending on
+  timing.
+- `Mango512.png` and `sample-hut-400x300.png`, traced
+  [below](#mango512-step-29-october) and on
+  [27 October](#sample-hut-step-27-october).
+- Psyduck, Pikachu and Poliwrath, whose floors come from earlier paths
+  ([accepted trade-offs](#accepted-trade-offs)), and the reference misses.
+
+Artifacts: `work/regressions-20261029/`.
 
 <a id="refresh-29-october"></a>
 
@@ -118,7 +234,7 @@ last range. Of the other 13:
   `b23274b` at 16 seconds and `9f36bdb` at 10, but 140,098 with `9f36bdb` at
   16 seconds. Every later build gives 140,098 at 10 and 16 seconds, and this
   build at 48. This is a non-monotonic step that the faster builds pass
-  sooner; it is not traced.
+  sooner ([traced below](#mango512-step-29-october)).
 - The other nine stop at their tripled deadlines, so where their searches
   end is unknown. `Sock.png`, first larger at `77353bc`, gives 85,906 bytes at
   36 seconds against the earlier build's 85,856 at 12.
@@ -144,6 +260,72 @@ build is smaller than `9f36bdb` on both: 846,918–846,929 bytes against
 847,118–847,141, and 46,707–46,719 against 46,738.
 
 Artifacts: `work/deft4j-refresh-20261028/` and `work/deflopt-refresh-20261029/`.
+
+<a id="mango512-step-29-october"></a>
+
+### The non-monotonic step on `Mango512.png`
+
+Traced on 29 October with the executables of this refresh, one verbose run at
+each allowance:
+
+| Build | 140,005 bytes | 140,098 bytes |
+| --- | --- | --- |
+| `b23274b` | 16 seconds | 20 and 30 seconds |
+| `9f36bdb` | 10 seconds | 11–14 and 16 seconds |
+| `77353bc` | | 10 and 48 seconds |
+
+The image's IDAT stream decodes to 1,049,088 bytes, just over the 1 MiB class,
+so [G0t](routes-and-methods.md#g0t-max-terminal-share) gives it the
+finalization share, and every run uses its whole allowance. The bounded phase
+ends with the same no-split candidate
+([M2](routes-and-methods.md#m2-no-split-source)), 1,105,575 bits, in every
+run. Where the route window cuts the floor's Max descendant
+([M7](routes-and-methods.md#m7-floor-descendant)) decides the rest:
+
+- Cut early, at 1,112,867 bits, the descendant is larger than the no-split
+  candidate, so the floor-seeded continuation
+  ([M7a](routes-and-methods.md#m7a-best-first-floor-continuation)) does not
+  start. The follow-up continues the no-split candidate
+  ([M2c](routes-and-methods.md#m2c-changed-no-split-continuation)) to
+  1,097,373 bits beside the deft4j refinement
+  ([M10b](routes-and-methods.md#m10b-bounded-deft-refinement), 1,097,755
+  bits), and the no-split lineage ends at 1,096,438 bits.
+- Cut later, below 1,100,000 bits, the descendant leads, and M7a continues it
+  beside M10b until the hard stop. The follow-up can no longer start, so M2c
+  never runs, and the deft4j lineage ends at 1,097,177 bits. M7a itself
+  reaches only 1,099,925 bits at 10 seconds and 1,098,724 at 48.
+
+A faster build or more time passes the step sooner: `9f36bdb` between 10 and
+11 seconds, `b23274b` between 16 and 20, and every build from `c2aa4ba` on
+within 10 seconds. Unlike [`sample-hut-400x300.png`](#sample-hut-step-27-october),
+the better endpoint is not a state inside one search but a whole lineage that
+M7a starves, chosen by a comparison of parents whose size does not predict
+the better endpoint.
+
+Measured and rejected: running M2c beside M7a on a second worker, after any
+pending compact split, and not again in the follow-up. `Mango512.png` then
+gives 140,005 bytes at 10, 16 and 48 seconds, but the same mechanism works the
+other way on `Cherry512.png`, an image of the same size. There M2c reaches
+1,262,786 bits, below the floor-seeded parent's 1,264,465, so the no-split
+lineage becomes the incumbent and ends at 1,261,355 bits instead of 1,258,943:
+273 bytes larger at both 10 and 30 seconds. The floor-seeded lineage, now
+losing, is not finished: M7a has used the primary time up to the hard stop,
+and its close finds nothing. A screen of the 377 deadline-limited
+benchmark PNGs whose IDAT stream is in M2's class, one run each at 10
+seconds, found M2c beside M7a on 138. Every second of those by name, plus
+`Mango512.png`, run alternately on both builds (70 rows): 9 smaller, 7 larger,
+net +153 bytes, with 1.8% more CPU time. Over three runs of the 16 that
+differed, `Mango512.png` (−93 bytes), `file02.png` (−37),
+`black817-480x360-3.5.png` (−26) and `Gifts.png` (−14) repeat smaller, and
+`Cherry512.png` (+273), `Mittens.png` (+12),
+`interlaced_grayscale_alpha_8_should_be_grayscale_8.png` (+11) and
+`test-conversion-rgb-canalalpha.png` (+9) repeat larger: +139 bytes on
+average. Under the deadline only the incumbent gets the full terminal stage,
+so a sibling that wins as a parent moves the endpoint either way; keeping both
+would mean finishing more than one lineage, for which the finalization share
+leaves no time. Nothing changes, and the step is an
+[accepted trade-off](#accepted-trade-offs). Traces, scripts and the rejected
+candidate are in `work/mango512-nonmonotonic/`.
 
 <a id="deflopt-defluff-refresh-27-october"></a>
 
@@ -1411,15 +1593,25 @@ Current:
   Squirtle and Pikachu on 9 October. Parent size does not predict the better
   endpoint, and each fix tried cost more bytes or time than it recovered
   ([8 October](#early-lineage-parent-8-october), [9 October](#rows-that-grew-9-october)).
+- **Floor-seeded continuation before the no-split continuation.** Once the
+  floor's Max descendant leads, M7a can use the primary time up to the hard
+  stop, and M2c never runs: `Mango512.png` is 93 bytes larger once a build
+  gets the descendant ahead within its allowance.
+  Running M2c beside M7a recovered it but made `Cherry512.png` 273 bytes
+  larger, and was larger in total on a sample of the rows it changes
+  ([29 October](#mango512-step-29-october)).
 - **Timing.** Poliwrath's floor depends on timing, `sample_61-fs8.png` and
   `LevelLoading.png` reach theirs only with more time
   ([guard](#guard-9-october)), and `my-computer-on-fs8.png` is
   time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets a
   file-specific rule.
-- **Source-max replay parent.** `crossroads.png` and `074-Geodude-1.png` end
-  better from a source-max parent that the deadline cut short than from the
-  replayed one; only refining both parents would recover them
+- **Source-max replay parent.** `074-Geodude-1.png` ends better from a
+  source-max parent that the deadline cut short than from the replayed one;
+  only refining both parents would recover it
   ([16 October](#guard-16-october), [17 October](#guard-17-october)).
+  `crossroads.png`, listed here until 29 October, now ends below its floor at
+  10 seconds, since M14 finishes every kept candidate
+  ([29 October](#kept-candidates-29-october)).
 - **APNG fit order.** With R2–R5 after R18, R5's late rewrites miss the tree
   floors and refit that the sweep order gave them: `apng-medium/ball.png` is
   50 bytes above `6c81dfa`, against 261,016 bytes saved on the sticker corpus;

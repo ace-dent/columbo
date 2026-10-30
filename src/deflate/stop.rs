@@ -49,6 +49,14 @@ impl Deadline {
         self.duration.saturating_sub(self.started.elapsed())
     }
 
+    /// A deadline with this one's hard stop whose soft deadline is now, so
+    /// work under it gets only linear finalization: no route can start.
+    pub(crate) fn finalization_only(&self) -> Self {
+        let hard_duration = self.duration.saturating_add(self.grace);
+        let elapsed = self.started.elapsed().min(hard_duration);
+        Self::with_grace(self.started, elapsed, hard_duration - elapsed)
+    }
+
     // Deadline checks read the clock, so a call costs little, while an inlined
     // copy at each of their many call sites costs code size.
     #[inline(never)]

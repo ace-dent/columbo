@@ -2006,7 +2006,8 @@ fn run_deferred_source_max_split(
 
 /// Apply the terminal tree floors (Max only), then the terminal methods, then
 /// the tree floors once more (R18), then, for `ApngDefault`, R2–R5. Max then
-/// closes with the tree floors each candidate the terminal sweeps replaced.
+/// finishes the candidates its search replaced the same way, and closes with
+/// the tree floors each candidate the terminal sweeps replaced.
 fn finish_terminal_searches(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -2016,22 +2017,22 @@ fn finish_terminal_searches(
         source,
         options,
         progress,
-        deadline,
         ..
     } = *context;
     // Default runs these floors inside `improve_default_floor_with_feedback`.
     if !options.exhaustive {
         return finish_closed_candidate(context, deadlines, candidate);
     }
-    let terminal_work = DefaultFloorWork::Timed(deadlines.terminal_work());
+    let terminal_deadline = deadlines.terminal_work();
+    let terminal_work = DefaultFloorWork::Timed(terminal_deadline);
 
-    // Max applies them again to its final incumbent and, while routes may
-    // start, to each distinct complete candidate it replaced: a deadline could
-    // have handed any of those to the terminal searches, and a smaller
-    // candidate can close larger. The terminal searches can also end lower
-    // from a larger start, so the closed incumbent is finished first and the
-    // smallest closed parent that beats it is finished too, as time allows,
-    // keeping the smaller endpoint.
+    // A deadline could have handed any distinct complete candidate the search
+    // replaced to these same steps, and neither the tree floors nor the
+    // terminal methods are monotone in their starting size, so no closed size
+    // shows which parent finishes smallest. Max therefore finishes its
+    // incumbent first, then each parent, newest first, while terminal work may
+    // start, keeping the smaller endpoint; a tie keeps the earlier one. This is
+    // terminal work, so a G0t share's primary deadline does not stop it.
     let mut parents: Vec<Candidate> = Vec::new();
     for parent in std::mem::take(&mut candidate.replaced_parents) {
         if parent.data != candidate.data && parents.iter().all(|kept| kept.data != parent.data) {
@@ -2040,30 +2041,29 @@ fn finish_terminal_searches(
     }
     let candidate =
         improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
-    let mut best_parent: Option<Candidate> = None;
-    for parent in parents {
-        if !deadline.can_start_route() {
+    let mut finished = finish_closed_candidate(context, deadlines, candidate)?;
+    let mut swept = std::mem::take(&mut finished.replaced_parents);
+    for parent in parents.into_iter().rev() {
+        if !terminal_deadline.can_start_route() {
             break;
         }
         let parent =
             improve_with_terminal_tree_floors(source, options, terminal_work, progress, parent)?;
-        if parent.is_strictly_smaller_than(best_parent.as_ref().unwrap_or(&candidate)) {
-            best_parent = Some(parent);
-        }
-    }
-    let mut finished = finish_closed_candidate(context, deadlines, candidate)?;
-    let mut swept = std::mem::take(&mut finished.replaced_parents);
-    if let Some(parent) = best_parent.filter(|_| deadline.can_start_route()) {
         let mut parent = finish_closed_candidate(context, deadlines, parent)?;
         swept.append(&mut parent.replaced_parents);
         finished.replace_if_smaller(parent);
     }
     // The terminal sweeps keep each candidate a method that needs a route
     // start replaced: a deadline just before that method would have handed it
-    // to the finishing steps, which end with the tree floors, and those are
-    // not monotone in their starting size. Both endpoints are complete, so
-    // closing these with the floors, as linear finalization until the hard
-    // stop, can only make the result smaller; a tie keeps the endpoint.
+    // to the finishing steps that need none, R1c and R13–R18, and those are
+    // not monotone in their starting size. Each is closed with the tree floors
+    // first; a stream that owns its time then also gives each one those
+    // steps, newest first, under a deadline that lets no route start, since
+    // either close can end lower. The other policies stop at the floors: as for
+    // M10d, no container member, metadata stream or APNG frame may use time
+    // reserved for later streams. All of this is linear finalization until
+    // the hard stop after the endpoints are complete, so it can only make the
+    // result smaller; a tie keeps the endpoint.
     let mut distinct: Vec<Candidate> = Vec::new();
     for replaced in swept {
         if replaced.data != finished.data && distinct.iter().all(|kept| kept.data != replaced.data)
@@ -2071,13 +2071,29 @@ fn finish_terminal_searches(
             distinct.push(replaced);
         }
     }
-    for replaced in distinct {
+    for replaced in &distinct {
         if !terminal_work.can_finalize() {
             break;
         }
-        let replaced =
-            improve_with_terminal_tree_floors(source, options, terminal_work, progress, replaced)?;
-        finished.replace_if_smaller(replaced);
+        let closed = improve_with_terminal_tree_floors(
+            source,
+            options,
+            terminal_work,
+            progress,
+            replaced.clone(),
+        )?;
+        finished.replace_if_smaller(closed);
+    }
+    if context.default_floor.owns_terminal_stream_time() {
+        let finalization = terminal_deadline.finalization_only();
+        for replaced in distinct.into_iter().rev() {
+            if !terminal_work.can_finalize() {
+                break;
+            }
+            let mut replaced = finish_candidate_by(context, &finalization, replaced)?;
+            replaced.replaced_parents.clear();
+            finished.replace_if_smaller(replaced);
+        }
     }
     finished.replaced_parents.clear();
     Ok(finished)
@@ -2090,6 +2106,15 @@ fn finish_closed_candidate(
     deadlines: &StreamDeadlines,
     candidate: Candidate,
 ) -> Result<Candidate> {
+    finish_candidate_by(context, deadlines.terminal_work(), candidate)
+}
+
+/// [`finish_closed_candidate`] under the given terminal deadline.
+fn finish_candidate_by(
+    context: &RouteContext<'_>,
+    terminal_deadline: &Deadline,
+    candidate: Candidate,
+) -> Result<Candidate> {
     let RouteContext {
         source,
         options,
@@ -2097,7 +2122,7 @@ fn finish_closed_candidate(
         progress,
         ..
     } = *context;
-    let terminal_work = DefaultFloorWork::Timed(deadlines.terminal_work());
+    let terminal_work = DefaultFloorWork::Timed(terminal_deadline);
     let restoration_work = if default_floor == DefaultFloor::MandatoryComplete {
         DefaultFloorWork::Mandatory
     } else {
