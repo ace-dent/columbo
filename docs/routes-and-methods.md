@@ -6964,7 +6964,15 @@ as on any other.
 sizes), the extra fields of unencrypted method-0 and method-8 members in both
 headers, every file comment, the archive comment, and any bytes before the first
 local record, between records, before the central directory and after the
-archive.
+archive. Other unencrypted members lose only the extra fields that record file
+times or Unix owners (IDs `0x000a`, `0x5455`, `0x5855`, `0x7855` and `0x7875`),
+Windows owners and permissions (security descriptor `0x4453`), copy the removed
+file comment (Info-ZIP Unicode comment `0x6375`), or only pad the header (Pixar
+USD `0x1986`, Apache Commons Compress `0xa11e`, Microsoft growth hint `0xa220`
+and Android alignment `0xd935`), since their method may need the rest; a block
+that does not split into whole fields is kept. The Unicode path field `0x7075`
+stays, since it can change the extracted name. Encrypted members keep every
+extra field, since WinZip AES stores the real method in one.
 
 Provenance: **ZIP APPNOTE** and **Columbo**; largest-first Default order from
 **Columbo C**.

@@ -30,7 +30,7 @@ fn ordering_entry(method: u16, compressed_size: u32, offset: usize) -> Entry {
         method,
         flags: 0,
         skip: false,
-        strip_extra: false,
+        extra_policy: ExtraPolicy::Keep,
         source_deflate_bits: 0,
         output_deflate_bits: 0,
     }
@@ -434,7 +434,7 @@ fn accepts_signatureless_descriptor_whose_crc_looks_like_a_signature() {
         method: 8,
         flags: FLAG_DATA_DESCRIPTOR,
         skip: false,
-        strip_extra: false,
+        extra_policy: ExtraPolicy::Keep,
         source_deflate_bits: 0,
         output_deflate_bits: 0,
     };
@@ -1046,6 +1046,222 @@ fn strip_removes_classic_zip_comments_and_supported_extras() {
     let eocd = find_end_of_central_directory(&result.data).unwrap();
     assert_eq!(le16(&result.data[eocd..], 20), 0);
     optimize(&result.data, &Options::default()).unwrap();
+}
+
+fn extra_field(id: u16, data: &[u8]) -> Vec<u8> {
+    let mut field = id.to_le_bytes().to_vec();
+    field.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    field.extend_from_slice(data);
+    field
+}
+
+/// One member of `archive_with_extras`. Its payload is interpreted only for
+/// Stored and Deflate.
+struct ExtraMember<'a> {
+    method: u16,
+    flags: u16,
+    payload: &'a [u8],
+    crc: u32,
+    uncompressed_size: u32,
+    local_extra: &'a [u8],
+    central_extra: &'a [u8],
+}
+
+/// Build an archive of one-letter members, each with the file comment "note".
+fn archive_with_extras(members: &[ExtraMember]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut local_offsets = Vec::new();
+    for (index, member) in members.iter().enumerate() {
+        local_offsets.push(output.len() as u32);
+        output.extend_from_slice(&LOCAL_FILE_HEADER.to_le_bytes());
+        output.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+        output.extend_from_slice(&member.flags.to_le_bytes());
+        output.extend_from_slice(&member.method.to_le_bytes());
+        output.extend_from_slice(&[0; 4]); // time and date
+        output.extend_from_slice(&member.crc.to_le_bytes());
+        output.extend_from_slice(&(member.payload.len() as u32).to_le_bytes());
+        output.extend_from_slice(&member.uncompressed_size.to_le_bytes());
+        output.extend_from_slice(&1_u16.to_le_bytes()); // name length
+        output.extend_from_slice(&(member.local_extra.len() as u16).to_le_bytes());
+        output.push(b'a' + index as u8);
+        output.extend_from_slice(member.local_extra);
+        output.extend_from_slice(member.payload);
+    }
+
+    let central_offset = output.len() as u32;
+    for (index, member) in members.iter().enumerate() {
+        output.extend_from_slice(&CENTRAL_DIRECTORY_HEADER.to_le_bytes());
+        output.extend_from_slice(&20_u16.to_le_bytes()); // version made by
+        output.extend_from_slice(&20_u16.to_le_bytes()); // version needed
+        output.extend_from_slice(&member.flags.to_le_bytes());
+        output.extend_from_slice(&member.method.to_le_bytes());
+        output.extend_from_slice(&[0; 4]); // time and date
+        output.extend_from_slice(&member.crc.to_le_bytes());
+        output.extend_from_slice(&(member.payload.len() as u32).to_le_bytes());
+        output.extend_from_slice(&member.uncompressed_size.to_le_bytes());
+        output.extend_from_slice(&1_u16.to_le_bytes()); // name length
+        output.extend_from_slice(&(member.central_extra.len() as u16).to_le_bytes());
+        output.extend_from_slice(&4_u16.to_le_bytes()); // comment length
+        output.extend_from_slice(&[0; 8]); // disk and attributes
+        output.extend_from_slice(&local_offsets[index].to_le_bytes());
+        output.push(b'a' + index as u8);
+        output.extend_from_slice(member.central_extra);
+        output.extend_from_slice(b"note");
+    }
+    let central_size = output.len() as u32 - central_offset;
+
+    output.extend_from_slice(&END_OF_CENTRAL_DIRECTORY.to_le_bytes());
+    output.extend_from_slice(&[0; 4]); // disk numbers
+    output.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    output.extend_from_slice(&(members.len() as u16).to_le_bytes());
+    output.extend_from_slice(&central_size.to_le_bytes());
+    output.extend_from_slice(&central_offset.to_le_bytes());
+    output.extend_from_slice(&0_u16.to_le_bytes()); // comment length
+    output
+}
+
+/// Each member's local extra field, central extra field and file comment, in
+/// central order.
+fn member_extras(input: &[u8]) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    let parsed = preflight(input, false, u64::MAX).unwrap();
+    parsed
+        .entries
+        .iter()
+        .map(|entry| {
+            let local = entry.local_offset_before;
+            let local_extra_start = local + 30 + le16(input, local + 26) as usize;
+            let local_extra_length = le16(input, local + 28) as usize;
+            let central = entry.central_offset;
+            let extra_start = central + 46 + le16(input, central + 28) as usize;
+            let extra_length = le16(input, central + 30) as usize;
+            let comment_length = le16(input, central + 32) as usize;
+            (
+                input[local_extra_start..][..local_extra_length].to_vec(),
+                input[extra_start..][..extra_length].to_vec(),
+                input[extra_start + extra_length..][..comment_length].to_vec(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn strip_removes_only_metadata_extras_from_members_it_cannot_decode() {
+    let ntfs = extra_field(0x000a, &[0; 32]);
+    let timestamp = extra_field(0x5455, &[1, 0, 0, 0, 0]);
+    let owner = extra_field(0x7875, &[1, 4, 0xe8, 3, 0, 0, 4, 0xe8, 3, 0, 0]);
+    let security_descriptor = extra_field(0x4453, &[0x40, 0, 0, 0]);
+    let unicode_comment = extra_field(0x6375, &[1, 0, 0, 0, 0, b'n', b'o', b't', b'e']);
+    let padding = [
+        extra_field(0x1986, &[0; 6]),
+        extra_field(0xa11e, &[4, 0, 0]),
+        extra_field(0xa220, &[0x28, 0xa0, 2, 0, 0, 0]),
+        extra_field(0xd935, &[4, 0, 0, 0]),
+    ]
+    .concat();
+    let jar = extra_field(0xcafe, &[]);
+    let lzma_payload = b"opaque LZMA payload";
+    let lzma_local = [timestamp.clone(), jar.clone(), padding].concat();
+    let lzma_central = [
+        ntfs.clone(),
+        jar.clone(),
+        owner,
+        security_descriptor,
+        unicode_comment,
+    ]
+    .concat();
+    let input = archive_with_extras(&[
+        ExtraMember {
+            method: 14,
+            flags: 0,
+            payload: lzma_payload,
+            crc: 0x1234_5678,
+            uncompressed_size: 64,
+            local_extra: &lzma_local,
+            central_extra: &lzma_central,
+        },
+        ExtraMember {
+            method: 0,
+            flags: 0,
+            payload: b"columbo",
+            crc: crc32_update(0, b"columbo"),
+            uncompressed_size: 7,
+            local_extra: &[],
+            central_extra: &ntfs,
+        },
+    ]);
+    let options = Options {
+        strip_metadata: true,
+        ..Options::default()
+    };
+
+    let kept = optimize(&input, &Options::default()).unwrap();
+    assert_eq!(member_extras(&kept.data), member_extras(&input));
+
+    let stripped = optimize(&input, &options).unwrap();
+    assert_eq!(
+        member_extras(&stripped.data),
+        [
+            (jar.clone(), jar, Vec::new()),
+            (Vec::new(), Vec::new(), Vec::new())
+        ]
+    );
+    assert!(stripped
+        .data
+        .windows(lzma_payload.len())
+        .any(|bytes| bytes == lzma_payload));
+    assert_eq!(
+        optimize(&stripped.data, &options).unwrap().data,
+        stripped.data
+    );
+}
+
+#[test]
+fn strip_keeps_every_extra_on_encrypted_members() {
+    // WinZip AES keeps the real method in its extra field.
+    let aes = extra_field(0x9901, &[2, 0, b'A', b'E', 3, 8, 0]);
+    let extra = [aes, extra_field(0x000a, &[0; 32])].concat();
+    let input = archive_with_extras(&[ExtraMember {
+        method: 99,
+        flags: FLAG_ENCRYPTED,
+        payload: &[0x5a; 24],
+        crc: 0,
+        uncompressed_size: 100,
+        local_extra: &extra,
+        central_extra: &extra,
+    }]);
+    let options = Options {
+        strip_metadata: true,
+        ..Options::default()
+    };
+
+    let stripped = optimize(&input, &options).unwrap();
+    assert_eq!(
+        member_extras(&stripped.data),
+        [(extra.clone(), extra, Vec::new())]
+    );
+}
+
+#[test]
+fn metadata_filter_keeps_blocks_that_are_not_whole_fields() {
+    let ntfs = extra_field(0x000a, &[0; 32]);
+    let jar = extra_field(0xcafe, &[]);
+    let filter = |extra: &[u8]| {
+        kept_extra(extra, ExtraPolicy::RemoveMetadata, "test extra")
+            .unwrap()
+            .into_owned()
+    };
+
+    assert_eq!(filter(&[]), b"");
+    assert_eq!(filter(&ntfs), b"");
+    assert_eq!(
+        filter(&[jar.clone(), ntfs.clone(), jar.clone()].concat()),
+        [jar.clone(), jar.clone()].concat()
+    );
+    // A partial field header or an overlong size leaves the block as it is.
+    let partial = [ntfs.clone(), vec![0xfe, 0xca]].concat();
+    assert_eq!(filter(&partial), partial);
+    let overlong = ntfs[..ntfs.len() - 1].to_vec();
+    assert_eq!(filter(&overlong), overlong);
 }
 
 /// Insert unreferenced bytes at `offset`, before the central directory, and

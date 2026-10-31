@@ -374,6 +374,10 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     )?;
     writeln!(
         output,
+        "--strip keeps ZIP extra fields that encryption or other compression may need."
+    )?;
+    writeln!(
+        output,
         "Multiple inputs are processed sequentially; --out accepts only one input."
     )?;
     writeln!(

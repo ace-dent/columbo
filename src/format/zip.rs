@@ -85,6 +85,36 @@ enum ParallelMemberPolicy {
     AnyIndependentWork,
 }
 
+/// What `--strip` removes from an entry's local and central extra fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtraPolicy {
+    /// Keep every field: no `--strip`, or an encrypted entry, whose fields may
+    /// describe the encryption (WinZip AES keeps the real method in one).
+    Keep,
+    /// Remove every field: Stored and Deflate members decode without any.
+    RemoveAll,
+    /// Remove only `METADATA_EXTRA_IDS`: other methods may need the rest.
+    RemoveMetadata,
+}
+
+/// Extra field IDs that only record file times, owners or permissions, copy
+/// the file comment (which `--strip` removes), or pad the header (to align the
+/// data or leave room to grow in place), so no method needs them to decode a
+/// member.
+const METADATA_EXTRA_IDS: [u16; 11] = [
+    0x000a, // NTFS times
+    0x1986, // Pixar USD alignment (padding)
+    0x4453, // Windows NT security descriptor: owners and permissions
+    0x5455, // Info-ZIP extended timestamp
+    0x5855, // Info-ZIP Unix, first version: times and owner
+    0x6375, // Info-ZIP Unicode comment
+    0x7855, // Info-ZIP Unix, second version: owner
+    0x7875, // Info-ZIP Unix, third version: owner
+    0xa11e, // Apache Commons Compress alignment (padding)
+    0xa220, // Microsoft Open Packaging growth hint (padding)
+    0xd935, // Android zipalign alignment (padding)
+];
+
 #[derive(Clone, Debug)]
 struct Entry {
     local: Vec<u8>,
@@ -100,7 +130,7 @@ struct Entry {
     method: u16,
     flags: u16,
     skip: bool,
-    strip_extra: bool,
+    extra_policy: ExtraPolicy,
     source_deflate_bits: u64,
     output_deflate_bits: u64,
 }
@@ -760,20 +790,22 @@ fn rebuild_archive(
         put_le32(&mut record, 20, entry.compressed_size_after);
         put_le32(&mut record, 42, local_offset);
 
-        let record_size = if options.strip_metadata {
-            let name_length = le16(&record, 28) as usize;
-            let extra_length = le16(&record, 30) as usize;
-            if entry.strip_extra {
-                put_le16(&mut record, 30, 0);
-            }
-            // Remove the file comment even when an unsupported entry keeps
-            // its extra field.
+        if options.strip_metadata {
+            let name_end = 46 + le16(&record, 28) as usize;
+            let extra_end = name_end + le16(&record, 30) as usize;
+            let extra = kept_extra(
+                &source[name_end..extra_end],
+                entry.extra_policy,
+                OUTPUT_ALLOCATION,
+            )?;
+            // The kept field is never longer than its 16-bit source.
+            put_le16(&mut record, 30, extra.len() as u16);
+            // Remove the file comment even when an entry keeps extra fields.
             put_le16(&mut record, 32, 0);
-            46 + name_length + if entry.strip_extra { 0 } else { extra_length }
-        } else {
-            record.len()
-        };
-        try_append_bytes(&mut output, &record[..record_size], OUTPUT_ALLOCATION)?;
+            record.truncate(name_end);
+            record.extend_from_slice(&extra);
+        }
+        try_append_bytes(&mut output, &record, OUTPUT_ALLOCATION)?;
         written_entries = written_entries
             .checked_add(1)
             .ok_or_else(|| Error::new("optimized ZIP requires ZIP64"))?;
@@ -1570,7 +1602,13 @@ fn parse_central_entries(
         let flags = le16(header, 8);
         let method = le16(header, 10);
         let name = &input[position + 46..position + 46 + name_length];
-        let understood = flags & FLAG_ENCRYPTED == 0 && matches!(method, 0 | 8);
+        let extra_policy = if !strip_metadata || flags & FLAG_ENCRYPTED != 0 {
+            ExtraPolicy::Keep
+        } else if matches!(method, 0 | 8) {
+            ExtraPolicy::RemoveAll
+        } else {
+            ExtraPolicy::RemoveMetadata
+        };
         entries.push(Entry {
             local: Vec::new(),
             local_size_before: 0,
@@ -1588,7 +1626,7 @@ fn parse_central_entries(
                 && name.last() == Some(&b'/')
                 && compressed_size == 0
                 && uncompressed_size == 0,
-            strip_extra: strip_metadata && understood,
+            extra_policy,
             source_deflate_bits: 0,
             output_deflate_bits: 0,
         });
@@ -1698,21 +1736,22 @@ fn build_local_entry(
         }
     }
 
-    let name_length = le16(&input[position..position + 30], 26) as usize;
-    let new_prefix_size = if entry.strip_extra {
-        30 + name_length
-    } else {
-        prefix_size
-    };
-    let local_size = new_prefix_size
-        .checked_add(payload.len())
+    let name_end = 30 + le16(&input[position..position + 30], 26) as usize;
+    let extra = kept_extra(
+        &input[position + name_end..position + prefix_size],
+        entry.extra_policy,
+        LOCAL_ALLOCATION,
+    )?;
+    let local_size = name_end
+        .checked_add(extra.len())
+        .and_then(|size| size.checked_add(payload.len()))
         .ok_or_else(|| Error::new("ZIP local entry too large"))?;
     let mut local = try_vec_with_capacity(local_size, LOCAL_ALLOCATION)?;
-    local.extend_from_slice(&input[position..position + new_prefix_size]);
+    local.extend_from_slice(&input[position..position + name_end]);
+    local.extend_from_slice(&extra);
     put_le16(&mut local, 6, entry.flags & !FLAG_DATA_DESCRIPTOR);
-    if entry.strip_extra {
-        put_le16(&mut local, 28, 0);
-    }
+    // The kept field is never longer than its 16-bit source.
+    put_le16(&mut local, 28, extra.len() as u16);
     put_le32(&mut local, 14, entry.crc32);
     put_le32(&mut local, 18, entry.compressed_size_after);
     put_le32(&mut local, 22, entry.uncompressed_size);
@@ -1806,6 +1845,49 @@ fn output_flags(entry: &Entry) -> u16 {
     } else {
         entry.flags & !FLAG_DATA_DESCRIPTOR
     }
+}
+
+/// The part of an extra field block that `policy` keeps. A block that is not
+/// a whole sequence of fields is kept as it is, since its layout is unknown.
+fn kept_extra<'a>(
+    extra: &'a [u8],
+    policy: ExtraPolicy,
+    what: &'static str,
+) -> Result<Cow<'a, [u8]>> {
+    match policy {
+        ExtraPolicy::Keep => return Ok(Cow::Borrowed(extra)),
+        ExtraPolicy::RemoveAll => return Ok(Cow::Borrowed(&[])),
+        ExtraPolicy::RemoveMetadata => {}
+    }
+    let mut removed = 0_usize;
+    let mut position = 0_usize;
+    while position < extra.len() {
+        let (Some(id), Some(size)) = (read_le16(extra, position), read_le16(extra, position + 2))
+        else {
+            return Ok(Cow::Borrowed(extra));
+        };
+        let end = position + 4 + size as usize;
+        if end > extra.len() {
+            return Ok(Cow::Borrowed(extra));
+        }
+        if METADATA_EXTRA_IDS.contains(&id) {
+            removed += end - position;
+        }
+        position = end;
+    }
+    if removed == 0 {
+        return Ok(Cow::Borrowed(extra));
+    }
+    let mut kept = try_vec_with_capacity(extra.len() - removed, what)?;
+    let mut position = 0_usize;
+    while position < extra.len() {
+        let end = position + 4 + le16(extra, position + 2) as usize;
+        if !METADATA_EXTRA_IDS.contains(&le16(extra, position)) {
+            kept.extend_from_slice(&extra[position..end]);
+        }
+        position = end;
+    }
+    Ok(Cow::Owned(kept))
 }
 
 fn descriptor_length(input: &[u8], position: usize, limit: usize, entry: &Entry) -> Result<usize> {
