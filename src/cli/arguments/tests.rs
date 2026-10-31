@@ -274,7 +274,7 @@ fn help_describes_only_the_merged_strict_policy() {
     let help = String::from_utf8(help).unwrap();
 
     assert!(help.contains("--strict 0|1"));
-    assert!(help.contains("default: 1"));
+    assert!(help.contains("on by default (1)"));
     assert!(!help.contains("--mincodes"));
     assert!(!help.contains("--allow-258-alias"));
     assert!(!help.contains("--inspect"));

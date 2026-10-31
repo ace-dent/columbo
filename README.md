@@ -33,7 +33,7 @@ Input and decoded Deflate data are limited to 1 GiB per file, and decoded data t
 - `-d`, `--dry-run`: Run the complete optimization for each input and report savings without writing files. With one input, `--out` is ignored; with several, it is rejected.
 - `--out <file>`: Write a single input to `file` instead of modifying it. When there is nothing to write, Columbo copies the input to a missing `file` and leaves an existing `file` unchanged.
 - `-t <seconds>`, `--timeout <seconds>`: Stop starting new search routes after the specified time. The default is 180 seconds; values are clamped to 10–4000 seconds and fractions round up. An active route receives a grace period of 10% plus one second.
-- `--strict <0|1>`: Select conservative Deflate output. The default, `1`, supports strict and older decoders; `0` permits compact empty or singleton Huffman alphabets and the non-standard length-258 alias.
+- `--strict <0|1>`: Emit conservative Deflate for strict and older decoders. On by default (`1`); `0` turns it off and permits compact empty or singleton Huffman alphabets and the non-standard length-258 alias. Files are still replaced only when Columbo saves space, so a file left unchanged keeps its original encoding.
 - `--strip`: Remove supported metadata, credentials, signatures, and extraneous payloads, including unreferenced ZIP records and trailing data. Decoded content and supported structural information are preserved; ambiguous layouts are rejected. Without `--strip`, metadata and understood extraneous payloads are kept.
 - `--raw`: Treat the input as a headerless RFC 1951 Deflate stream instead of detecting a wrapper.
 

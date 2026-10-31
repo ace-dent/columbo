@@ -351,10 +351,10 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     writeln!(
         output,
         concat!(
-            "      --strict 0|1       emit conservative Deflate for strict and old",
-            "\n                         decoders (default: 1); 0 permits compact",
-            "\n                         empty/singleton Huffman alphabets and the",
-            "\n                         non-standard 258 alias"
+            "      --strict 0|1       conservative Deflate for strict and old decoders:",
+            "\n                         on by default (1); 0 turns it off and permits",
+            "\n                         compact empty/singleton Huffman alphabets and",
+            "\n                         the non-standard 258 alias"
         )
     )?;
     writeln!(
