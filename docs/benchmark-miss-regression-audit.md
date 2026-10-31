@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The two 29 October 2026 entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 30 October 2026 entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,109 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="kept-replacements-30-october"></a>
+
+## Kept replacements on 30 October 2026
+
+### Starting state
+
+At `87ed30d` the hundred-file guard passes 97 of 100 floors. Of the rows that
+grew in the [29 October refresh](#refresh-29-october), these were still above
+their earlier sizes:
+
+- **Traced and accepted:** `Mango512.png` and `sample-hut-400x300.png`.
+- **Recover at three times their allowances:** the `interlaced_rgba_16` rows,
+  `images.png` and `pengbrew_160x160.png`.
+- **The earlier result was a cut:** `rgba_16_should_be_palette_8.png`.
+- **Rechecked:**
+  - `092-Gastly-1.png`, 1 bit larger, finishing in under 4 seconds;
+  - `sample_35-fs8.png` (+3 bytes);
+  - `Sock.png` (+56);
+  - three DeflOpt rows.
+
+Alternating reruns against `b23274b` put the three DeflOpt rows
+(`sample_71.png`, `4_original.png` and `strip_chunks_all.png`) at their
+reference sizes. Three alternating runs give `Sock.png` 85,912 bytes on every
+build. Gastly is 1 bit larger in every run.
+
+### Cause
+
+On `092-Gastly-1.png` later source max (M12) closes one of its replay parents
+to 1,962 bits, which replaces the 1,963-bit incumbent. That replacement kept
+nothing and discarded the incumbent's own kept list. Finished, the 1,963-bit
+incumbent ends at 1,955 bits with a header-directed match response (R10),
+while the replay parent's line ends at 1,956. In `b23274b` source max hands
+M12 no replay parent on this file, so the 1,963-bit incumbent stays; from
+`9f36bdb` on it hands over one, and the run ends at 1,956.
+
+[M14](routes-and-methods.md#m14-replaced-candidate-close) listed the
+replacements that keep nothing:
+
+- a winning M12 replay parent;
+- the final compact balanced tree (M4);
+- `Complete`'s Default endpoint;
+- the M10d split;
+- the compact-split and no-split folds into the deft4j lineage.
+
+Except for `Complete`'s Default endpoint, a deadline can stop each of these
+before it runs. A shorter run then hands the candidate it would replace to the
+finish, so these replacements have the same reason to keep it as the lineage
+steps and routes that already kept theirs.
+
+### Accepted change
+
+Every replacement that a deadline could have stopped now keeps the candidate
+it replaces, with that candidate's own kept list:
+
+- the M12 replay parents, the final M4 and M10d on the incumbent;
+- the compact-split and no-split folds on the deft4j lineage.
+
+`Complete`'s Default endpoint keeps nothing, since it is compared whatever the
+deadline. A losing contender's kept list now joins at the oldest end, so M14
+finishes those candidates last: each is larger than a contender that already
+lost, so it is the least likely start of a shorter run's finish.
+
+Keeping without that order (probe p4) made `sample_65-fs8.png` 10–15 bytes
+larger in three of three runs. The deft4j lineage there loses to the
+floor-seeded continuation. Its newly kept candidate was then finished first,
+ending at 60,803 bits, and the deadline came before the candidate that
+finishes at 60,726, the result of the [29 October](#kept-candidates-29-october)
+change.
+
+On `sample_55-fs8.png` the compact split (50,657 bits) replaces the refined
+deft4j candidate (50,689). Kept and finished, that candidate ends at 50,328
+bits, against 50,474.
+
+| Check, against `87ed30d`, alternating builds | Result |
+| --- | --- |
+| Rows that finish early | `092-Gastly-1.png` 1,956 → 1,955 bits, its floor; Psyduck, Pikachu, Poliwrath, Geodude and Squirtle unchanged |
+| The 42 rows of 29 October that grew | 4 smaller, 3 larger, net +1 byte / −2 bits; wall time flat. Reproducible: `road.png` −1 byte and Gastly −1 bit; `profile_srgb_allow_gray.png` +5 bytes, 107,875 against 107,870 in three of three runs each |
+| Every twentieth deadline-bound row (75: PNG, ZIP, GZIP) | 5 smaller, 2 larger; net −12 bytes / −131 bits; wall time +0.2%, CPU +0.5%. `sample_55-fs8.png` −18 bytes in three of three runs; `test-conversion-rgb-canalalpha.png`, `Cookies.png` and `dance.png` overlap on both builds over three runs |
+| Every twelfth early-finishing row (92) | Identical; wall time +0.1% |
+| Hundred-file guard | 97 of 100, the same three failures at their sizes |
+| `monarch.PNG` at 16 seconds, twice each | 840,882 bytes on both builds |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Identical bytes; instructions −0.06% and −0.13% |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+
+`profile_srgb_allow_gray.png` is the cost of the order. On that row a losing
+lineage's kept candidate, finished first, led to the sweep-replaced candidate
+whose close gave the 29 October gain of 5 bytes.
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with the Python tests, formatting and all-feature Clippy with warnings denied.
+Two unit tests cover the new helper and the order. The shipped executable
+keeps its 958,512 bytes and its `__text` size.
+
+### Not changed
+
+- `sample_35-fs8.png`: none of the kept candidates reaches the earlier result.
+- `Sock.png`, `sample_66-fs8.png` and the grayscale `_should_be_palette_4` row
+  vary with timing on every build.
+- Psyduck, Pikachu and Poliwrath, whose floors come from earlier paths
+  ([accepted trade-offs](#accepted-trade-offs)), and the reference misses.
+
+Artifacts: `work/regressions-20261030/`.
 
 <a id="kept-candidates-29-october"></a>
 
@@ -1600,6 +1703,11 @@ Current:
   Running M2c beside M7a recovered it but made `Cherry512.png` 273 bytes
   larger, and was larger in total on a sample of the rows it changes
   ([29 October](#mango512-step-29-october)).
+- **Kept-candidate order.** M14 finishes a losing contender's kept candidates
+  last, since no shorter run is likely to start from them.
+  `profile_srgb_allow_gray.png` is 5 bytes larger, because one finished first
+  led to its smaller close; finishing them first instead cost
+  `sample_65-fs8.png` 10–15 bytes ([30 October](#kept-replacements-30-october)).
 - **Timing.** Poliwrath's floor depends on timing, `sample_61-fs8.png` and
   `LevelLoading.png` reach theirs only with more time
   ([guard](#guard-9-october)), and `my-computer-on-fs8.png` is

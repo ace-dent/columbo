@@ -628,14 +628,20 @@ impl Candidate {
     /// Like [`Self::replace_if_smaller`], but with `keep` (Max) the replaced
     /// candidate, bytes only, and the parents of both stay in
     /// `replaced_parents`: a deadline before the replacement would have
-    /// handed that candidate over, and a smaller one can close larger.
+    /// handed that candidate over, and a smaller one can close larger. The
+    /// list runs oldest to newest. A losing contender's parents go to the
+    /// oldest end: each is larger than a contender that lost here, so it is
+    /// the least likely start of a shorter run's finish, and is finished only
+    /// if time remains.
     fn replace_keeping_parent(&mut self, mut contender: Self, keep: bool) -> bool {
         if !keep {
             return self.replace_if_smaller(contender);
         }
         if !contender.is_strictly_smaller_than(self) {
-            self.replaced_parents
-                .append(&mut contender.replaced_parents);
+            contender
+                .replaced_parents
+                .append(&mut self.replaced_parents);
+            self.replaced_parents = contender.replaced_parents;
             return false;
         }
         let mut parent = std::mem::replace(self, contender);
@@ -755,6 +761,22 @@ fn build_source_max_candidate_verbose(
         Err(error) => {
             step.fail();
             Err(error)
+        }
+    }
+}
+
+/// [`replace_optional_if_smaller`], keeping the replaced candidate with `keep`
+/// (Max) as [`Candidate::replace_keeping_parent`] does.
+fn replace_optional_keeping_parent(
+    incumbent: &mut Option<Candidate>,
+    contender: Candidate,
+    keep: bool,
+) -> bool {
+    match incumbent {
+        Some(current) => current.replace_keeping_parent(contender, keep),
+        None => {
+            *incumbent = Some(contender);
+            true
         }
     }
 }

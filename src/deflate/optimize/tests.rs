@@ -4515,14 +4515,41 @@ fn max_replacements_keep_the_replaced_candidate_and_both_histories() {
         .collect();
     assert_eq!(routes, ["winner's parent", "older", "incumbent"]);
 
-    // A tie keeps the incumbent but still hands over the contender's parents.
+    // A tie keeps the incumbent but still hands over the contender's parents,
+    // at the oldest end, so they are finished last.
     let mut tie = candidate(9, 72, "tie");
     tie.replaced_parents
         .push(candidate(13, 104, "tie's parent"));
     assert!(!incumbent.replace_keeping_parent(tie, true));
     assert_eq!(incumbent.route, "winner");
+    let routes: Vec<_> = incumbent
+        .replaced_parents
+        .iter()
+        .map(|parent| parent.route)
+        .collect();
     assert_eq!(
-        incumbent.replaced_parents.last().map(|parent| parent.route),
-        Some("tie's parent")
+        routes,
+        ["tie's parent", "winner's parent", "older", "incumbent"]
     );
+
+    // An empty lineage takes its first candidate; a later winner keeps it.
+    let mut lineage = None;
+    assert!(replace_optional_keeping_parent(
+        &mut lineage,
+        candidate(10, 80, "first"),
+        true
+    ));
+    assert!(replace_optional_keeping_parent(
+        &mut lineage,
+        candidate(9, 72, "second"),
+        true
+    ));
+    let lineage = lineage.unwrap();
+    assert_eq!(lineage.route, "second");
+    let routes: Vec<_> = lineage
+        .replaced_parents
+        .iter()
+        .map(|parent| parent.route)
+        .collect();
+    assert_eq!(routes, ["first"]);
 }

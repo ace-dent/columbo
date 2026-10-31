@@ -46,11 +46,12 @@ use super::{
     refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
     refine_with_max_planner, refine_with_no_split_route,
     refine_with_terminal_source_split_floor_until, replace_optional_if_smaller,
-    source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
-    BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, DefaultFloor,
-    DefaultFloorWork, HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity,
-    TerminalParseCache, TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED,
-    DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    replace_optional_keeping_parent, source_run_match_count_exceeds, spawn_route,
+    BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy, BoundedRoutes,
+    Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork, HeaderFit,
+    RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
+    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
+    WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
@@ -516,7 +517,9 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
     run_compact_balanced_tree(context, &eligibility, &mut candidate)?;
 
     // Compare `Complete`'s retained Default endpoint only now, so it cannot
-    // redirect the rewritten-seed refinement.
+    // redirect the rewritten-seed refinement. The comparison runs whatever the
+    // deadline, so no shorter run finishes what it replaces, and Max keeps
+    // nothing here.
     if let Some(complete_default) = state.complete_default.take() {
         candidate.replace_if_smaller(complete_default);
     }
@@ -1323,8 +1326,10 @@ fn run_bounded_refinement(
     if let Some(step) = compact_split_step {
         step.finish(context.report_optional(state.compact_split.as_ref()));
     }
+    // Max keeps the lineage candidate a winning split replaces: a deadline
+    // before the split would have handed it over.
     if let Some(split) = state.compact_split.take() {
-        replace_optional_if_smaller(&mut state.deft4j, split);
+        replace_optional_keeping_parent(&mut state.deft4j, split, options.exhaustive);
     }
     Ok(())
 }
@@ -1504,7 +1509,9 @@ fn continue_no_split(
 }
 
 /// Fold the no-split candidate into the deft4j lineage, first running the
-/// terminal tree floors on a changed topology that would otherwise lose.
+/// terminal tree floors on a changed topology that would otherwise lose. Max
+/// keeps the candidate a winner replaces, which a shorter no-split route could
+/// have left in place, and a loser's own kept candidates.
 fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) -> Result<()> {
     let RouteContext {
         source,
@@ -1536,7 +1543,7 @@ fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) ->
                 narrow,
             )?;
         }
-        replace_optional_if_smaller(&mut state.deft4j, narrow);
+        replace_optional_keeping_parent(&mut state.deft4j, narrow, options.exhaustive);
     }
     Ok(())
 }
@@ -1810,14 +1817,16 @@ fn merge_source_max(
 
     // A deadline can stop source max after any replay and hand over that
     // parent, and a better parent can finish worse. Closing each parent the
-    // replays replaced keeps a longer search from ending above a shorter one.
-    // A winning parent is a new encoding, which no Max fixed point covers.
+    // replays replaced keeps a longer search from ending above a shorter one,
+    // and a deadline before a close would have handed over the incumbent a
+    // winning parent replaces, so Max keeps that incumbent. A winning parent
+    // is a new encoding, which no Max fixed point covers.
     for parent in replaced_parents {
         if !deadline.can_start_route() {
             break;
         }
         let parent = close_source_max_topology(context, eligibility, candidate, parent)?;
-        if candidate.replace_if_smaller(parent) {
+        if candidate.replace_keeping_parent(parent, options.exhaustive) {
             stabilized = false;
         }
     }
@@ -1942,7 +1951,9 @@ fn run_complementary_no_split(
     Ok(())
 }
 
-/// Run the final balanced-tree cleanup (M4) on the selected candidate.
+/// Run the final balanced-tree cleanup (M4) on the selected candidate. It
+/// waits on G0, so a deadline could have handed over the candidate it
+/// replaces, which Max keeps.
 fn run_compact_balanced_tree(
     context: &RouteContext<'_>,
     eligibility: &RouteEligibility,
@@ -1962,7 +1973,7 @@ fn run_compact_balanced_tree(
     )?;
     tree_step.finish(context.report_optional(tree.as_ref()));
     if let Some(tree) = tree {
-        candidate.replace_if_smaller(tree);
+        candidate.replace_keeping_parent(tree, context.options.exhaustive);
     }
     Ok(())
 }
@@ -1970,7 +1981,8 @@ fn run_compact_balanced_tree(
 /// Price the split of the saved compact source-max parent (M10d) after every
 /// ordinary timed route. Source max can end at a different endpoint from the
 /// deft4j parent split earlier. The `_until` variant uses any remaining
-/// allowance, or its deterministic one-block rescue after the hard stop.
+/// allowance, or its deterministic one-block rescue after the hard stop. A
+/// deadline can stop the split, so Max keeps the candidate a split replaces.
 fn run_deferred_source_max_split(
     context: &RouteContext<'_>,
     deadlines: &StreamDeadlines,
@@ -1999,7 +2011,7 @@ fn run_deferred_source_max_split(
     )?;
     split_step.finish(context.report_optional(split.as_ref()));
     if let Some(split) = split {
-        candidate.replace_if_smaller(split);
+        candidate.replace_keeping_parent(split, context.options.exhaustive);
     }
     Ok(())
 }

@@ -967,9 +967,9 @@ What happens to one stream:
      starting size. Max therefore closes and finishes the incumbent, then
      closes and finishes each replaced candidate it kept, newest first, while
      terminal work may start, and keeps the smallest endpoint. It then closes
-     the candidates its sweeps replaced. A few route wins before the finish
-     discard the kept list, so some replaced candidates are never finished
-     ([M14: replaced-candidate close](#m14-replaced-candidate-close)).
+     the candidates its sweeps replaced. Only `Complete`'s Default endpoint,
+     which is compared whatever the deadline, discards the kept list when it
+     wins ([M14: replaced-candidate close](#m14-replaced-candidate-close)).
    - **Max, last:** Default's own finish of the complete Default endpoint (R1c,
      R13–R18), and any R1b win, are kept only as final competitors. They are
      compared after Max's terminal stage, so that Max does not end above Default
@@ -1111,7 +1111,7 @@ linked as evidence.
      comparing it, since a different topology may win only after them (code
      comment).
    - In Max, it keeps complete candidates that later steps replace and finishes
-     them at the end, though a few later wins discard them
+     them at the end
      ([M14: replaced-candidate close](#m14-replaced-candidate-close)). A
      complete Max search once ended 1 byte above the same search cut at 10
      seconds. Keeping and closing the replay parents of later source max (M12)
@@ -1394,10 +1394,10 @@ those its lineage steps and routes replaced like the incumbent, and closes those
 its terminal methods replaced with the tree floors
 ([M14: replaced-candidate close](#m14-replaced-candidate-close)). Later source
 max (M12) does the same for its replay parents
-([M12: later source max](#m12-later-source-max)). The coverage is not complete.
-A few later wins, such as a winning M12 replay parent or the final compact
-balanced tree (M4), replace the incumbent with a candidate that keeps nothing,
-and the candidates kept until then are lost; M14 lists these cases.
+([M12: later source max](#m12-later-source-max)). Every replacement that a
+deadline could have stopped keeps what it replaces. Only `Complete`'s Default
+endpoint keeps nothing: it is compared whatever the deadline, so no shorter run
+finishes the candidate it replaces.
 
 The finishes of what lineage steps and routes replaced are optional terminal
 work: each starts only under the G0 of the deadline that governs terminal work,
@@ -1678,6 +1678,11 @@ against deft4j. Its measured effects:
   by 47 bytes, and 4 of 75 deadline-bound sampled rows, with none
   reproducibly larger
   ([29 October](benchmark-miss-regression-audit.md#kept-candidates-29-october)).
+  Keeping what every stoppable replacement replaces, with a losing
+  contender's kept candidates finished last, made three rows reproducibly
+  smaller (19 bytes and a bit) and one 5 bytes larger, with the early-finishing
+  sample identical
+  ([30 October](benchmark-miss-regression-audit.md#kept-replacements-30-october)).
   M12's replay-parent closes are measured under
   [Source max route](#source-max-route).
 - **Other Max routes:** Columbo's reports have no isolated incremental
@@ -5807,9 +5812,9 @@ Parent size does not predict endpoint size, so Columbo does not discard a
 competing lineage just because it is larger now. Default finishes D4 beside the
 planner's endpoint and keeps the smaller result. Max closes most losing
 topologies with the terminal tree floors before it discards them, since a
-different topology may win only after them. It also keeps most candidates that
-later routes replace for the final close, although a few later replacements
-discard that list ([M14](#m14-replaced-candidate-close)).
+different topology may win only after them. It also keeps the candidates that
+later routes replace for the final close, unless `Complete`'s Default endpoint
+wins ([M14](#m14-replaced-candidate-close)).
 
 | Route | Starts from | Search | Modes |
 | --- | --- | --- | --- |
@@ -6251,7 +6256,8 @@ M2 candidate. The worker slot, the thread bound and why M2c needs no
 parallel-route cap (M5) are in [M2c](#m2c-changed-no-split-continuation).
 
 **Closing the lineage.** Before the comparison floor is set, the no-split
-candidate folds into the deft4j lineage on a strict win. A changed candidate
+candidate folds into the deft4j lineage on a strict win, and Max keeps the
+deft4j candidate it replaces for the final close. A changed candidate
 that is not strictly smaller than every other retained lineage first gets the
 terminal tree floors, because a slightly larger changed topology can still win
 once the terminal methods change only its trees.
@@ -6396,8 +6402,8 @@ after strict replays, so M11 replays it as its own lineage.
    blocks. Repeated replays reach nested cuts, since each round can split the
    blocks the last one produced.
 4. The result competes with the incumbent like any route. An incumbent it
-   replaces is kept for the final close unless a later replacement discards that
-   list ([M14](#m14-replaced-candidate-close)).
+   replaces is kept for the final close unless `Complete`'s Default endpoint
+   wins ([M14](#m14-replaced-candidate-close)).
 
 **Pitfalls and lessons.**
 
@@ -8463,8 +8469,8 @@ could not start before the deadline
 under a G0t share after a primary-phase yield, it may run only its rescue
 ([M10d: deferred source-max split](#m10d-deferred-source-max-split)).
 
-M14's start conditions, and the later wins that discard its kept list, are in
-[M14: replaced-candidate close](#m14-replaced-candidate-close).
+M14's start conditions, and the one comparison that discards its kept list, are
+in [M14: replaced-candidate close](#m14-replaced-candidate-close).
 
 ### Terminal sweep order
 
@@ -9110,9 +9116,10 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   M12. M2's size class applies instead of M5, so the M2c worker starts even when
   M5 failed.
 - **After:** before the comparison floor, the no-split lineage folds into the
-  deft4j lineage on a strict win. If it changed boundaries or spellings and is
-  not strictly smaller than every other retained lineage, it first gets the
-  terminal tree floors under the primary deadline.
+  deft4j lineage on a strict win, and the deft4j candidate it replaces is kept
+  for M14. If it changed boundaries or spellings and is not strictly smaller
+  than every other retained lineage, it first gets the terminal tree floors
+  under the primary deadline.
 - **Why:** a smaller sibling may have a different topology (code comment), and a
   changed parent can give the no-split route another fixed point. M2's 1 MiB and
   128-block bounds keep its candidates well inside the parallel-route memory cap
@@ -9156,7 +9163,9 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   paired candidates from the four lowest-payload-change moves per alphabet, a
   combined payload change of at most 18 bits (Default allows at most 0), and
   every tree priced with the exhaustive header search. Only a strictly smaller
-  complete stream survives; it is emitted with no replay.
+  complete stream survives; it is emitted with no replay. At the end, under G0,
+  Max keeps the incumbent it replaces for M14; the first two places run with no
+  G0 test and keep nothing.
 - **Why:** a smaller proven-feedback endpoint can hide the balanced-tree win
   reachable from source max (code comment).
 - **See:**
@@ -9438,7 +9447,9 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   3. M10a's dependency split, which needs `FloorExpansion`, M1, G0, the compact
      dependent class and a sparse repartition graph. It runs untimed.
 - **Effect:** runs the compact split floor on the parent. The best split joins
-  the deft4j lineage on a strict win, or the floor-seeded lineage for entry 2.
+  the deft4j lineage on a strict win, keeping the deft4j candidate it replaces
+  for M14, or the floor-seeded lineage for entry 2, which has no G0 test and
+  keeps nothing.
 - **Why:** split pricing is not monotone in the parent's encoded size, so each
   distinct parent is kept (code comment), and smaller parents go first because
   they carry the best known spellings and tables (code comment). The
@@ -9464,7 +9475,8 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   only the rescue: always under a G0t share while the full allowance can still
   start routes ([G0t](#g0t-max-terminal-share)), and otherwise only if the
   primary deadline has a nonzero grace and no route failed. A strictly smaller
-  result replaces the incumbent.
+  result replaces the incumbent, which is kept for M14, since a deadline can
+  stop the split.
 - **Why:** source max can end at a different endpoint from the deft4j parent
   split earlier, and deferring the split keeps it from taking the timed routes'
   time (code comments). The other policies (`Shared`, `SharedExact`, `ApngMax`,
@@ -9517,7 +9529,8 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
      a replaced incumbent for M14, and notes whether source max reproduced the
      incumbent's exact bytes and bits at a Max fixed point.
   3. Closes each replay parent the same way while G0 allows. A strictly smaller
-     parent replaces the incumbent and clears that fixed-point note.
+     parent replaces the incumbent, which is kept for M14, and clears that
+     fixed-point note.
 - **Why:** it runs before a rewritten seed can spend the remaining time on one
   large merged block (code comment). A deadline can stop source max after any
   replay and hand over that parent, and a better parent can finish worse, so
@@ -9547,20 +9560,22 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
 
 - **Runs:** Max, every policy, in the terminal stage, after M10d. Default keeps
   no replaced candidates.
-- **Eligible:** the candidates kept for M14. In Max these steps keep the
-  candidate they replace, as bytes only, together with its own kept list: the
-  lineage steps M7a, M2c and M10b's refinements and continuations; the later
-  routes that displace the incumbent, namely the floor-seeded and deft4j
-  topologies, M11, M12's route candidate, M13 and M2 late; and, inside the
-  finish, R1 and R1b–R11. A losing contender's own kept list joins the
-  incumbent's, but the loser itself is not kept. M12 closes its own replay
+- **Eligible:** the candidates kept for M14. In Max every replacement that a
+  deadline could have stopped keeps the candidate it replaces, as bytes only,
+  together with its own kept list: the lineage steps M7a, M2c and M10b's
+  refinements and continuations, and the compact-split and no-split folds into
+  the deft4j lineage; the later routes that displace the incumbent, namely the
+  floor-seeded and deft4j topologies, M11, M12's route candidate and replay
+  parents, M13, M2 late, the final M4 and M10d; and, inside the finish, R1 and
+  R1b–R11. A losing contender's own kept list joins the incumbent's at the
+  oldest end, but the loser itself is not kept. M12 closes its own replay
   parents.
 - **What is lost:** M14 finishes only what is still on the final incumbent's
-  list when the terminal stage starts. These replacements keep nothing and
-  discard the list they overwrite: on the incumbent, a winning M12 replay
-  parent, the final M4, `Complete`'s Default endpoint and M10d; on the deft4j
-  lineage, the compact-split and no-split folds, which drop M10b's kept
-  candidates, or M2c's when the no-split candidate loses.
+  list when the terminal stage starts. `Complete`'s Default endpoint keeps
+  nothing and discards the list it overwrites: it is compared whatever the
+  deadline, so no shorter run finishes the candidate it replaces. Closes that
+  start with no G0 test, such as the tree floors, M4 at M7 and M12, and the
+  finishing steps R1c and R13–R17, keep nothing for the same reason.
 - **Effect,** in order:
   1. Collect the kept candidates, distinct by bytes and different from the
      incumbent.
@@ -9588,7 +9603,24 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   ([replaced candidates](benchmark-miss-regression-audit.md#replaced-candidates-25-october),
   [terminal sweep replacements](benchmark-miss-regression-audit.md#terminal-sweep-replacements-25-october),
   [29 October](benchmark-miss-regression-audit.md#kept-candidates-29-october)).
-  Each step's rule has its own reason:
+  Each rule has its own reason:
+  - The kept candidates are those a deadline could have handed over: a
+    replacement that a deadline could have stopped is one a shorter run need
+    not make. On `092-Gastly-1.png` an M12 replay parent that closes at 1,962
+    bits replaced the 1,963-bit incumbent, which finishes at 1,955 bits
+    against the parent's 1,956; on `sample_55-fs8.png` a compact split at
+    50,657 bits replaced the refined deft4j candidate at 50,689, which
+    finishes at 50,328 against 50,474
+    ([30 October](benchmark-miss-regression-audit.md#kept-replacements-30-october)).
+  - A losing contender's kept candidates are finished last: each is larger
+    than a contender that lost, so it is the least likely start of a shorter
+    run's finish. Under the earlier rule, which put them at the newest end,
+    the compact-split fold's kept candidate on `sample_65-fs8.png` was
+    finished first, ending at 60,803 bits, and took the time of the one that
+    finishes at 60,726. The order is not right on every row:
+    `profile_srgb_allow_gray.png` ends 5 bytes larger, because a losing
+    lineage's candidate finished first had led to the sweep-replaced
+    candidate whose close gave its smaller size.
   - Step 2 finishes the incumbent before any kept candidate, so optional closes
     cannot push its own finish past the hard stop. Closing kept candidates
     before that finish, after the route deadline too, made `monarch.PNG` 2–3
