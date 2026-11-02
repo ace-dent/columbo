@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 30 October 2026 entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 31 October 2026 entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,102 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="kept-refinements-31-october"></a>
+
+## Kept refinements on 31 October 2026
+
+### Starting state
+
+At `1bc6cbb`, whose Deflate code is that of `d55ceee`, the hundred-file guard
+passes 97 of 100 floors: `054-Psyduck-1.png` (1,564 bits against 1,563),
+`025-Pikachu-2.png` (2,090 against 2,089) and `062-Poliwrath-1.png` (1,120
+against 1,118) fail, as they have since 8 October. All three finish within
+about a second. Of the rows that grew in the
+[29 October refresh](#refresh-29-october), these were still above their
+earlier sizes:
+
+- **Traced and accepted:** `Mango512.png` and `sample-hut-400x300.png`.
+- **Timing, or recovering at three times their allowances:** `Sock.png`,
+  `sample_66-fs8.png`, the `interlaced_rgba_16` rows, `images.png`,
+  `pengbrew_160x160.png` and `rgba_16_should_be_palette_8.png`.
+- **The order trade-off:** `profile_srgb_allow_gray.png`
+  ([30 October](#kept-replacements-30-october)).
+- **Unexplained:** `sample_35-fs8.png`, 3 bytes larger in every run.
+
+### Cause
+
+[M14](routes-and-methods.md#m14-replaced-candidate-close) finished what the
+lineage steps and later routes replaced, but six stoppable replacements inside
+the bounded routes still kept nothing:
+
+- M10a's Default replay of the direct deft4j candidate, which waits on G0;
+- M2's Default refinement, which stops at the route window or the hard stop,
+  in M2, M2c and M2 late;
+- M3's merge into the phase floor, which waits on G0 or the route window;
+- three M10c split comparisons: a later prepared parent's split, which waits
+  on G0; a follow-up split; and a dependent split, which waits on G0 unless it
+  beats every prepared parent.
+
+A shorter run hands the replaced candidate on, as with the replacements of
+[30 October](#kept-replacements-30-october). On `062-Poliwrath-1.png` the
+direct deft4j candidate that M10a's replay replaced closes with the tree floors
+at 1,118 bits, where every lineage ends at 1,120. On `025-Pikachu-2.png` a
+no-split walk that an M2 refinement replaced finishes at 2,089 bits, against
+the incumbent's 2,090. On `yahoo.png` M10a's replaced candidate is 1,062 bits
+larger than the incumbent after the floors and finishes 21 bits smaller; the
+closes of what that finish replaced end 54 bits (7 bytes) smaller.
+
+`sample_35-fs8.png` is not of this kind. Two runs of each build at 10 seconds
+give 6,903 bytes with `b23274b` and 6,906 with `9f36bdb`, `c2aa4ba`,
+`77353bc` and `1bc6cbb`. M10c's split of the floor-seeded parent is 46,741 bits
+with `b23274b` and 46,738 from `9f36bdb` on, and its finish ends at 46,508 and
+46,536 bits. The other prepared parent's split, 47,017 bits, loses, so nothing
+is discarded: a deterministic change between the two builds gives a 3-bit
+smaller split whose finish ends 28 bits larger, and the earlier split is no
+longer built.
+
+### Accepted change
+
+Max keeps the candidate that each of the six replaces, with its kept list,
+for M14 ([M14 Eligible](routes-and-methods.md#m14-replaced-candidate-close)).
+One probe build with each site switchable attributes every changed row: M10a's
+replay gives 19 of the 21, including Poliwrath and `yahoo.png`; M2's
+refinement gives Pikachu. The split comparisons and M3's merge change none of
+them and add no measurable time: on the six slowest rows with unchanged
+output, keeping only at the two effective sites takes the same time as keeping
+at all of them. The merge of M10a's prebuilt deft4j candidate with the phase's
+own is left as it was, since the phase skips its M1 route whenever M10a
+prebuilds, so it never compares two candidates.
+
+| Check, against `1bc6cbb`, alternating builds | Result |
+| --- | --- |
+| Every twelfth early-finishing row (92) | 13 smaller, none larger; net −6 bytes / −48 bits; wall time +0.5%, CPU +0.5% |
+| Every twentieth deadline-bound row (75: PNG, ZIP, GZIP) | 6 smaller, 2 larger; net −14 bytes / −114 bits; wall time +0.8%, CPU +1.5%. `yahoo.png` −7 bytes, `compose.png` −5, `paintroller.png` −2, `s39i3p04.png` and `zoomout.png` −1 in three of three runs; `Cookies.png` and `dance.png` overlap on both builds |
+| The 42 rows of 29 October that grew | `Lotus-buddha-APNG-animation.png` −3 bits, `sample_36-fs8.png` +1 bit; wall time flat |
+| Hundred-file guard | 99 of 100: Pikachu (2,089 bits) and Poliwrath (1,118) reach their floors; Psyduck stays at 1,564. `074-Geodude-1.png` 1,842 → 1,837 bits, 1 byte below its floor |
+| `monarch.PNG` at 16 seconds, twice each | 840,882 bytes on both builds |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Clefable 1,956 → 1,953 bits at the same 492 bytes, with 3.0% more instructions; Tangela identical, instructions +0.1% |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+
+The cost is leftover time. Rows that finish within their allowances spend it
+finishing the kept candidate: `AlphaBall.png` takes 10.3 seconds instead of
+9.4, with identical output.
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with the Python tests, formatting and all-feature Clippy with warnings denied.
+The sites reuse the keep helpers and their tests. The shipped executable keeps
+its 958,512 bytes; `__text` is 396 bytes smaller.
+
+### Not changed
+
+- `054-Psyduck-1.png`, the early-lineage parent choice
+  ([accepted trade-offs](#accepted-trade-offs)).
+- `sample_35-fs8.png`, above, now an accepted trade-off.
+- The rows that vary with timing or recover with more time, `Mango512.png`,
+  `sample-hut-400x300.png` and the reference misses.
+
+Artifacts: `work/regressions-20261031/`.
 
 <a id="kept-replacements-30-october"></a>
 
@@ -1696,6 +1792,13 @@ Current:
   Squirtle and Pikachu on 9 October. Parent size does not predict the better
   endpoint, and each fix tried cost more bytes or time than it recovered
   ([8 October](#early-lineage-parent-8-october), [9 October](#rows-that-grew-9-october)).
+  Squirtle and Pikachu now reach their guard floors through finished kept
+  candidates ([29 October](#kept-candidates-29-october),
+  [31 October](#kept-refinements-31-october)); Psyduck stays 1 bit above.
+- **Split parent.** From `9f36bdb` on, M10c's split of the floor-seeded parent
+  of `sample_35-fs8.png` is 3 bits smaller, and its finish ends 28 bits larger,
+  3 bytes in all. The earlier split is no longer built, so no kept candidate
+  can reach its endpoint ([31 October](#kept-refinements-31-october)).
 - **Floor-seeded continuation before the no-split continuation.** Once the
   floor's Max descendant leads, M7a can use the primary time up to the hard
   stop, and M2c never runs: `Mango512.png` is 93 bytes larger once a build
@@ -1708,11 +1811,12 @@ Current:
   `profile_srgb_allow_gray.png` is 5 bytes larger, because one finished first
   led to its smaller close; finishing them first instead cost
   `sample_65-fs8.png` 10–15 bytes ([30 October](#kept-replacements-30-october)).
-- **Timing.** Poliwrath's floor depends on timing, `sample_61-fs8.png` and
-  `LevelLoading.png` reach theirs only with more time
-  ([guard](#guard-9-october)), and `my-computer-on-fs8.png` is
-  time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets a
-  file-specific rule.
+- **Timing.** `sample_61-fs8.png` and `LevelLoading.png` reach their floors
+  only with more time ([guard](#guard-9-october)), and `my-computer-on-fs8.png`
+  is time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets
+  a file-specific rule. Poliwrath, listed here until 31 October, now reaches
+  its floor through a kept candidate
+  ([31 October](#kept-refinements-31-october)).
 - **Source-max replay parent.** `074-Geodude-1.png` ends better from a
   source-max parent that the deadline cut short than from the replayed one;
   only refining both parents would recover it

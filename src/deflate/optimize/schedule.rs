@@ -774,8 +774,9 @@ fn run_proven_feedback_floor(
         .is_some_and(|(proven, normal)| {
             proven.data.len() == normal.data.len() && proven.bits < normal.bits
         });
+    // M3 waits on G0 or the route window, so Max keeps the floor it replaces.
     if let Some(proven_feedback) = state.proven_feedback.take() {
-        replace_optional_if_smaller(&mut state.floor, proven_feedback);
+        replace_optional_keeping_parent(&mut state.floor, proven_feedback, options.exhaustive);
     }
     Ok(())
 }
@@ -1282,8 +1283,14 @@ fn run_bounded_refinement(
             BoundedFollowUpCandidates::default()
         };
         state.compact_split_attempted |= follow_up.attempted_compact_split;
+        // A deadline can stop the follow-up, so Max keeps an earlier split
+        // that a follow-up split replaces.
         if let Some(compact_split) = follow_up.compact_split {
-            replace_optional_if_smaller(&mut state.compact_split, compact_split);
+            replace_optional_keeping_parent(
+                &mut state.compact_split,
+                compact_split,
+                options.exhaustive,
+            );
         }
         if let Some(source_max) = follow_up.source_max {
             state.source_max = Some(source_max);
@@ -1475,9 +1482,11 @@ fn run_concurrent_follow_up(
         };
         refinement?;
         let mut compact_split = early_split?;
+        // Unless it beats every early parent, the dependent split waits on G0,
+        // so Max keeps the early split it replaces.
         if let Some(result) = dependent_split {
             if let Some(candidate) = result? {
-                replace_optional_if_smaller(&mut compact_split, candidate);
+                replace_optional_keeping_parent(&mut compact_split, candidate, options.exhaustive);
             }
         }
         Ok(BoundedFollowUpCandidates {

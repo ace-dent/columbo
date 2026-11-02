@@ -1200,7 +1200,9 @@ fn build_bounded_phase_candidates(
                 source.identity,
                 &mut deadline.hard_stop(),
             )?;
-            deft4j.replace_if_smaller(refined);
+            // The replay waits on G0, so a deadline could have handed over the
+            // direct candidate it replaces, which Max keeps.
+            deft4j.replace_keeping_parent(refined, options.exhaustive);
         }
         if prebuild_compact_split {
             if let Some(seed) =
@@ -3497,7 +3499,9 @@ fn build_narrow_source_candidate_with_policy(
             source.identity,
             refinement_stop,
         )?;
-        candidate.replace_if_smaller(refined);
+        // A deadline can stop the refinement, so Max keeps the walk it
+        // replaces.
+        candidate.replace_keeping_parent(refined, options.exhaustive);
     }
     Ok(Some(candidate.named(if individual_prune {
         "Individual no-split source"
@@ -3739,7 +3743,8 @@ fn build_prepared_compact_source_split_floors(
     let mut attempted = false;
     for seed in seeds {
         // The first parent always runs and polls the hard stop, keeping every
-        // completed cut. Later parents start only before the soft deadline.
+        // completed cut. Later parents start only before the soft deadline,
+        // so Max keeps a split that a later parent's split replaces.
         if attempted && !deadline.can_start_route() {
             break;
         }
@@ -3751,7 +3756,7 @@ fn build_prepared_compact_source_split_floors(
             identity,
             &mut deadline.hard_stop(),
         )? {
-            replace_optional_if_smaller(&mut candidate, contender);
+            replace_optional_keeping_parent(&mut candidate, contender, options.exhaustive);
         }
     }
     Ok(candidate)

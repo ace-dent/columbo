@@ -1388,8 +1388,9 @@ per byte of the first emission ([Replay limits](#replay-limits)).
 
 The finishing steps are not monotone in their starting size, so a deadline that
 hands an earlier candidate to the finish can end lower than a complete search.
-Max therefore keeps the complete candidates that its lineage steps, its later
-routes and its route-gated terminal methods replace. At the end it finishes
+Max therefore keeps the complete candidates that its lineage steps, the
+refinements and split comparisons inside its bounded routes, its later routes
+and its route-gated terminal methods replace. At the end it finishes
 those its lineage steps and routes replaced like the incumbent, and closes those
 its terminal methods replaced with the tree floors
 ([M14: replaced-candidate close](#m14-replaced-candidate-close)). Later source
@@ -1683,6 +1684,11 @@ against deft4j. Its measured effects:
   smaller (19 bytes and a bit) and one 5 bytes larger, with the early-finishing
   sample identical
   ([30 October](benchmark-miss-regression-audit.md#kept-replacements-30-october)).
+  Keeping what the refinements and split comparisons inside the bounded routes
+  replace made 13 of 92 early-finishing sampled rows and 5 of 75 deadline-bound
+  ones reproducibly smaller, by 22 bytes, with none reproducibly larger, for
+  about 0.5–0.8% more time, and two more guard floors pass
+  ([31 October](benchmark-miss-regression-audit.md#kept-refinements-31-october)).
   M12's replay-parent closes are measured under
   [Source max route](#source-max-route).
 - **Other Max routes:** Columbo's reports have no isolated incremental
@@ -9096,7 +9102,9 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   blocks and leaves it out for 4 or more. A candidate that changed block
   boundaries or token spellings gets one Default refinement (at most 3 replays),
   which stops at the route window with M5 and at the hard stop in the serial
-  phase; a header-only change gets none.
+  phase; a header-only change gets none. A smaller refinement replaces the walk,
+  which is kept for M14, since a deadline can stop the refinement; M2c and M2
+  late keep theirs the same way.
 - **M2 late:** after M13, if G0 allows, Max prices the other pruning variant on
   the original source as an independent topology, with the same one Default
   refinement, both polling the hard stop. It is closed with the terminal tree
@@ -9148,7 +9156,8 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   Max skips D1's second seed, the full integrated search, because source max
   covers it (code comment). The result sets S0, then merges into the phase floor
   on a strict win, so the floor-seeded continuation (M7a) must beat it and it
-  becomes part of the comparison floor. A one-block M3 source never carries the
+  becomes part of the comparison floor. M3 waits on G0 or the route window, so
+  the floor it replaces is kept for M14. A one-block M3 source never carries the
   [weak-deft signal](#m10b-bounded-deft-refinement), which needs at least 2
   nonempty source blocks, so M3's floor is never an M10c or M10b floor parent.
 - **See:**
@@ -9356,7 +9365,8 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   block has at most 4,000 tokens and the repartition runs number at least the
   nonempty blocks.
 - **Effect:** builds the direct deft4j candidate, polling the hard stop, then,
-  if G0 allows, refines it with the Default planner (at most 3 replays). In the
+  if G0 allows, refines it with the Default planner (at most 3 replays); a
+  smaller replay replaces the direct candidate, which is kept for M14. In the
   multi-block case it then runs M10c's compact split on it, untimed, and records
   one parent as completed: the split's endpoint if it kept the source blocks
   unchanged, otherwise the input parent, so that a structurally changed split
@@ -9457,7 +9467,10 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
 - **Effect:** runs the compact split floor on the parent. The best split joins
   the deft4j lineage on a strict win, keeping the deft4j candidate it replaces
   for M14, or the floor-seeded lineage for entry 2, which has no G0 test and
-  keeps nothing.
+  keeps nothing. Under entry 1 a split that replaces another, from a later
+  prepared parent, the follow-up or the dependent split, keeps it for M14: each
+  of those waits on G0, except a dependent split that beats every prepared
+  parent.
 - **Why:** split pricing is not monotone in the parent's encoded size, so each
   distinct parent is kept (code comment), and smaller parents go first because
   they carry the best known spellings and tables (code comment). The
@@ -9572,7 +9585,9 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   deadline could have stopped keeps the candidate it replaces, as bytes only,
   together with its own kept list: the lineage steps M7a, M2c and M10b's
   refinements and continuations, and the compact-split and no-split folds into
-  the deft4j lineage; the later routes that displace the incumbent, namely the
+  the deft4j lineage; inside the bounded routes, M10a's and M2's Default
+  refinements, M3's merge into the phase floor and M10c's split comparisons;
+  the later routes that displace the incumbent, namely the
   floor-seeded and deft4j topologies, M11, M12's route candidate and replay
   parents, M13, M2 late, the final M4 and M10d; and, inside the finish, R1 and
   R1b–R11. A losing contender's own kept list joins the incumbent's at the
@@ -9620,6 +9635,15 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
     50,657 bits replaced the refined deft4j candidate at 50,689, which
     finishes at 50,328 against 50,474
     ([30 October](benchmark-miss-regression-audit.md#kept-replacements-30-october)).
+  - The refinements and comparisons inside the bounded routes are lineage
+    steps too. On `062-Poliwrath-1.png` the direct deft4j candidate that
+    M10a's Default replay replaced closes at 1,118 bits, where every lineage
+    ends at 1,120. On `025-Pikachu-2.png` a no-split walk that an M2
+    refinement replaced finishes at 2,089 bits, against the incumbent's 2,090.
+    On `yahoo.png` M10a's replaced candidate is 1,062 bits larger than the
+    incumbent after the floors, finishes 21 bits smaller, and with the closes
+    of what its finish replaced ends 54 bits smaller
+    ([31 October](benchmark-miss-regression-audit.md#kept-refinements-31-october)).
   - A losing contender's kept candidates are finished last: each is larger
     than a contender that lost, so it is the least likely start of a shorter
     run's finish. Under the earlier rule, which put them at the newest end,
