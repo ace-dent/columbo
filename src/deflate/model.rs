@@ -299,20 +299,46 @@ pub(crate) fn same_tokens(left: &[Token], right: &[Token]) -> bool {
 // Out of line: each call scans every token.
 #[inline(never)]
 pub(crate) fn count_frequencies(tokens: &[Token]) -> ([u32; 286], [u32; 30]) {
-    let mut literal = [0_u32; 286];
-    let mut distance = [0_u32; 30];
-    for token in tokens {
-        match *token {
-            Token::Literal(value) => literal[usize::from(value)] += 1,
-            Token::Match {
-                length_symbol,
-                distance_symbol,
-                ..
-            } => {
-                literal[usize::from(length_symbol)] += 1;
-                distance[usize::from(distance_symbol)] += 1;
-            }
+    // No count can reach `u32::MAX`, so wrapping additions keep release
+    // overflow checks out of the loop. Two tables, summed at the end, let
+    // repeats of one symbol in a row count without waiting on each other.
+    assert!(
+        tokens.len() < u32::MAX as usize,
+        "token count fits a symbol count"
+    );
+    let mut literal = [[0_u32; 286]; 2];
+    let mut distance = [[0_u32; 30]; 2];
+    let mut count = |table: usize, token: &Token| match *token {
+        Token::Literal(value) => {
+            let count = &mut literal[table][usize::from(value)];
+            *count = count.wrapping_add(1);
         }
+        Token::Match {
+            length_symbol,
+            distance_symbol,
+            ..
+        } => {
+            let count = &mut literal[table][usize::from(length_symbol)];
+            *count = count.wrapping_add(1);
+            let count = &mut distance[table][usize::from(distance_symbol)];
+            *count = count.wrapping_add(1);
+        }
+    };
+    let mut pairs = tokens.chunks_exact(2);
+    for pair in &mut pairs {
+        count(0, &pair[0]);
+        count(1, &pair[1]);
+    }
+    for token in pairs.remainder() {
+        count(0, token);
+    }
+    let [mut literal, other_literal] = literal;
+    let [mut distance, other_distance] = distance;
+    for (count, other) in literal.iter_mut().zip(other_literal) {
+        *count = count.wrapping_add(other);
+    }
+    for (count, other) in distance.iter_mut().zip(other_distance) {
+        *count = count.wrapping_add(other);
     }
     literal[256] += 1;
     (literal, distance)

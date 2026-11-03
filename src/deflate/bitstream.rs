@@ -87,6 +87,15 @@ impl<'a> BitReader<'a> {
         Ok((self.buffer & mask) as u32)
     }
 
+    /// Drop bits of a word [`Self::peek_word`] returned: it buffered at least
+    /// 32, so no check is needed.
+    #[inline]
+    pub(crate) fn drop_peeked_bits(&mut self, bits: u8) {
+        debug_assert!(bits <= 32 && bits <= self.buffered_bits);
+        self.buffer >>= bits;
+        self.buffered_bits -= bits;
+    }
+
     #[inline]
     pub(crate) fn drop_bits(&mut self, bits: u8) -> Result<()> {
         if bits > self.buffered_bits {

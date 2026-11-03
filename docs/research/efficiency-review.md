@@ -88,6 +88,7 @@ gains where established.
 | 2 Nov 2026 | [`3860542`](#3860542-2-november-2026) | Max length-swap trials and header checks (`header.rs`, `header/swap_costs.rs`, `huffman.rs`) | Each thread keeps the header costs of greedy length-swap trials by start lengths and pair, in sets of four that grow with use up to 3 MiB; the payload shape check counts codes in its Kraft pass; the shortest-RLE repeat test compares counts before tokens | Completing Max runs of three small deadline-bound PNGs 17.2%, 17.0% and 7.7% fewer instructions (1.21×, 1.19×, 1.07×); 177 completing sprites 4.0% fewer; Default 0.86% fewer; sprite peak memory +2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 11,343 replayed swap searches; 275,887 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 shape-check comparisons; 703 Rust, 7 Python tests |
 | 3 Nov 2026 | [`a540aac`](#a540aac-3-november-2026) | Validated parses and the bit reader (`optimize.rs`, `model.rs`, `bitstream.rs`) | Each thread keeps its last validated parse, which a reparse of the same bytes and limit shares; the endpoint-proven lineage takes its candidate's validating parse; the bit reader derives its position from its byte position | Default CPU 1.015× (33 inputs, 1.69% fewer instructions, 1.32% fewer cycles); Partnership card 1.03×; peak memory +0.2 MiB median, +2.7 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 673 Rust, 7 Python tests |
 | 3 Nov 2026 | [`4ebfefd`](#4ebfefd-3-november-2026) | Exact Defluff trees and swap-trial costs (`huffman.rs`, `header.rs`, `header/swap_costs.rs`) | Package-merge's fallback built only when it fails; one unconstrained Defluff tree per alphabet for every depth limit; the limited Columbo tree from an unrepaired variant-0 build; swap-trial costs in up to 2^19 slots | Completing Max runs of three small PNGs 6.6%, 3.4% and 4.6% fewer instructions; 177 completing sprites 2.3% fewer; 14,440 replayed large-block searches 3.1% fewer; Default 0.82% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 14,440 replayed large-block searches; 58 Max runs at 10 seconds; 66 Default timing runs; 16,000 tree-builder comparisons; 674 Rust, 7 Python tests |
+| 3 Nov 2026 | [`851e373`](#851e373-3-november-2026) | Payload decoding, symbol counts, match expansion and the short-family floor (`parse.rs`, `huffman.rs`, `bitstream.rs`, `model.rs`, `search.rs`) | The parser's payload loop decodes through an inlined table path; symbol counts alternate two tables with wrapping additions; expansions copy unchanged token runs whole; the short-family floor prices its bands from one walk's count changes and spells only a winner; expansion walks price bytes from a 256-entry table with a cheapest-byte bound | Default CPU 1.069× (33 inputs, 7.84% fewer instructions, 6.27% fewer cycles); completing Max runs 0.4% and 4.2% fewer instructions; peak memory median unchanged, `Banana512.png` +22.1 MiB of cached freed blocks | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs with debug assertions; 66 Default timing runs; 2 completing Max runs; 4,000 symbol-count comparisons; 675 Rust, 7 Python tests |
 
 ## Entries
 
@@ -484,6 +485,105 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `851e373`, 3 November 2026
+
+Batches: retired instructions and cycles from `time -l` over the 33 stratified
+Default inputs, two alternating rounds, for every step and for the final
+build; whole-file Default CPU (user plus system) and peak resident memory over
+the same inputs, one round alternating the builds; two alternating runs of
+each completing Max run.
+
+A sampled profile of the 33 Default inputs at `851e373` (34,320 CPU samples)
+put 8.2% under the validating parser, with 3.3% of all samples in its
+out-of-line symbol decoder, and found three passes over whole token lists that
+could take less work: counting a candidate's symbols (2.8%), spelling an
+expansion's tokens (2.6%) and choosing which matches to expand (2.4%). A
+second profile after the parser changes put the short-family floor at 4.0%:
+for each of its five bands it spelled the expanded tokens, counted them and
+summed their extra bits, then threw the tokens away unless the band won.
+
+- **Inlined payload decoding.** The parser's payload loop decodes literal,
+  length and distance codes through an inlined copy of the decoder's table
+  path, so a symbol no longer passes through a returned result and a separate
+  call; codes the table cannot answer still take the out-of-line path. It drops
+  the bits of a 32-bit window `peek_word` buffered without checking them
+  again: a code takes at most 15 bits and its extra bits 13. The loop's symbol
+  counts use wrapping additions, since the model limit keeps them far below
+  `u32::MAX`, and one scratch buffer serves every match.
+- **Two-table symbol counts.** `count_frequencies` counts alternate tokens in
+  two tables with wrapping additions and sums them at the end, so repeats of a
+  symbol in a row no longer wait on each other, and the release profile's
+  overflow checks stay out of the loop.
+- **Bulk expansion spelling.** An expansion copies each run of tokens between
+  expanded matches in one block copy, needing only its decoded length, instead
+  of pushing its tokens one at a time.
+- **Short-family bands priced from counts.** One walk finds every band's
+  count changes (the summary the planner's grouping already uses), so the
+  floor prices each band from the block's counts and extra bits with those
+  changes applied, skips the bands that would expand nothing or exceed the
+  candidate limit as spelling them would, and spells the tokens only for a
+  band that wins.
+- **Byte-cost tables for match expansion.** The walks that choose which
+  matches to expand under given code lengths price literals from a 256-entry
+  table built once per walk, and skip pricing a match's bytes when even the
+  cheapest byte's cost puts its literals above the match's cost.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, instructions retired over two rounds | 1,101.6 billion | 1,015.2 billion | −7.84% |
+| Same inputs, cycles over two rounds | 261.2 billion | 244.9 billion | −6.27% |
+| Same inputs, CPU over one round | 42.1 s | 39.4 s | 1.069× |
+| `Partnership_Card___John_Lewis_Finance.png`, Default CPU | 9.12 s | 8.46 s | 1.08× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 18.36 billion | 18.29 billion | −0.4% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.34 billion | 2.24 billion | −4.2% |
+
+Measured step by step, each against the step before, the inlined decoding
+with its wrapping counts took 2.55% of the instructions, bulk spelling 2.63%,
+short-family pricing from counts 1.66% (2.15% of the cycles), the byte-cost
+tables 0.63%, the two-table counts 0.28%, and the unchecked bit drop and shared
+scratch buffer about 0.2% together.
+
+Median Default peak memory did not change, and every input but one stayed
+within 1.2 MiB. `Banana512.png` peaked at 153.0 MiB instead of 130.9 MiB, in
+each of six repeated runs, from the short-family change. The difference is the
+allocator's cache of freed large blocks, not data the program holds: with
+`MallocLargeCache=0` both builds peak near 90 MiB, the new one 0.7 MiB lower,
+and a build that still spells and drops every band's tokens peaks at 129.6 MiB.
+Those allocations had reused or evicted cached blocks; without them, more freed
+blocks stay resident.
+
+Equivalence: in debug builds the short-family floor checks that the block's
+counts are its tokens' counts and that each band's counts and extra bits equal
+those of its spelled tokens, and a release build with debug assertions agreed
+with the final build on all 33 Default inputs. A new test compares the
+two-table counts with a single pass on 4,000 token lists; existing tests
+compare expansion spelling with a per-token reference on 20,000 cases and the
+byte-cost pricing with full sums on 20,000 more. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every Default timing and instruction run and every
+completing Max run matched byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting and all-feature Clippy with warnings denied.
+`__text` grew from 886,004 to 890,256 bytes; the shipped executable keeps its
+974,944 bytes, and the final source builds the tested executable byte for
+byte.
+
+Measured and rejected in the same review:
+
+- A fast path for the parser's per-literal limit check: 0.12% more
+  instructions.
+- Inlining the bit writer's `write` into block payload writing: 0.05% fewer
+  instructions and 0.22% fewer cycles, within run-to-run noise, for more code.
+
+Not changed in the same review:
+
+- Ranges cut from a composite copy their tokens (1.6% of samples at the end of
+  the review); sharing the composite's storage needs a slice-view token model.
+- Transformed blocks count their tokens' symbols (1.0%); deriving the counts
+  from an expansion's changes would need each of six callers to carry them.
+
+Artifacts: `work/efficiency-review-default8-20261103/`.
 
 ### `4ebfefd`, 3 November 2026
 

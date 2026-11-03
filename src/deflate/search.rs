@@ -30,9 +30,9 @@ use super::huffman::{
 };
 use super::minima::SuffixMinima;
 use super::model::{
-    canonical_length_encoding, count_frequencies, same_tokens, token_extra_bits, try_clone_slice,
-    DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token,
-    LENGTH_BASE as DEFLATE_LENGTH_BASE, LENGTH_EXTRA_BITS,
+    canonical_length_encoding, count_frequencies, frequency_extra_bits, same_tokens,
+    token_extra_bits, try_clone_slice, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
+    Token, LENGTH_BASE as DEFLATE_LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -2941,18 +2941,90 @@ pub(crate) fn improve_plan_with_short_family_floor(
         return best;
     }
 
-    for last_symbol in 260..=264 {
-        let Some(tokens) =
-            expand_selected_matches(&block.tokens, &block.plain, |_, token, _| match token {
-                Token::Match { length_symbol, .. } => (260..=last_symbol).contains(&length_symbol),
-                Token::Literal(_) => false,
-            })
-        else {
+    // Each candidate expands the matches of length symbols 260 up to
+    // `last_symbol`. One walk gives every family's count changes, so a
+    // candidate is priced from counts, and its tokens are spelled only if it
+    // wins.
+    debug_assert_eq!(
+        (block.literal_frequencies, block.distance_frequencies),
+        count_frequencies(&block.tokens)
+    );
+    let Some(stats) = ShortFamilyStats::from_block(block) else {
+        return best;
+    };
+    let mut counts = ShortFamilyCounts {
+        literal: block.literal_frequencies,
+        distance: block.distance_frequencies,
+        extra_bits: frequency_extra_bits(&block.literal_frequencies, &block.distance_frequencies),
+    };
+    let mut removed_matches = 0_usize;
+    let mut added_literals = 0_usize;
+    for last_symbol in 260..=264_u16 {
+        let family = usize::from(last_symbol - 260);
+        counts.literal[usize::from(last_symbol)] -= stats.match_removals[family];
+        for (count, &added) in counts
+            .literal
+            .iter_mut()
+            .zip(&stats.literal_additions[family])
+        {
+            *count += added;
+            added_literals += added as usize;
+        }
+        for (count, &removed) in counts
+            .distance
+            .iter_mut()
+            .zip(&stats.distance_removals[family])
+        {
+            *count -= removed;
+        }
+        counts.extra_bits -= stats.extra_bits_removed[family];
+        removed_matches += stats.match_removals[family] as usize;
+        // As spelling them would, skip a candidate that expands nothing or
+        // whose tokens would exceed the candidate model limit.
+        let token_count = block.tokens.len() - removed_matches + added_literals;
+        if removed_matches == 0
+            || parsed_model_bytes(block.plain.len(), token_count, 1)
+                .map_or(true, |bytes| bytes > MAX_TOKEN_CANDIDATE_BYTES)
+        {
             continue;
-        };
-        consider_short_family_tokens(block, tokens, &floor_options, &mut best);
+        }
+        debug_assert_eq!(
+            Some(&counts),
+            expand_short_families(block, last_symbol)
+                .map(|tokens| ShortFamilyCounts::of(&tokens))
+                .as_ref()
+        );
+        consider_short_family_tokens(block, last_symbol, &counts, &floor_options, &mut best);
     }
     best
+}
+
+/// The block's tokens with the matches of length symbols 260 to
+/// `last_symbol` spelled as literals.
+fn expand_short_families(block: &ParsedBlock, last_symbol: u16) -> Option<Vec<Token>> {
+    expand_selected_matches(&block.tokens, &block.plain, |_, token, _| match token {
+        Token::Match { length_symbol, .. } => (260..=last_symbol).contains(&length_symbol),
+        Token::Literal(_) => false,
+    })
+}
+
+/// A short-family candidate's symbol counts and extra bits.
+#[derive(Debug, PartialEq, Eq)]
+struct ShortFamilyCounts {
+    literal: [u32; 286],
+    distance: [u32; 30],
+    extra_bits: u64,
+}
+
+impl ShortFamilyCounts {
+    fn of(tokens: &[Token]) -> Self {
+        let (literal, distance) = count_frequencies(tokens);
+        Self {
+            literal,
+            distance,
+            extra_bits: token_extra_bits(tokens),
+        }
+    }
 }
 
 /// Frequency changes from expanding the matches of each length symbol
@@ -3116,16 +3188,18 @@ pub(crate) fn score_short_family_frequencies(
 
 fn consider_short_family_tokens(
     source: &ParsedBlock,
-    tokens: Vec<Token>,
+    last_symbol: u16,
+    counts: &ShortFamilyCounts,
     options: &Options,
     best: &mut PlannedBlock,
 ) {
-    let (literal_frequencies, token_distance_frequencies) = count_frequencies(&tokens);
+    let literal_frequencies = counts.literal;
+    let token_distance_frequencies = counts.distance;
     let mut distance_frequencies = token_distance_frequencies;
     ensure_floor_distance_symbols(&mut distance_frequencies, options.strict);
     // The tokens' own counts, before the floor's added distance codes, price
     // each tree as a pass over the tokens would.
-    let extra_bits = token_extra_bits(&tokens);
+    let extra_bits = counts.extra_bits;
     let mut best_dynamic = None;
     let mut literal_lengths = [0_u8; 286];
     let mut distance_lengths = [0_u8; 30];
@@ -3182,6 +3256,9 @@ fn consider_short_family_tokens(
         return;
     };
     if dynamic.bits < best.bits {
+        let Some(tokens) = expand_short_families(source, last_symbol) else {
+            return;
+        };
         let bits = dynamic.bits;
         best.tokens = tokens.into();
         best.plain = source.plain.clone();
@@ -4790,19 +4867,38 @@ fn spell_expanded_matches(
     output_count: usize,
     byte_limit: usize,
 ) -> Option<Vec<Token>> {
+    debug_assert!(expanded.windows(2).all(|pair| pair[0] < pair[1]));
     let mut output = new_token_candidate_with_limit(output_count, plain.len(), byte_limit)?;
-    let mut expanded = expanded.iter().copied().peekable();
+    // The tokens between expanded matches are copied whole; only their decoded
+    // length is needed. Decoded offsets only grow, so a token past the end of
+    // `plain` shows at the next expanded match or at the end.
+    let decoded_end = |offset: usize, tokens: &[Token]| {
+        tokens.iter().try_fold(offset, |offset, token| {
+            offset.checked_add(token.decoded_len())
+        })
+    };
+    let mut copied = 0;
     let mut plain_offset = 0_usize;
-    for (index, &token) in source.iter().enumerate() {
-        let end = plain_offset.checked_add(token.decoded_len())?;
-        let decoded = plain.get(plain_offset..end)?;
-        if expanded.next_if_eq(&index).is_some() {
-            output.extend(decoded.iter().copied().map(Token::Literal));
-        } else {
-            output.push(token);
-        }
+    for &index in expanded {
+        let unchanged = source.get(copied..index)?;
+        plain_offset = decoded_end(plain_offset, unchanged)?;
+        output.extend_from_slice(unchanged);
+        let end = plain_offset.checked_add(source.get(index)?.decoded_len())?;
+        output.extend(
+            plain
+                .get(plain_offset..end)?
+                .iter()
+                .copied()
+                .map(Token::Literal),
+        );
         plain_offset = end;
+        copied = index + 1;
     }
+    let rest = source.get(copied..)?;
+    if decoded_end(plain_offset, rest)? > plain.len() {
+        return None;
+    }
+    output.extend_from_slice(rest);
     debug_assert_eq!(output.len(), output_count);
     Some(output)
 }
@@ -4832,14 +4928,21 @@ fn expand_matches_with_token_limit(
     include_equal: bool,
     token_limit: usize,
 ) -> Option<Vec<Token>> {
+    let byte_costs = LiteralByteCosts::new(literal_lengths);
     expand_selected_matches_with_limits(
         tokens,
         plain,
         MAX_TOKEN_CANDIDATE_BYTES,
         token_limit,
         |_, token, decoded| {
-            literals_against_match(token, decoded, literal_lengths, distance_lengths)
-                .is_some_and(|order| order.is_lt() || (include_equal && order.is_eq()))
+            literals_against_match(
+                token,
+                decoded,
+                &byte_costs,
+                literal_lengths,
+                distance_lengths,
+            )
+            .is_some_and(|order| order.is_lt() || (include_equal && order.is_eq()))
         },
     )
 }
@@ -4849,6 +4952,7 @@ fn expand_matches_with_token_limit(
 fn literals_against_match(
     token: Token,
     decoded: &[u8],
+    byte_costs: &LiteralByteCosts,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
 ) -> Option<std::cmp::Ordering> {
@@ -4866,7 +4970,7 @@ fn literals_against_match(
         + u64::from(length_extra_bits)
         + estimated_length(distance_lengths, usize::from(distance_symbol))
         + u64::from(distance_extra_bits);
-    let literal_bits = literal_bits_up_to(decoded, literal_lengths, match_bits)?;
+    let literal_bits = byte_costs.up_to(decoded, match_bits)?;
     Some(literal_bits.cmp(&match_bits))
 }
 
@@ -4878,6 +4982,7 @@ fn expand_matches_strict_and_non_larger(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
 ) -> [Option<Vec<Token>>; 2] {
+    let byte_costs = LiteralByteCosts::new(literal_lengths);
     let mut expanded: [Vec<usize>; 2] = [Vec::new(), Vec::new()];
     let mut output_counts = [0_usize; 2];
     let mut plain_offset = 0_usize;
@@ -4888,7 +4993,13 @@ fn expand_matches_strict_and_non_larger(
         else {
             return [None, None];
         };
-        let order = literals_against_match(token, decoded, literal_lengths, distance_lengths);
+        let order = literals_against_match(
+            token,
+            decoded,
+            &byte_costs,
+            literal_lengths,
+            distance_lengths,
+        );
         let expands = [
             order.is_some_and(|order| order.is_lt()),
             order.is_some_and(|order| order.is_le()),
@@ -4934,6 +5045,7 @@ fn has_dearer_match(
     literal_lengths: &[u8],
     distance_lengths: &[u8],
 ) -> bool {
+    let byte_costs = LiteralByteCosts::new(literal_lengths);
     let mut offset = 0_usize;
     for token in tokens {
         match *token {
@@ -4954,7 +5066,8 @@ fn has_dearer_match(
                     + u64::from(length_extra_bits)
                     + estimated_length(distance_lengths, usize::from(distance_symbol))
                     + u64::from(distance_extra_bits);
-                if literal_bits_up_to(decoded, literal_lengths, match_bits)
+                if byte_costs
+                    .up_to(decoded, match_bits)
                     .is_some_and(|literal_bits| literal_bits < match_bits)
                 {
                     return true;
@@ -4974,18 +5087,36 @@ fn estimated_length(lengths: &[u8], symbol: usize) -> u64 {
         .map_or(15, u64::from)
 }
 
-/// The decoded bytes' [`estimated_length`] total as literals, or `None` once
-/// it exceeds `limit`. Every byte costs at least one bit, so a match longer
-/// than its own cost stops early instead of pricing all its bytes.
-fn literal_bits_up_to(decoded: &[u8], literal_lengths: &[u8], limit: u64) -> Option<u64> {
-    let mut bits = 0_u64;
-    for &byte in decoded {
-        bits += estimated_length(literal_lengths, usize::from(byte));
-        if bits > limit {
+/// Each byte's [`estimated_length`] as a literal, found once for a walk that
+/// prices many matches' bytes.
+struct LiteralByteCosts {
+    costs: [u8; 256],
+    /// The least of `costs`: no byte costs less as a literal.
+    cheapest: u8,
+}
+
+impl LiteralByteCosts {
+    fn new(literal_lengths: &[u8]) -> Self {
+        // An estimated length is a code length or 15, so it fits a byte.
+        let costs: [u8; 256] =
+            std::array::from_fn(|byte| estimated_length(literal_lengths, byte) as u8);
+        let cheapest = costs.iter().copied().min().unwrap_or(0);
+        Self { costs, cheapest }
+    }
+
+    /// The decoded bytes' total as literals, or `None` when it exceeds
+    /// `limit`. A match whose bytes would exceed it even at the cheapest cost
+    /// is not priced byte by byte; most matches cost less than their literals.
+    fn up_to(&self, decoded: &[u8], limit: u64) -> Option<u64> {
+        if decoded.len() as u64 * u64::from(self.cheapest) > limit {
             return None;
         }
+        let bits: u64 = decoded
+            .iter()
+            .map(|&byte| u64::from(self.costs[usize::from(byte)]))
+            .sum();
+        (bits <= limit).then_some(bits)
     }
-    Some(bits)
 }
 
 pub(crate) fn rewrite_258_symbols(

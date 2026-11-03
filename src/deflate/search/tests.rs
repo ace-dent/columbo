@@ -2433,3 +2433,39 @@ fn one_walk_expands_both_strict_and_non_larger_matches() {
     }
     assert!(both > 2_000, "only {both} cases expanded both ways");
 }
+
+#[test]
+fn two_table_symbol_counts_match_one_pass() {
+    let mut state = 0x2545_f491_u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let one_pass = |tokens: &[Token]| {
+        let mut literal = [0_u32; 286];
+        let mut distance = [0_u32; 30];
+        for token in tokens {
+            match *token {
+                Token::Literal(value) => literal[usize::from(value)] += 1,
+                Token::Match {
+                    length_symbol,
+                    distance_symbol,
+                    ..
+                } => {
+                    literal[usize::from(length_symbol)] += 1;
+                    distance[usize::from(distance_symbol)] += 1;
+                }
+            }
+        }
+        literal[256] += 1;
+        (literal, distance)
+    };
+    assert_eq!(count_frequencies(&[]), one_pass(&[]));
+    for case in 0..4_000 {
+        // One to 24 tokens: odd counts leave a token past the last pair.
+        let (tokens, _, _, _) = random_literal_sum_case(&mut next);
+        assert_eq!(count_frequencies(&tokens), one_pass(&tokens), "case {case}");
+    }
+}

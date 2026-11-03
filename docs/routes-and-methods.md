@@ -3748,7 +3748,9 @@ a strict win; their size gates are in
 1. **Short-family floor.** For each `last` from 260 to 264, expand every match
    with a length symbol in 260..=`last`: five candidates, covering lengths 6,
    then 6–7, up to 6–10. Each is priced only with DeflOpt heap variants 0–3 and
-   an explicit-length header with Default header search, which keeps it cheap.
+   an explicit-length header with Default header search, from counts: one walk
+   over the block finds every band's count changes, and only a winning band's
+   tokens are spelled. This keeps it cheap.
    It runs after the block floor on every block of the mandatory token floor,
    "before a deadline can steer optional splitting to a locally attractive
    two-block layout" (code comment), and also on source-aligned floor ranges, on

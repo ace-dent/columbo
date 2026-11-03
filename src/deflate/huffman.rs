@@ -465,6 +465,29 @@ impl Huffman {
         Some(tree)
     }
 
+    /// [`Self::decode_value`] with its table path inlined into a decoding
+    /// loop; anything else takes the out-of-line path.
+    #[inline(always)]
+    pub(crate) fn decode_value_inline(&self, reader: &mut BitReader<'_>) -> Result<DecodedValue> {
+        if let (Some(_), Some(table)) = (self.decode_profile, &self.decode_table) {
+            if let Some(window) = reader.peek_word() {
+                let (entry, code_bits) = table.entry(window)?;
+                let extra_bits = entry.extra_bits();
+                let extra = ((window >> code_bits) & ((1_u32 << extra_bits) - 1)) as u16;
+                // A code takes at most 15 bits and its extra bits 13, within
+                // the 32 that `peek_word` buffered.
+                reader.drop_peeked_bits(code_bits + extra_bits);
+                return Ok(DecodedValue {
+                    symbol: entry.symbol(),
+                    value: entry.value_base() + extra,
+                    extra,
+                    extra_bits,
+                });
+            }
+        }
+        self.decode_value(reader)
+    }
+
     pub(crate) fn decode_value(&self, reader: &mut BitReader<'_>) -> Result<DecodedValue> {
         let profile = self
             .decode_profile

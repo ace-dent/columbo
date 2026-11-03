@@ -498,14 +498,19 @@ impl Parser<'_> {
         let mut plain = Vec::new();
         let mut literal_frequencies = [0_u32; 286];
         let mut distance_frequencies = [0_u32; 30];
+        // `expand_match` writes every byte it returns, so one buffer serves
+        // every match.
+        let mut scratch = [0_u8; MAX_MATCH_LENGTH];
 
         loop {
-            let decoded = literal_tree.decode_value(&mut self.reader)?;
+            let decoded = literal_tree.decode_value_inline(&mut self.reader)?;
             let symbol = decoded.symbol;
             if symbol > 285 {
                 return Err(Error::new("invalid literal/length code"));
             }
-            literal_frequencies[usize::from(symbol)] += 1;
+            // The model limit keeps every count far below `u32::MAX`.
+            let count = &mut literal_frequencies[usize::from(symbol)];
+            *count = count.wrapping_add(1);
             match symbol {
                 0..=255 => {
                     self.reserve_payload(1, 1)?;
@@ -520,7 +525,7 @@ impl Parser<'_> {
                 257..=285 => {
                     let length = decoded.value;
 
-                    let decoded_distance = distance_tree.decode_value(&mut self.reader)?;
+                    let decoded_distance = distance_tree.decode_value_inline(&mut self.reader)?;
                     let distance_symbol = decoded_distance.symbol;
                     if distance_symbol > 29 {
                         return Err(Error::new("invalid distance code"));
@@ -539,7 +544,8 @@ impl Parser<'_> {
                     plain
                         .try_reserve(usize::from(length))
                         .map_err(|_| model_limit_error())?;
-                    distance_frequencies[distance_index] += 1;
+                    let count = &mut distance_frequencies[distance_index];
+                    *count = count.wrapping_add(1);
                     tokens.push(Token::Match {
                         length,
                         distance,
@@ -551,7 +557,6 @@ impl Parser<'_> {
                         distance_extra_bits: decoded_distance.extra_bits,
                     });
 
-                    let mut scratch = [0_u8; MAX_MATCH_LENGTH];
                     let expanded = expand_match(
                         &self.window,
                         self.decoded_position,
