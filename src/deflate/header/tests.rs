@@ -446,8 +446,7 @@ fn reduced_depth_candidates_beat_full_depth_tree_families() {
         let reduced = exact_tree_candidate(
             &literal_frequencies,
             &distance_frequencies,
-            &literal_frequencies,
-            &distance_frequencies,
+            &mut ExactTreeBuilder::new(&literal_frequencies, &distance_frequencies),
             0,
             max_bits,
             true,

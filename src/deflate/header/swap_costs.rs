@@ -12,9 +12,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// The most trial slots a thread keeps, 12 bytes each, 3 MiB. Repeated trials
-/// on the benchmark sample were mostly 32,000 to 256,000 trials apart.
-const MAX_TRIAL_SLOTS: usize = 1 << 18;
+/// The most trial slots a thread keeps, 12 bytes each, 6 MiB. Repeated trials
+/// on the benchmark sample were mostly 32,000 to 256,000 trials apart, and on
+/// a traced run these slots kept 93% of them, against 79% with half as many.
+const MAX_TRIAL_SLOTS: usize = 1 << 19;
 /// The slots a thread starts with. They grow fourfold each time they have
 /// taken as many new trials as they hold, so a short search keeps little.
 const MIN_TRIAL_SLOTS: usize = 1 << 12;

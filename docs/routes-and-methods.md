@@ -2007,7 +2007,14 @@ limit. When a leaf and a package have equal weight it must take one first; leaf
 first and package first are both optimal and can give different trees. Columbo
 accepts a package-merge result only if every used symbol gets a length from 1 to
 the limit, every unused symbol gets none, and the Kraft sum is exactly 1;
-otherwise it keeps the builder's fallback tree.
+otherwise it keeps the builder's fallback tree. Package-merge reads only the
+counts, so the exact Defluff builder makes its fallback, the generic variant-0
+tree, only when package-merge fails. The exact Defluff tree's unconstrained
+merge does not depend on the limit, so a search that asks for several limits
+of the same counts (the reduced-depth pair, the bounded-depth floor and the
+smoothed-tree candidates) builds it once per alphabet. The limited Columbo tree
+is the generic variant-0 tree whenever that needs no repair, so Max's tree
+families take it from the variant-0 build.
 
 **How it works**
 
@@ -7323,7 +7330,9 @@ without their plans.
   many repeats as twice the slots mapped directly.
 - A thread's first swap search allocates 4,096 slots, 48 KiB. Each time they
   have taken as many new trials as they hold, they grow fourfold, keeping their
-  trials, up to 2^18 slots, 3 MiB, so a short search keeps little.
+  trials, up to 2^19 slots, 6 MiB, so a short search keeps little. On a traced
+  run 2^19 slots kept 93% of the repeats an unbounded memo would, against 79%
+  with 2^18.
 - The pass compares kept and new costs exactly as before. When its cheapest
   trial's cost was kept, it plans that swap again once, which gives the plan the
   trial would have given.

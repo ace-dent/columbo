@@ -1981,3 +1981,68 @@ fn merged_tree_depths_match_the_recursive_walk() {
         check(&lengths, &scratch);
     }
 }
+
+#[test]
+fn package_merge_fallbacks_and_shared_unlimited_trees_match_their_references() {
+    let mut state = 0x3c6e_f372_fe94_f82b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut limited = 0;
+    for case in 0..4_000 {
+        let size = [19, 30, 286][case % 3];
+        let mut frequencies = vec![0_u32; size];
+        for frequency in &mut frequencies {
+            if next() % 3 != 0 {
+                // Skewed counts, some deep enough to need limiting.
+                *frequency = match next() % 4 {
+                    0 => 1,
+                    1 => (next() % 8) as u32,
+                    2 => 1 << (next() % 20),
+                    _ => (next() % 10_000) as u32,
+                };
+            }
+        }
+        for max_bits in [7, 9, 10, 15] {
+            // The exact builder before it deferred its fallback: the generic
+            // tree first, kept if package-merge fails.
+            let mut expected = vec![0_u8; size];
+            let mut scratch = TreeBuildScratch::default();
+            if make_lengths_defluff_unconstrained(&frequencies, &mut expected, &mut scratch.nodes)
+                > usize::from(max_bits)
+            {
+                make_lengths_into(&frequencies, &mut expected, max_bits, 0, &mut scratch);
+                apply_package_merge(
+                    &frequencies,
+                    &mut expected,
+                    max_bits,
+                    PackageMergeTie::LeafFirst,
+                );
+                limited += 1;
+            }
+            assert_eq!(
+                make_lengths_defluff_exact(&frequencies, max_bits, 0),
+                expected,
+                "{frequencies:?} {max_bits}"
+            );
+
+            // One unconstrained tree serves every limit.
+            let tree = DefluffExactTree::new(&frequencies, &mut scratch);
+            assert_eq!(tree.limited(&frequencies, max_bits, &mut scratch), expected);
+
+            // Defluff's limited tree is the variant-0 tree when that needs no
+            // repair.
+            let mut variant_zero = vec![0_u8; size];
+            if !make_lengths_into(&frequencies, &mut variant_zero, max_bits, 0, &mut scratch) {
+                assert_eq!(
+                    make_lengths_columbo_defluff_limited(&frequencies, max_bits, 0),
+                    variant_zero
+                );
+            }
+        }
+    }
+    assert!(limited > 1_000, "{limited} limited trees");
+}

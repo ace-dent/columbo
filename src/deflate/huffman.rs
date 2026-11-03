@@ -1528,7 +1528,7 @@ pub(crate) fn make_lengths_columbo_defluff_limited_into(
     if !make_lengths_inner(frequencies, lengths, max_bits, 0, scratch) {
         return false;
     }
-    apply_package_merge_with_scratch(
+    let _ = apply_package_merge_with_scratch(
         frequencies,
         lengths,
         max_bits,
@@ -1565,19 +1565,61 @@ pub(crate) fn make_lengths_defluff_exact_into(
 ) {
     assert_eq!(frequencies.len(), lengths.len());
     let max_depth = make_lengths_defluff_unconstrained(frequencies, lengths, &mut scratch.nodes);
+    limit_defluff_exact_lengths(frequencies, lengths, max_depth, max_bits, scratch);
+}
+
+/// Turn Defluff's unconstrained lengths, `max_depth` deep, into its exact
+/// lengths under `max_bits`.
+fn limit_defluff_exact_lengths(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_depth: usize,
+    max_bits: u8,
+    scratch: &mut TreeBuildScratch,
+) {
     if max_depth <= usize::from(max_bits) {
         return;
     }
-
-    // Start package-merge from the `make_lengths` result, kept if it fails.
-    make_lengths_into(frequencies, lengths, max_bits, 0, scratch);
-    apply_package_merge_with_scratch(
+    // If package-merge fails, keep the `make_lengths` result. Package-merge
+    // reads only the counts, so that result is built only then.
+    if !apply_package_merge_with_scratch(
         frequencies,
         lengths,
         max_bits,
         PackageMergeTie::LeafFirst,
         &mut scratch.package_merge,
-    );
+    ) {
+        make_lengths_into(frequencies, lengths, max_bits, 0, scratch);
+    }
+}
+
+/// Defluff's unconstrained tree for one alphabet. It does not depend on the
+/// depth limit, so the exact lengths under several limits follow from one
+/// build.
+pub(crate) struct DefluffExactTree {
+    lengths: Vec<u8>,
+    max_depth: usize,
+}
+
+impl DefluffExactTree {
+    pub(crate) fn new(frequencies: &[u32], scratch: &mut TreeBuildScratch) -> Self {
+        let mut lengths = vec![0; frequencies.len()];
+        let max_depth =
+            make_lengths_defluff_unconstrained(frequencies, &mut lengths, &mut scratch.nodes);
+        Self { lengths, max_depth }
+    }
+
+    /// [`make_lengths_defluff_exact`] for the counts this tree was built from.
+    pub(crate) fn limited(
+        &self,
+        frequencies: &[u32],
+        max_bits: u8,
+        scratch: &mut TreeBuildScratch,
+    ) -> Vec<u8> {
+        let mut lengths = self.lengths.clone();
+        limit_defluff_exact_lengths(frequencies, &mut lengths, self.max_depth, max_bits, scratch);
+        lengths
+    }
 }
 
 /// Run package-merge with Zopfli's package-first tie rule (Defluff takes the
@@ -1707,19 +1749,21 @@ struct PackageMergeScratch {
     candidate: Vec<u8>,
 }
 
+/// Replace `lengths` with package-merge's code lengths, returning whether it
+/// did; `lengths` is not read, and stays as it was when package-merge fails.
 fn apply_package_merge_with_scratch(
     frequencies: &[u32],
     lengths: &mut [u8],
     max_bits: u8,
     tie: PackageMergeTie,
     scratch: &mut PackageMergeScratch,
-) {
+) -> bool {
     let leaf_count = frequencies
         .iter()
         .filter(|&&frequency| frequency != 0)
         .count();
     if leaf_count < 2 || max_bits == 0 {
-        return;
+        return false;
     }
 
     let PackageMergeScratch {
@@ -1797,7 +1841,7 @@ fn apply_package_merge_with_scratch(
     }
 
     if previous.len() < target {
-        return;
+        return false;
     }
     // A leaf's length is how often it occurs in the selected nodes. Every
     // package follows the nodes it pairs, so one pass from the end hands each
@@ -1822,9 +1866,11 @@ fn apply_package_merge_with_scratch(
             }
         }
     }
-    if package_lengths_are_valid(frequencies, candidate, max_bits) {
-        lengths.copy_from_slice(candidate);
+    if !package_lengths_are_valid(frequencies, candidate, max_bits) {
+        return false;
     }
+    lengths.copy_from_slice(candidate);
+    true
 }
 
 fn package_lengths_are_valid(frequencies: &[u32], lengths: &[u8], max_bits: u8) -> bool {

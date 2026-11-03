@@ -87,6 +87,7 @@ gains where established.
 | 28 Oct 2026 | [`6e6a0c4`](#6e6a0c4-28-october-2026) | Per-thread header-plan store (`header.rs`) | Each generation's plans appended to one byte arena with an offset index; one byte per RLE token, code lengths checked by decoding the RLE instead of stored; 16 MiB budget | 177 completing Max runs 1.06× (6.0% fewer instructions); Default CPU 1.03× (33 inputs, 3.1% fewer cycles); peak memory −1.1 MiB median Default, −4 MiB median Max, +39 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 177 completing and 2 long completing Max runs; 89,255 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 65,536 token-encoding checks; 695 Rust, 7 Python tests |
 | 2 Nov 2026 | [`3860542`](#3860542-2-november-2026) | Max length-swap trials and header checks (`header.rs`, `header/swap_costs.rs`, `huffman.rs`) | Each thread keeps the header costs of greedy length-swap trials by start lengths and pair, in sets of four that grow with use up to 3 MiB; the payload shape check counts codes in its Kraft pass; the shortest-RLE repeat test compares counts before tokens | Completing Max runs of three small deadline-bound PNGs 17.2%, 17.0% and 7.7% fewer instructions (1.21×, 1.19×, 1.07×); 177 completing sprites 4.0% fewer; Default 0.86% fewer; sprite peak memory +2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 11,343 replayed swap searches; 275,887 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 shape-check comparisons; 703 Rust, 7 Python tests |
 | 3 Nov 2026 | [`a540aac`](#a540aac-3-november-2026) | Validated parses and the bit reader (`optimize.rs`, `model.rs`, `bitstream.rs`) | Each thread keeps its last validated parse, which a reparse of the same bytes and limit shares; the endpoint-proven lineage takes its candidate's validating parse; the bit reader derives its position from its byte position | Default CPU 1.015× (33 inputs, 1.69% fewer instructions, 1.32% fewer cycles); Partnership card 1.03×; peak memory +0.2 MiB median, +2.7 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 673 Rust, 7 Python tests |
+| 3 Nov 2026 | [`4ebfefd`](#4ebfefd-3-november-2026) | Exact Defluff trees and swap-trial costs (`huffman.rs`, `header.rs`, `header/swap_costs.rs`) | Package-merge's fallback built only when it fails; one unconstrained Defluff tree per alphabet for every depth limit; the limited Columbo tree from an unrepaired variant-0 build; swap-trial costs in up to 2^19 slots | Completing Max runs of three small PNGs 6.6%, 3.4% and 4.6% fewer instructions; 177 completing sprites 2.3% fewer; 14,440 replayed large-block searches 3.1% fewer; Default 0.82% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 14,440 replayed large-block searches; 58 Max runs at 10 seconds; 66 Default timing runs; 16,000 tree-builder comparisons; 674 Rust, 7 Python tests |
 
 ## Entries
 
@@ -483,6 +484,102 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `4ebfefd`, 3 November 2026
+
+Batches: one paired run of each build, alternating order, on the three small
+PNGs whose Max search completes within 1,200 seconds; two rotating runs of a
+new replay of 14,440 large-block exhaustive dynamic-plan searches, every
+seventh captured from five Max runs at 20 seconds; two alternating runs of each
+completing Max run; one paired run of each build on the 177 sprites whose Max
+search completes within 10 seconds and on every sixteenth DeflOpt PNG by name
+(58 files, Max at 10 seconds); retired instructions and cycles over the 33
+stratified Default inputs, two alternating rounds, and their CPU and peak
+memory, one round.
+
+A sampled profile of ten inputs in Max at 20 seconds (235,849 CPU samples)
+had the shape of `3860542`'s. `exact_tree_candidate`, which prices each
+dynamic-plan search's reduced-depth pair (ECT's 10- and 9-bit trees) and the
+smoothed-tree candidates' depth limits, took 5.7%: 2.9% building exact Defluff
+trees and 2.7% planning their headers. Each exact
+Defluff tree built a generic fallback before package-merge, 1.5% of all
+samples, although package-merge reads only the counts and the fallback is kept
+only if package-merge fails, and each depth limit built the same unconstrained
+tree again.
+
+- **The package-merge fallback only when needed.** Package-merge now reports
+  whether it replaced the lengths, and the exact Defluff builder makes its
+  generic fallback only when it did not.
+- **One unconstrained Defluff tree for every limit.** The tree before
+  limiting does not depend on the limit, so the reduced-depth pair, the
+  bounded-depth floor and the smoothed-tree candidates build it once per
+  alphabet and derive each limit's lengths from it.
+- **The limited Columbo tree from the variant-0 build.** It starts from the
+  generic variant-0 tree and differs only when that needs repair, so Max's tree
+  families take an unrepaired variant-0 tree for it.
+- **Swap-trial costs in 2^19 slots.** On a traced run of `star.png`, sets of
+  four in 2^19 slots kept 93% of the repeats an unbounded memo would, against
+  79% in 2^18; the slots still grow with use, so only long searches reach
+  6 MiB.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `crossroads.png`, Max completing its search, instructions retired | 2,589.7 billion | 2,418.9 billion | −6.6% |
+| Same run, user CPU | 166.3 s | 155.9 s | 1.07× |
+| `star.png`, Max completing its search, instructions retired | 1,162.2 billion | 1,123.0 billion | −3.4% |
+| `basi4a16.png`, Max completing its search, instructions retired | 878.0 billion | 837.8 billion | −4.6% |
+| 14,440 replayed large-block dynamic-plan searches, instructions retired | 231.5 billion | 224.3 billion | −3.1% |
+| Same replay, cycles | 55.8 billion | 54.1 billion | −3.1% |
+| 177 sprites, Max completing its search, instructions retired | 3,007.8 billion | 2,939.3 billion | −2.3% |
+| Same runs, user CPU | 233.1 s | 227.7 s | 1.02× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 18.70 billion | 18.37 billion | −1.7% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.46 billion | 2.34 billion | −4.7% |
+| 33 Default inputs, instructions retired over two rounds | 1,110.8 billion | 1,101.7 billion | −0.82% |
+| Same inputs, cycles over two rounds | 265.5 billion | 262.6 billion | −1.08% |
+
+The larger swap memo alone took 6.1%, 2.9% and 2.3% of the instructions off
+the three small PNGs; the tree changes account for the replay, which plans no
+swaps, and Default gains through the bounded-depth floor and the exact trees
+of its feedback seeds. Default peak memory rose 0.9 MiB at most, and the
+median did not change.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name, 56 outputs were identical, in 449.9
+instead of 450.1 seconds. `sample_20.png` gave 9,695 bytes instead of 9,692,
+the baseline's own endpoint at 11 seconds and later, as in `3860542`'s review.
+`interlaced_rgba_8_should_be_grayscale_alpha_8.png` was 1 byte larger once;
+in three more runs at 10 seconds both builds gave 132,248 bytes, and 132,247
+at 11, 12 and 14 seconds.
+
+Equivalence: a new test compares the exact Defluff builder with the order it
+replaced, the shared tree's limited lengths with the builder, and the limited
+Columbo tree with an unrepaired variant-0 tree, on 4,000 alphabets of 19, 30
+and 286 symbols at limits of 7, 9, 10 and 15 bits, more than 1,000 of them
+limited. The replays matched plan for plan. API comparisons on the 52 inputs,
+in Default with the 180-second budget and in zero-budget Max, matched in all
+104 runs, and every Default timing run and every completing Max run matched
+byte for byte. Rust tests, including the private corpus, passed in release and
+debug modes, with documentation and Python tests, a locked build, formatting
+and all-feature Clippy with warnings denied. `__text` grew from 884,112 to
+886,004 bytes, and the shipped executable by one 16 KiB page, to 974,944 bytes.
+
+Measured and rejected in the same review:
+
+- Spelling the shortest RLE's tokens only when a pass adopts it or compares
+  it: of 14.5 million computed in 20 seconds on `crossroads.png`, 8.5 million
+  were adopted and 7.7 million had the counts of the pass's RLE, so their
+  tokens were compared; nearly all needed their tokens.
+- Ending a seed at a pass that starts from an RLE an earlier seed started from
+  at the same or an earlier pass: 1.4 million such passes on `crossroads.png`,
+  but the work after them was 356 milliseconds of 15.7 seconds.
+
+Not changed in the same review:
+
+- `sample` groups a function's addresses even without line tables, and
+  `xctrace` and an unprivileged `dtrace` were not available, so the header
+  planner's inlined self time (11.4%) could not be split by instruction.
+
+Artifacts: `work/efficiency-review-max8-20261103/`.
 
 ### `a540aac`, 3 November 2026
 

@@ -14,8 +14,8 @@ use super::huffman::{
     make_lengths_defluff_exact, make_lengths_defluff_exact_into, make_lengths_deft4j_java_heap,
     make_lengths_deft4j_java_heap_into, make_lengths_into,
     make_lengths_order_heap_into_with_scratch, make_lengths_zopfli_package_from,
-    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, HeapBuild, TreeBuildScratch,
-    FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
+    make_zopfli_rle_pseudofrequencies, payload_tree_shape_is_valid, DefluffExactTree, HeapBuild,
+    TreeBuildScratch, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
     count_frequencies, token_extra_bits, try_clone_slice, DynamicPlan, RleToken, Token,
@@ -1237,15 +1237,18 @@ pub(crate) fn best_dynamic_plan_cached(
     // A depth-limited tree can have a much cheaper header than a
     // payload-optimal tree with very long rare codes (as in ECT).
     if exhaustive {
+        let mut trees = None;
         for max_bits in REDUCED_PAYLOAD_TREE_DEPTHS {
             if stop.reached() {
                 break;
             }
+            let trees = trees.get_or_insert_with(|| {
+                ExactTreeBuilder::new(&build_literal_frequencies, &build_distance_frequencies)
+            });
             if let Some(candidate) = exact_tree_candidate(
                 literal_frequencies,
                 distance_frequencies,
-                &build_literal_frequencies,
-                &build_distance_frequencies,
+                trees,
                 extra_bits,
                 max_bits,
                 true,
@@ -1863,15 +1866,27 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     }
 
     if exhaustive {
+        // Defluff's limited builder starts from the variant-0 tree and differs
+        // only when that tree needs limiting, so an unrepaired one is its tree.
+        let mut unlimited = None;
         for variant in 0..4 {
-            push_unique(
-                &mut candidates,
-                make_lengths(frequencies, max_bits, variant),
+            let mut lengths = vec![0_u8; frequencies.len()];
+            let repaired = make_lengths_into(
+                frequencies,
+                &mut lengths,
+                max_bits,
+                variant,
+                &mut heap_scratch,
             );
+            if variant == 0 && !repaired {
+                unlimited = Some(lengths.clone());
+            }
+            push_unique(&mut candidates, lengths);
         }
         push_unique(
             &mut candidates,
-            make_lengths_columbo_defluff_limited(frequencies, max_bits, 0),
+            unlimited
+                .unwrap_or_else(|| make_lengths_columbo_defluff_limited(frequencies, max_bits, 0)),
         );
         let defluff_exact = make_lengths_defluff_exact(frequencies, max_bits, 0);
         push_unique(&mut candidates, defluff_exact.clone());
@@ -1895,19 +1910,56 @@ fn tree_candidates(frequencies: &[u32], max_bits: u8, exhaustive: bool) -> Vec<V
     candidates
 }
 
+/// Defluff's exact trees of both alphabets under several depth limits, each
+/// alphabet's unconstrained tree built once.
+struct ExactTreeBuilder<'a> {
+    build_literal_frequencies: &'a [u32; 286],
+    build_distance_frequencies: &'a [u32; 30],
+    literal: DefluffExactTree,
+    distance: DefluffExactTree,
+    scratch: TreeBuildScratch,
+}
+
+impl<'a> ExactTreeBuilder<'a> {
+    fn new(
+        build_literal_frequencies: &'a [u32; 286],
+        build_distance_frequencies: &'a [u32; 30],
+    ) -> Self {
+        let mut scratch = TreeBuildScratch::default();
+        Self {
+            build_literal_frequencies,
+            build_distance_frequencies,
+            literal: DefluffExactTree::new(build_literal_frequencies, &mut scratch),
+            distance: DefluffExactTree::new(build_distance_frequencies, &mut scratch),
+            scratch,
+        }
+    }
+
+    /// The exact Defluff literal/length lengths limited to `max_bits`.
+    fn literal_lengths(&mut self, max_bits: u8) -> Vec<u8> {
+        self.literal
+            .limited(self.build_literal_frequencies, max_bits, &mut self.scratch)
+    }
+
+    /// The exact Defluff distance lengths limited to `max_bits`.
+    fn distance_lengths(&mut self, max_bits: u8) -> Vec<u8> {
+        self.distance
+            .limited(self.build_distance_frequencies, max_bits, &mut self.scratch)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exact_tree_candidate(
     literal_frequencies: &[u32; 286],
     distance_frequencies: &[u32; 30],
-    build_literal_frequencies: &[u32; 286],
-    build_distance_frequencies: &[u32; 30],
+    trees: &mut ExactTreeBuilder<'_>,
     extra_bits: u64,
     max_bits: u8,
     exhaustive: bool,
     header_cache: &mut HeaderPlanCache,
 ) -> Option<DynamicPlan> {
-    let literal_lengths = make_lengths_defluff_exact(build_literal_frequencies, max_bits, 0);
-    let distance_lengths = make_lengths_defluff_exact(build_distance_frequencies, max_bits, 0);
+    let literal_lengths = trees.literal_lengths(max_bits);
+    let distance_lengths = trees.distance_lengths(max_bits);
 
     explicit_exact_tree_candidate(
         literal_frequencies,
@@ -2124,13 +2176,14 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
     let extra_bits = token_extra_bits(tokens);
     let mut header_cache = HeaderPlanCache::new();
     let mut best = None;
+    let mut trees = ExactTreeBuilder::new(&build_literal_frequencies, &build_distance_frequencies);
 
     if independent_depths {
         let mut literal_candidates = Vec::new();
         for max_bits in minimum_complete_tree_depth(&build_literal_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            let defluff = make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0);
+            let defluff = trees.literal_lengths(max_bits);
             let package_first =
                 make_lengths_zopfli_package_from(&build_literal_frequencies, &defluff, max_bits);
             push_unique(&mut literal_candidates, defluff);
@@ -2140,7 +2193,7 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
         for max_bits in minimum_complete_tree_depth(&build_distance_frequencies)
             ..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH
         {
-            let defluff = make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0);
+            let defluff = trees.distance_lengths(max_bits);
             let package_first =
                 make_lengths_zopfli_package_from(&build_distance_frequencies, &defluff, max_bits);
             push_unique(&mut distance_candidates, defluff);
@@ -2164,8 +2217,7 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
         let mut distance_candidates = Vec::with_capacity(2);
         for max_bits in minimum_depth..=MAX_RESTRICTED_PAYLOAD_TREE_DEPTH {
             literal_candidates.clear();
-            let literal_defluff =
-                make_lengths_defluff_exact(&build_literal_frequencies, max_bits, 0);
+            let literal_defluff = trees.literal_lengths(max_bits);
             let literal_package_first = make_lengths_zopfli_package_from(
                 &build_literal_frequencies,
                 &literal_defluff,
@@ -2174,8 +2226,7 @@ pub(crate) fn plan_bounded_depth_tree_candidate(
             push_unique(&mut literal_candidates, literal_defluff);
             push_unique(&mut literal_candidates, literal_package_first);
             distance_candidates.clear();
-            let distance_defluff =
-                make_lengths_defluff_exact(&build_distance_frequencies, max_bits, 0);
+            let distance_defluff = trees.distance_lengths(max_bits);
             let distance_package_first = make_lengths_zopfli_package_from(
                 &build_distance_frequencies,
                 &distance_defluff,
@@ -2230,12 +2281,13 @@ pub(crate) fn plan_rle_smoothed_tree_candidate(
         }
         ensure_code_symbols(build_literal_frequencies, strict);
         ensure_distance_symbols(build_distance_frequencies, strict);
+        let mut trees =
+            ExactTreeBuilder::new(build_literal_frequencies, build_distance_frequencies);
         for max_bits in [15, 14, 13, 12, 11, 10, 9] {
             if let Some(candidate) = exact_tree_candidate(
                 literal_frequencies,
                 distance_frequencies,
-                build_literal_frequencies,
-                build_distance_frequencies,
+                &mut trees,
                 extra_bits,
                 max_bits,
                 true,
