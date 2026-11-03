@@ -770,6 +770,75 @@ const FEEDBACK_RAW: &[u8] = &[
     0xd3, 0xcc, 0xcc, 0xcc, 0xcc, 0x01, 0x00, 0x00, 0xc0, 0x71, 0x5d, 0xaa, 0xaa, 0xaa, 0xfe, 0x76,
     0x77, 0x93, 0x24, 0x49, 0x9e, 0xa7, 0x6d, 0xdb, 0xf6, 0x03,
 ];
+#[test]
+fn a_kept_validated_parse_is_the_parse_it_replaces() {
+    let fresh = parse_stream(FEEDBACK_RAW, 1 << 20).unwrap();
+    let identity = StreamIdentity {
+        decoded_size: fresh.decoded_size,
+        crc32: fresh.crc32,
+        adler32: fresh.adler32,
+    };
+    let same = |left: &ParsedStream, right: &ParsedStream| {
+        let scalars = |stream: &ParsedStream| {
+            (
+                stream.consumed,
+                stream.meaningful_bits,
+                stream.crc32,
+                stream.adler32,
+                stream.decoded_size,
+                stream.max_distance,
+            )
+        };
+        assert_eq!(scalars(left), scalars(right));
+        assert_eq!(left.source_block_count, right.source_block_count);
+        assert_eq!(
+            left.source_empty_block_count,
+            right.source_empty_block_count
+        );
+        assert_eq!(left.blocks.len(), right.blocks.len());
+        for (left, right) in left.blocks.iter().zip(&right.blocks) {
+            assert_eq!(left.tokens, right.tokens);
+            assert_eq!(left.plain, right.plain);
+            assert_eq!(left.literal_frequencies, right.literal_frequencies);
+            assert_eq!(left.distance_frequencies, right.distance_frequencies);
+            assert_eq!(left.original, right.original);
+            assert_eq!(left.original_dynamic, right.original_dynamic);
+            assert_eq!(left.source_type, right.source_type);
+        }
+    };
+
+    release_kept_validated_parse();
+    let first = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    // The second parse is the kept one, sharing the first's buffers.
+    let kept = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    same(&first, &fresh);
+    same(&kept, &fresh);
+    assert!(Arc::ptr_eq(&first.blocks[0].tokens, &kept.blocks[0].tokens));
+
+    // A hit still validates against the caller's identity, and another
+    // decoded limit parses again, failing as a fresh parse does.
+    let changed = StreamIdentity {
+        crc32: identity.crc32 ^ 1,
+        ..identity
+    };
+    assert!(parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, changed).is_err());
+    let short = fresh.decoded_size - 1;
+    assert_eq!(
+        parse_validated_rewrite(FEEDBACK_RAW, short, identity)
+            .unwrap_err()
+            .message(),
+        parse_stream(FEEDBACK_RAW, short).unwrap_err().message()
+    );
+    release_kept_validated_parse();
+    let after = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    same(&after, &fresh);
+    assert!(!Arc::ptr_eq(
+        &after.blocks[0].tokens,
+        &first.blocks[0].tokens
+    ));
+    release_kept_validated_parse();
+}
+
 fn corpus_file(relative: &str) -> Vec<u8> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")

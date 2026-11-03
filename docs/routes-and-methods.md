@@ -7105,7 +7105,8 @@ bounded per-thread stores of completed block and header plans behind them. Each
 thread also keeps a code-length tree cache, RLE run tables and the header costs
 of greedy length-swap trials, and a few methods
 keep local memos: R6 and R15 a range cache, the terminal sequence a one-entry
-parse cache, and the deft4j route its state memos. There is no global route DAG
+parse cache, and the deft4j route its state memos; each thread keeps its last
+validated parse. There is no global route DAG
 and no interval cache shared across routes or methods. Every cache and store
 belongs to one thread, so none needs a lock.
 
@@ -7581,6 +7582,16 @@ Besides those, Columbo:
   before R1 restoration, which builds its own model, so two models are never
   held (on one large input it cut peak memory from 1,042 to about 940 MiB,
   [efficiency review `04d63bd`](research/efficiency-review.md#04d63bd-20-october-2026));
+- keeps each thread's last validated parse, with its bytes and decoded limit,
+  since the next step often reparses what the previous one validated: the
+  tree floors and the terminal parse cache reparse a candidate just built, and
+  Default's endpoint-proven lineage now takes the parse that validated its
+  candidate. A parse is a function of the bytes and the limit, so a hit, which
+  compares both in full, returns a copy sharing the kept blocks' token and
+  decoded-byte buffers, and still checks the caller's identity. The entry is
+  dropped before a different stream is parsed, so a stale model is never held
+  while a new one is built, and is released when each stream ends
+  ([efficiency review `a540aac`](research/efficiency-review.md#a540aac-3-november-2026));
 - closes most topologies that would lose with the terminal tree floors before
   comparing them, and closes a winning branch only once, at the final stage
   ([Late max sequence](#late-max-sequence),

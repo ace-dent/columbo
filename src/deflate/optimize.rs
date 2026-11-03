@@ -9,6 +9,7 @@
 //! `stream` and `search`. Route labels (D1, M0, R1, …) refer to
 //! `docs/routes-and-methods.md`.
 
+use std::cell::RefCell;
 use std::thread;
 use std::time::Instant;
 
@@ -4505,13 +4506,15 @@ fn build_candidate_with_proven_policy(
     ) else {
         return source_candidate(source, options);
     };
-    let mut candidate = build_candidate_from_plans(
+    let (mut candidate, validated) = build_candidate_and_parse(
         source,
         plans,
         options,
         replay_limit,
         ReplayPlanner::Full,
         expired,
+        None,
+        false,
     )?;
     if !run_proven_lineage || expired.reached() {
         return Ok(candidate);
@@ -4522,9 +4525,13 @@ fn build_candidate_with_proven_policy(
     // replays start from and can hide a better fixed point.
     let endpoint_proven = {
         // Original-bit references are invalid after an accepted replay, so
-        // reparse these exact bytes.
-        let replayed =
-            parse_validated_rewrite(&candidate.data, source.decoded_limit, source.identity)?;
+        // use the parse of these exact bytes that validated them, or make one.
+        let replayed = match validated {
+            Some(validated) => validated,
+            None => {
+                parse_validated_rewrite(&candidate.data, source.decoded_limit, source.identity)?
+            }
+        };
         let proven_source =
             rewritten_input(&candidate, &replayed, source.decoded_limit, source.identity);
         plan_proven_submatch_route(&replayed.blocks, 0, options, &mut *expired)
@@ -4885,9 +4892,56 @@ fn parse_validated_rewrite(
     decoded_limit: u64,
     identity: StreamIdentity,
 ) -> Result<ParsedStream> {
+    let kept = KEPT_VALIDATED_PARSE
+        .try_with(|kept| {
+            let kept = kept.try_borrow().ok()?;
+            let (bytes, limit, stream) = kept.as_ref()?;
+            (*limit == decoded_limit && bytes.as_slice() == data)
+                .then(|| stream.try_clone_shared())
+                .flatten()
+        })
+        .ok()
+        .flatten();
+    if let Some(stream) = kept {
+        validate_replayed_stream(&stream, data.len(), identity)?;
+        return Ok(stream);
+    }
+    // Release a stale model before building its replacement.
+    release_kept_validated_parse();
     let stream = parse_stream(data, decoded_limit)?;
     validate_replayed_stream(&stream, data.len(), identity)?;
+    let _ = KEPT_VALIDATED_PARSE.try_with(|kept| {
+        let Ok(mut kept) = kept.try_borrow_mut() else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(data.len()).is_err() {
+            return;
+        }
+        bytes.extend_from_slice(data);
+        *kept = stream
+            .try_clone_shared()
+            .map(|shared| (bytes, decoded_limit, shared));
+    });
     Ok(stream)
+}
+
+thread_local! {
+    /// The last stream this thread parsed and validated, with its decoded
+    /// limit. A method often reparses the bytes the previous step validated;
+    /// parsing is a function of the bytes and the limit, so a copy sharing the
+    /// kept blocks' buffers is the parse it would make.
+    static KEPT_VALIDATED_PARSE: RefCell<Option<(Vec<u8>, u64, ParsedStream)>> =
+        const { RefCell::new(None) };
+}
+
+/// Drop this thread's kept parse; each stream releases it when it ends.
+pub(crate) fn release_kept_validated_parse() {
+    let _ = KEPT_VALIDATED_PARSE.try_with(|kept| {
+        if let Ok(mut kept) = kept.try_borrow_mut() {
+            *kept = None;
+        }
+    });
 }
 
 /// The parser has already computed every compared value, so this check is

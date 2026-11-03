@@ -45,13 +45,13 @@ use super::{
     refine_with_compact_balanced_tree_floor, refine_with_compact_proven_feedback,
     refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
     refine_with_max_planner, refine_with_no_split_route,
-    refine_with_terminal_source_split_floor_until, replace_optional_if_smaller,
-    replace_optional_keeping_parent, source_run_match_count_exceeds, spawn_route,
-    BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy, BoundedRoutes,
-    Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork, HeaderFit,
-    RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
-    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
-    WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    refine_with_terminal_source_split_floor_until, release_kept_validated_parse,
+    replace_optional_if_smaller, replace_optional_keeping_parent, source_run_match_count_exceeds,
+    spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy,
+    BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork,
+    HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache,
+    TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT,
+    MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
@@ -72,9 +72,11 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     grace: Duration,
 ) -> Result<RawOptimization> {
     let result = optimize_stream(input, options, decoded_limit, default_floor, grace);
-    // Block plans repeat within a stream, rarely across streams, and APNG
-    // frames and ZIP members reuse worker threads: release this thread's.
+    // Block plans and parses repeat within a stream, rarely across streams,
+    // and APNG frames and ZIP members reuse worker threads: release this
+    // thread's.
     release_thread_block_plans();
+    release_kept_validated_parse();
     result
 }
 

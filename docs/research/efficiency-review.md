@@ -86,6 +86,7 @@ gains where established.
 | 28 Oct 2026 | [`4013a14`](#4013a14-28-october-2026) | Code-length trees and feedback passes (`huffman.rs`, `header.rs`, `search.rs`) | Heap builds note tie turns per sift-down, and every variant whose rules agree shares the tree; the code-length tree cache tracks every heap build; an exhaustive pass prices a repaired first tree alone at exact Defluff's cost; seeds stop at a shortest RLE already followed; code-length heaps on stack arrays, a 19-length completeness check and exact Defluff on kept scratch | Replayed header plans 1.16× (9.4% fewer instructions, 11.0% fewer cycles); Default CPU 1.05× (33 inputs, 4.3% fewer cycles); a completing Max run 3.6% fewer instructions; executable one 16 KiB page larger | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 stack-array, 20,000 completeness and 20,000 first-tree comparisons; 694 Rust, 7 Python tests |
 | 28 Oct 2026 | [`6e6a0c4`](#6e6a0c4-28-october-2026) | Per-thread header-plan store (`header.rs`) | Each generation's plans appended to one byte arena with an offset index; one byte per RLE token, code lengths checked by decoding the RLE instead of stored; 16 MiB budget | 177 completing Max runs 1.06× (6.0% fewer instructions); Default CPU 1.03× (33 inputs, 3.1% fewer cycles); peak memory −1.1 MiB median Default, −4 MiB median Max, +39 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 177 completing and 2 long completing Max runs; 89,255 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 65,536 token-encoding checks; 695 Rust, 7 Python tests |
 | 2 Nov 2026 | [`3860542`](#3860542-2-november-2026) | Max length-swap trials and header checks (`header.rs`, `header/swap_costs.rs`, `huffman.rs`) | Each thread keeps the header costs of greedy length-swap trials by start lengths and pair, in sets of four that grow with use up to 3 MiB; the payload shape check counts codes in its Kraft pass; the shortest-RLE repeat test compares counts before tokens | Completing Max runs of three small deadline-bound PNGs 17.2%, 17.0% and 7.7% fewer instructions (1.21×, 1.19×, 1.07×); 177 completing sprites 4.0% fewer; Default 0.86% fewer; sprite peak memory +2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 11,343 replayed swap searches; 275,887 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 shape-check comparisons; 703 Rust, 7 Python tests |
+| 3 Nov 2026 | [`a540aac`](#a540aac-3-november-2026) | Validated parses and the bit reader (`optimize.rs`, `model.rs`, `bitstream.rs`) | Each thread keeps its last validated parse, which a reparse of the same bytes and limit shares; the endpoint-proven lineage takes its candidate's validating parse; the bit reader derives its position from its byte position | Default CPU 1.015× (33 inputs, 1.69% fewer instructions, 1.32% fewer cycles); Partnership card 1.03×; peak memory +0.2 MiB median, +2.7 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 673 Rust, 7 Python tests |
 
 ## Entries
 
@@ -482,6 +483,89 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `a540aac`, 3 November 2026
+
+Batches: retired instructions and cycles from `time -l` over the 33 stratified
+Default inputs, two alternating rounds; whole-file Default CPU (user plus
+system) and peak resident memory over the same inputs, two rounds alternating
+the builds; two alternating runs of each completing Max run.
+
+A sampled profile of the 33 Default inputs at `a540aac` (36,469 CPU samples) put
+38% under uncached header planning, half of it building code-length trees, and
+9.5% under the validating parser. Counters showed the header-plan store
+already catching repeats: 0.4% of 17.4 seconds of uncached header planning
+repeated a plan the thread had made. The parser did repeat work: of 4.0
+seconds spent parsing 1,025 candidates, 16% parsed bytes the same thread had
+just parsed and validated. The bounded-depth tree floor and the terminal parse
+cache reparse a candidate that `build_candidate_and_parse` validated and
+dropped, and Default's endpoint-proven lineage reparses the candidate whose
+validated parse that function had just returned.
+
+- **Kept validated parse.** Each thread keeps its last validated parse with
+  its bytes and decoded limit. A parse is a function of the two, so a hit,
+  which compares both in full, returns a copy sharing the kept blocks' token
+  and decoded-byte buffers, and still checks the caller's identity. The entry
+  is dropped before a different stream is parsed, so a stale model is never
+  held while a new one is built, and is released when each stream ends. On
+  the call sequence, one entry caught 509 of the 572 milliseconds that four
+  would.
+- **The endpoint-proven lineage takes its candidate's parse.**
+  `build_candidate_with_proven_policy` keeps the validated parse that built
+  its candidate instead of parsing the same bytes again.
+- **A derived bit position.** The bit reader's position is the bits of the
+  bytes it has loaded less those still buffered, so it no longer keeps a
+  separate count with a checked addition at every decoded symbol. A slice
+  holds at most `isize::MAX` bytes, so the derived count cannot overflow.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, instructions retired over two rounds | 1,129.3 billion | 1,110.3 billion | −1.69% |
+| Same inputs, cycles over two rounds | 267.6 billion | 264.0 billion | −1.32% |
+| Same inputs, CPU over two rounds | 85.5 s | 84.3 s | 1.015× |
+| `Partnership_Card___John_Lewis_Finance.png`, Default CPU | 9.53 s | 9.24–9.27 s | 1.03× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 18.72 billion | 18.71 billion | −0.0% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.46 billion | 2.46 billion | −0.2% |
+
+The kept parse and the endpoint-proven parse took 1.48% of the instructions
+and the derived bit position another 0.22%. Median Default peak memory rose
+0.2 MiB and at most 2.7 MiB (`y2rc2_large.png`, 68.8 to 71.5 MiB); the
+Partnership card peaked 1.4–3.9 MiB lower, near 963 MiB.
+
+Equivalence: a new test checks that a kept parse matches a fresh one block by
+block and shares its buffers, that a hit is checked against the caller's
+identity, and that another decoded limit fails as a fresh parse does; the bit
+reader's reference tests cover the derived position across reads and aligned
+reads. API comparisons on the 52 inputs, in Default with the 180-second budget
+and in zero-budget Max, matched in all 104 runs, and every Default timing run
+and every completing Max run matched byte for byte. Rust tests, including the
+private corpus, passed in release and debug modes, with documentation and
+Python tests, a locked build, formatting and all-feature Clippy with warnings
+denied. `__text` grew from 883,932 to 884,112 bytes; the shipped executable
+keeps its 958,528 bytes, and the final source builds the tested executable
+byte for byte.
+
+Measured and rejected in the same review:
+
+- Validating without the model where a caller drops the parse: the parse is
+  mostly decoding, so a check without tokens or counts cost 84% of a full
+  parse, and 270 of the 399 final validations belong to terminal methods whose
+  winners keep their parse. No instructions changed, cycles fell 0.18%, and
+  the code grew by an executable page.
+- Bounds to skip the payload-tree pairs of a block plan: 56.5% of the pairs
+  that lose would need a header bound above 95% of their actual header.
+- A cache of `tree_candidates` by counts: repeats took 5% of its 4.9 seconds.
+
+Not changed in the same review:
+
+- Code-length trees: of 16.5 million builds, 75% were another builder's tree
+  for a histogram the thread had built before, and 42–96% of each builder's
+  trees equal one already built for the histogram, where tie decisions differ
+  but reconverge. No build was repeated for want of cache room (6%), and the
+  heaps' tie tracking already shares the trees it can prove equal; histograms
+  without ties, where every builder must agree, were 2% of builds.
+
+Artifacts: `work/efficiency-review-default7-20261103/`.
 
 ### `3860542`, 2 November 2026
 

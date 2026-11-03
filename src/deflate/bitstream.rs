@@ -6,13 +6,13 @@
 use crate::{Error, Result};
 
 /// Bits of `buffer` above `buffered_bits` are zero or the input's next bits in
-/// place, so loading a byte or word over them never changes a bit.
+/// place, so loading a byte or word over them never changes a bit. The bits
+/// read so far are the loaded bytes' bits less those still buffered.
 pub(crate) struct BitReader<'a> {
     input: &'a [u8],
     byte_pos: usize,
     buffer: u64,
     buffered_bits: u8,
-    bit_pos: u64,
 }
 
 impl<'a> BitReader<'a> {
@@ -22,7 +22,6 @@ impl<'a> BitReader<'a> {
             byte_pos: 0,
             buffer: 0,
             buffered_bits: 0,
-            bit_pos: 0,
         }
     }
 
@@ -93,13 +92,8 @@ impl<'a> BitReader<'a> {
         if bits > self.buffered_bits {
             return Err(Error::new("cannot drop unavailable Deflate bits"));
         }
-        let bit_position = self
-            .bit_pos
-            .checked_add(u64::from(bits))
-            .ok_or_else(|| Error::new("Deflate stream is too large"))?;
         self.buffer >>= bits;
         self.buffered_bits -= bits;
-        self.bit_pos = bit_position;
         Ok(())
     }
 
@@ -130,22 +124,14 @@ impl<'a> BitReader<'a> {
             .checked_add(count)
             .filter(|&end| end <= self.input.len())
             .ok_or_else(|| Error::new("truncated Deflate stream"))?;
-        let added_bits = u64::try_from(count)
-            .ok()
-            .and_then(|count| count.checked_mul(8))
-            .ok_or_else(|| Error::new("Deflate stream is too large"))?;
-        let bit_position = self
-            .bit_pos
-            .checked_add(added_bits)
-            .ok_or_else(|| Error::new("Deflate stream is too large"))?;
         let bytes = &self.input[self.byte_pos..end];
         self.byte_pos = end;
-        self.bit_pos = bit_position;
         Ok(bytes)
     }
 
     pub(crate) fn bit_position(&self) -> u64 {
-        self.bit_pos
+        // A slice holds at most `isize::MAX` bytes, so its bits fit `u64`.
+        self.byte_pos as u64 * 8 - u64::from(self.buffered_bits)
     }
 }
 

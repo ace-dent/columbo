@@ -264,6 +264,30 @@ pub(crate) struct ParsedStream {
     pub(crate) source_trailing_empty_block_count: usize,
 }
 
+impl ParsedStream {
+    /// A copy that shares each block's token and decoded-byte buffers.
+    pub(crate) fn try_clone_shared(&self) -> Option<Self> {
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(self.blocks.len()).ok()?;
+        for block in &self.blocks {
+            blocks.push(block.try_clone_shared()?);
+        }
+        Some(Self {
+            blocks,
+            consumed: self.consumed,
+            meaningful_bits: self.meaningful_bits,
+            crc32: self.crc32,
+            adler32: self.adler32,
+            decoded_size: self.decoded_size,
+            max_distance: self.max_distance,
+            source_block_count: self.source_block_count,
+            source_empty_block_count: self.source_empty_block_count,
+            #[cfg(test)]
+            source_trailing_empty_block_count: self.source_trailing_empty_block_count,
+        })
+    }
+}
+
 /// Whether two token lists are equal. One list compares equal to itself
 /// without a scan, as `Arc` comparisons of `Eq` values do. Out of line: one
 /// copy of the scan serves every comparison of whole lists.
