@@ -18,10 +18,12 @@ The code and reverse engineering in this project were completed with AI models.
 ```text
 columbo [options] input [input ...]
 columbo [options] --out file input
+columbo [options] --stdout input > output
+columbo [options] - < input > output
 columbo --dry-run [options] input [input ...]
 ```
 
-Each `input` may be a PNG/APNG, GZIP, ZIP, or zlib file; its format is detected automatically. Multiple inputs are processed sequentially and optimized in place unless `--dry-run` is used. `--out` is available only when processing one input. An existing file is replaced only when the output is smaller, saves at least one meaningful Deflate bit, applies `--strip` changes, or changes a ZIP member of at most four bytes from Deflate to Store.
+Each `input` may be a PNG/APNG, GZIP, ZIP, or zlib file; its format is detected automatically. An `input` of `-` reads one input from standard input, within the same size limit as a file; its output goes to standard output unless `--out` names a file. Use `-- -` or `./-` for a file named `-`. Multiple inputs are processed sequentially and optimized in place unless `--dry-run` is used. `--out` and `--stdout` are available only when processing one input. An existing file is replaced only when the output is smaller, saves at least one meaningful Deflate bit, applies `--strip` changes, or changes a ZIP member of at most four bytes from Deflate to Store.
 
 Input and decoded Deflate data are limited to 1 GiB per file, and decoded data to 512 times the input size or 64 MiB, whichever is larger. These limits bound data, not process memory: peak memory is typically 10–125 times the decoded size, highest with `--max`.
 
@@ -32,6 +34,7 @@ Input and decoded Deflate data are limited to 1 GiB per file, and decoded data t
 - `-m`, `--max`: Enable slower block-boundary and token-spelling searches for potentially smaller output.
 - `-d`, `--dry-run`: Run the complete optimization for each input and report savings without writing files. With one input, `--out` is ignored; with several, it is rejected.
 - `--out <file>`: Write a single input to `file` instead of modifying it. When there is nothing to write, Columbo copies the input to a missing `file` and leaves an existing `file` unchanged.
+- `--stdout`: Write the output for a single input to standard output instead of modifying it. Standard output always receives a complete file: the optimized one, or the original when nothing was saved. Reports then go to standard error. `--dry-run` ignores `--stdout`. Columbo will not read `-` from, or write binary output to, a terminal, and on Unix it refuses a stdout that is the input file; see [file safety](docs/file-safety.md#standard-input-and-output) for how piped output differs from a published file.
 - `-t <seconds>`, `--timeout <seconds>`: Stop starting new search routes after the specified time. The default is 180 seconds; values are clamped to 10–4000 seconds and fractions round up. An active route receives a grace period of 10% plus one second.
 - `--strict <0|1>`: Emit conservative Deflate for strict and older decoders. On by default (`1`); `0` turns it off and permits compact empty or singleton Huffman alphabets and the non-standard length-258 alias. Files are still replaced only when Columbo saves space, so a file left unchanged keeps its original encoding.
 - `--strip`: Remove supported metadata, credentials, signatures, and extraneous payloads, including unreferenced ZIP records and trailing data. Decoded content and supported structural information are preserved; ambiguous layouts are rejected. ZIP members that are neither Stored nor Deflate lose only their comments (with Info-ZIP's Unicode copy) and their time, owner, permission and padding extra fields, since their method may need the other fields; encrypted members keep every extra field. Without `--strip`, metadata and understood extraneous payloads are kept.
@@ -44,6 +47,7 @@ Options that take a value also accept `--out=<file>`, `--timeout=<seconds>`, and
 ```sh
 columbo image.png
 columbo --out optimized.png image.png
+columbo - < image.png > optimized.png
 columbo --dry-run --max archive.zip
 columbo --raw --timeout 60 stream.deflate
 ```

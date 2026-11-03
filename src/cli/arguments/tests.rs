@@ -223,6 +223,96 @@ fn dry_run_accepts_multiple_inputs_and_ignores_out_for_one_input() {
 }
 
 #[test]
+fn stdin_reads_one_input_and_writes_stdout_unless_out_names_a_file() {
+    for command in [
+        parsed_command(["-"]),
+        parsed_command(["-", "--stdout"]),
+        parsed_command(["-", "-"]),
+    ] {
+        assert!(command.stdin);
+        assert!(command.inputs.is_empty());
+        assert!(matches!(command.destination, Destination::Stdout));
+    }
+
+    let to_file = parsed_command(["-", "--out", "out"]);
+    assert!(to_file.stdin);
+    assert!(matches!(
+        to_file.destination,
+        Destination::Explicit(path) if path == Path::new("out")
+    ));
+    assert!(parsed_command(["-", "--dry-run"]).destination.is_dry_run());
+
+    let file = parsed_command(["--", "-"]);
+    assert!(!file.stdin);
+    assert_eq!(file.inputs, [PathBuf::from("-")]);
+    assert!(matches!(file.destination, Destination::InPlace));
+}
+
+#[test]
+fn stdout_writes_one_file_input_and_dry_run_ignores_it() {
+    let command = parsed_command(["--stdout", "in"]);
+    assert!(!command.stdin);
+    assert_eq!(command.inputs, [PathBuf::from("in")]);
+    assert!(matches!(command.destination, Destination::Stdout));
+    assert!(!command.destination.overwrites_input(Path::new("in")));
+
+    assert!(parsed_command(["--dry-run", "--stdout", "in"])
+        .destination
+        .is_dry_run());
+}
+
+#[test]
+fn pipe_options_reject_ambiguous_combinations() {
+    let cases = [
+        (
+            vec!["-", "in"],
+            "'-' (stdin) cannot be used with other input files",
+        ),
+        (
+            vec!["in", "-"],
+            "'-' (stdin) cannot be used with other input files",
+        ),
+        (
+            vec!["--stdout", "--out", "out", "in"],
+            "--stdout cannot be used with --out",
+        ),
+        (
+            vec!["-", "--stdout", "--out=out"],
+            "--stdout cannot be used with --out",
+        ),
+        (
+            vec!["--stdout", "one", "two"],
+            "--stdout cannot be used when processing multiple input files",
+        ),
+        (
+            vec!["--dry-run", "--stdout", "one", "two"],
+            "--stdout cannot be used when processing multiple input files",
+        ),
+    ];
+    for (arguments, expected) in cases {
+        let error = match parse_args(arguments.into_iter().map(OsString::from)) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid pipe arguments should fail"),
+        };
+        assert_eq!(error.message.as_deref(), Some(expected));
+        assert!(error.show_usage);
+    }
+
+    let error = match parse_args([OsString::from("--stdin")]) {
+        Err(error) => error,
+        Ok(_) => panic!("--stdin should be an unknown option"),
+    };
+    assert_eq!(error.message.as_deref(), Some("unknown option: --stdin"));
+
+    let error = match parse_args([OsString::from("--stdout")]) {
+        Err(error) => error,
+        Ok(_) => panic!("--stdout without an input should fail"),
+    };
+    assert!(error.message.is_none());
+    assert!(error.show_usage);
+}
+
+#[test]
 fn batch_inputs_accept_all_per_file_processing_options() {
     let command = parsed_command([
         "--dry-run",
@@ -289,7 +379,12 @@ fn help_describes_only_the_merged_strict_policy() {
     assert!(help.contains("instead of optimizing it in place"));
     assert!(help.contains("without writing output"));
     assert!(help.contains("Multiple inputs are processed sequentially"));
-    assert!(help.contains("--out accepts only one input"));
+    assert!(help.contains("--out and --stdout accept only one"));
+    assert!(help.contains("columbo [options] - < input > output"));
+    assert!(help.contains("An input of - reads stdin"));
+    assert!(!help.contains("--stdin"));
+    assert!(help.contains("--stdout           write one output to stdout"));
+    assert!(help.contains("reports go to stderr instead"));
     assert!(help.contains("meaningful Deflate bit is saved"));
     assert!(help.contains("Advanced:"));
     assert!(help.contains("--raw"));

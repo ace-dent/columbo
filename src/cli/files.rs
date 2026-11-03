@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
-//! Bounded input reads and atomic output replacement.
+//! Bounded input reads and atomic output replacement, plus the unstaged
+//! stdin and stdout pipes.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -41,6 +42,56 @@ pub(super) fn read_file(path: &Path, maximum_size: u64) -> Result<Vec<u8>, ReadE
         return Err(ReadError::Changed);
     }
     Ok(bytes)
+}
+
+/// Read stdin to its end under the same size limit as a file. A pipe has no
+/// file version to recheck.
+pub(super) fn read_stdin(maximum_size: u64) -> Result<Vec<u8>, ReadError> {
+    read_bounded(io::stdin().lock(), maximum_size)
+}
+
+/// Write a complete output to stdout. Unlike a published file, an error or
+/// kill during the write leaves the reader with a partial output; only the
+/// exit status reports it.
+pub(super) fn write_stdout(bytes: &[u8]) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    output.write_all(bytes)?;
+    output.flush()
+}
+
+/// Whether stdout is the regular file that `input` names, or stdin's file when
+/// `input` is `None`. Writing output there would append to, or follow a shell
+/// truncation of, the input. Only Unix exposes file identity in the standard
+/// library; elsewhere, and when a handle cannot be inspected, this is `false`.
+pub(super) fn stdout_is_input(input: Option<&Path>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let handle_metadata = |handle: std::os::fd::BorrowedFd<'_>| {
+            handle
+                .try_clone_to_owned()
+                .and_then(|handle| File::from(handle).metadata())
+        };
+        let input = match input {
+            Some(path) => fs::metadata(path),
+            None => handle_metadata(io::stdin().as_fd()),
+        };
+        matches!(
+            (handle_metadata(io::stdout().as_fd()), input),
+            (Ok(output), Ok(input))
+                if output.is_file()
+                    && input.is_file()
+                    && output.dev() == input.dev()
+                    && output.ino() == input.ino()
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = input;
+        false
+    }
 }
 
 /// Unlike `Read::read_to_end`, growth uses fallible reservations, so memory

@@ -8,10 +8,10 @@
 //! cache is bounded: past 64 MiB, a report stops growing and ends with a note.
 
 use std::fmt::{self, Write as _};
-use std::io::{self, Write};
 use std::sync::{Mutex, OnceLock};
 
 use crate::sort::SortShared;
+use crate::terminal;
 
 const MAX_CACHED_BYTES: usize = 64 * 1_024 * 1_024;
 
@@ -244,19 +244,19 @@ pub(super) fn write(reports: Vec<Report>) {
     if reports.is_empty() {
         return;
     }
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-    for report in reports {
-        let _ = output.write_all(report.text.as_bytes());
-        if report.truncated {
-            let _ = writeln!(
-                output,
-                "  S{} … remaining verbose details omitted; 64 MiB report cache reached",
-                report.stream_id
-            );
+    terminal::write_report(&mut |output| {
+        for report in &reports {
+            let _ = output.write_all(report.text.as_bytes());
+            if report.truncated {
+                let _ = writeln!(
+                    output,
+                    "  S{} … remaining verbose details omitted; 64 MiB report cache reached",
+                    report.stream_id
+                );
+            }
         }
-    }
-    let _ = output.flush();
+        output.flush()
+    });
 }
 
 /// Print every finished report that is still buffered.

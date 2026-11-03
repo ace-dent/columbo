@@ -18,6 +18,7 @@ fn dry_run_optimizes_without_creating_an_output() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::DryRun,
     })
     .unwrap();
@@ -45,6 +46,7 @@ fn batch_continues_sequentially_after_a_file_error() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![missing, valid.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     });
 
@@ -65,6 +67,7 @@ fn batch_dry_run_leaves_every_input_unchanged() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![first.clone(), second.clone()],
+        stdin: false,
         destination: Destination::DryRun,
     })
     .unwrap();
@@ -89,6 +92,7 @@ fn no_gain_in_place_preserves_the_original_directory_entry() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     })
     .unwrap();
@@ -111,6 +115,7 @@ fn no_gain_preserves_an_existing_explicit_output() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input],
+        stdin: false,
         destination: Destination::Explicit(output.clone()),
     })
     .unwrap();
@@ -130,6 +135,7 @@ fn no_gain_creates_a_missing_explicit_output_from_the_original() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input],
+        stdin: false,
         destination: Destination::Explicit(output.clone()),
     })
     .unwrap();
@@ -153,6 +159,7 @@ fn no_gain_does_not_write_a_zlib_header_only_change() {
         format: Format::Zlib,
         options: Options::default(),
         inputs: vec![input],
+        stdin: false,
         destination: Destination::Explicit(output.clone()),
     })
     .unwrap();
@@ -178,6 +185,7 @@ fn equal_byte_output_with_a_one_bit_gain_replaces_in_place() {
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     })
     .unwrap();
@@ -197,6 +205,7 @@ fn equal_byte_tiny_zip_normalization_replaces_in_place() {
         format: Format::Zip,
         options: Options::default(),
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     })
     .unwrap();
@@ -228,6 +237,7 @@ fn padding_only_rewrite_without_a_meaningful_saving_does_not_replace_in_place() 
         format: Format::Raw,
         options: Options::default(),
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     })
     .unwrap();
@@ -249,6 +259,7 @@ fn strip_writes_padding_cleanup_even_without_a_size_or_bit_saving() {
             ..Options::default()
         },
         inputs: vec![input.clone()],
+        stdin: false,
         destination: Destination::InPlace,
     })
     .unwrap();
@@ -295,6 +306,7 @@ fn strip_only_size_savings_write_in_place_and_explicit_outputs() {
                 format: Format::Raw,
                 options: options.clone(),
                 inputs: vec![input.clone()],
+                stdin: false,
                 destination: if in_place {
                     Destination::InPlace
                 } else {

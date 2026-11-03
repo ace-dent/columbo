@@ -19,13 +19,16 @@ use super::{PROGRAM_NAME, PROGRAM_STAGE, PROGRAM_VERSION};
 pub(super) struct Command {
     pub(super) format: Format,
     pub(super) options: Options,
+    /// Empty when the input comes from stdin.
     pub(super) inputs: Vec<PathBuf>,
+    pub(super) stdin: bool,
     pub(super) destination: Destination,
 }
 
 pub(super) enum Destination {
     InPlace,
     Explicit(PathBuf),
+    Stdout,
     DryRun,
 }
 
@@ -38,7 +41,7 @@ impl Destination {
         match self {
             Self::InPlace => Some(input),
             Self::Explicit(path) => Some(path),
-            Self::DryRun => None,
+            Self::Stdout | Self::DryRun => None,
         }
     }
 
@@ -46,7 +49,7 @@ impl Destination {
         match self {
             Self::InPlace => true,
             Self::Explicit(path) => paths_refer_to_same_file(input, path),
-            Self::DryRun => false,
+            Self::Stdout | Self::DryRun => false,
         }
     }
 }
@@ -85,6 +88,8 @@ pub(super) fn parse_args(
     let mut format = Format::Auto;
     let mut dry_run = false;
     let mut output = None;
+    let mut stdin = false;
+    let mut stdout = false;
     let mut positional = Vec::new();
     let mut parse_options = true;
     let mut index = 0_usize;
@@ -122,6 +127,9 @@ pub(super) fn parse_args(
                 }
                 set_output(&mut output, value.clone())?;
             }
+            // A lone `-` reads stdin, as in oxipng; after `--` it names a file.
+            "-" => stdin = true,
+            "--stdout" => stdout = true,
             "--strip" => options.strip_metadata = true,
             "-t" | "--timeout" => {
                 index += 1;
@@ -159,7 +167,13 @@ pub(super) fn parse_args(
         index += 1;
     }
 
-    if positional.is_empty() {
+    if stdin && !positional.is_empty() {
+        return Err(CliError::message(
+            "'-' (stdin) cannot be used with other input files",
+            true,
+        ));
+    }
+    if !stdin && positional.is_empty() {
         return Err(CliError::usage());
     }
     if positional.len() > 1 && output.is_some() {
@@ -168,18 +182,37 @@ pub(super) fn parse_args(
             true,
         ));
     }
+    if stdout && output.is_some() {
+        return Err(CliError::message(
+            "--stdout cannot be used with --out",
+            true,
+        ));
+    }
+    if stdout && positional.len() > 1 {
+        return Err(CliError::message(
+            "--stdout cannot be used when processing multiple input files",
+            true,
+        ));
+    }
 
     let inputs = positional.into_iter().map(PathBuf::from).collect();
+    // Stdin cannot be optimized in place, so its output goes to stdout unless
+    // --out names a file.
     let destination = if dry_run {
         Destination::DryRun
+    } else if let Some(output) = output {
+        Destination::Explicit(output)
+    } else if stdin || stdout {
+        Destination::Stdout
     } else {
-        output.map_or(Destination::InPlace, Destination::Explicit)
+        Destination::InPlace
     };
 
     Ok(ParsedCommand::Run(Command {
         format,
         options,
         inputs,
+        stdin,
         destination,
     }))
 }
@@ -320,6 +353,16 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
         PROGRAM_NAME
     )?;
     writeln!(output, "       {} [options] --out file input", PROGRAM_NAME)?;
+    writeln!(
+        output,
+        "       {} [options] --stdout input > output",
+        PROGRAM_NAME
+    )?;
+    writeln!(
+        output,
+        "       {} [options] - < input > output",
+        PROGRAM_NAME
+    )?;
     writeln!(output)?;
     writeln!(output, "Options:")?;
     writeln!(output, "  -h, --help             show this help and exit")?;
@@ -338,6 +381,10 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     writeln!(
         output,
         "      --out <file>       write one input to file instead of optimizing it in place"
+    )?;
+    writeln!(
+        output,
+        "      --stdout           write one output to stdout instead of a file"
     )?;
     writeln!(
         output,
@@ -378,12 +425,21 @@ pub(super) fn print_usage(output: &mut dyn Write, color: bool) -> io::Result<()>
     )?;
     writeln!(
         output,
-        "Multiple inputs are processed sequentially; --out accepts only one input."
+        "Multiple inputs are processed sequentially; --out and --stdout accept only one."
+    )?;
+    writeln!(
+        output,
+        "An input of - reads stdin; its output goes to stdout unless --out names a file."
     )?;
     writeln!(
         output,
         "Reports go to stdout; warnings, errors, and the spinner go to stderr."
     )?;
+    writeln!(
+        output,
+        "When output goes to stdout, reports go to stderr instead."
+    )?;
+    writeln!(output, "Piped input and output must not be a terminal.")?;
     writeln!(
         output,
         "NO_COLOR disables color; TERM=dumb also disables the spinner."

@@ -4,7 +4,8 @@
 //! Verbose optimization reports.
 //!
 //! Each optimizer call on a stream buffers one report instead of writing to
-//! standard output from its worker thread. A file-level coordinator prints
+//! the report stream (stdout, or stderr when the CLI writes output data to
+//! stdout) from its worker thread. A file-level coordinator prints
 //! each physical stream, in file order, as soon as all its producers have
 //! finished and every earlier stream is printed. Quiet calls get disabled
 //! reporters and never touch the shared report state.
@@ -18,6 +19,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::terminal;
 use crate::terminal::formatting::{plural, plural_u64};
 use crate::{Format, Options};
 
@@ -84,7 +86,7 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
     };
     stream::restart_stream_numbering();
     buffer::reset();
-    let _ = write_format_summary(&mut io::stdout().lock(), label, deflate_streams);
+    terminal::write_report(&mut |output| write_format_summary(output, label, deflate_streams));
     coordinator::begin_file(deflate_streams.unwrap_or(0), options.timeout);
 }
 
@@ -97,7 +99,7 @@ pub(crate) fn finish_file(options: &Options) {
     }
     let store_changes = coordinator::finish_file();
     buffer::flush();
-    let _ = write_zip_store_changes(&mut io::stdout().lock(), &store_changes);
+    terminal::write_report(&mut |output| write_zip_store_changes(output, &store_changes));
 }
 
 fn write_format_summary(

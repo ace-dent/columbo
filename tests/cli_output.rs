@@ -4,9 +4,9 @@
 //! Report streams and explicit output validation through the public CLI.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static DIRECTORY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -20,6 +20,14 @@ const SIGNED_PNG: &[u8] = &[
     0x02, 0x00, 0x01, 0xe5, 0x27, 0xde, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82,
 ];
+
+/// A stored raw Deflate block of 1,000 `a` bytes, which Columbo re-plans as a
+/// much smaller Huffman block.
+fn stored_run() -> Vec<u8> {
+    let mut stream = vec![0x01, 0xe8, 0x03, 0x17, 0xfc];
+    stream.extend([b'a'; 1_000]);
+    stream
+}
 
 struct TestDirectory(PathBuf);
 
@@ -60,6 +68,26 @@ impl TestDirectory {
             .args(inputs)
             .output()
             .unwrap()
+    }
+
+    /// Run with `input` on stdin and capture both output streams.
+    fn run_piped(&self, arguments: &[&str], input: &[u8]) -> Output {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_columbo"))
+            .current_dir(&self.0)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // Columbo reads all of stdin before writing, so this cannot deadlock;
+        // a file input never reads it, so send nothing then.
+        let mut stdin = child.stdin.take().unwrap();
+        if !input.is_empty() {
+            stdin.write_all(input).unwrap();
+        }
+        drop(stdin);
+        child.wait_with_output().unwrap()
     }
 
     fn assert_entries(&self, expected: &[&str]) {
@@ -414,4 +442,149 @@ fn symlink_probe_leaves_the_link_and_its_target_untouched() {
     assert_optimization_error(&result);
     assert_eq!(fs::read_link(&output).unwrap(), target);
     directory.assert_entries(&["input.deflate", "output.deflate"]);
+}
+
+#[test]
+fn piped_output_matches_out_and_reports_move_to_stderr() {
+    let directory = TestDirectory::new();
+    let input = stored_run();
+    fs::write(directory.0.join("input.deflate"), &input).unwrap();
+    let reference = directory.run_piped(
+        &["--raw", "--out", "expected.deflate", "input.deflate"],
+        &[],
+    );
+    assert_eq!(reference.status.code(), Some(0), "{reference:?}");
+    let expected = fs::read(directory.0.join("expected.deflate")).unwrap();
+    assert!(expected.len() < input.len());
+
+    for verbose in [false, true] {
+        for (arguments, stdin, name) in [
+            (&["--raw", "-"][..], &input[..], "\"<stdin>\""),
+            (
+                &["--raw", "--stdout", "input.deflate"][..],
+                &[][..],
+                "\"input.deflate\"",
+            ),
+        ] {
+            let mut arguments = arguments.to_vec();
+            if verbose {
+                arguments.push("--verbose");
+            }
+            let result = directory.run_piped(&arguments, stdin);
+            assert_eq!(result.status.code(), Some(0), "{result:?}");
+            assert_eq!(result.stdout, expected, "{arguments:?}");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(stderr.contains(name), "{stderr}");
+            assert_eq!(stderr.contains("Format   raw Deflate"), verbose, "{stderr}");
+            assert!(!result.stderr.contains(&0x1b), "{result:?}");
+        }
+    }
+    assert_eq!(fs::read(directory.0.join("input.deflate")).unwrap(), input);
+    directory.assert_entries(&["expected.deflate", "input.deflate"]);
+}
+
+#[test]
+fn piped_output_is_the_original_when_nothing_is_saved() {
+    let directory = TestDirectory::new();
+    let result = directory.run_piped(&["--raw", "-"], &[0x03, 0x00]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(result.stdout, [0x03, 0x00]);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("\"<stdin>\" 2 -> 2 bytes (no savings; copied original to \"<stdout>\")"),
+        "{stderr}"
+    );
+    directory.assert_entries(&[]);
+}
+
+#[test]
+fn stdin_with_out_writes_the_file_and_reports_on_stdout() {
+    let directory = TestDirectory::new();
+    let input = stored_run();
+    let piped = directory.run_piped(&["--raw", "-"], &input);
+    assert_eq!(piped.status.code(), Some(0), "{piped:?}");
+
+    let result = directory.run_piped(&["--raw", "-", "--out", "output.deflate"], &input);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.starts_with("\"<stdin>\" 1005 -> "), "{stdout}");
+    assert!(result.stderr.is_empty(), "{result:?}");
+    assert_eq!(
+        fs::read(directory.0.join("output.deflate")).unwrap(),
+        piped.stdout
+    );
+    directory.assert_entries(&["output.deflate"]);
+}
+
+#[test]
+fn failed_piped_input_writes_nothing_to_stdout() {
+    let directory = TestDirectory::new();
+    for flags in [&[][..], &["--verbose"][..]] {
+        let mut arguments = vec!["--raw", "-"];
+        arguments.extend(flags);
+        let result = directory.run_piped(&arguments, &[0xff]);
+        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        assert!(result.stdout.is_empty(), "{result:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("could not optimize \"<stdin>\":"),
+            "{stderr}"
+        );
+    }
+    directory.assert_entries(&[]);
+}
+
+#[cfg(unix)]
+#[test]
+fn stdout_that_is_the_input_file_is_refused_before_reading() {
+    let directory = TestDirectory::new();
+    let input = stored_run();
+    let path = directory.0.join("input.deflate");
+    for from_stdin in [false, true] {
+        fs::write(&path, &input).unwrap();
+        // Like `>>`: no truncation, so a write would append to the input.
+        let append = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_columbo"));
+        command
+            .current_dir(&directory.0)
+            .arg("--raw")
+            .stdout(append);
+        if from_stdin {
+            command.arg("-").stdin(fs::File::open(&path).unwrap());
+        } else {
+            command
+                .args(["--stdout", "input.deflate"])
+                .stdin(Stdio::null());
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(1), "{result:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(stderr.starts_with("stdout is the input "), "{stderr}");
+        assert_eq!(fs::read(&path).unwrap(), input);
+    }
+    directory.assert_entries(&["input.deflate"]);
+}
+
+#[test]
+fn stdout_redirected_to_another_file_receives_the_output() {
+    let directory = TestDirectory::new();
+    let input = stored_run();
+    fs::write(directory.0.join("input.deflate"), &input).unwrap();
+    let piped = directory.run_piped(&["--raw", "--stdout", "input.deflate"], &[]);
+    assert_eq!(piped.status.code(), Some(0), "{piped:?}");
+
+    let output = fs::File::create(directory.0.join("output.deflate")).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_columbo"))
+        .current_dir(&directory.0)
+        .args(["--raw", "--stdout", "input.deflate"])
+        .stdin(Stdio::null())
+        .stdout(output)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(
+        fs::read(directory.0.join("output.deflate")).unwrap(),
+        piped.stdout
+    );
+    assert_eq!(fs::read(directory.0.join("input.deflate")).unwrap(), input);
 }

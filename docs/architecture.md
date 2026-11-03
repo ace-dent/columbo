@@ -12,7 +12,7 @@ remain private to the crate.
 | `src/main.rs` | Start the CLI through the library's hidden `run_cli` and return its exit status. |
 | `src/cli/mod.rs` | Process input files sequentially through reading, optimization, and writing. The CLI lives in the library, so it shares one copy of the terminal code with the progress reports. |
 | `src/cli/arguments.rs` | Parse OS-native arguments, validate combinations, and render help. |
-| `src/cli/files.rs` | Read within resource limits and stage atomic file replacements. |
+| `src/cli/files.rs` | Read files or stdin within resource limits, stage atomic file replacements, and write piped output. |
 | `src/cli/report.rs` | Render per-file results and select the appropriate output channel. |
 | `src/format/` | Detect and validate PNG/APNG, GZIP, ZIP, and zlib wrappers; schedule embedded streams and rebuild containers. |
 | `src/format/deadline.rs` | Share file-wide time limits and scale embedded-stream search allowances. |
@@ -21,7 +21,7 @@ remain private to the crate.
 | `src/checksum.rs` | Incremental CRC-32 and Adler-32 checksums. |
 | `src/sort.rs` | Sort off the hot paths through two shared index sorts, instead of one compiled sort per element type and comparator. |
 | `src/progress/` | Coordinate physical stream order and render verbose route reports. |
-| `src/terminal/` | Share terminal capability checks, text formatting, and spinner behavior between the library and CLI. |
+| `src/terminal/` | Share terminal capability checks, the report stream (stderr when stdout carries output data), text formatting, and spinner behavior between the library and CLI. |
 
 The library performs optimization, while the CLI performs filesystem changes.
 Shared terminal code is compiled privately into both targets so the library does
@@ -131,8 +131,8 @@ checkpoints after snapshot comparison and publication, which make the
 concurrent-edit, force-kill, and sync-failure tests deterministic.
 
 `tests/public_api.rs` exercises the library as an external consumer.
-`tests/cli_output.rs` runs the CLI executable to check report streams and
-`--out` validation. `tests/local_corpus.rs` holds opt-in public-API regressions
+`tests/cli_output.rs` runs the CLI executable to check report streams,
+`--out` validation, and the stdin and stdout pipes. `tests/local_corpus.rs` holds opt-in public-API regressions
 backed by local files. `tests/test_check_binary_paths.py` checks the
 distribution path audit, and `tests/test_build_distribution.py` checks
 concurrent packaging and failure cleanup with synthetic executables and a fake

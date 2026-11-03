@@ -75,7 +75,7 @@ impl Progress {
             .as_ref()
             .map_or(&[][..], |group| group.duplicates.as_slice());
         let report_id = NEXT_REPORT_ID.fetch_add(1, Ordering::Relaxed);
-        let color = terminal::stdout_color_enabled();
+        let color = terminal::report_color_enabled();
         let title = stream_title(stream_id, note, duplicates, color);
         buffer::begin(report_id, stream_id, report_order(note), title);
         let lines = ReportLines {

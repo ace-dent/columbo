@@ -8,17 +8,19 @@ mod files;
 mod report;
 
 use std::env;
-use std::path::Path;
+use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::optimize;
 
+use crate::terminal;
 use crate::terminal::spinner::Spinner;
 
 use arguments::{parse_args, print_cli_error, print_usage, Command, Destination, ParsedCommand};
 use files::{
-    output_entry_exists, read_file, validate_output_destination, write_file,
-    write_file_if_unchanged, write_new_file, ReadError,
+    output_entry_exists, read_file, read_stdin, stdout_is_input, validate_output_destination,
+    write_file, write_file_if_unchanged, write_new_file, write_stdout, ReadError,
 };
 use report::{
     print_blocking_chunk_notice, print_detailed_header, print_result, print_strict_mode_caution,
@@ -33,6 +35,9 @@ const PROGRAM_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION_MINOR")
 );
 const PROGRAM_STAGE: &str = "Beta";
+/// Names for the pipes in reports and diagnostics.
+const STDIN_NAME: &str = "<stdin>";
+const STDOUT_NAME: &str = "<stdout>";
 
 pub(crate) fn run() -> std::result::Result<(), u8> {
     let command = match parse_args(env::args_os().skip(1)) {
@@ -64,18 +69,45 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
             return Err(1);
         }
     }
+    // Typing a file or printing one is never intended; the pipes exist for
+    // scripts and tool chains.
+    if command.stdin && io::stdin().is_terminal() {
+        eprintln!("cannot read input '-' from a terminal; pipe or redirect a file");
+        return Err(1);
+    }
+    if matches!(command.destination, Destination::Stdout) {
+        if io::stdout().is_terminal() {
+            eprintln!("cannot write binary output to a terminal; redirect stdout or use --out");
+            return Err(1);
+        }
+        // Checked before reading, so `>>` cannot append to the input; a `>`
+        // redirection has already emptied it.
+        let input = command.inputs.first().map(PathBuf::as_path);
+        if stdout_is_input(input) {
+            eprintln!(
+                "stdout is the input {:?}; redirect to another file \
+                 (a > redirection empties the input before {PROGRAM_NAME} starts)",
+                input.unwrap_or(Path::new(STDIN_NAME))
+            );
+            return Err(1);
+        }
+        terminal::send_reports_to_stderr();
+    }
 
     let report_mode = ReportMode::for_options(&command.options);
 
     let input_count = command.inputs.len();
     let mut failed = false;
     let mut caution_printed = false;
+    if command.stdin {
+        failed = execute_file(&command, report_mode, None, 0, 1, &mut caution_printed).is_err();
+    }
     for (index, input) in command.inputs.iter().enumerate() {
         // One input at a time bounds peak memory.
         if execute_file(
             &command,
             report_mode,
-            input,
+            Some(input),
             index,
             input_count,
             &mut caution_printed,
@@ -93,19 +125,25 @@ fn execute(command: Command) -> std::result::Result<(), u8> {
     }
 }
 
+/// Optimize one input: the file at `source`, or stdin when it is `None`.
 fn execute_file(
     command: &Command,
     report_mode: ReportMode,
-    input_path: &Path,
+    source: Option<&Path>,
     input_index: usize,
     input_count: usize,
     caution_printed: &mut bool,
 ) -> std::result::Result<(), u8> {
-    let overwrites_input = command.destination.overwrites_input(input_path);
+    let input_path = source.unwrap_or(Path::new(STDIN_NAME));
+    let overwrites_input = source.is_some_and(|path| command.destination.overwrites_input(path));
     let detailed = report_mode.detailed();
     let total_started = detailed.then(Instant::now);
     let read_started = detailed.then(Instant::now);
-    let input = match read_file(input_path, command.options.max_input_bytes) {
+    let read = match source {
+        Some(path) => read_file(path, command.options.max_input_bytes),
+        None => read_stdin(command.options.max_input_bytes),
+    };
+    let input = match read {
         Ok(bytes) => bytes,
         Err(ReadError::TooLarge) => {
             eprintln!("input {:?} exceeds the 1 GiB file-size limit", input_path);
@@ -145,7 +183,7 @@ fn execute_file(
     };
 
     if detailed {
-        OutputChannel::Stdout
+        OutputChannel::reports()
             .write(|output| print_detailed_header(output, command, &input_report, read_elapsed));
     }
 
@@ -175,6 +213,25 @@ fn execute_file(
 
     let write_started = detailed.then(Instant::now);
     let output_action = match command.destination.output_path(input_path) {
+        // Like a missing --out file, stdout receives the original when nothing
+        // was saved, so a pipeline always ends with a complete file.
+        None if matches!(command.destination, Destination::Stdout) => {
+            let replace = optimized.should_replace();
+            let bytes = if replace { &optimized.data } else { &input };
+            if let Err(error) = write_stdout(bytes) {
+                eprintln!(
+                    "could not complete write to stdout: {}",
+                    error.to_string().escape_debug()
+                );
+                return Err(1);
+            }
+            let output = PathBuf::from(STDOUT_NAME);
+            if replace {
+                OutputAction::WrittenOptimized(output)
+            } else {
+                OutputAction::CopiedOriginal(output)
+            }
+        }
         None => OutputAction::DryRun,
         Some(output) if optimized.should_replace() => {
             let written = if overwrites_input {
@@ -244,7 +301,7 @@ fn execute_file(
     }
     // Default output stays one line per file.
     if optimized.timed_out && detailed {
-        OutputChannel::Stdout
+        OutputChannel::reports()
             .write(|output| print_timeout_notice(output, &output_action, command.options.timeout));
     }
     let timings = ExecutionTimings {
@@ -258,7 +315,7 @@ fn execute_file(
         bits_saved: optimized.bits_saved,
         removed_data_bytes: optimized.removed_data_bytes,
     };
-    OutputChannel::Stdout.write(|output| {
+    OutputChannel::reports().write(|output| {
         print_result(
             output,
             report_mode,

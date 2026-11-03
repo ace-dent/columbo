@@ -99,6 +99,29 @@ Windows security descriptors; staging on Windows inherits directory security
 settings. When that metadata must be kept, use an explicit output path and a
 native installation step.
 
+## Standard input and output
+
+An input of `-` reads standard input to its end within the input size limit.
+A pipe has no file type or version to check, so the regular-file and
+changed-input checks do not apply. With `--out`, the output is published as
+described above.
+
+`--stdout` bypasses publication. Optimization still finishes in memory before
+the first output byte is written, so a failed optimization writes nothing to
+standard output. A write error, such as a reader that closes the pipe early,
+or a kill during the write leaves the reader with a partial file; exit status
+1 is the only signal. There is no staging, sync, or atomic replacement, and
+the reader receives nothing until the whole file is optimized.
+
+Shell redirection happens before Columbo starts. On Unix, Columbo refuses to
+run when stdout is the input file (the same device and inode, including through
+a symlink or hard link), before reading it, so `>>` or `1<>` onto the input
+leaves it unchanged. A `>` redirection onto the input, as in `columbo --stdout
+image.png > image.png` or `columbo - < image.png > image.png`, has
+already emptied it by then; Columbo reports the mistake but cannot undo it.
+Windows builds have no such check, because the standard library exposes no
+file identity there.
+
 ## Validation
 
 Synthetic unit tests exercise partial write errors, panic unwinding, failed

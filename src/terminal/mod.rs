@@ -9,12 +9,46 @@ pub(crate) mod spinner;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Set once by the CLI before optimizing when stdout carries output data.
+static REPORTS_ON_STDERR: AtomicBool = AtomicBool::new(false);
 
 /// `env::var_os`, compiled once for every check here.
 #[inline(never)]
 fn env_value(name: &str) -> Option<OsString> {
     env::var_os(name)
+}
+
+/// Send the CLI's and the verbose reporter's reports to stderr for the rest of
+/// the process, keeping stdout for output data.
+pub(crate) fn send_reports_to_stderr() {
+    REPORTS_ON_STDERR.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn reports_on_stderr() -> bool {
+    REPORTS_ON_STDERR.load(Ordering::Relaxed)
+}
+
+pub(crate) fn report_color_enabled() -> bool {
+    if reports_on_stderr() {
+        stderr_color_enabled()
+    } else {
+        stdout_color_enabled()
+    }
+}
+
+/// Run `operation` on the locked report stream, ignoring write errors such as
+/// a closed pipe. Out of line, so report writers share one copy of the stream
+/// choice.
+#[inline(never)]
+pub(crate) fn write_report(operation: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>) {
+    let _ = if reports_on_stderr() {
+        operation(&mut io::stderr().lock())
+    } else {
+        operation(&mut io::stdout().lock())
+    };
 }
 
 pub(crate) fn stdout_color_enabled() -> bool {

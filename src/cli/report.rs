@@ -52,7 +52,8 @@ pub(super) struct OptimizationReport {
     pub(super) removed_data_bytes: u64,
 }
 
-/// Reports go to stdout; warnings, errors, and the spinner go to stderr.
+/// Reports go to stdout, or to stderr when stdout carries output data;
+/// warnings, errors, and the spinner go to stderr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum OutputChannel {
     Stdout,
@@ -60,6 +61,14 @@ pub(super) enum OutputChannel {
 }
 
 impl OutputChannel {
+    pub(super) fn reports() -> Self {
+        if terminal::reports_on_stderr() {
+            Self::Stderr
+        } else {
+            Self::Stdout
+        }
+    }
+
     pub(super) fn color_enabled(self) -> bool {
         match self {
             Self::Stdout => terminal::stdout_color_enabled(),
