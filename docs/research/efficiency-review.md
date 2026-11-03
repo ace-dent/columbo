@@ -91,6 +91,7 @@ gains where established.
 | 3 Nov 2026 | [`851e373`](#851e373-3-november-2026) | Payload decoding, symbol counts, match expansion and the short-family floor (`parse.rs`, `huffman.rs`, `bitstream.rs`, `model.rs`, `search.rs`) | The parser's payload loop decodes through an inlined table path; symbol counts alternate two tables with wrapping additions; expansions copy unchanged token runs whole; the short-family floor prices its bands from one walk's count changes and spells only a winner; expansion walks price bytes from a 256-entry table with a cheapest-byte bound | Default CPU 1.069× (33 inputs, 7.84% fewer instructions, 6.27% fewer cycles); completing Max runs 0.4% and 4.2% fewer instructions; peak memory median unchanged, `Banana512.png` +22.1 MiB of cached freed blocks | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs with debug assertions; 66 Default timing runs; 2 completing Max runs; 4,000 symbol-count comparisons; 675 Rust, 7 Python tests |
 | 3 Nov 2026 | [`58ccf01`](#58ccf01-3-november-2026) | APNG header fit: joint tree and RLE search and symbol-set spellings (`joint.rs`, `symbol_set.rs`) | R4 charges each state's edges at once and relaxes each edge family in its own loop; explicit lengths and zero runs relaxed once per position and capacity from the first cheapest state; reached capacities kept in a bitset; R5 keeps each match's restricted spelling by the banned symbols the solver reads | APNG Default CPU 1.48× and wall time 1.50× (62 inputs, 39.85% fewer instructions, 29.78% fewer cycles); 33 Default inputs 2.72% fewer instructions; completing Max runs 2.3% and 1.4% fewer; APNG peak memory median −6.9 MiB | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 4,168 replayed R4 searches per step; 2,000 R4 comparisons; 677 Rust, 7 Python tests |
 | 3 Nov 2026 | [`4aeb053`](#4aeb053-3-november-2026) | R4 arithmetic, R5 rewrites and header-planning buffers (`joint.rs`, `symbol_set.rs`, `header.rs`, `huffman.rs`) | R4's index and bound arithmetic wraps where it cannot overflow; R5 rewrites only a block's matches, scores the block's counts with their changes and spells tokens only for kept proposals; depth repair, RLE seeds and the first best header plan reuse or reserve their buffers | APNG Default CPU 1.063× and wall time 1.059× (62 inputs, 6.30% fewer instructions, 5.70% fewer cycles); 4,168 replayed R4 searches 19.1% fewer instructions; 33 Default inputs 1.07% fewer; completing Max runs 1.1% and 0.3% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 4,168 replayed R4 searches; full-token rewrite comparisons on 8 blocks; 678 Rust, 7 Python tests |
+| 3 Nov 2026 | [`3bb4834`](#3bb4834-3-november-2026) | Greedy run-length spelling and payload sums (`header.rs`) | The greedy speller writes its tokens in place and spells runs too short for a repeat code without branching; a code's data bits are summed without branches or overflow checks in one out-of-line copy | APNG Default CPU 1.036× and wall time 1.040× (62 inputs, 2.85% fewer instructions, 3.55% fewer cycles); 33 Default inputs 2.27% fewer instructions, 3.27% fewer cycles; completing Max runs 2.8% and 2.5% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 160,000 greedy-spelling and 20,000 payload-sum comparisons; 679 Rust, 7 Python tests |
 
 ## Entries
 
@@ -487,6 +488,95 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `3bb4834`, 3 November 2026
+
+Batches: retired instructions, cycles, CPU (user plus system), wall time and
+peak memory from `time -l` over the 62 APNG inputs of
+[`58ccf01`](#58ccf01-3-november-2026), two alternating rounds at the default
+180-second timeout and two at the 4,000-second maximum; the 33 stratified
+Default inputs over two alternating rounds; and two alternating runs of each
+completing Max run.
+
+A sampled profile of the APNG inputs at `3bb4834` (84,728 CPU samples) put
+21.4% in the DeflOpt-style heap merges, about half of it building payload trees
+and a third code-length trees, 8.1% in R4, 7.8% in the uncached header
+planner's own code and 6.05% in the greedy run-length speller. An instrumented
+build counted 16 million greedy spellings of 2.35 billion runs, 146 per call,
+which took about 40 cycles per run in capacity checks and mispredicted
+branches; the payload sum of a code's data bits checked every addition and
+branched on every symbol. Repeated inputs were rare: 10.4% of payload tree
+candidate sets, 14.7% of header estimates (27% of R13's) and 2.9% of 56
+million code-length trees repeated on their thread.
+
+- **Greedy spelling in place.** The greedy speller writes its tokens into a
+  buffer sized for one token per code length, plus two, instead of pushing
+  each one, and a run too short for any repeat code (fewer than 3 zeros or 4
+  copies of a length) writes three slots without branching and advances by its
+  length.
+- **Branch-free payload sums.** A code's data bits are summed over every symbol
+  without branches or overflow checks, since at most 286 counts below 2^32
+  times lengths below 2^8 cannot wrap a u64, with a flag for a used symbol
+  that has no code. One out-of-line copy serves both alphabets and every
+  caller, so the loop vectorizes without adding code.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 62 APNG inputs, instructions retired over two rounds | 3,507.3 billion | 3,407.3 billion | −2.85% |
+| Same inputs, cycles over two rounds | 1,069.0 billion | 1,031.1 billion | −3.55% |
+| Same inputs, CPU over two rounds | 467.7 s | 451.3 s | 1.036× |
+| Same inputs, wall time over two rounds | 84.6 s | 81.4 s | 1.040× |
+| Same at 4,000 seconds, instructions retired | 3,507.2 billion | 3,406.7 billion | −2.86% |
+| Same at 4,000 seconds, cycles | 1,047.0 billion | 1,008.6 billion | −3.67% |
+| 33 Default inputs, instructions retired over two rounds | 978.6 billion | 956.4 billion | −2.27% |
+| Same inputs, cycles over two rounds | 246.4 billion | 238.3 billion | −3.27% |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 17.68 billion | 17.19 billion | −2.8% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.21 billion | 2.15 billion | −2.5% |
+
+Measured step by step over the APNG inputs at 4,000 seconds, each against the
+step before, writing greedy spellings in place took 1.02% of the instructions
+(0.55% of the cycles), the branch-free payload sums 1.48% (1.44%), and the
+branch-free short runs 0.39% (1.72%). Median APNG peak memory changed by
+−0.1 MiB.
+
+Equivalence: an existing test compares the greedy speller with a scanning
+reference for all eight repeat-code masks on 20,000 random code-length
+sequences, starting from stale buffers, and a new test compares the payload
+sum with the checked one on 20,000 random alphabets, including used symbols
+whose lengths are 0 or missing. A release build with debug assertions agreed
+with the final build on 61 APNG inputs at 4,000 seconds; on
+`animation_icos4d.ref.png`, whose smallest frame's allowance can end its
+search, its two runs gave the two outcomes, one matching a debug-assertion
+baseline and the other the release build. Every 4,000-second APNG run matched
+byte for byte; at 180 seconds 123 of 124 did, the exception that file again,
+where the baseline's second run retired 0.72 billion instructions fewer than
+its first. API comparisons on the 52 inputs, in Default with the 180-second
+budget and in zero-budget Max, matched in all 104 runs, and every Default and
+completing Max run matched byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting and all-feature Clippy with warnings denied.
+`__text` shrank from 900,468 to 900,380 bytes; the shipped executable keeps
+its 974,960 bytes, and the final source builds the tested executable byte for
+byte.
+
+Measured and rejected in the same review:
+
+- The payload sum inlined at its four call sites: 1.54% fewer instructions,
+  like the out-of-line copy, but 1.1 KiB more code took the executable a
+  16 KiB page larger.
+- In-place writes in the shortest-RLE speller: 0.25% fewer instructions and
+  0.31% fewer cycles, within run-to-run noise.
+- The RLE seeds' zero-run remainders in closed form: 0.04%.
+
+Not changed in the same review:
+
+- The heap merges (21% of samples) build trees for new inputs. Recent-input
+  caches of payload tree candidates (8.8% of calls repeat within 64) or of
+  R13's estimates would each save about 0.9%, but need more code than the 222
+  bytes left before the executable's next 16 KiB page.
+- R4 (8.1% of samples) after the previous review's changes.
+
+Artifacts: `work/efficiency-review-apng3-20261103/`.
 
 ### `4aeb053`, 3 November 2026
 

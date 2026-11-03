@@ -2858,3 +2858,61 @@ fn counted_rle_cost_matches_the_token_walk() {
         );
     }
 }
+
+/// The payload sum before it ran without branches: checked additions, and
+/// `None` at the first used symbol without a code.
+fn reference_alphabet_payload_bits(frequencies: &[u32], lengths: &[u8]) -> Option<u64> {
+    let mut bits = 0_u64;
+    for (symbol, &frequency) in frequencies.iter().enumerate() {
+        if frequency == 0 {
+            continue;
+        }
+        let length = *lengths.get(symbol)?;
+        if length == 0 {
+            return None;
+        }
+        bits = bits.checked_add(u64::from(frequency) * u64::from(length))?;
+    }
+    Some(bits)
+}
+
+#[test]
+fn branch_free_payload_bits_match_checked_sum() {
+    let mut state = 0x5d1c_7e43u32;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut uncoded = 0;
+    for case in 0..20_000 {
+        let size = if case % 2 == 0 { 286 } else { 30 };
+        let frequencies: Vec<u32> = (0..size)
+            .map(|_| match next() % 4 {
+                0 => 0,
+                1 => u32::MAX - next() % 4,
+                _ => next() % 1000,
+            })
+            .collect();
+        // A few lengths are 0 or missing, so some used symbols have no code.
+        let missing = if next() % 8 == 0 { 1 + next() % 2 } else { 0 };
+        let lengths: Vec<u8> = (0..size - missing as usize)
+            .map(|_| {
+                if next() % 4000 == 0 {
+                    0
+                } else {
+                    (next() % 15 + 1) as u8
+                }
+            })
+            .collect();
+        let expected = reference_alphabet_payload_bits(&frequencies, &lengths);
+        uncoded += usize::from(expected.is_none());
+        assert_eq!(
+            alphabet_payload_bits(&frequencies, &lengths),
+            expected,
+            "case {case}"
+        );
+    }
+    assert!(uncoded > 1_000 && uncoded < 10_000);
+}

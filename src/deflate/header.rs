@@ -1052,19 +1052,23 @@ pub(crate) fn token_bits_from_frequencies(
         .checked_add(distance_bits)
 }
 
-fn alphabet_payload_bits<const N: usize>(frequencies: &[u32; N], lengths: &[u8]) -> Option<u64> {
-    let mut bits = 0_u64;
-    for (symbol, &frequency) in frequencies.iter().enumerate() {
-        if frequency == 0 {
-            continue;
-        }
-        let length = *lengths.get(symbol)?;
-        if length == 0 {
-            return None;
-        }
-        bits = bits.checked_add(u64::from(frequency) * u64::from(length))?;
+// Out of line: one vectorized copy serves every alphabet and caller.
+#[inline(never)]
+fn alphabet_payload_bits(frequencies: &[u32], lengths: &[u8]) -> Option<u64> {
+    // A used symbol needs a code: one past `lengths`, or of length 0, has none.
+    let (coded, past) = frequencies.split_at(lengths.len().min(frequencies.len()));
+    if past.iter().any(|&frequency| frequency != 0) {
+        return None;
     }
-    Some(bits)
+    // At most 286 counts below 2^32 times lengths below 2^8 cannot wrap a
+    // u64, so the loop needs no overflow checks or branches and vectorizes.
+    let mut bits = 0_u64;
+    let mut uncoded = false;
+    for (&frequency, &length) in coded.iter().zip(lengths) {
+        bits = bits.wrapping_add(u64::from(frequency).wrapping_mul(u64::from(length)));
+        uncoded |= frequency != 0 && length == 0;
+    }
+    (!uncoded).then_some(bits)
 }
 
 pub(crate) fn score_existing_dynamic(
@@ -4678,58 +4682,82 @@ fn greedy_rle_from_runs(
     no_18: bool,
     mut output: Vec<RleToken>,
 ) -> CountedRle {
-    // Each token spells at least one length.
+    // Each token spells at least one length, so `length_count` slots hold the
+    // spelling, and two more let a short run write three: write in place and
+    // cut off the rest.
     output.clear();
-    output.reserve(length_count);
+    output.resize(
+        length_count + 2,
+        RleToken {
+            symbol: 0,
+            extra: 0,
+        },
+    );
+    let tokens = output.as_mut_slice();
+    let mut next = 0;
     // Counted as spelled: each run's explicit lengths, and the repeat codes.
     let mut frequencies = [0_u32; 19];
     let mut repeats = [0_u32; 3];
     for &(value, mut run) in runs {
+        // No repeat code spells fewer than 3 zeros or 4 copies of a length,
+        // so a shorter run is explicit lengths: write three without branching.
+        if run < 3 + usize::from(value != 0) {
+            tokens[next..next + 3].fill(RleToken {
+                symbol: value,
+                extra: 0,
+            });
+            next += run;
+            frequencies[usize::from(value)] += run as u32;
+            continue;
+        }
         if value == 0 {
             while !no_18 && run >= 11 {
                 let count = run.min(138);
-                output.push(RleToken {
+                tokens[next] = RleToken {
                     symbol: 18,
                     extra: (count - 11) as u8,
-                });
+                };
+                next += 1;
                 repeats[2] += 1;
                 run -= count;
             }
             while !no_17 && run >= 3 {
                 let count = run.min(10);
-                output.push(RleToken {
+                tokens[next] = RleToken {
                     symbol: 17,
                     extra: (count - 3) as u8,
-                });
+                };
+                next += 1;
                 repeats[1] += 1;
                 run -= count;
             }
         } else if !no_16 && run >= 4 {
-            output.push(RleToken {
+            tokens[next] = RleToken {
                 symbol: value,
                 extra: 0,
-            });
+            };
+            next += 1;
             frequencies[usize::from(value)] += 1;
             run -= 1;
             while run >= 3 {
                 let count = run.min(6);
-                output.push(RleToken {
+                tokens[next] = RleToken {
                     symbol: 16,
                     extra: (count - 3) as u8,
-                });
+                };
+                next += 1;
                 repeats[0] += 1;
                 run -= count;
             }
         }
-        output.extend(
-            std::iter::repeat(RleToken {
-                symbol: value,
-                extra: 0,
-            })
-            .take(run),
-        );
+        tokens[next..next + run].fill(RleToken {
+            symbol: value,
+            extra: 0,
+        });
+        next += run;
         frequencies[usize::from(value)] += run as u32;
     }
+    output.truncate(next);
     frequencies[16..].copy_from_slice(&repeats);
     (output, frequencies)
 }
