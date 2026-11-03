@@ -43,6 +43,24 @@ impl JointBudget {
     }
 }
 
+// The search's arithmetic cannot wrap: table indices stay below its cell
+// count, under 2^21, and a score (a cost, header bits and a payload) plus two
+// bounds stays below 2^64, since costs and bounds are at most `INF` (2^62) and
+// payloads below 2^46. Wrapping operations keep the release build's overflow
+// checks out of the search loop.
+
+/// Entry `column` of row `row` in a table `width` entries wide.
+#[inline(always)]
+fn entry(row: usize, width: usize, column: usize) -> usize {
+    row.wrapping_mul(width).wrapping_add(column)
+}
+
+/// A cost or score plus two bounds, header bits or payloads.
+#[inline(always)]
+fn sum3(cost: u64, first: u64, second: u64) -> u64 {
+    cost.wrapping_add(first).wrapping_add(second)
+}
+
 fn filled<T: Clone>(size: usize, value: T) -> Option<Vec<T>> {
     let mut values = Vec::new();
     values.try_reserve_exact(size).ok()?;
@@ -266,15 +284,18 @@ fn solve(
     // length `length` at `score`, unless its bound reaches the target.
     macro_rules! relax {
         ($j:expr, $next:expr, $length:expr, $score:expr, $link:expr) => {{
-            let (j, next, length, score) = ($j, $next, $length, $score);
-            if score + payload_bound[j * bound_width + next] + header[j * previous_count + length]
-                < target
+            let (j, next, length, score): (usize, usize, usize, u64) = ($j, $next, $length, $score);
+            if sum3(
+                score,
+                payload_bound[entry(j, bound_width, next)],
+                header[entry(j, previous_count, length)],
+            ) < target
             {
-                let to = j * stride + next * previous_count + length;
+                let to = entry(j, stride, entry(next, previous_count, length));
                 if score < cost[to] {
                     cost[to] = score;
                     trace[to] = $link;
-                    live[j * live_words + next / 32] |= 1 << (next % 32);
+                    live[entry(j, live_words, next / 32)] |= 1 << (next % 32);
                     if j == n {
                         debug_assert_eq!(next, 0);
                         target = score;
@@ -311,13 +332,8 @@ fn solve(
                     }
                     remaining - units
                 };
-                relax!(
-                    j,
-                    next,
-                    length,
-                    old + bits + frequency * length as u64,
-                    link
-                );
+                let payload = frequency.wrapping_mul(length as u64);
+                relax!(j, next, length, sum3(old, bits, payload), link);
             }
         }};
     }
@@ -332,7 +348,7 @@ fn solve(
                 (3, $short, u64::from(cl[17]) + 3, 2),
                 (11, $long, u64::from(cl[18]) + 7, 3),
             ] {
-                let score = old + bits;
+                let score = old.wrapping_add(bits);
                 for j in i + first..i + first + count {
                     let next = if i < split && j >= split {
                         if remaining != 0 {
@@ -384,10 +400,11 @@ fn solve(
                 let merge = fixed_target && group_edges <= work_left;
                 let mut cheapest = (INF, 0);
                 for previous in 0..previous_count {
-                    let from = i * stride + remaining * previous_count + previous;
+                    let from = entry(i, stride, entry(remaining, previous_count, previous));
                     let old = cost[from];
                     if old == INF
-                        || old + state_bound + header[i * previous_count + previous] >= target
+                        || sum3(old, state_bound, header[entry(i, previous_count, previous)])
+                            >= target
                     {
                         continue;
                     }
@@ -438,7 +455,9 @@ fn solve(
                                 }
                                 remaining - count * units
                             };
-                            let score = old + bits + (sums[j] - sums[i]) * previous as u64;
+                            let payload =
+                                sums[j].wrapping_sub(sums[i]).wrapping_mul(previous as u64);
+                            let score = sum3(old, bits, payload);
                             relax!(j, next, previous, score, link | 1);
                         }
                     }

@@ -2987,6 +2987,8 @@ struct HeaderPlanSearch {
     code_length_candidates: Vec<[u8; 19]>,
     /// RLE buffers a finished seed returns, for the next plan's seeds.
     spare_rles: Vec<Vec<RleToken>>,
+    /// This plan's RLE seeds; the buffer stays for the next plan's.
+    seeds: Vec<CountedRle>,
 }
 
 /// A code-length code's shortest RLE in a [`HeaderPlanSearch`].
@@ -3090,13 +3092,15 @@ fn plan_for_trimmed_lengths_uncached(
     search.shortest_rle_count = 0;
     // Every RLE spells the same runs, so find them once.
     length_runs_into(decoded_lengths, &mut search.runs);
-    let seeds = rle_seed_candidates_from_runs(
+    let mut seeds = std::mem::take(&mut search.seeds);
+    rle_seed_candidates_from_runs_into(
         &search.runs,
         decoded_length_count,
         rle_mask,
         &mut search.spare_rles,
+        &mut seeds,
     );
-    for seed in seeds {
+    for seed in seeds.drain(..) {
         consider_rle(
             data_bits,
             literal_lengths,
@@ -3107,6 +3111,7 @@ fn plan_for_trimmed_lengths_uncached(
             &mut search,
         );
     }
+    search.seeds = seeds;
     let best = search.best.take();
     let _ = HEADER_PLAN_SEARCH.try_with(|cell| cell.set(Some(search)));
     best
@@ -3165,25 +3170,27 @@ fn rle_seed_opportunities(runs: &[LengthRun]) -> RleSeedOpportunities {
 /// 18.
 #[cfg(test)]
 fn rle_seed_candidates(decoded_lengths: &[u8], rle_mask: u8) -> Vec<Vec<RleToken>> {
-    rle_seed_candidates_from_runs(
+    let mut candidates = Vec::new();
+    rle_seed_candidates_from_runs_into(
         &length_runs(decoded_lengths),
         decoded_lengths.len(),
         rle_mask,
         &mut Vec::new(),
-    )
-    .into_iter()
-    .map(|(rle, _)| rle)
-    .collect()
+        &mut candidates,
+    );
+    candidates.into_iter().map(|(rle, _)| rle).collect()
 }
 
 /// [`rle_seed_candidates`] for code lengths given as their `runs`, `count`
-/// lengths in all.
-fn rle_seed_candidates_from_runs(
+/// lengths in all, into `candidates`, which must be empty.
+fn rle_seed_candidates_from_runs_into(
     runs: &[LengthRun],
     count: usize,
     rle_mask: u8,
     spare: &mut Vec<Vec<RleToken>>,
-) -> Vec<CountedRle> {
+    candidates: &mut Vec<CountedRle>,
+) {
+    debug_assert!(candidates.is_empty());
     let opportunities = rle_seed_opportunities(runs);
     // Always keep bit 0: it also decides whether the balanced and zero-repeat
     // spellings run, even when disabling code 16 leaves the greedy spelling
@@ -3194,7 +3201,6 @@ fn rle_seed_candidates_from_runs(
     // The greedy spellings already made, by the codes they actually leave out:
     // disabling a code the greedy spelling would not use repeats one.
     let mut seen_greedy = [false; 8];
-    let mut candidates = Vec::new();
     for mask in 0..8 {
         if rle_mask & (1 << mask) == 0 {
             continue;
@@ -3219,7 +3225,7 @@ fn rle_seed_candidates_from_runs(
                 no_18,
                 spare.pop().unwrap_or_default(),
             );
-            push_unique(&mut candidates, rle);
+            push_unique(candidates, rle);
         }
 
         if !no_16 && opportunities.balanced_repeat {
@@ -3230,7 +3236,7 @@ fn rle_seed_candidates_from_runs(
                 no_18,
                 spare.pop().unwrap_or_default(),
             );
-            push_unique(&mut candidates, balanced);
+            push_unique(candidates, balanced);
         }
 
         if !no_16 {
@@ -3243,11 +3249,10 @@ fn rle_seed_candidates_from_runs(
                     no_18,
                     spare.pop().unwrap_or_default(),
                 );
-                push_unique(&mut candidates, zero_repeat);
+                push_unique(candidates, zero_repeat);
             }
         }
     }
-    candidates
 }
 
 /// Most payload bits a trade-off swap (R2) may add to shorten the header.
@@ -4999,11 +5004,15 @@ fn consider_dynamic_header(
             current.bits = bits;
         }
         None => {
+            // Room for the longest RLE, one token per code length, so later
+            // improvements need not grow it.
+            let mut kept_rle = Vec::with_capacity(literal_lengths.len() + distance_lengths.len());
+            kept_rle.extend_from_slice(rle);
             *best = Some(DynamicPlan {
                 literal_lengths: literal_lengths.to_vec(),
                 distance_lengths: distance_lengths.to_vec(),
                 code_length_lengths,
-                rle: rle.to_vec(),
+                rle: kept_rle,
                 hlit: literal_lengths.len(),
                 hdist: distance_lengths.len(),
                 hclen,

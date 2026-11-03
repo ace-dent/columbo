@@ -168,7 +168,7 @@ fn make_lengths_scanning_reference(frequencies: &[u32], max_bits: u8, variant: u
     merge_generic_nodes_scanning(&mut nodes, &mut active, variant);
     let max_depth = assign_depths(&nodes, active[0], 0, &mut lengths);
     if max_depth > usize::from(max_bits) {
-        limit_generic_lengths(frequencies, &mut lengths, max_bits);
+        limit_generic_lengths(frequencies, &mut lengths, max_bits, &mut Vec::new());
     }
     lengths
 }

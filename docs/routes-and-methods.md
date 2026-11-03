@@ -4153,7 +4153,10 @@ match.
    touch at least 2 used symbols and score at most the parent's estimate plus 16
    bits become proposals, the best 8 overall. Then every length seed is crossed
    with every distance seed (at most 64 mixed bans), and those within the window
-   are proposed too. A single-symbol ban is never proposed alone.
+   are proposed too. A single-symbol ban is never proposed alone. A ban
+   changes only matches, so a rewrite visits only the block's matches and
+   scores the block's counts with the replaced matches' changes; it spells the
+   whole token list only for a kept proposal.
 5. **Price** each proposal at the block's real alignment with the ordinary
    planner (strict codes forced, Default tree families), plus one bounded-depth
    tree candidate and one RLE-smoothed tree candidate; the plan may be stored,

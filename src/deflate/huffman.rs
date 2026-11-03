@@ -1225,6 +1225,7 @@ fn make_lengths_inner(
         depths,
         keyed_heaps,
         reverse_front,
+        leaf_keys,
         ..
     } = scratch;
     nodes.clear();
@@ -1272,11 +1273,16 @@ fn make_lengths_inner(
     if max_depth <= usize::from(max_bits) {
         return false;
     }
-    limit_generic_lengths(frequencies, lengths, max_bits);
+    limit_generic_lengths(frequencies, lengths, max_bits, leaf_keys);
     true
 }
 
-fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) {
+fn limit_generic_lengths(
+    frequencies: &[u32],
+    lengths: &mut [u8],
+    max_bits: u8,
+    leaves: &mut Vec<u64>,
+) {
     let limit = usize::from(max_bits);
     if limit == 0 || limit > MAX_TRACKED_DEPTH {
         lengths.fill(0);
@@ -1320,13 +1326,15 @@ fn limit_generic_lengths(frequencies: &[u32], lengths: &mut [u8], max_bits: u8) 
     // Assign the shortest lengths to the most frequent symbols. Equal
     // frequencies are ordered by symbol, matching the `qsort` comparator of
     // Columbo's C implementation; inverting the frequency sorts it descending.
-    let mut leaves: Vec<u64> = frequencies
-        .iter()
-        .enumerate()
-        .filter(|&(_, &frequency)| frequency != 0)
-        .map(|(symbol, &frequency)| leaf_key(!frequency, symbol as u32))
-        .collect();
-    sort_leaf_keys(&mut leaves);
+    leaves.clear();
+    leaves.extend(
+        frequencies
+            .iter()
+            .enumerate()
+            .filter(|&(_, &frequency)| frequency != 0)
+            .map(|(symbol, &frequency)| leaf_key(!frequency, symbol as u32)),
+    );
+    sort_leaf_keys(leaves);
 
     lengths.fill(0);
     let mut leaf = 0;
@@ -1970,6 +1978,8 @@ pub(crate) struct TreeBuildScratch {
     /// The generic builder's live nodes.
     node_indices: Vec<usize>,
     java_heap: Vec<u64>,
+    /// The generic builder's leaves by descending frequency, for depth repair.
+    leaf_keys: Vec<u64>,
     keyed_heaps: KeyedHeaps,
     reverse_front: ReverseFront,
     package_merge: PackageMergeScratch,

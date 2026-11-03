@@ -175,22 +175,120 @@ impl SubmatchSpellings {
     }
 }
 
+/// A block's matches, by token index and decoded start, found once for every
+/// ban: a ban changes only matches, so a rewrite need not visit literals.
+struct BlockMatches {
+    matches: Vec<(usize, usize)>,
+    /// Whether the tokens decode to exactly the block's bytes.
+    complete: bool,
+    extra_bits: u64,
+}
+
+impl BlockMatches {
+    fn new(block: &ParsedBlock) -> Option<Self> {
+        let mut matches = Vec::new();
+        // Each match has one distance symbol.
+        let match_count = block.distance_frequencies.iter().sum::<u32>();
+        matches.try_reserve_exact(match_count as usize).ok()?;
+        let mut position = 0_usize;
+        for (index, token) in block.tokens.iter().enumerate() {
+            if matches!(token, Token::Match { .. }) {
+                matches.try_reserve(1).ok()?;
+                matches.push((index, position));
+            }
+            position = position.checked_add(token.decoded_len())?;
+        }
+        Some(Self {
+            matches,
+            complete: position == block.plain.len(),
+            extra_bits: token_extra_bits(&block.tokens),
+        })
+    }
+}
+
+/// A ban's rewrite of a block: each replaced match's token index with the end
+/// of its replacement in `tokens`, and the rewritten block's symbol counts and
+/// extra bits.
+struct Rewrite {
+    replaced: Vec<(usize, usize)>,
+    tokens: Vec<Token>,
+    literal_frequencies: [u32; 286],
+    distance_frequencies: [u32; 30],
+    extra_bits: u64,
+}
+
+impl Rewrite {
+    /// Count `token` in the rewritten block, or uncount it.
+    fn count(&mut self, token: Token, added: bool) {
+        let step = |count: &mut u32| {
+            *count = if added { *count + 1 } else { *count - 1 };
+        };
+        match token {
+            Token::Literal(value) => step(&mut self.literal_frequencies[usize::from(value)]),
+            Token::Match {
+                length_symbol,
+                distance_symbol,
+                length_extra_bits,
+                distance_extra_bits,
+                ..
+            } => {
+                step(&mut self.literal_frequencies[usize::from(length_symbol)]);
+                step(&mut self.distance_frequencies[usize::from(distance_symbol)]);
+                let extra = u64::from(length_extra_bits) + u64::from(distance_extra_bits);
+                self.extra_bits = if added {
+                    self.extra_bits + extra
+                } else {
+                    self.extra_bits - extra
+                };
+            }
+        }
+    }
+
+    fn estimate(&self) -> Option<u64> {
+        estimate_boundary_block_bits(
+            &self.literal_frequencies,
+            &self.distance_frequencies,
+            self.extra_bits,
+            true,
+        )
+    }
+
+    /// The rewritten block's tokens.
+    fn spell(&self, block: &ParsedBlock) -> Option<Vec<Token>> {
+        let mut result = Vec::new();
+        result
+            .try_reserve_exact(block.tokens.len() - self.replaced.len() + self.tokens.len())
+            .ok()?;
+        let (mut next, mut start) = (0, 0);
+        for &(index, end) in &self.replaced {
+            result.extend_from_slice(&block.tokens[next..index]);
+            result.extend_from_slice(&self.tokens[start..end]);
+            (next, start) = (index + 1, end);
+        }
+        result.extend_from_slice(&block.tokens[next..]);
+        Some(result)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn rewrite(
     block: &ParsedBlock,
+    matches: &BlockMatches,
     ban: Ban,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
     mut spellings: Option<&mut SubmatchSpellings>,
     budget: &mut SymbolSetBudget,
     stop: &mut SearchStop<'_>,
-) -> Option<Vec<Token>> {
+) -> Option<Rewrite> {
     if stop.reached() || !budget.spend(block.tokens.len()) {
         return None;
     }
     let mut affected = 0;
     let mut bytes = 0;
     let mut edges = 0;
-    for &token in block.tokens.iter() {
+    for &(index, _) in &matches.matches {
+        let token = block.tokens[index];
         if !ban.affects(token) {
             continue;
         }
@@ -211,51 +309,84 @@ fn rewrite(
             }
         }
     }
-    if affected == 0 || !budget.spend(edges + bytes + block.tokens.len()) {
+    if affected == 0 || !budget.spend(edges + bytes + block.tokens.len()) || !matches.complete {
         return None;
     }
-    let mut result = Vec::new();
-    result.try_reserve_exact(block.tokens.len() + bytes).ok()?;
-    let mut position = 0;
-    for (i, &token) in block.tokens.iter().enumerate() {
-        if i & 255 == 0 && stop.reached() {
+    debug_assert_eq!(
+        (block.literal_frequencies, block.distance_frequencies),
+        count_frequencies(&block.tokens)
+    );
+    let mut rewrite = Rewrite {
+        replaced: Vec::new(),
+        tokens: Vec::new(),
+        literal_frequencies: block.literal_frequencies,
+        distance_frequencies: block.distance_frequencies,
+        extra_bits: matches.extra_bits,
+    };
+    rewrite.replaced.try_reserve_exact(affected).ok()?;
+    rewrite.tokens.try_reserve_exact(bytes).ok()?;
+    // Check the stop every 256 tokens, as a pass over every token would.
+    let mut checkpoint = 0;
+    for &(index, start) in &matches.matches {
+        let token = block.tokens[index];
+        let Token::Match {
+            length_symbol,
+            distance_symbol,
+            ..
+        } = token
+        else {
+            continue;
+        };
+        if !ban.affects(token) {
+            continue;
+        }
+        while checkpoint <= index {
+            if stop.reached() {
+                return None;
+            }
+            checkpoint += 256;
+        }
+        let decoded = &block.plain[start..start + token.decoded_len()];
+        rewrite.count(token, false);
+        let replacement_start = rewrite.tokens.len();
+        if ban.distances & (1 << distance_symbol) != 0 {
+            rewrite
+                .tokens
+                .extend(decoded.iter().copied().map(Token::Literal));
+        } else {
+            let solve = |stop: &mut SearchStop<'_>| {
+                solve_proven_submatch_avoiding(
+                    token,
+                    decoded,
+                    literal_lengths,
+                    distance_lengths,
+                    ban.lengths,
+                    stop,
+                )
+            };
+            let spelled = match spellings.as_deref_mut() {
+                Some(spellings) => {
+                    let relevant = ban.lengths & ((2 << (length_symbol - 257)) - 1);
+                    spellings.spell(index, relevant, stop, solve)
+                }
+                None => solve(stop),
+            }?;
+            rewrite.tokens.try_reserve(spelled.len()).ok()?;
+            rewrite.tokens.extend(spelled);
+        }
+        for position in replacement_start..rewrite.tokens.len() {
+            let replacement = rewrite.tokens[position];
+            rewrite.count(replacement, true);
+        }
+        rewrite.replaced.push((index, rewrite.tokens.len()));
+    }
+    while checkpoint < block.tokens.len() {
+        if stop.reached() {
             return None;
         }
-        let end = position + token.decoded_len();
-        let decoded = block.plain.get(position..end)?;
-        match token {
-            Token::Match {
-                distance_symbol, ..
-            } if ban.distances & (1 << distance_symbol) != 0 => {
-                result.extend(decoded.iter().copied().map(Token::Literal))
-            }
-            Token::Match { length_symbol, .. }
-                if ban.lengths & (1 << (length_symbol - 257)) != 0 =>
-            {
-                let solve = |stop: &mut SearchStop<'_>| {
-                    solve_proven_submatch_avoiding(
-                        token,
-                        decoded,
-                        literal_lengths,
-                        distance_lengths,
-                        ban.lengths,
-                        stop,
-                    )
-                };
-                let spelled = match spellings.as_deref_mut() {
-                    Some(spellings) => {
-                        let relevant = ban.lengths & ((2 << (length_symbol - 257)) - 1);
-                        spellings.spell(i, relevant, stop, solve)
-                    }
-                    None => solve(stop),
-                };
-                result.extend(spelled?);
-            }
-            _ => result.push(token),
-        }
-        position = end;
+        checkpoint += 256;
     }
-    (position == block.plain.len()).then_some(result)
+    Some(rewrite)
 }
 
 struct Proposal {
@@ -270,18 +401,28 @@ impl Proposal {
     }
 }
 
-fn retain_proposal(proposals: &mut Vec<Proposal>, proposal: Proposal) {
+/// Keep a proposal among the best `MAX_SELECTED`, spelling its tokens only if
+/// it is kept.
+fn retain_proposal(
+    proposals: &mut Vec<Proposal>,
+    ban: Ban,
+    score: u64,
+    spell: impl FnOnce() -> Option<Vec<Token>>,
+) {
     let position = proposals
         .iter()
-        .position(|p| proposal.key() < p.key())
+        .position(|p| (score, ban) < p.key())
         .unwrap_or(proposals.len());
     if position >= MAX_SELECTED {
         return;
     }
+    let Some(tokens) = spell() else {
+        return;
+    };
     if proposals.len() == MAX_SELECTED {
         proposals.pop();
     }
-    proposals.insert(position, proposal);
+    proposals.insert(position, Proposal { ban, score, tokens });
 }
 
 fn retain_seed(seeds: &mut Vec<(u64, Ban)>, seed: (u64, Ban)) {
@@ -293,11 +434,6 @@ fn retain_seed(seeds: &mut Vec<(u64, Ban)>, seed: (u64, Ban)) {
         seeds.pop();
     }
     seeds.insert(position, seed);
-}
-
-fn estimate(tokens: &[Token]) -> Option<u64> {
-    let (literal, distance) = count_frequencies(tokens);
-    estimate_boundary_block_bits(&literal, &distance, token_extra_bits(tokens), true)
 }
 
 /// Price one token spelling with the standard planner (strict, not exhaustive)
@@ -370,10 +506,11 @@ pub(crate) fn plan_symbol_sets(
     {
         return None;
     }
+    let matches = BlockMatches::new(block)?;
     let parent_score = estimate_boundary_block_bits(
         &block.literal_frequencies,
         &block.distance_frequencies,
-        token_extra_bits(&block.tokens),
+        matches.extra_bits,
         true,
     )?;
     let mut proposals = Vec::new();
@@ -387,8 +524,9 @@ pub(crate) fn plan_symbol_sets(
         if stop.reached() {
             break;
         }
-        let Some(tokens) = rewrite(
+        let Some(rewritten) = rewrite(
             block,
+            &matches,
             ban,
             &parent.literal_lengths,
             &parent.distance_lengths,
@@ -398,7 +536,7 @@ pub(crate) fn plan_symbol_sets(
         ) else {
             continue;
         };
-        let Some(score) = estimate(&tokens) else {
+        let Some(score) = rewritten.estimate() else {
             continue;
         };
         let count = ban.targeted_symbols(block);
@@ -409,7 +547,7 @@ pub(crate) fn plan_symbol_sets(
         // candidates up to `ESTIMATE_WINDOW` bits worse than the parent under
         // the same estimate.
         if count >= 2 && score <= parent_score + ESTIMATE_WINDOW {
-            retain_proposal(&mut proposals, Proposal { ban, score, tokens });
+            retain_proposal(&mut proposals, ban, score, || rewritten.spell(block));
         }
     }
     for &(_, literal) in &seeds[0] {
@@ -421,8 +559,9 @@ pub(crate) fn plan_symbol_sets(
                 lengths: literal.lengths,
                 distances: distance.distances,
             };
-            let Some(tokens) = rewrite(
+            let Some(rewritten) = rewrite(
                 block,
+                &matches,
                 ban,
                 &parent.literal_lengths,
                 &parent.distance_lengths,
@@ -432,11 +571,11 @@ pub(crate) fn plan_symbol_sets(
             ) else {
                 continue;
             };
-            let Some(score) = estimate(&tokens) else {
+            let Some(score) = rewritten.estimate() else {
                 continue;
             };
             if score <= parent_score + ESTIMATE_WINDOW {
-                retain_proposal(&mut proposals, Proposal { ban, score, tokens });
+                retain_proposal(&mut proposals, ban, score, || rewritten.spell(block));
             }
         }
     }
@@ -465,13 +604,16 @@ pub(crate) fn plan_symbol_sets(
             // literal into a match.
             if let Some(tokens) = rewrite(
                 block,
+                &matches,
                 proposal.ban,
                 literal_lengths,
                 distance_lengths,
                 None,
                 budget,
                 stop,
-            ) {
+            )
+            .and_then(|rewritten| rewritten.spell(block))
+            {
                 if !same_tokens(&tokens, &candidate.tokens) {
                     if let Some(feedback) =
                         price_spelling(block, tokens, alignment, options, budget, stop)
