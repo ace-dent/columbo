@@ -27,10 +27,12 @@ use crate::sort::SortShared;
 mod coupled;
 mod response;
 mod rotate;
+mod swap_costs;
 mod tree;
 pub(crate) use coupled::{plan_coupled_length_swaps, CoupledSwapBudget};
 pub(crate) use response::{plan_header_response, plan_length_exchange, ResponseBudget};
 pub(crate) use rotate::{plan_code_length_rotations, RotationBudget};
+use swap_costs::{keep_swap_trial, kept_swap_trial, release_swap_trials, swap_trial_start};
 pub(crate) use tree::{plan_header_tree, HeaderTreeBudget};
 
 const INF: u64 = u64::MAX / 4;
@@ -613,9 +615,10 @@ fn stored_header_plan_kernel(
     Some(plan)
 }
 
-/// Drop this thread's stored header plans, code-length trees and run
-/// spellings. A top-level optimization calls this on return, so library callers
-/// keep no plans between inputs; worker threads free theirs when they exit.
+/// Drop this thread's stored header plans, code-length trees, run spellings
+/// and swap-trial costs. A top-level optimization calls this on return, so
+/// library callers keep no plans between inputs; worker threads free theirs
+/// when they exit.
 pub(crate) fn release_thread_header_plans() {
     let _ = HEADER_PLAN_SEARCH.try_with(Cell::take);
     let _ = HEADER_PLAN_STORE.try_with(|store| {
@@ -628,6 +631,7 @@ pub(crate) fn release_thread_header_plans() {
             *cache = None;
         }
     });
+    release_swap_trials();
 }
 
 /// A builder of code-length codes: 19 symbols, at most 7 bits.
@@ -3568,10 +3572,26 @@ fn improve_one_tree_by_swaps(
         else {
             break;
         };
+        // A trial's header depends only on these lengths and its pair, so a
+        // pass from the same lengths, under other counts, reuses its cost.
+        let start = swap_trial_start(
+            header_plan_fingerprint(
+                &literal_lengths[..hlit],
+                &distance_lengths[..hdist],
+                exhaustive,
+                0x01,
+            ),
+            &literal_lengths[..hlit],
+            &distance_lengths[..hdist],
+            exhaustive,
+        );
 
         let mut selected_pair = None;
         let mut selected_payload_bits = payload_bits;
-        let mut selected_plan = current.clone();
+        let mut selected_bits = current.bits;
+        // `None` when the selected trial's cost was kept: its plan is made
+        // again once the pass ends.
+        let mut selected_plan = None;
         for a in 0..frequencies.len() {
             if stop.reached() {
                 return;
@@ -3613,25 +3633,43 @@ fn improve_one_tree_by_swaps(
                     Some(data_bits),
                     token_bits(tokens, &literal_lengths[..hlit], &distance_lengths[..hdist])
                 );
-                let candidate = plan_for_trimmed_lengths(
-                    &literal_lengths[..hlit],
-                    &distance_lengths[..hdist],
-                    data_bits,
-                    exhaustive,
-                    0x01,
-                );
+                let kept = start.and_then(|start| kept_swap_trial(start, literal_tree, a, b));
+                let (header_bits, plan) = match kept {
+                    Some(header_bits) => (header_bits, None),
+                    None => {
+                        let plan = plan_for_trimmed_lengths(
+                            &literal_lengths[..hlit],
+                            &distance_lengths[..hdist],
+                            0,
+                            exhaustive,
+                            0x01,
+                        );
+                        let header_bits = plan.as_ref().map(|plan| plan.bits);
+                        if let Some(start) = start {
+                            keep_swap_trial(start, literal_tree, a, b, header_bits);
+                        }
+                        (header_bits, plan)
+                    }
+                };
                 if literal_tree {
                     literal_lengths.swap(a, b);
                 } else {
                     distance_lengths.swap(a, b);
                 }
 
-                if let Some(candidate) = candidate {
-                    if candidate.bits < selected_plan.bits {
-                        selected_pair = Some((a, b));
-                        selected_payload_bits = data_bits;
-                        selected_plan = candidate;
-                    }
+                let Some(candidate_bits) =
+                    header_bits.and_then(|header_bits| header_bits.checked_add(data_bits))
+                else {
+                    continue;
+                };
+                if candidate_bits < selected_bits {
+                    selected_pair = Some((a, b));
+                    selected_payload_bits = data_bits;
+                    selected_bits = candidate_bits;
+                    selected_plan = plan.map(|mut plan| {
+                        plan.bits = candidate_bits;
+                        plan
+                    });
                 }
             }
         }
@@ -3644,6 +3682,24 @@ fn improve_one_tree_by_swaps(
         } else {
             distance_lengths.swap(a, b);
         }
+        let selected_plan = selected_plan.or_else(|| {
+            plan_for_trimmed_lengths(
+                &literal_lengths[..hlit],
+                &distance_lengths[..hdist],
+                selected_payload_bits,
+                exhaustive,
+                0x01,
+            )
+        });
+        let Some(selected_plan) = selected_plan else {
+            if literal_tree {
+                literal_lengths.swap(a, b);
+            } else {
+                distance_lengths.swap(a, b);
+            }
+            break;
+        };
+        debug_assert_eq!(selected_plan.bits, selected_bits);
         *current = selected_plan;
         keep_better(best, current.clone());
 
@@ -3890,8 +3946,12 @@ fn consider_rle(
         if let Some((shortest, shortest_frequencies, entry, first_pass)) = shortest {
             // A pass depends only on its RLE, and pricing a header again
             // cannot change the best plan. A seed that started this pass or an
-            // earlier one from this RLE has done all that would follow.
-            if shortest == rle.as_slice() || first_pass <= pass + 1 {
+            // earlier one from this RLE has done all that would follow. Equal
+            // RLEs have equal symbol counts, so the counts are compared before
+            // the tokens.
+            if first_pass <= pass + 1
+                || (*shortest_frequencies == frequencies && shortest == rle.as_slice())
+            {
                 break;
             }
             rle.clear();

@@ -1956,6 +1956,89 @@ fn thread_header_plans_match_uncached_planning() {
     assert!(HEADER_PLAN_SEARCH.with(Cell::take).is_none());
 }
 
+#[test]
+fn swap_searches_with_kept_trial_costs_match_cold_searches() {
+    let mut state = 0xbb67_ae85_84ca_a73b_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // A literal-heavy block with many rare symbols, whose equal counts give
+    // the swap search payload-neutral trials, and a few matches.
+    let mut base = Vec::new();
+    for symbol in 0..120_u8 {
+        let count = 1 + next() % if symbol % 7 == 0 { 12 } else { 3 };
+        base.extend((0..count).map(|_| Token::Literal(symbol.wrapping_mul(2))));
+    }
+    for (length_symbol, distance_symbol) in [(257, 0), (258, 3), (260, 4), (257, 4)] {
+        base.push(Token::Match {
+            length: 3,
+            distance: 1,
+            length_symbol,
+            distance_symbol,
+            length_extra: 0,
+            distance_extra: 0,
+            length_extra_bits: 0,
+            distance_extra_bits: (distance_symbol / 2).saturating_sub(1),
+        });
+    }
+    let (literal, distance) = count_frequencies(&base);
+    let seed = DynamicPlan {
+        literal_lengths: make_lengths(&literal, 15, 0),
+        distance_lengths: make_lengths(&distance, 15, 0),
+        code_length_lengths: [0; 19],
+        rle: Vec::new(),
+        hlit: 286,
+        hdist: 30,
+        hclen: 19,
+        bits: 0,
+    };
+    // Variants keep the seed's used symbols and change their counts, as the
+    // queue's children do.
+    let variants: Vec<Vec<Token>> = (0..6)
+        .map(|_| {
+            let mut tokens = base.clone();
+            for _ in 0..8 {
+                let index = usize::try_from(next() % base.len() as u64).unwrap();
+                tokens.push(base[index]);
+            }
+            tokens
+        })
+        .collect();
+    let search = |tokens: &[Token]| {
+        let (literal, distance) = count_frequencies(tokens);
+        let mut best = None;
+        improve_by_length_swaps(
+            tokens,
+            &literal,
+            &distance,
+            &seed,
+            true,
+            &mut SearchStop::never(),
+            &mut best,
+        );
+        best
+    };
+
+    release_thread_header_plans();
+    let mut warm = Vec::new();
+    for tokens in &variants {
+        // The second search finds every trial kept.
+        let first = search(tokens);
+        assert_eq!(search(tokens), first);
+        warm.push(first);
+    }
+    assert!(swap_costs::test_support::kept_swap_trial_count() > 0);
+    for (tokens, warm) in variants.iter().zip(warm) {
+        release_thread_header_plans();
+        assert_eq!(search(tokens), warm);
+    }
+    release_thread_header_plans();
+    assert_eq!(swap_costs::test_support::kept_swap_trial_count(), 0);
+}
+
 /// The local rewrite before it counted frequencies and allocated on the first
 /// change.
 fn rewrite_rle_deflopt_local_reference(

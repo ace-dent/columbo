@@ -90,11 +90,35 @@ pub(crate) fn code_length_tree_shape_is_valid(lengths: &[u8; 19]) -> bool {
 // Out of line: each call scans the lengths.
 #[inline(never)]
 pub(crate) fn payload_tree_shape_is_valid(lengths: &[u8], allow_empty: bool) -> bool {
-    let populated = lengths.iter().filter(|&&length| length != 0).count();
+    // One branch-free pass, as in `huffman_tree_shape_is_complete`, also
+    // counts the codes. A single code is valid when it is one bit long, which
+    // is when it fills half the code space.
+    let mut occupied = 0_u64;
+    let mut populated = 0_usize;
+    let mut longest = 0_u8;
+    for chunk in lengths.chunks(1 << 16) {
+        let mut chunk_occupied = 0_u32;
+        let mut chunk_populated = 0_u32;
+        for &length in chunk {
+            longest = longest.max(length);
+            chunk_populated = chunk_populated.wrapping_add(u32::from(length != 0));
+            chunk_occupied = chunk_occupied.wrapping_add(
+                (u32::from(length != 0) << MAX_CODE_BITS) >> length.min(MAX_CODE_BITS as u8),
+            );
+        }
+        occupied = occupied.wrapping_add(u64::from(chunk_occupied));
+        populated = populated.saturating_add(chunk_populated as usize);
+    }
     match populated {
         0 => allow_empty,
-        1 => lengths.contains(&1),
-        _ => huffman_tree_shape_is_complete(lengths),
+        1 => {
+            usize::from(longest) <= MAX_CODE_BITS
+                && occupied == u64::from(COMPLETE_HUFFMAN_CODE_SPACE / 2)
+        }
+        _ => {
+            usize::from(longest) <= MAX_CODE_BITS
+                && occupied == u64::from(COMPLETE_HUFFMAN_CODE_SPACE)
+        }
     }
 }
 

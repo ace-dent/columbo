@@ -85,6 +85,7 @@ gains where established.
 | 28 Oct 2026 | [`c2aa4ba`](#c2aa4ba-28-october-2026) | Max header-plan buffers, expansion marks and generic heap entries (`header.rs`, `source_recode.rs`, `huffman.rs`) | The header planner's rewrites, local-rewrite steps, candidate trees, shortest-RLE memo and seed spellings use buffers kept per thread; the DeflOpt rewrite is skipped when the RLE already costs the shortest RLE's; source recode's expansion marks stop their literal sums at the match's cost; the generic builder's heap entries take one word | Replayed header plans 1.10× (5.5% fewer instructions); a completing Max run 7.1% fewer instructions; Default CPU 1.02× (33 inputs, 1.8% fewer cycles); peak memory −0.2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 expansion-mark comparisons; 692 Rust, 7 Python tests |
 | 28 Oct 2026 | [`4013a14`](#4013a14-28-october-2026) | Code-length trees and feedback passes (`huffman.rs`, `header.rs`, `search.rs`) | Heap builds note tie turns per sift-down, and every variant whose rules agree shares the tree; the code-length tree cache tracks every heap build; an exhaustive pass prices a repaired first tree alone at exact Defluff's cost; seeds stop at a shortest RLE already followed; code-length heaps on stack arrays, a 19-length completeness check and exact Defluff on kept scratch | Replayed header plans 1.16× (9.4% fewer instructions, 11.0% fewer cycles); Default CPU 1.05× (33 inputs, 4.3% fewer cycles); a completing Max run 3.6% fewer instructions; executable one 16 KiB page larger | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 89,255 replayed header plans; 2 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 stack-array, 20,000 completeness and 20,000 first-tree comparisons; 694 Rust, 7 Python tests |
 | 28 Oct 2026 | [`6e6a0c4`](#6e6a0c4-28-october-2026) | Per-thread header-plan store (`header.rs`) | Each generation's plans appended to one byte arena with an offset index; one byte per RLE token, code lengths checked by decoding the RLE instead of stored; 16 MiB budget | 177 completing Max runs 1.06× (6.0% fewer instructions); Default CPU 1.03× (33 inputs, 3.1% fewer cycles); peak memory −1.1 MiB median Default, −4 MiB median Max, +39 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 177 completing and 2 long completing Max runs; 89,255 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 65,536 token-encoding checks; 695 Rust, 7 Python tests |
+| 2 Nov 2026 | [`3860542`](#3860542-2-november-2026) | Max length-swap trials and header checks (`header.rs`, `header/swap_costs.rs`, `huffman.rs`) | Each thread keeps the header costs of greedy length-swap trials by start lengths and pair, in sets of four that grow with use up to 3 MiB; the payload shape check counts codes in its Kraft pass; the shortest-RLE repeat test compares counts before tokens | Completing Max runs of three small deadline-bound PNGs 17.2%, 17.0% and 7.7% fewer instructions (1.21×, 1.19×, 1.07×); 177 completing sprites 4.0% fewer; Default 0.86% fewer; sprite peak memory +2 MiB median | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 11,343 replayed swap searches; 275,887 replayed header plans; 58 Max runs at 10 seconds; 66 Default timing runs; 20,000 shape-check comparisons; 703 Rust, 7 Python tests |
 
 ## Entries
 
@@ -481,6 +482,137 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `3860542`, 2 November 2026
+
+Batches: one paired run of each build, alternating order, on three small PNGs
+whose Max search reaches a 20-second deadline but completes within 1,200
+seconds, where two earlier candidates' paired runs agreed with it; two
+alternating runs of each completing Max run; one paired run of each build
+on the 177 sprites whose Max search completes within 10 seconds, alternating
+order; one paired run of each build on every sixteenth DeflOpt PNG by name (58
+files, Max at 10 seconds, alternating order); retired instructions and cycles
+from `time -l` over the 33 stratified Default inputs, two alternating rounds;
+two rotating runs of two new replays. The header-plan replay holds 275,887
+uncached header plans sampled from seven Max runs at 20 seconds; the
+swap-search replay holds the inputs of 11,343 greedy length-swap searches from
+four Max runs, replayed thread by thread in their order.
+
+A sampled profile of ten inputs in Max at 20 seconds at `3860542` (237,481 CPU
+samples) put half of all samples under the ordered state queue, 95% of them
+planning its children, and 17.7% under the greedy length swaps, which plan a
+header for every swap of a pass's start lengths: on `crossroads.png`, 79% of
+the dynamic-plan search. Counters on the per-thread header-plan store found
+uncached plans the same thread had already made taking 24% of uncached
+planning time on `crossroads.png`, 6% on `france.png` and `OwlAlpha-0.5.png`
+and 2% on `Banana512.png`. On the small inputs nearly all were swap trials, most
+of them 32,000 to a million misses apart, beyond the store's reach. Whole swap
+searches never repeated: the queue's children keep their parent's code lengths
+under slightly different counts, so passes start from the same lengths, but the
+counts change which pairs are tried and what each costs in payload. Keyed by
+start lengths and swapped pair, 35% of swap-trial time on `crossroads.png` and
+`star.png` repeated an earlier trial on the same thread, and 27% on
+`basi4a16.png`, most of them 32,000 to 256,000 trials earlier.
+
+- **Swap-trial costs.** A trial's header depends only on the pass's start
+  lengths, the swapped pair and the `exhaustive` flag, so each thread keeps
+  the trials' header bits without their plans, 12 bytes a trial. A pass finds
+  its start lengths by fingerprint, compares them in full and gets an
+  identifier that is never reused, so a kept trial can answer only for the
+  lengths it was planned from. A key hashes to a set of four slots kept in
+  order of use. The slots start at 4,096 and grow fourfold, keeping their
+  trials, each time they have taken as many new trials as they hold, up to
+  2^18 slots, 3 MiB. The pass compares kept and new costs as before, and plans
+  its chosen swap again when that swap's cost was kept, once per pass. Default
+  never runs the swaps.
+- **One-pass payload shape check.** The check that every uncached header plan
+  makes on both payload alphabets counts the codes in the same branch-free pass
+  as the Kraft sum. A single code is valid when it fills half the code space,
+  which is when it is one bit long.
+- **Shortest-RLE comparison.** A feedback pass stops when the shortest RLE is
+  the RLE it already has, or a seed started from it earlier. It now tests the
+  pass index first, then the symbol counts, which equal RLEs share, before
+  comparing tokens.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `crossroads.png`, Max completing its search, instructions retired | 3,121.2 billion | 2,584.7 billion | −17.2% |
+| Same run, user CPU | 198.8 s | 164.3 s | 1.21× |
+| `star.png`, Max completing its search, instructions retired | 1,401.4 billion | 1,162.9 billion | −17.0% |
+| Same run, user CPU | 86.5 s | 72.9 s | 1.19× |
+| `basi4a16.png`, Max completing its search, instructions retired | 944.9 billion | 871.9 billion | −7.7% |
+| Same run, user CPU | 63.0 s | 58.8 s | 1.07× |
+| 11,343 replayed swap searches, instructions retired | 722.6 billion | 645.4 billion | −10.7% |
+| 275,887 replayed header plans, instructions retired | 68.25 billion | 67.27 billion | −1.4% |
+| 177 sprites, Max completing its search, instructions retired | 3,095.0 billion | 2,972.0 billion | −4.0% |
+| Same runs, user CPU | 239.6 s | 232.4 s | 1.03× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 19.09 billion | 18.31 billion | −4.1% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.37 billion | 2.30 billion | −2.9% |
+| 33 Default inputs, instructions retired over two rounds | 1,139.6 billion | 1,129.7 billion | −0.86% |
+| Same inputs, cycles over two rounds | 268.9 billion | 267.5 billion | −0.52% |
+
+The swap-search replay underestimates the memo, since its store sees no other
+planning between searches: with the trials mapped directly to 2^18 slots, it
+fell 6.1% while the completing runs fell 13.1%, 11.8% and 4.9%. The shape check
+and the comparison account for the header-plan replay's 1.4% and the Default
+inputs' 0.86%. On traced swap trials, sets of four kept as many repeats as
+twice the slots mapped directly: 79% of an unbounded memo's on `star.png`,
+against 64% for 2^18 direct slots and 78% for 2^19. A thread's slots first
+filled their full 3 MiB on every swap search, which raised peak memory on
+`036-Clefable-0.png` from 27 to 37 MiB; growing them with use took that to
+30–32 MiB. Over the 177 sprites, median peak memory rose from 24 to 26 MiB and
+at most by 8 MiB (`108-Lickitung-0.png`, 63 to 71 MiB). The three long runs
+peaked at 402, 445 and 372 MiB, against 373, 457 and 389.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name (58 files, Max at 10 seconds, alternating
+builds), 57 outputs were identical, in 447.9 instead of 448.9 seconds.
+`sample_20.png` came out 9,695 instead of 9,692 bytes in three runs of each
+build. The baseline also gives 9,695 bytes at 11, 12, 14 and 30 seconds, so the
+faster build reaches the baseline's later endpoint sooner; both end at 9,700
+bytes when the search completes, in 99 seconds.
+
+Equivalence: new tests run swap searches under six sets of counts twice each
+with trials kept, then each again from empty costs, and compare the plans; grow
+the trial slots through every size and find the most recent trials with their
+costs; check that start lengths are compared in full and never get a
+reused identifier; and compare the shape check with the counting reference on
+20,000 alphabets, complete, single-code, empty and invalid. The replays matched
+plan for plan and search for search. API comparisons on the 52 inputs, in
+Default with the 180-second budget and in zero-budget Max, matched in all 104
+runs, and every Default timing run and every completing Max run matched byte
+for byte. Rust tests, including the private corpus, passed in release and debug
+modes, with documentation and Python tests, a locked build, formatting,
+all-feature Clippy with warnings denied and a package list without private
+fixtures or scratch artifacts. `__text` grew from 877,060 to 883,344 bytes; the shipped
+executable stays at 958,512 bytes apart from a 16-byte longer signature, and
+the final source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- A lower bound to skip planning the queue's children, as in `e25d20d`: only
+  7.2% of children could not join the beam or replace the incumbent, 3.0% of
+  their planning time, and an optimal-code payload bound with the least header
+  skipped 0.4% of it.
+- A bound to skip swap trials: 95% of trials on `crossroads.png` ended 5 to 16
+  bits worse than the pass's state, too close for any cheap header bound. A
+  swap of two lengths that each stand alone between other values keeps every
+  RLE's cost, and in 45,000 such trials the planned header never changed, but
+  they were 1% of trials on the heavy inputs.
+- Stopping the DeflOpt and deft4j RLE rewrites after their last repeat code:
+  the per-token count cost more than the tail it skipped, 2.4% more
+  instructions on the header-plan replay.
+
+Not changed in the same review:
+
+- Header plans another thread had already made took 0.1% to 3.8% of uncached
+  planning time; sharing the store would need a lock on every lookup.
+- With line tables in the binary, `sample` groups a function's addresses by
+  source line and lists only a few, so per-line attribution of inlined code
+  was not reliable; the changes above were chosen and kept by replays and
+  completing runs.
+
+Artifacts: `work/efficiency-review-max7-20261102/`.
 
 ### `6e6a0c4`, 28 October 2026
 

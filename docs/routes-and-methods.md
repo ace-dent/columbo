@@ -2059,7 +2059,9 @@ every swap of two unequal nonzero lengths whose payload change, (f_a − f_b) ×
 seeds (mask `0x01`) and commits the cheapest swap strictly below the current
 state; the committed state is also priced with every RLE spelling (mask `0xff`).
 The zero-cost guard stays on purpose: relaxing it changes intermediate winners
-and so redirects later searches.
+and so redirects later searches. Each thread keeps the trials' header costs, so
+a pass that starts from the same code lengths under other counts reuses them
+([swap-trial costs](#header-plan-caches-and-stores)).
 
 **Acceptance.** Every candidate is a complete plan priced exactly. The planner
 replaces its best plan only on strictly fewer bits, so the earliest of equal
@@ -7098,7 +7100,8 @@ Columbo follows four rules:
 Columbo has two general-purpose route-local plan caches, the block-plan cache
 (`CanonicalPlanCache`) and the header-plan cache (`HeaderPlanCache`), with
 bounded per-thread stores of completed block and header plans behind them. Each
-thread also keeps a code-length tree cache and RLE run tables, and a few methods
+thread also keeps a code-length tree cache, RLE run tables and the header costs
+of greedy length-swap trials, and a few methods
 keep local memos: R6 and R15 a range cache, the terminal sequence a one-entry
 parse cache, and the deft4j route its state memos. There is no global route DAG
 and no interval cache shared across routes or methods. Every cache and store
@@ -7294,6 +7297,43 @@ per-thread store with the same key and verification.
 - The store is emptied when the top-level `optimize` call returns, and freed
   when a worker thread exits. It is not emptied per stream, so a lane thread
   keeps it across the members and frames it processes within one call.
+
+**Swap-trial costs.** A greedy length-swap pass prices a header for every
+swap of its start lengths
+([Equal-frequency and code-length adjustments](#length-limited-huffman-families)).
+In the ordered queue, a child's block usually keeps its parent's code lengths
+under slightly different counts, so many passes start from lengths an earlier
+pass on the same thread started from, and price the same swaps again. A trial's
+header depends only on the start lengths, the swapped pair and the `exhaustive`
+flag (the mask is always `0x01`); the counts decide only which pairs are tried
+and their payload changes. Each thread therefore keeps the trials' header costs
+without their plans.
+
+- A pass finds its start lengths by fingerprint and compares them in full. New
+  start lengths get an identifier that is never reused, so a trial kept under
+  start lengths that were dropped cannot answer for others. The thread keeps
+  4,096 start sequences, then drops them all.
+- Trials sit in slots of 12 bytes: the key is the start identifier, the
+  alphabet and the two symbols, and the value is the header's bits, or that the
+  trial has no plan. A key hashes to a set of four slots kept in order of use;
+  a new trial replaces the set's least recent. On traced runs, four ways kept as
+  many repeats as twice the slots mapped directly.
+- A thread's first swap search allocates 4,096 slots, 48 KiB. Each time they
+  have taken as many new trials as they hold, they grow fourfold, keeping their
+  trials, up to 2^18 slots, 3 MiB, so a short search keeps little.
+- The pass compares kept and new costs exactly as before. When its cheapest
+  trial's cost was kept, it plans that swap again once, which gives the plan the
+  trial would have given.
+- The costs are emptied with the header-plan store. Default never runs the
+  swaps, so it allocates none.
+- Measured: on three small PNGs whose Max search reaches a 20-second deadline
+  but completes within 1,200 seconds, `crossroads.png`, `star.png` and
+  `basi4a16.png`, the completing runs retired 17.2%, 17.0% and 7.7% fewer
+  instructions with identical output, and the 177 sprites whose search
+  completes within 10 seconds 4.0% fewer. Before, 35% of swap-trial time on the
+  first two repeated a trial the thread had made, most of them 32,000 to 256,000
+  trials earlier
+  ([efficiency review `3860542`](research/efficiency-review.md#3860542-2-november-2026)).
 
 **Bypasses.** The terminal header methods R1b, R2 and R3 call the uncached
 header planner directly, and R4 and R8–R11 plan through the advertised-length
@@ -10286,6 +10326,7 @@ explains its part.
 | Block representation selection and emission, the route-local block-plan cache and the per-thread block-plan store | [`src/deflate/block.rs`](../src/deflate/block.rs) |
 | Huffman construction and count smoothers | [`src/deflate/huffman.rs`](../src/deflate/huffman.rs) |
 | Dynamic headers, the header-plan cache and per-thread header-plan store, tree floors, R1b, R2 and R3 | [`src/deflate/header.rs`](../src/deflate/header.rs) |
+| Per-thread header costs of greedy length-swap trials | [`src/deflate/header/swap_costs.rs`](../src/deflate/header/swap_costs.rs) |
 | Max code-length searches: R7, R8, R9, R10 and R11 | [`src/deflate/header/tree.rs`](../src/deflate/header/tree.rs), [`src/deflate/header/rotate.rs`](../src/deflate/header/rotate.rs), [`src/deflate/header/coupled.rs`](../src/deflate/header/coupled.rs), [`src/deflate/header/response.rs`](../src/deflate/header/response.rs), [`src/deflate/header/response/exchange.rs`](../src/deflate/header/response/exchange.rs) |
 | Bounded two-generation store type behind both per-thread plan stores | [`src/deflate/plan_store.rs`](../src/deflate/plan_store.rs) |
 | deft4j-derived source route (M1) | [`src/deflate/source_recode.rs`](../src/deflate/source_recode.rs) |

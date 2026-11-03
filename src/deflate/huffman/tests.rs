@@ -347,6 +347,62 @@ fn compact_code_length_decoder_rejects_invalid_shapes() {
 }
 
 #[test]
+fn payload_shape_check_matches_the_counting_reference() {
+    // The check before it counted the codes in a pass of its own.
+    fn reference(lengths: &[u8], allow_empty: bool) -> bool {
+        match lengths.iter().filter(|&&length| length != 0).count() {
+            0 => allow_empty,
+            1 => lengths.contains(&1),
+            _ => huffman_tree_shape_is_complete(lengths),
+        }
+    }
+    let mut state = 0x510e_527f_ade6_82d1_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut valid = 0;
+    for case in 0..20_000 {
+        let size = [30, 286, 1, 0][case % 4];
+        let mut lengths = vec![0_u8; size];
+        match case % 5 {
+            // Complete codes: a Huffman tree's lengths.
+            0 | 1 if size > 1 => {
+                let frequencies: Vec<u32> = (0..size).map(|_| (next() % 9) as u32).collect();
+                lengths.copy_from_slice(&make_lengths(&frequencies, 15, 0));
+            }
+            // At most one code, of any length up to 17.
+            2 => {
+                if size != 0 && next() % 4 != 0 {
+                    let index = (next() % size as u64) as usize;
+                    lengths[index] = (next() % 18) as u8;
+                }
+            }
+            _ => {
+                let longest = [4, 9, 16, 18][case % 4];
+                for length in &mut lengths {
+                    if next() % 3 == 0 {
+                        *length = (next() % longest) as u8;
+                    }
+                }
+            }
+        }
+        for allow_empty in [false, true] {
+            let expected = reference(&lengths, allow_empty);
+            assert_eq!(
+                payload_tree_shape_is_valid(&lengths, allow_empty),
+                expected,
+                "{lengths:?}"
+            );
+            valid += usize::from(expected);
+        }
+    }
+    assert!(valid > 10_000, "{valid} valid codes");
+}
+
+#[test]
 fn code_length_shape_check_matches_the_general_completeness_check() {
     let mut state = 0x9b05_688c_2b3e_6c1f_u64;
     let mut next = move || {
