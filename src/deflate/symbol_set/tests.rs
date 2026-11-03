@@ -58,6 +58,7 @@ fn rewrite_limits_are_inclusive_and_rejections_keep_the_scan_charge() {
             },
             &super::super::huffman::FIXED_LITERAL_CODE_LENGTHS,
             &super::super::huffman::FIXED_DISTANCE_CODE_LENGTHS,
+            None,
             &mut budget,
             &mut SearchStop::callback(&mut counter),
         );
@@ -208,4 +209,102 @@ fn budgets_and_stops_preserve_completed_parents() {
         }
     }
     assert!(retained_after_stop);
+}
+
+#[test]
+fn remembered_submatch_spellings_match_fresh_rewrites() {
+    let mut seed = 0x6c07_8965u32;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for case in 0..12 {
+        // Matches at distance 1 inside one run, so every submatch is proven.
+        let mut tokens = vec![Token::Literal(b'a')];
+        for _ in 0..120 {
+            if next() % 6 == 0 {
+                tokens.push(Token::Literal(b'a'));
+                continue;
+            }
+            let length = 3 + (next() % if case % 2 == 0 { 256 } else { 40 }) as u16;
+            let (length_symbol, length_extra, length_extra_bits) =
+                super::super::model::canonical_length_encoding(length).unwrap();
+            tokens.push(Token::Match {
+                length,
+                distance: 1,
+                length_symbol,
+                distance_symbol: 0,
+                length_extra,
+                distance_extra: 0,
+                length_extra_bits,
+                distance_extra_bits: 0,
+            });
+        }
+        let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();
+        let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+        let block = ParsedBlock {
+            tokens: tokens.into(),
+            plain: vec![b'a'; plain_len].into(),
+            literal_frequencies,
+            distance_frequencies,
+            original_literal_lengths: None,
+            original_distance_lengths: None,
+            original_dynamic: None,
+            original: None,
+            source_splits: Vec::new(),
+            source_type: super::super::model::SourceBlockType::Fixed,
+        };
+        let weights: Vec<u32> = (0..286).map(|_| 1 + next() % 1000).collect();
+        let literal_lengths = super::super::huffman::make_lengths(&weights, 15, 0);
+        let distance_lengths = [5_u8; 30];
+        let mut bans = masks(&block).unwrap();
+        let crosses: Vec<_> = bans
+            .iter()
+            .filter(|literal| literal.distances == 0)
+            .flat_map(|literal| {
+                bans.iter()
+                    .filter(|distance| distance.lengths == 0)
+                    .map(|distance| Ban {
+                        lengths: literal.lengths,
+                        distances: distance.distances,
+                    })
+            })
+            .collect();
+        bans.extend(crosses);
+        let mut spellings = SubmatchSpellings::new(&block).unwrap();
+        let mut remembered = 0;
+        for _ in 0..2 {
+            for &ban in &bans {
+                let mut fresh_budget = SymbolSetBudget::new();
+                let mut kept_budget = SymbolSetBudget::new();
+                let fresh = rewrite(
+                    &block,
+                    ban,
+                    &literal_lengths,
+                    &distance_lengths,
+                    None,
+                    &mut fresh_budget,
+                    &mut SearchStop::never(),
+                );
+                let kept = rewrite(
+                    &block,
+                    ban,
+                    &literal_lengths,
+                    &distance_lengths,
+                    Some(&mut spellings),
+                    &mut kept_budget,
+                    &mut SearchStop::never(),
+                );
+                assert_eq!(kept, fresh, "case {case}: {ban:?}");
+                assert_eq!(kept_budget.work_left, fresh_budget.work_left);
+                if let Some(tokens) = kept {
+                    assert_proven_rewrite(&block, &tokens);
+                    remembered += 1;
+                }
+            }
+        }
+        assert!(remembered > 0, "case {case}");
+    }
 }

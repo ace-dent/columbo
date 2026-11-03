@@ -91,9 +91,11 @@ fn payload_suffix(
             for &(length, units) in allowed {
                 let price = u64::from(frequencies[i]) * length as u64;
                 // Offsetting the rows by `units` tries this length at every
-                // capacity where it fits.
+                // capacity where it fits. Entries stay at most `INF` and a
+                // price is below 2^36, so the sum cannot wrap, and the loop
+                // vectorizes without overflow checks.
                 for (best, &rest) in current[units..].iter_mut().zip(next) {
-                    *best = (*best).min(rest + price);
+                    *best = (*best).min(rest.wrapping_add(price));
                 }
             }
         }
@@ -160,14 +162,19 @@ fn solve(
         zero,
         stop,
     )?;
+    // One table of payload bounds by position and remaining capacity: a
+    // literal/length position adds the cheapest complete distance code.
+    let bound_width = capacity + 1;
     let distance_minimum = distance_bound[capacity];
-    let payload_bound = |i: usize, remaining: usize| -> u64 {
-        if i < split {
-            (literal_bound[i * (capacity + 1) + remaining] + distance_minimum).min(INF)
-        } else {
-            distance_bound[(i - split) * (capacity + 1) + remaining]
-        }
-    };
+    let mut payload_bound = filled((n + 1) * bound_width, INF)?;
+    for (bound, &literal) in payload_bound[..split * bound_width]
+        .iter_mut()
+        .zip(&literal_bound)
+    {
+        *bound = (literal + distance_minimum).min(INF);
+    }
+    payload_bound[split * bound_width..].copy_from_slice(&distance_bound);
+    drop((literal_bound, distance_bound));
     let mut sums = [0u64; MAX_DYNAMIC_CODE_LENGTH_COUNT + 1];
     let mut used = [0usize; MAX_DYNAMIC_CODE_LENGTH_COUNT + 1];
     let mut zero_run = [0usize; MAX_DYNAMIC_CODE_LENGTH_COUNT + 1];
@@ -225,7 +232,7 @@ fn solve(
             header[i * previous_count + previous] = best;
         }
     }
-    if payload_bound(0, capacity) + header[none] >= target {
+    if payload_bound[capacity] + header[none] >= target {
         return None;
     }
     // At depth 9 the two tables plus suffix bounds take less than 24 MiB,
@@ -234,92 +241,227 @@ fn solve(
     let mut trace = filled(cells, u32::MAX)?;
     let start = capacity * previous_count + none;
     cost[start] = 0;
+    // Capacities with a reached state, one bit each in 32-bit words per
+    // position, so the search skips capacities no edge has reached.
+    let live_words = capacity / 32 + 1;
+    let mut live = filled((n + 1) * live_words, 0_u32)?;
+    live[capacity / 32] = 1 << (capacity % 32);
     let mut winner = None;
-    'search: for i in 0..n {
-        for remaining in 0..=capacity {
-            if remaining % 32 == 0 && (budget.work_left == 0 || stop.reached()) {
-                break 'search;
+    // Single code lengths the code-length code can spell, in symbol order,
+    // with their header bits and capacity units.
+    let singles: Vec<_> = (0..=depth)
+        .filter(|&length| cl[length] > 0)
+        .map(|length| {
+            let units = if length == 0 {
+                0
+            } else {
+                1 << (depth - length)
+            };
+            (length, u64::from(cl[length]), units)
+        })
+        .collect();
+    let repeat_edges = if cl[16] > 0 { 4 } else { 0 };
+    let mut work_left = budget.work_left;
+    // Relax the edge into position `j` with `next` capacity and previous
+    // length `length` at `score`, unless its bound reaches the target.
+    macro_rules! relax {
+        ($j:expr, $next:expr, $length:expr, $score:expr, $link:expr) => {{
+            let (j, next, length, score) = ($j, $next, $length, $score);
+            if score + payload_bound[j * bound_width + next] + header[j * previous_count + length]
+                < target
+            {
+                let to = j * stride + next * previous_count + length;
+                if score < cost[to] {
+                    cost[to] = score;
+                    trace[to] = $link;
+                    live[j * live_words + next / 32] |= 1 << (next % 32);
+                    if j == n {
+                        debug_assert_eq!(next, 0);
+                        target = score;
+                        winner = Some(to);
+                    }
+                }
             }
-            for previous in 0..previous_count {
-                let from = i * stride + remaining * previous_count + previous;
-                let old = cost[from];
-                if old == INF
-                    || old + payload_bound(i, remaining) + header[i * previous_count + previous]
-                        >= target
-                {
+        }};
+    }
+    // Relax the single code lengths from `old` at position `i` and `remaining`
+    // capacity: the first `count` the code-length code can spell.
+    macro_rules! relax_singles {
+        ($i:expr, $remaining:expr, $old:expr, $link:expr, $count:expr) => {{
+            let (i, remaining, old, link) = ($i, $remaining, $old, $link);
+            let j = i + 1;
+            let frequency = u64::from(frequencies[i]);
+            for &(length, bits, units) in &singles[..$count] {
+                let legal = if length == 0 {
+                    frequency == 0
+                } else {
+                    j <= reserved_from
+                };
+                if !legal {
                     continue;
                 }
-                let mut edge = |count: usize, length: usize, symbol: usize, kind: u32| {
-                    if !budget.spend(1) || !legal(i, count, length) {
-                        return;
+                let next = if j == split {
+                    if remaining != units {
+                        continue;
                     }
-                    let j = i + count;
-                    let units = if length == 0 {
-                        0
-                    } else {
-                        1 << (depth - length)
-                    };
-                    let next = if i < split && j >= split {
-                        if remaining != (split - i) * units || (j - split) * units > capacity {
-                            return;
-                        }
-                        capacity - (j - split) * units
-                    } else {
-                        if count * units > remaining {
-                            return;
-                        }
-                        remaining - count * units
-                    };
-                    let extra = match symbol {
-                        16 => 2,
-                        17 => 3,
-                        18 => 7,
-                        _ => 0,
-                    };
-                    let score =
-                        old + u64::from(cl[symbol]) + extra + (sums[j] - sums[i]) * length as u64;
-                    if score + payload_bound(j, next) + header[j * previous_count + length]
-                        >= target
-                    {
-                        return;
+                    capacity
+                } else {
+                    if units > remaining {
+                        continue;
                     }
-                    let to = j * stride + next * previous_count + length;
-                    if score < cost[to] {
-                        cost[to] = score;
-                        // Position always advances, so a predecessor's trace
-                        // is final before it is read. There are fewer than
-                        // 2^21 cells, so `from << 2` fits in a u32.
-                        trace[to] = ((from as u32) << 2) | kind;
-                        if j == n {
-                            debug_assert_eq!(next, 0);
-                            target = score;
-                            winner = Some(to);
-                        }
-                    }
+                    remaining - units
                 };
-                for (length, &cl_bits) in cl.iter().enumerate().take(depth + 1) {
-                    if cl_bits > 0 {
-                        edge(1, length, length, 0);
+                relax!(
+                    j,
+                    next,
+                    length,
+                    old + bits + frequency * length as u64,
+                    link
+                );
+            }
+        }};
+    }
+    // Relax the zero runs (17, then 18) from `old` at position `i` and
+    // `remaining` capacity. They stay inside `zero_run[i]`, so they are legal,
+    // add no payload and use no capacity; crossing into the distance code
+    // needs a complete literal/length code.
+    macro_rules! relax_zero_runs {
+        ($i:expr, $remaining:expr, $old:expr, $link:expr, $short:expr, $long:expr) => {{
+            let (i, remaining, old, link) = ($i, $remaining, $old, $link);
+            for (first, count, bits, kind) in [
+                (3, $short, u64::from(cl[17]) + 3, 2),
+                (11, $long, u64::from(cl[18]) + 7, 3),
+            ] {
+                let score = old + bits;
+                for j in i + first..i + first + count {
+                    let next = if i < split && j >= split {
+                        if remaining != 0 {
+                            continue;
+                        }
+                        capacity
+                    } else {
+                        remaining
+                    };
+                    relax!(j, next, 0, score, link | kind);
+                }
+            }
+        }};
+    }
+    'search: for i in 0..n {
+        let short_zero_edges = if cl[17] > 0 {
+            zero_run[i].min(10).saturating_sub(2)
+        } else {
+            0
+        };
+        let long_zero_edges = if cl[18] > 0 {
+            zero_run[i].min(138).saturating_sub(10)
+        } else {
+            0
+        };
+        // Only an edge that reaches the end lowers the target, so if none can
+        // from here, the target holds while position `i` is searched.
+        let fixed_target = i + zero_run[i].clamp(6, 138) < n;
+        let group_edges = (previous_count
+            * (singles.len() + repeat_edges + short_zero_edges + long_zero_edges))
+            as u64;
+        // The budget and stop are checked at every 32nd capacity, reached or
+        // not, before its states.
+        for word in 0..live_words {
+            if work_left == 0 || stop.reached() {
+                break 'search;
+            }
+            let mut reached = live[i * live_words + word];
+            while reached != 0 {
+                let remaining = word * 32 + reached.trailing_zeros() as usize;
+                reached &= reached - 1;
+                let state_bound = payload_bound[i * bound_width + remaining];
+                // A single length or zero run from any previous length reaches the
+                // same states at the same added cost, and no other edge from this
+                // position and capacity reaches them except the 16 repeats of
+                // length 0, which come first. With a fixed target and every edge
+                // affordable, the first cheapest state's edges therefore set what
+                // all of them would, so the others' are charged but not relaxed.
+                let merge = fixed_target && group_edges <= work_left;
+                let mut cheapest = (INF, 0);
+                for previous in 0..previous_count {
+                    let from = i * stride + remaining * previous_count + previous;
+                    let old = cost[from];
+                    if old == INF
+                        || old + state_bound + header[i * previous_count + previous] >= target
+                    {
+                        continue;
+                    }
+                    // Every edge is charged, legal or not, in the order below; a
+                    // budget that runs out mid-state cuts the remaining edges.
+                    let repeats = if previous == none { 0 } else { repeat_edges };
+                    let edges = singles.len() + repeats + short_zero_edges + long_zero_edges;
+                    let mut allowance = (edges as u64).min(work_left);
+                    work_left -= allowance;
+                    let mut take = |count: usize| {
+                        let taken = (count as u64).min(allowance);
+                        allowance -= taken;
+                        taken as usize
+                    };
+                    // Position always advances, so a predecessor's trace is final
+                    // before it is read. There are fewer than 2^21 cells, so
+                    // `from << 2` fits in a u32.
+                    let link = (from as u32) << 2;
+
+                    let single_count = take(singles.len());
+                    if !merge {
+                        relax_singles!(i, remaining, old, link, single_count);
+                    }
+
+                    let repeats = take(repeats);
+                    if repeats > 0 {
+                        let units = if previous == 0 {
+                            0
+                        } else {
+                            1 << (depth - previous)
+                        };
+                        let bits = u64::from(cl[16]) + 2;
+                        for count in 3..3 + repeats {
+                            let j = i + count;
+                            if !legal(i, count, previous) {
+                                continue;
+                            }
+                            let next = if i < split && j >= split {
+                                if remaining != (split - i) * units
+                                    || (j - split) * units > capacity
+                                {
+                                    continue;
+                                }
+                                capacity - (j - split) * units
+                            } else {
+                                if count * units > remaining {
+                                    continue;
+                                }
+                                remaining - count * units
+                            };
+                            let score = old + bits + (sums[j] - sums[i]) * previous as u64;
+                            relax!(j, next, previous, score, link | 1);
+                        }
+                    }
+
+                    if merge {
+                        if old < cheapest.0 {
+                            cheapest = (old, link);
+                        }
+                    } else {
+                        let short = take(short_zero_edges);
+                        let long = take(long_zero_edges);
+                        relax_zero_runs!(i, remaining, old, link, short, long);
                     }
                 }
-                if previous != none && cl[16] > 0 {
-                    for count in 3..=6 {
-                        edge(count, previous, 16, 1);
-                    }
-                }
-                if cl[17] > 0 {
-                    for count in 3..=zero_run[i].min(10) {
-                        edge(count, 0, 17, 2);
-                    }
-                }
-                if cl[18] > 0 {
-                    for count in 11..=zero_run[i].min(138) {
-                        edge(count, 0, 18, 3);
-                    }
+                if merge && cheapest.0 != INF {
+                    let (old, link) = cheapest;
+                    relax_singles!(i, remaining, old, link, singles.len());
+                    relax_zero_runs!(i, remaining, old, link, short_zero_edges, long_zero_edges);
                 }
             }
         }
     }
+    budget.work_left = work_left;
     let mut at = winner?;
     let bits = cost[at];
     let mut rle = Vec::new();

@@ -89,6 +89,7 @@ gains where established.
 | 3 Nov 2026 | [`a540aac`](#a540aac-3-november-2026) | Validated parses and the bit reader (`optimize.rs`, `model.rs`, `bitstream.rs`) | Each thread keeps its last validated parse, which a reparse of the same bytes and limit shares; the endpoint-proven lineage takes its candidate's validating parse; the bit reader derives its position from its byte position | Default CPU 1.015× (33 inputs, 1.69% fewer instructions, 1.32% fewer cycles); Partnership card 1.03×; peak memory +0.2 MiB median, +2.7 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 673 Rust, 7 Python tests |
 | 3 Nov 2026 | [`4ebfefd`](#4ebfefd-3-november-2026) | Exact Defluff trees and swap-trial costs (`huffman.rs`, `header.rs`, `header/swap_costs.rs`) | Package-merge's fallback built only when it fails; one unconstrained Defluff tree per alphabet for every depth limit; the limited Columbo tree from an unrepaired variant-0 build; swap-trial costs in up to 2^19 slots | Completing Max runs of three small PNGs 6.6%, 3.4% and 4.6% fewer instructions; 177 completing sprites 2.3% fewer; 14,440 replayed large-block searches 3.1% fewer; Default 0.82% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 14,440 replayed large-block searches; 58 Max runs at 10 seconds; 66 Default timing runs; 16,000 tree-builder comparisons; 674 Rust, 7 Python tests |
 | 3 Nov 2026 | [`851e373`](#851e373-3-november-2026) | Payload decoding, symbol counts, match expansion and the short-family floor (`parse.rs`, `huffman.rs`, `bitstream.rs`, `model.rs`, `search.rs`) | The parser's payload loop decodes through an inlined table path; symbol counts alternate two tables with wrapping additions; expansions copy unchanged token runs whole; the short-family floor prices its bands from one walk's count changes and spells only a winner; expansion walks price bytes from a 256-entry table with a cheapest-byte bound | Default CPU 1.069× (33 inputs, 7.84% fewer instructions, 6.27% fewer cycles); completing Max runs 0.4% and 4.2% fewer instructions; peak memory median unchanged, `Banana512.png` +22.1 MiB of cached freed blocks | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 33 Default inputs with debug assertions; 66 Default timing runs; 2 completing Max runs; 4,000 symbol-count comparisons; 675 Rust, 7 Python tests |
+| 3 Nov 2026 | [`58ccf01`](#58ccf01-3-november-2026) | APNG header fit: joint tree and RLE search and symbol-set spellings (`joint.rs`, `symbol_set.rs`) | R4 charges each state's edges at once and relaxes each edge family in its own loop; explicit lengths and zero runs relaxed once per position and capacity from the first cheapest state; reached capacities kept in a bitset; R5 keeps each match's restricted spelling by the banned symbols the solver reads | APNG Default CPU 1.48× and wall time 1.50× (62 inputs, 39.85% fewer instructions, 29.78% fewer cycles); 33 Default inputs 2.72% fewer instructions; completing Max runs 2.3% and 1.4% fewer; APNG peak memory median −6.9 MiB | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 4,168 replayed R4 searches per step; 2,000 R4 comparisons; 677 Rust, 7 Python tests |
 
 ## Entries
 
@@ -485,6 +486,120 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `58ccf01`, 3 November 2026
+
+Batches: retired instructions, cycles, CPU (user plus system), wall time and
+peak memory from `time -l` over 62 APNG inputs, two alternating rounds at the
+default 180-second timeout and two at the 4,000-second maximum, where no frame
+allowance binds; the 33 stratified Default inputs over two alternating rounds;
+two alternating runs of each completing Max run; and one run of a replay of
+4,168 captured R4 searches per step. The APNG inputs are 32 Steam stickers (24
+at evenly spaced quantiles of Default time over the 2,431-sticker corpus, the 5
+large stickers of earlier reviews and the 3 slowest) and all 30 files in
+`apng-small`, `apng-medium`, `apng-large` and `steam-shop_apng`. Runs under a
+competing load were discarded: small frames then reach their allowances, even
+at 4,000 seconds, and are retried, which changes instruction counts too.
+
+A sampled profile of the 62 APNG inputs at `58ccf01` (179,438 CPU samples) put
+57.7% under the header fit that `ApngDefault` runs after the tree floors
+(R2–R5), 41.6% in R4's joint tree and RLE search, and 35.4% in that search's
+out-of-line edge closure. An instrumented build logged 4,169 searches charging
+32.5 billion work units: none exhausted its budget, repeated searches were 0.3%
+of the work, and each live state charged about 90 units, most of them for code
+18 zero runs of 11–138 positions.
+
+- **Specialized R4 edges.** Each live state's edges are charged at once,
+  capped by what is left of the budget, so a budget that runs out still cuts
+  the same edge. Explicit lengths and codes 16, 17 and 18 are relaxed in their
+  own loops, where legality and the capacity arithmetic reduce to a few
+  comparisons, instead of through one out-of-line closure per edge, and the
+  literal/length and distance payload bounds share one table.
+- **Merged R4 relaxations.** An explicit length or zero run adds the same cost
+  from every previous length at a position and capacity, and among that
+  position and capacity's edges only the code 16 repeats of length 0, which
+  come first, reach the same states. While no edge from the position can reach
+  the end, so the target holds, and the budget covers every state's edges, the
+  search relaxes them once, from the first cheapest state, and still charges
+  every state's edges.
+- **Reached capacities.** A bitset per position marks the capacities some edge
+  has reached, and the search skips the others; the budget and stop are still
+  checked at every 32nd capacity. The payload bounds add with wrapping
+  arithmetic, which cannot wrap there, so their loop vectorizes.
+- **Kept R5 spellings.** The proven-submatch solver reads only the banned
+  length symbols up to a match's own, so R5 keeps each match's spelling under
+  the parent's code lengths by that set, and the other bans holding the symbol
+  and the crossed bans reuse it. Each rewrite charges its budget as before.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 62 APNG inputs, instructions retired over two rounds | 6,222.9 billion | 3,742.8 billion | −39.85% |
+| Same inputs, cycles over two rounds | 1,591.2 billion | 1,117.3 billion | −29.78% |
+| Same inputs, CPU over two rounds | 727.1 s | 492.7 s | 1.48× |
+| Same inputs, wall time over two rounds | 128.5 s | 85.7 s | 1.50× |
+| Same at 4,000 seconds, instructions retired | 6,197.9 billion | 3,742.4 billion | −39.62% |
+| Same at 4,000 seconds, cycles | 1,582.6 billion | 1,112.6 billion | −29.70% |
+| `4162040_4062578…` (APNG), Default CPU | 37.27 s | 9.68 s | 3.85× |
+| `794800_141419…` (APNG), Default CPU | 54.41 s | 32.62 s | 1.67× |
+| 33 Default inputs, instructions retired over two rounds | 1,015.6 billion | 987.9 billion | −2.72% |
+| Same inputs, cycles over two rounds | 247.5 billion | 242.8 billion | −1.89% |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 18.30 billion | 17.87 billion | −2.3% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.24 billion | 2.21 billion | −1.4% |
+| 4,168 replayed R4 searches, instructions retired | 1,628.1 billion | 285.7 billion | −82.5% |
+| Same searches, cycles | 240.0 billion | 49.9 billion | 4.81× |
+
+In the replay, each step against the step before, the specialized edges took
+54.9% of the instructions (47.5% of the cycles), merged zero runs 30.5%
+(27.0%), merged explicit lengths 31.2% (32.6%), and the bitset with the
+vectorized bounds 18.5% (19.4%). Over the APNG inputs at 4,000 seconds the R4
+changes took 37.49% of the instructions and the kept R5 spellings 3.40% more.
+The gain follows R4's share of a file: `4162040_4062578…` ran 3.85× faster,
+while `1328670_115967…` and `976310_99309…` barely changed.
+
+Median APNG peak memory fell 6.9 MiB at 180 seconds and 7.5 MiB at 4,000
+seconds; each R4 search holds up to 24 MiB of tables, now for less time. The
+largest rise was 38.9 MiB in one run of
+`Biker.png`, which fell by 45 MiB in another; at 4,000 seconds the largest rise
+was 10.8 MiB.
+
+Equivalence: a new test compares R4 with the previous per-edge search on 2,000
+random problems, including budgets that run out mid-search, targets at and
+above the optimum and callback stops, matching solutions, budget left and stop
+checks; the replayed searches matched at every step. Another new test compares
+R5 rewrites with and without kept spellings, budgets included, for every ban
+and crossed ban of 12 generated blocks. A release build with debug assertions
+agreed with the final build on 61 APNG inputs at 4,000 seconds and with a
+debug-assertion baseline on the last. Every 4,000-second APNG run matched byte
+for byte. At 180 seconds 123 of 124 did: `animation_icos4d.ref.png` gives its
+smallest frame about 9 ms, and the baseline's second run, 0.54 billion
+instructions short of its first, wrote another file. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every Default and completing Max run matched byte for
+byte. Rust tests, including the private corpus, passed in release and debug
+modes, with documentation and Python tests, a locked build, formatting and
+all-feature Clippy with warnings denied. `__text` grew from 890,256 to 896,188
+bytes; the shipped executable grew from 974,944 to 974,960 bytes, and the final
+source builds the tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- One queue of Default APNG jobs, largest first, in place of contiguous lanes:
+  with the faster R4, lanes already kept 6.0 of 8 busy on average and the queue
+  6.3, for 1.8% less wall time at 4,000 seconds, but running the largest frames
+  at once raised peak memory by up to about 150 MiB (`794800_141419…` from
+  about 260 to 410 MiB).
+
+Not changed in the same review:
+
+- The header planner shared with all Default work is now half of APNG Default
+  samples (51% under `best_dynamic_plan_cached`); each frame's initial planner
+  is 50%.
+- R4's code 16 repeats depend on the previous length, so they stay per state
+  (1.35 billion edges over the inputs).
+- R5's proposals run the full planner (9% of samples), and the header
+  estimates of R5, R13 and R15 build two trees each (6%).
+
+Artifacts: `work/efficiency-review-apng-20261103/`.
 
 ### `851e373`, 3 November 2026
 

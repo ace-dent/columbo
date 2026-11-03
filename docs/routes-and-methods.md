@@ -2921,6 +2921,14 @@ units, below 2^27.
   and budget checked every 32 capacity rows; scratch below 24 MiB per solver at
   depth 9 (the largest table has 1,800,117 cells at 318 entries); ≤1 full header
   re-price per successful block, not charged.
+- **Work:** only a code 16 edge depends on the previous length. An explicit
+  length or zero run costs the same from every previous length at a position
+  and capacity, and among that position and capacity's edges only the code 16
+  repeats of length 0, which come first, reach the same states. So while no
+  edge from the position can reach the end (the target holds) and the budget
+  covers every state's edges, the search relaxes them once, from the first
+  cheapest state, and still charges each state's edges. It skips capacities no
+  edge has reached. Results and charges are those of trying every edge.
 - **After a win:** none.
 
 Validation: [joint tree and RLE](research/joint-tree-rle-validation.md).
@@ -4135,7 +4143,10 @@ match.
    as literals and proven submatches that use no banned length symbol, with the
    [proven-submatch solver](#proven-submatch-resegmentation-and-feedback-d1-d2).
    A ban is skipped if it affects more than 64 matches or 8,192 bytes, or if
-   some match has no legal spelling.
+   some match has no legal spelling. The solver reads only the banned length
+   symbols up to the match's own, so each match is spelled once per such set
+   under the parent's code lengths, and the other bans holding it and the
+   crossed bans of step 4 reuse that spelling.
 4. **Shortlist.** Score each rewrite with the header-aware estimate (DeflOpt
    heap variant-0 trees and a greedy header, or the fixed codes). Bans that
    touch at most 2 used symbols become seeds, the best 8 per alphabet. Bans that
@@ -4198,7 +4209,7 @@ streams and 12.3% on containers.
   bytes; at most 8 proposals, with one feedback attempt each. Per invocation,
   2^25 rewrite work units and 128 spelling prices; a rewrite charges twice the
   block's tokens plus the affected bytes plus `(L−1)(L−2)/2` for each re-spelled
-  match of length `L`.
+  match of length `L`, even when step 3 reuses its spelling.
 - **After a win:** the sweep continues with the next method.
 
 Validation: [symbol set removal](research/symbol-set-validation.md). Provenance:

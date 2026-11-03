@@ -14,8 +14,8 @@ use super::header::{
     plan_rle_smoothed_tree_candidate,
 };
 use super::model::{
-    count_frequencies, same_tokens, token_extra_bits, ParsedBlock, PlannedBlock, Representation,
-    Token,
+    count_frequencies, same_tokens, token_extra_bits, try_clone_slice, ParsedBlock, PlannedBlock,
+    Representation, Token,
 };
 use super::search::{solve_proven_submatch_avoiding, try_transformed_block};
 use super::stop::SearchStop;
@@ -131,11 +131,56 @@ fn masks(block: &ParsedBlock) -> Option<Vec<Ban>> {
     Some(singles)
 }
 
+/// Restricted spellings of a block's matches under the parent's code lengths,
+/// by token index and the banned length symbols up to the match's own. The
+/// submatch solver never uses a longer symbol, so bans that agree on these
+/// spell the match alike: the bans holding a symbol first, and the cross bans,
+/// repeat their single and group bans' spellings.
+struct SubmatchSpellings {
+    by_token: Vec<Vec<(u32, Option<Vec<Token>>)>>,
+}
+
+impl SubmatchSpellings {
+    fn new(block: &ParsedBlock) -> Option<Self> {
+        let mut by_token = Vec::new();
+        by_token.try_reserve_exact(block.tokens.len()).ok()?;
+        by_token.resize_with(block.tokens.len(), Vec::new);
+        Some(Self { by_token })
+    }
+
+    /// The spelling of the match at `index` with the `relevant` symbols
+    /// banned, from `solve` the first time.
+    fn spell(
+        &mut self,
+        index: usize,
+        relevant: u32,
+        stop: &mut SearchStop<'_>,
+        solve: impl FnOnce(&mut SearchStop<'_>) -> Option<Vec<Token>>,
+    ) -> Option<Vec<Token>> {
+        let known = self.by_token.get_mut(index)?;
+        if let Some((_, spelled)) = known.iter().find(|(mask, _)| *mask == relevant) {
+            return try_clone_slice(spelled.as_ref()?);
+        }
+        let spelled = solve(stop);
+        // A stopped search proves nothing about the spelling.
+        if spelled.is_some() || !stop.reached() {
+            let kept = match &spelled {
+                Some(tokens) => Some(try_clone_slice(tokens)?),
+                None => None,
+            };
+            known.try_reserve(1).ok()?;
+            known.push((relevant, kept));
+        }
+        spelled
+    }
+}
+
 fn rewrite(
     block: &ParsedBlock,
     ban: Ban,
     literal_lengths: &[u8],
     distance_lengths: &[u8],
+    mut spellings: Option<&mut SubmatchSpellings>,
     budget: &mut SymbolSetBudget,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<Token>> {
@@ -187,14 +232,24 @@ fn rewrite(
             Token::Match { length_symbol, .. }
                 if ban.lengths & (1 << (length_symbol - 257)) != 0 =>
             {
-                result.extend(solve_proven_submatch_avoiding(
-                    token,
-                    decoded,
-                    literal_lengths,
-                    distance_lengths,
-                    ban.lengths,
-                    stop,
-                )?);
+                let solve = |stop: &mut SearchStop<'_>| {
+                    solve_proven_submatch_avoiding(
+                        token,
+                        decoded,
+                        literal_lengths,
+                        distance_lengths,
+                        ban.lengths,
+                        stop,
+                    )
+                };
+                let spelled = match spellings.as_deref_mut() {
+                    Some(spellings) => {
+                        let relevant = ban.lengths & ((2 << (length_symbol - 257)) - 1);
+                        spellings.spell(i, relevant, stop, solve)
+                    }
+                    None => solve(stop),
+                };
+                result.extend(spelled?);
             }
             _ => result.push(token),
         }
@@ -327,6 +382,7 @@ pub(crate) fn plan_symbol_sets(
     for list in &mut seeds {
         list.try_reserve_exact(MAX_CROSS_SEEDS).ok()?;
     }
+    let mut spellings = SubmatchSpellings::new(block)?;
     for ban in masks(block)? {
         if stop.reached() {
             break;
@@ -336,6 +392,7 @@ pub(crate) fn plan_symbol_sets(
             ban,
             &parent.literal_lengths,
             &parent.distance_lengths,
+            Some(&mut spellings),
             budget,
             stop,
         ) else {
@@ -369,6 +426,7 @@ pub(crate) fn plan_symbol_sets(
                 ban,
                 &parent.literal_lengths,
                 &parent.distance_lengths,
+                Some(&mut spellings),
                 budget,
                 stop,
             ) else {
@@ -410,6 +468,7 @@ pub(crate) fn plan_symbol_sets(
                 proposal.ban,
                 literal_lengths,
                 distance_lengths,
+                None,
                 budget,
                 stop,
             ) {
