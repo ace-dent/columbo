@@ -652,6 +652,24 @@ impl Candidate {
         true
     }
 
+    /// Like [`Self::replace_keeping_parent`], but with `keep` (Max) a losing
+    /// contender is kept as well, after its own parents: it lost to an
+    /// incumbent that other routes reached in their own time, and a shorter
+    /// run, which compares it with the incumbent those routes had reached by
+    /// then, can let it win.
+    fn replace_keeping_both(&mut self, mut contender: Self, keep: bool) -> bool {
+        if !keep || contender.is_strictly_smaller_than(self) {
+            return self.replace_keeping_parent(contender, keep);
+        }
+        let mut kept = std::mem::take(&mut contender.replaced_parents);
+        contender.plans = Vec::new();
+        contender.block_report = None;
+        kept.push(contender);
+        kept.append(&mut self.replaced_parents);
+        self.replaced_parents = kept;
+        false
+    }
+
     /// Whether another candidate proved this exact encoding to be a Max
     /// planner fixed point.
     fn is_encoding_stabilized_by(&self, contender: &Self) -> bool {

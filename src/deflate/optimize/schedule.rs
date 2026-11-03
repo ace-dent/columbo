@@ -1820,22 +1820,27 @@ fn merge_source_max(
         deferred_split_parent = Some(parent);
     }
 
+    // The incumbent comes from routes that ran in their own time: a deadline
+    // that stopped them sooner could have let source max win, and no closed
+    // size shows which candidate finishes smallest, so Max keeps whichever
+    // loses for its finishing steps (M14).
     let max_candidate = close_source_max_topology(context, eligibility, candidate, max_candidate)?;
     let mut stabilized = candidate.is_encoding_stabilized_by(&max_candidate);
-    candidate.replace_keeping_parent(max_candidate, options.exhaustive);
+    candidate.replace_keeping_both(max_candidate, options.exhaustive);
 
     // A deadline can stop source max after any replay and hand over that
     // parent, and a better parent can finish worse. Closing each parent the
     // replays replaced keeps a longer search from ending above a shorter one,
     // and a deadline before a close would have handed over the incumbent a
-    // winning parent replaces, so Max keeps that incumbent. A winning parent
-    // is a new encoding, which no Max fixed point covers.
+    // winning parent replaces, so Max keeps that incumbent. A losing parent
+    // is kept too, for the same reason as a losing result above. A winning
+    // parent is a new encoding, which no Max fixed point covers.
     for parent in replaced_parents {
         if !deadline.can_start_route() {
             break;
         }
         let parent = close_source_max_topology(context, eligibility, candidate, parent)?;
-        if candidate.replace_keeping_parent(parent, options.exhaustive) {
+        if candidate.replace_keeping_both(parent, options.exhaustive) {
             stabilized = false;
         }
     }

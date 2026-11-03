@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 31 October 2026 entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 3 November 2026 entry, the 31 October entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,82 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="kept-source-max-losers-3-november"></a>
+
+## Kept source-max losers on 3 November 2026
+
+### Starting state
+
+At `a38abf7`, the
+[2 November efficiency review](research/efficiency-review.md#3860542-2-november-2026)
+found `sample_20.png` 3 bytes larger at 10 seconds, 9,695 bytes against
+9,692. The earlier build also gives 9,695 bytes at 11, 12, 14 and 30 seconds,
+and both end at 9,700 when the search completes, in about 100 seconds: a
+complete Max run 8 bytes above a 10-second one.
+
+### Cause
+
+Verbose reports and a traced build at 3 to 300 seconds give three endpoints:
+
+- **3 to 10 seconds.** The route's soft deadline cuts source max's first
+  replay during its search of the first block, and the route hands over its
+  best state so far, 77,331 bits. The floor-seeded refinement (M7) is at
+  77,344 bits, so source max wins, and the finish ends at 77,031 bits (9,692
+  bytes). Every allowance from 3 to 10 seconds gives the same state.
+- **11 to 30 seconds.** The cut comes later in the same search, at 77,328
+  bits, which finishes at 77,049 (9,695 bytes).
+- **Complete.** Source max replays four times, 77,345 → 77,305 → 77,295 →
+  77,294 bits, while the floor-seeded refinement reaches 77,256 bits and
+  finishes at 77,091 (9,700 bytes). M12 closed source max's result and each
+  replay parent, all closed above 77,256, and dropped them.
+
+The 77,331-bit state lies inside one replay's search, like the
+`crossroads.png` and `g8t.png` states of
+[25 October](#replaced-candidates-25-october): no complete run emits it, so no
+kept candidate can reach 77,031 bits. The dropped candidates are another
+matter. Finished, they end at 77,062 bits (the first replay's parent, 77,345),
+77,110 (77,305 and 77,295) and 77,109 (the route's result): the first ends
+below the incumbent's endpoint. M12 chose them by closed size against the
+final incumbent, the last place where a closed size decided which complete
+candidates are finished. That incumbent comes from routes that ran in their
+own time, and a shorter run compares source max with the incumbent those
+routes had reached by then.
+
+### Accepted change
+
+M12 keeps its route candidate, and each replay parent, that loses to the
+incumbent, after their own kept lists, for M14's full finish
+([M12](routes-and-methods.md#m12-later-source-max),
+[M14 Eligible](routes-and-methods.md#m14-replaced-candidate-close)). A loser
+at any other comparison is still not kept, and Default keeps nothing.
+
+| Check, against `a38abf7`, alternating builds | Result |
+| --- | --- |
+| `sample_20.png`, Max completing its search | 9,700 → 9,696 bytes |
+| Every twelfth early-finishing row (92) | 3 smaller by 1 to 3 bits, none larger; wall time +0.8%, CPU +0.9% |
+| Every twentieth deadline-bound row (75: PNG, ZIP, GZIP) | 9 smaller, 2 larger; net −34 bytes / −249 bits; wall time +0.8%, CPU +0.3%. In two more runs of the 14 changed rows, `f03n0g08.png` −3 bytes and `globe.png`, `target.png`, `bad-paletted.png`, `compose.png` and `sample_12.png` −1 byte in three of three, and five rows 1 to 3 bits smaller in three of three. `dance.png` gives −28, +1 and +19 bytes, and `test-conversion-rgb-canalalpha.png` 64,905–64,909 bytes against 64,909 |
+| Hundred-file guard | 99 of 100; Psyduck stays at 1,564 bits |
+| `monarch.PNG` at 16 seconds, twice each | 840,882 bytes on both builds |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Identical bytes; 2.2% and 6.6% more instructions |
+| API comparisons, 52 inputs, Default at the 180-second budget and zero-budget Max | 104 identical |
+
+The cost is the finishes of the kept losers, in the time a run has left.
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with the Python tests, formatting and all-feature Clippy with warnings denied.
+A new test checks that a loser is kept after its own kept list and a winner
+as before.
+
+### Not changed
+
+- `sample_20.png` up to 10 seconds stays 4 bytes below its complete run: a
+  state inside one replay, now an accepted trade-off.
+- Keeping intermediate states inside a replay's search: each would need the
+  other blocks planned to make a complete candidate, and every improvement a
+  full finish.
+
+Artifacts: `work/sample20-20261103/`.
 
 <a id="kept-refinements-31-october"></a>
 
@@ -1795,6 +1871,10 @@ Current:
   Squirtle and Pikachu now reach their guard floors through finished kept
   candidates ([29 October](#kept-candidates-29-october),
   [31 October](#kept-refinements-31-october)); Psyduck stays 1 bit above.
+- **Replay-internal state.** At 3 to 10 seconds source max's first replay
+  on `sample_20.png` is cut inside its search at a state that finishes at
+  9,692 bytes; a complete run passes that state without emitting it and ends
+  at 9,696 ([3 November](#kept-source-max-losers-3-november)).
 - **Split parent.** From `9f36bdb` on, M10c's split of the floor-seeded parent
   of `sample_35-fs8.png` is 3 bits smaller, and its finish ends 28 bits larger,
   3 bytes in all. The earlier split is no longer built, so no kept candidate

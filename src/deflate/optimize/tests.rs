@@ -4481,6 +4481,55 @@ fn terminal_parse_cache_reuses_only_identical_validated_bytes() {
 }
 
 #[test]
+fn source_max_comparisons_keep_a_losing_contender_after_its_parents() {
+    let candidate = |bytes: usize, bits: u64, route: &'static str| Candidate {
+        data: vec![0; bytes],
+        bits,
+        output_max_distance: None,
+        plans: Vec::new(),
+        block_report: None,
+        route,
+        max_planner_is_stable: false,
+        replaced_parents: Vec::new(),
+    };
+
+    // Default keeps nothing, win or lose.
+    let mut incumbent = candidate(10, 80, "incumbent");
+    assert!(!incumbent.replace_keeping_both(candidate(11, 88, "larger"), false));
+    assert!(incumbent.replaced_parents.is_empty());
+
+    // A loser is kept after its own parents, both at the oldest end, without
+    // its plans.
+    let mut incumbent = candidate(10, 80, "incumbent");
+    incumbent.replaced_parents.push(candidate(12, 96, "older"));
+    let mut loser = candidate(11, 88, "loser");
+    loser
+        .replaced_parents
+        .push(candidate(13, 104, "loser's parent"));
+    assert!(!incumbent.replace_keeping_both(loser, true));
+    assert_eq!(incumbent.route, "incumbent");
+    let routes: Vec<_> = incumbent
+        .replaced_parents
+        .iter()
+        .map(|parent| parent.route)
+        .collect();
+    assert_eq!(routes, ["loser's parent", "loser", "older"]);
+    assert!(incumbent
+        .replaced_parents
+        .iter()
+        .all(|parent| parent.plans.is_empty()));
+
+    // A winner replaces the incumbent and keeps it, as with
+    // `replace_keeping_parent`.
+    assert!(incumbent.replace_keeping_both(candidate(9, 72, "winner"), true));
+    assert_eq!(incumbent.route, "winner");
+    assert_eq!(
+        incumbent.replaced_parents.last().map(|parent| parent.route),
+        Some("incumbent")
+    );
+}
+
+#[test]
 fn max_replacements_keep_the_replaced_candidate_and_both_histories() {
     let candidate = |bytes: usize, bits: u64, route: &'static str| Candidate {
         data: vec![0; bytes],

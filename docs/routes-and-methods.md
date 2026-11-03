@@ -1394,7 +1394,9 @@ and its route-gated terminal methods replace. At the end it finishes
 those its lineage steps and routes replaced like the incumbent, and closes those
 its terminal methods replaced with the tree floors
 ([M14: replaced-candidate close](#m14-replaced-candidate-close)). Later source
-max (M12) does the same for its replay parents
+max (M12) does the same for its replay parents, and keeps them and its own
+result even when they lose, since the incumbent they lose to came from routes
+that ran in their own time
 ([M12: later source max](#m12-later-source-max)). Every replacement that a
 deadline could have stopped keeps what it replaces. Only `Complete`'s Default
 endpoint keeps nothing: it is compared whatever the deadline, so no shorter run
@@ -8513,7 +8515,8 @@ The topology merges, M12 and the late M2 route first close a candidate that
 would lose with the terminal tree floors, since a different topology may win
 only after them; a winner gets the same work at the end of Max. M11's and M13's
 losing candidates are dropped without that close. M12 also closes the complete
-parents its replays replaced ([M12](#m12-later-source-max)).
+parents its replays replaced, and keeps its candidate and any parent that
+loses for M14 ([M12](#m12-later-source-max)).
 
 M12's "Completed" edge takes the candidate that an earlier phase's source-max
 worker already built. "Suppressed" means an earlier phase claimed source max
@@ -9586,17 +9589,22 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
      parent.
   2. Closes the route's final candidate: M4 with compact proven feedback when
      M4's source gate holds, then the terminal tree floors under the primary
-     deadline if the candidate would lose. Compares it with the incumbent, keeps
-     a replaced incumbent for M14, and notes whether source max reproduced the
-     incumbent's exact bytes and bits at a Max fixed point.
+     deadline if the candidate would lose. Compares it with the incumbent and
+     keeps whichever loses for M14, and notes whether source max reproduced
+     the incumbent's exact bytes and bits at a Max fixed point.
   3. Closes each replay parent the same way while G0 allows. A strictly smaller
      parent replaces the incumbent, which is kept for M14, and clears that
-     fixed-point note.
+     fixed-point note; a parent that loses is kept for M14 itself.
 - **Why:** it runs before a rewritten seed can spend the remaining time on one
   large merged block (code comment). A deadline can stop source max after any
   replay and hand over that parent, and a better parent can finish worse, so
   closing every parent keeps a longer search from ending above a shorter one
   ([source-max replaced parents](benchmark-miss-regression-audit.md#source-max-replaced-parents-24-october)).
+  The incumbent comes from routes that ran in their own time, and a shorter
+  run compares source max with the incumbent they had reached by then, so a
+  candidate that loses here can win there; no closed size shows which one
+  finishes smallest, so whichever loses is kept for M14's full finish
+  ([3 November](benchmark-miss-regression-audit.md#kept-source-max-losers-3-november)).
 - **See:** [Source max route](#source-max-route).
 
 #### M13: rewritten-seed refinement
@@ -9631,8 +9639,9 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   floor-seeded and deft4j topologies, M11, M12's route candidate and replay
   parents, M13, M2 late, the final M4 and M10d; and, inside the finish, R1 and
   R1b–R11. A losing contender's own kept list joins the incumbent's at the
-  oldest end, but the loser itself is not kept. M12 closes its own replay
-  parents.
+  oldest end, but the loser itself is not kept, except at M12: its route
+  candidate and each replay parent that loses to the incumbent are kept after
+  their own lists. M12 closes its own replay parents.
 - **What is lost:** M14 finishes only what is still on the final incumbent's
   list when the terminal stage starts. `Complete`'s Default endpoint keeps
   nothing and discards the list it overwrites: it is compared whatever the
@@ -9684,6 +9693,11 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
     incumbent after the floors, finishes 21 bits smaller, and with the closes
     of what its finish replaced ends 54 bits smaller
     ([31 October](benchmark-miss-regression-audit.md#kept-refinements-31-october)).
+  - M12's losers are kept because other routes set the incumbent in their own
+    time. On `sample_20.png` the floor-seeded refinement ends at 77,256 bits
+    and finishes at 77,091; source max ends at 77,294 and its first replay's
+    parent at 77,345, both closing above it, yet that parent finishes at
+    77,062 ([3 November](benchmark-miss-regression-audit.md#kept-source-max-losers-3-november)).
   - A losing contender's kept candidates are finished last: each is larger
     than a contender that lost, so it is the least likely start of a shorter
     run's finish. Under the earlier rule, which put them at the newest end,
