@@ -1952,7 +1952,7 @@ fn thread_header_plans_match_uncached_planning() {
     }
     release_thread_header_plans();
     assert!(HEADER_PLAN_STORE.with(|store| store.borrow().current.offsets.is_empty()));
-    assert!(HEADER_PLAN_SEARCH.with(Cell::take).is_none());
+    assert!(HEADER_PLAN_SEARCH.with(|search| search.borrow().is_none()));
 }
 
 #[test]
@@ -2040,6 +2040,39 @@ fn swap_searches_with_kept_trial_costs_match_cold_searches() {
     }
     release_thread_header_plans();
     assert_eq!(swap_costs::test_support::kept_swap_trial_count(), 0);
+}
+
+#[test]
+fn code_length_tree_entries_keep_their_size() {
+    assert_eq!(std::mem::size_of::<CodeLengthTreeEntry>(), 472);
+}
+
+#[test]
+fn word_run_finding_matches_a_scan() {
+    let mut state = 0x243f_6a88_85a3_08d3_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    // A stale buffer, as the planner's is.
+    let mut runs = vec![(9, 9)];
+    for _ in 0..20_000 {
+        let count = (next() % 320) as usize;
+        // Few values give long runs, sixteen give short ones.
+        let values = [1, 2, 6, 16][(next() % 4) as usize];
+        let lengths: Vec<u8> = (0..count).map(|_| (next() % values) as u8).collect();
+        let mut expected: Vec<LengthRun> = Vec::new();
+        for &length in &lengths {
+            match expected.last_mut() {
+                Some((value, run)) if *value == length => *run += 1,
+                _ => expected.push((length, 1)),
+            }
+        }
+        length_runs_into(&lengths, &mut runs);
+        assert_eq!(runs, expected, "{lengths:?}");
+    }
 }
 
 /// The plans in this thread's header-plan store.

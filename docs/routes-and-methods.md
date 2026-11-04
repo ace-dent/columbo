@@ -7306,7 +7306,10 @@ per-thread store with the same key and verification.
 
 - Each generation appends its entries to one byte arena, found through an
   index of offsets by fingerprint, so storing a plan allocates nothing of its
-  own. An entry is 22 bytes of fields (HLIT, HDIST, HCLEN, the policy, the 19
+  own. The fingerprint, already a mixed 64-bit hash, is the index's hash: the
+  standard library's SipHash, keyed per process, took 1.3% of completing Max
+  runs hashing it again
+  ([efficiency review `9a3f174`](research/efficiency-review.md#9a3f174-4-november-2026)). An entry is 22 bytes of fields (HLIT, HDIST, HCLEN, the policy, the 19
   code-length code lengths two per byte, the bits and the token count) and one
   byte per RLE token: lengths 0–15 as themselves, then code 16 from 16, code 17
   from 20 and code 18 from 28, each plus its extra value.
@@ -7314,6 +7317,10 @@ per-thread store with the same key and verification.
   and compares the lengths it spells, HLIT, HDIST and the policy with the
   lookup's. A plan is stored only when the planner kept the code lengths it was
   given.
+- A miss plans without checking the payload trees' shapes again where they are
+  known to be valid: the route-local cache's one caller checks them before its
+  lookup, and a swap trial only exchanges two lengths of one alphabet, which
+  keeps its start's valid shapes.
 - The store holds two generations within 16 MiB: each arena's used bytes, which
   grow in steps bounded by half the budget, and each index's slots. A thread
   that plans a block exhaustively, which only Max does, raises its budget to
@@ -7427,9 +7434,18 @@ comes from a builder that is a pure function of the RLE histogram, the 19 counts
 of code-length symbols in a header's RLE. Header plans for different code
 lengths often share a histogram, and repeats come close together.
 
-- Each thread keeps 4,096 direct-mapped entries, about 1.3 MiB, allocated on
-  first use. An entry holds one histogram and up to 14 builders' trees, with a
-  bit per tree for "built" and one for "unrepaired Huffman tree".
+- Each thread keeps 4,096 direct-mapped entries of 472 bytes, about 1.8 MiB,
+  allocated on first use. An entry holds one histogram, up to 14 builders'
+  trees and a bit per tree for "built". With each tree it keeps what a header
+  search asks of it, each fixed by the tree and the histogram: whether it is an
+  unrepaired Huffman tree, whether its shape is valid, whether its lengths
+  already follow the histogram's counts (so DeflOpt's reordering leaves them
+  unchanged), its HCLEN and the RLE's cost under it. A feedback pass, the
+  DeflOpt local rewrite and deft4j's pruned header price a cached tree from
+  these, without working any of them out again: this took 8.8% of the
+  instructions off replayed greedy length-swap searches and 2.6% off replayed
+  large-block searches
+  ([efficiency review `9a3f174`](research/efficiency-review.md#9a3f174-4-november-2026)).
 - The slot comes from a four-lane multiply hash, found once per feedback pass
   for every builder it asks for. A hit compares the whole histogram by combining
   the differences, which vectorizes, instead of calling the C library's
@@ -7459,10 +7475,10 @@ lengths often share a histogram, and repeats come close together.
   was built 99,000 times instead of 279,000. The payload tree lists track only
   variant 0, since on payload alphabets tracking the others cost more than it
   saved.
-- Storing each histogram once with all its trees holds more trees in less memory
-  than one slot per builder and histogram: in a completing Max run, 4,096
-  entries built 10% fewer trees than 16,384 per-builder slots (1.7 MiB), and
-  twice the entries only 5% fewer again.
+- Storing each histogram once with all its trees holds more trees than one slot
+  per builder and histogram: in a completing Max run, 4,096 entries built 10%
+  fewer trees than 16,384 per-builder slots, and twice the entries only 5% fewer
+  again.
 
 **First-tree rule.** A header plan runs up to four feedback passes per RLE seed.
 Each pass prices the candidate code-length codes for the current RLE, keeps any
@@ -7540,7 +7556,8 @@ each tree's shortest RLE with its symbol counts, clears the list when the next
 plan starts, and searches it linearly. In an exhaustive pass, the next RLE is
 that shortest RLE when it is strictly cheaper under the tree than the DeflOpt
 rewrite, compared from the symbol counts. The plan's runs of equal code lengths
-are found once and shared by every seed and shortest RLE. A pass depends only
+are found once, eight lengths at a time, and shared by every seed and shortest
+RLE. A pass depends only
 on its RLE, so each kept shortest RLE also records the earliest pass a seed of
 the plan started from it; a seed that would start the same or a later pass from
 it stops, since an earlier seed has priced everything that would follow.

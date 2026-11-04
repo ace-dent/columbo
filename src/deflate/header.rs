@@ -3,8 +3,9 @@
 
 //! Dynamic-header construction and exact bit accounting.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use super::huffman::{
     code_length_tree_shape_is_valid, huffman_code_lengths_are_valid,
@@ -49,6 +50,31 @@ fn minimum_complete_tree_depth(frequencies: &[u32]) -> u8 {
         1
     } else {
         (usize::BITS - (populated - 1).leading_zeros()) as u8
+    }
+}
+
+/// A table keyed by [`header_plan_fingerprint`], already a mixed 64-bit hash,
+/// which the table uses as its own instead of hashing it again: the
+/// per-thread store looks one up for every header plan.
+type FingerprintMap<V> = HashMap<u64, V, BuildHasherDefault<FingerprintHasher>>;
+
+#[derive(Default)]
+struct FingerprintHasher(u64);
+
+impl Hasher for FingerprintHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // A `u64` key writes itself whole; fold in anything else.
+        for &byte in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(byte)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
     }
 }
 
@@ -97,6 +123,8 @@ impl HeaderPlanCache {
         }
     }
 
+    /// The plan for these trimmed lengths, whose payload trees the caller has
+    /// checked for a valid shape, with `data_bits` added.
     fn price(
         &mut self,
         literal_lengths: &[u8],
@@ -128,12 +156,15 @@ impl HeaderPlanCache {
         }
         self.stats.misses = self.stats.misses.saturating_add(1);
 
-        let mut plan = stored_header_plan_kernel(
+        // Its one caller has checked both payload trees' shapes.
+        let mut plan = stored_header_plan_kernel_keeping(
             fingerprint,
             literal_lengths,
             distance_lengths,
             exhaustive,
             rle_mask,
+            true,
+            true,
         )?;
         let bits = plan.bits.checked_add(data_bits)?;
         self.insert(fingerprint, exhaustive, rle_mask, &plan);
@@ -308,7 +339,7 @@ impl PackedDynamicPlan {
 /// arena and found by fingerprint.
 #[derive(Default)]
 struct HeaderPlanGeneration {
-    offsets: HashMap<u64, u32>,
+    offsets: FingerprintMap<u32>,
     arena: Vec<u8>,
 }
 
@@ -594,10 +625,14 @@ fn stored_header_plan_kernel(
         exhaustive,
         rle_mask,
         true,
+        false,
     )
 }
 
 /// [`stored_header_plan_kernel`], storing a newly made plan only if `keep`.
+/// With `shapes_valid`, the caller vouches that both payload trees have a
+/// valid shape, which the planner then does not check again.
+#[allow(clippy::too_many_arguments)]
 fn stored_header_plan_kernel_keeping(
     fingerprint: u64,
     literal_lengths: &[u8],
@@ -605,6 +640,7 @@ fn stored_header_plan_kernel_keeping(
     exhaustive: bool,
     rle_mask: u8,
     keep: bool,
+    shapes_valid: bool,
 ) -> Option<DynamicPlan> {
     let stored = HEADER_PLAN_STORE
         .try_with(|store| {
@@ -621,13 +657,23 @@ fn stored_header_plan_kernel_keeping(
     if stored.is_some() {
         return stored;
     }
-    let plan = plan_for_trimmed_lengths_uncached(
-        literal_lengths,
-        distance_lengths,
-        0,
-        exhaustive,
-        rle_mask,
-    )?;
+    let plan = if shapes_valid {
+        plan_for_valid_trimmed_lengths_uncached(
+            literal_lengths,
+            distance_lengths,
+            0,
+            exhaustive,
+            rle_mask,
+        )
+    } else {
+        plan_for_trimmed_lengths_uncached(
+            literal_lengths,
+            distance_lengths,
+            0,
+            exhaustive,
+            rle_mask,
+        )
+    }?;
     // The planner keeps the code lengths it is given, which the store then
     // need not hold.
     if keep && plan.literal_lengths == literal_lengths && plan.distance_lengths == distance_lengths
@@ -646,7 +692,11 @@ fn stored_header_plan_kernel_keeping(
 /// library callers keep no plans between inputs; worker threads free theirs
 /// when they exit.
 pub(crate) fn release_thread_header_plans() {
-    let _ = HEADER_PLAN_SEARCH.try_with(Cell::take);
+    let _ = HEADER_PLAN_SEARCH.try_with(|search| {
+        if let Ok(mut search) = search.try_borrow_mut() {
+            *search = None;
+        }
+    });
     let _ = HEADER_PLAN_STORE.try_with(|store| {
         if let Ok(mut store) = store.try_borrow_mut() {
             *store = HeaderPlanStore::default();
@@ -784,31 +834,79 @@ struct BuiltCodeLengthTree {
     huffman: bool,
 }
 
+/// A code-length code for one RLE histogram, with what a header search asks
+/// of it. Each is fixed by the lengths and the histogram, so a cached tree
+/// keeps them and later searches need not work them out again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeLengthTree {
+    lengths: [u8; 19],
+    /// HCLEN, from [`trim_code_lengths`].
+    hclen: u8,
+    /// Whether a heap builder's Huffman tree fit 7 bits unrepaired, as
+    /// [`BuiltCodeLengthTree`] describes.
+    huffman: bool,
+    /// [`code_length_tree_shape_is_valid`].
+    valid: bool,
+    /// [`code_lengths_follow_frequencies`] for the histogram.
+    follows: bool,
+    /// [`rle_frequency_cost`] of the histogram, or `u32::MAX` for [`INF`];
+    /// a finite cost is at most 316 tokens of 14 bits.
+    rle_bits: u32,
+}
+
+const EMPTY_CODE_LENGTH_TREE: CodeLengthTree = CodeLengthTree {
+    lengths: [0; 19],
+    hclen: 0,
+    huffman: false,
+    valid: false,
+    follows: false,
+    rle_bits: 0,
+};
+
+impl CodeLengthTree {
+    fn new(lengths: [u8; 19], huffman: bool, frequencies: &[u32; 19]) -> Self {
+        let rle_bits = rle_frequency_cost(frequencies, &lengths);
+        Self {
+            lengths,
+            hclen: trim_code_lengths(&lengths) as u8,
+            huffman,
+            valid: code_length_tree_shape_is_valid(&lengths),
+            follows: code_lengths_follow_frequencies(&lengths, frequencies),
+            rle_bits: u32::try_from(rle_bits).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// [`rle_frequency_cost`] of the histogram.
+    fn rle_bits(&self) -> u64 {
+        if self.rle_bits == u32::MAX {
+            INF
+        } else {
+            u64::from(self.rle_bits)
+        }
+    }
+}
+
 /// One RLE histogram's code-length trees, by [`CodeLengthBuilder::index`].
 #[derive(Clone, Copy)]
 struct CodeLengthTreeEntry {
     frequencies: [u32; 19],
-    /// Bit `index` is set once `lengths[index]` holds that builder's tree.
+    /// Bit `index` is set once `trees[index]` holds that builder's tree.
     built: u16,
-    /// Bit `index` is set when that tree is an unrepaired Huffman tree, as
-    /// [`BuiltCodeLengthTree`] describes.
-    huffman: u16,
-    lengths: [[u8; 19]; CodeLengthBuilder::COUNT],
+    trees: [CodeLengthTree; CodeLengthBuilder::COUNT],
 }
 
 const EMPTY_CODE_LENGTH_TREE_ENTRY: CodeLengthTreeEntry = CodeLengthTreeEntry {
     frequencies: [0; 19],
     built: 0,
-    huffman: 0,
-    lengths: [[0; 19]; CodeLengthBuilder::COUNT],
+    trees: [EMPTY_CODE_LENGTH_TREE; CodeLengthBuilder::COUNT],
 };
 
-/// Entries in each thread's code-length tree cache, about 1.3 MiB. Header
-/// plans for different code lengths often share an RLE histogram, and repeats
-/// come close together. Storing each histogram once, with all its builders'
-/// trees, holds more trees in less memory than one slot per builder and
-/// histogram: in a completing Max run, this size built 10% fewer trees than
-/// 16,384 such slots (1.7 MiB), and twice the entries 5% fewer again.
+/// Entries in each thread's code-length tree cache, 472 bytes each, about
+/// 1.8 MiB. Header plans for different code lengths often share an RLE
+/// histogram, and repeats come close together. Storing each histogram once,
+/// with all its builders' trees, holds more trees than one slot per builder
+/// and histogram: in a completing Max run, this many entries built 10% fewer
+/// trees than 16,384 such slots, and twice the entries 5% fewer again.
 const CODE_LENGTH_TREE_CACHE_BITS: u32 = 12;
 
 thread_local! {
@@ -870,19 +968,30 @@ impl<'a> CodeLengthTrees<'a> {
 
     /// [`code_length_tree`] for this histogram.
     fn get(&self, builder: CodeLengthBuilder, heap_scratch: &mut TreeBuildScratch) -> [u8; 19] {
-        self.get_with_huffman(builder, heap_scratch).0
+        self.get_tree(builder, heap_scratch).lengths
     }
 
     /// [`Self::get`], and whether the tree is an unrepaired Huffman tree.
+    #[cfg(test)]
     fn get_with_huffman(
         &self,
         builder: CodeLengthBuilder,
         heap_scratch: &mut TreeBuildScratch,
     ) -> ([u8; 19], bool) {
+        let tree = self.get_tree(builder, heap_scratch);
+        (tree.lengths, tree.huffman)
+    }
+
+    /// The tree [`Self::get`] returns, with what a header search asks of it.
+    fn get_tree(
+        &self,
+        builder: CodeLengthBuilder,
+        heap_scratch: &mut TreeBuildScratch,
+    ) -> CodeLengthTree {
         let Self { frequencies, slot } = *self;
         let Some(index) = builder.index() else {
             let built = builder.build(frequencies, false, heap_scratch);
-            return (built.lengths, built.huffman);
+            return CodeLengthTree::new(built.lengths, built.huffman, frequencies);
         };
         let cached = CODE_LENGTH_TREES
             .try_with(|cache| {
@@ -891,8 +1000,7 @@ impl<'a> CodeLengthTrees<'a> {
                 if !same_histogram(&entry.frequencies, frequencies) {
                     return None;
                 }
-                (entry.built & (1 << index) != 0)
-                    .then_some((entry.lengths[index], entry.huffman & (1 << index) != 0))
+                (entry.built & (1 << index) != 0).then_some(entry.trees[index])
             })
             .ok()
             .flatten();
@@ -909,6 +1017,7 @@ impl<'a> CodeLengthTrees<'a> {
             shared,
             huffman,
         } = builder.build(frequencies, true, heap_scratch);
+        let tree = CodeLengthTree::new(lengths, huffman, frequencies);
         let _ = CODE_LENGTH_TREES.try_with(|cache| {
             let Ok(mut cache) = cache.try_borrow_mut() else {
                 return;
@@ -933,18 +1042,16 @@ impl<'a> CodeLengthTrees<'a> {
             if !same_histogram(&entry.frequencies, frequencies) {
                 entry.frequencies = *frequencies;
                 entry.built = 0;
-                entry.huffman = 0;
             }
             let mut indices = shared | 1 << index;
             while indices != 0 {
                 let index = indices.trailing_zeros() as usize;
                 indices &= indices - 1;
-                entry.lengths[index] = lengths;
+                entry.trees[index] = tree;
                 entry.built |= 1 << index;
-                entry.huffman = (entry.huffman & !(1 << index)) | (u16::from(huffman) << index);
             }
         });
-        (lengths, huffman)
+        tree
     }
 }
 
@@ -2445,6 +2552,17 @@ fn push_unique<T: PartialEq>(candidates: &mut Vec<T>, candidate: T) {
     }
 }
 
+/// [`push_unique`] for code-length trees, by their lengths: equal lengths for
+/// one histogram are one candidate.
+fn push_unique_tree(candidates: &mut Vec<CodeLengthTree>, candidate: CodeLengthTree) {
+    if !candidates
+        .iter()
+        .any(|tree| tree.lengths == candidate.lengths)
+    {
+        candidates.push(candidate);
+    }
+}
+
 fn trim_literal(lengths: &[u8]) -> usize {
     trim_to_last_nonzero(lengths, 257)
 }
@@ -3027,7 +3145,7 @@ struct HeaderPlanSearch {
     /// Each seed's local rewrite steps and candidate code-length codes, kept
     /// for the next seed's.
     local_rewrite_steps: LocalRewriteSteps,
-    code_length_candidates: Vec<[u8; 19]>,
+    code_length_candidates: Vec<CodeLengthTree>,
     /// RLE buffers a finished seed returns, for the next plan's seeds.
     spare_rles: Vec<Vec<RleToken>>,
     /// This plan's RLE seeds; the buffer stays for the next plan's.
@@ -3115,6 +3233,28 @@ fn plan_for_trimmed_lengths_uncached(
     {
         return None;
     }
+    plan_for_valid_trimmed_lengths_uncached(
+        literal_lengths,
+        distance_lengths,
+        data_bits,
+        exhaustive,
+        rle_mask,
+    )
+}
+
+/// [`plan_for_trimmed_lengths_uncached`] for payload trees whose shapes the
+/// caller has checked.
+fn plan_for_valid_trimmed_lengths_uncached(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    data_bits: u64,
+    exhaustive: bool,
+    rle_mask: u8,
+) -> Option<DynamicPlan> {
+    debug_assert!(
+        payload_tree_shape_is_valid(literal_lengths, false)
+            && payload_tree_shape_is_valid(distance_lengths, true)
+    );
     let decoded_length_count = literal_lengths.len().checked_add(distance_lengths.len())?;
     if decoded_length_count > MAX_DYNAMIC_CODE_LENGTH_COUNT {
         return None;
@@ -3124,13 +3264,39 @@ fn plan_for_trimmed_lengths_uncached(
     decoded_length_storage[literal_lengths.len()..decoded_length_count]
         .copy_from_slice(distance_lengths);
     let decoded_lengths = &decoded_length_storage[..decoded_length_count];
-    // This thread's buffers, reused between plans; the best plan and the
-    // shortest RLEs belong to one plan's code lengths.
-    let mut search = HEADER_PLAN_SEARCH
-        .try_with(Cell::take)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let plan = |search: &mut HeaderPlanSearch| {
+        plan_with_search(
+            literal_lengths,
+            distance_lengths,
+            decoded_lengths,
+            data_bits,
+            exhaustive,
+            rle_mask,
+            search,
+        )
+    };
+    // This thread's buffers, reused between plans where they lie, not moved
+    // in and out; a nested plan, which none makes, would take fresh ones.
+    HEADER_PLAN_SEARCH
+        .try_with(|cell| match cell.try_borrow_mut() {
+            Ok(mut search) => plan(search.get_or_insert_with(HeaderPlanSearch::default)),
+            Err(_) => plan(&mut HeaderPlanSearch::default()),
+        })
+        .unwrap_or_else(|_| plan(&mut HeaderPlanSearch::default()))
+}
+
+/// [`plan_for_valid_trimmed_lengths_uncached`] in `search`'s buffers.
+fn plan_with_search(
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    decoded_lengths: &[u8],
+    data_bits: u64,
+    exhaustive: bool,
+    rle_mask: u8,
+    search: &mut HeaderPlanSearch,
+) -> Option<DynamicPlan> {
+    let decoded_length_count = decoded_lengths.len();
+    // The best plan and the shortest RLEs belong to one plan's code lengths.
     search.best = None;
     search.shortest_rle_count = 0;
     // Every RLE spells the same runs, so find them once.
@@ -3151,18 +3317,16 @@ fn plan_for_trimmed_lengths_uncached(
             decoded_lengths,
             seed,
             exhaustive,
-            &mut search,
+            search,
         );
     }
     search.seeds = seeds;
-    let best = search.best.take();
-    let _ = HEADER_PLAN_SEARCH.try_with(|cell| cell.set(Some(search)));
-    best
+    search.best.take()
 }
 
 thread_local! {
     /// The uncached header planner's buffers on this thread, between plans.
-    static HEADER_PLAN_SEARCH: Cell<Option<HeaderPlanSearch>> = const { Cell::new(None) };
+    static HEADER_PLAN_SEARCH: RefCell<Option<HeaderPlanSearch>> = const { RefCell::new(None) };
 }
 
 #[derive(Default)]
@@ -3739,7 +3903,8 @@ fn improve_one_tree_by_swaps(
                     None => {
                         // A trial whose cost is kept here is not stored: trials
                         // far outnumber other plans and would push them out
-                        // of the thread's store.
+                        // of the thread's store. A swap keeps each alphabet's
+                        // lengths, so the trees keep the start's valid shapes.
                         let plan = stored_header_plan_kernel_keeping(
                             header_plan_fingerprint(
                                 &literal_lengths[..hlit],
@@ -3752,6 +3917,7 @@ fn improve_one_tree_by_swaps(
                             exhaustive,
                             0x01,
                             start.is_none(),
+                            true,
                         );
                         let header_bits = plan.as_ref().map(|plan| plan.bits);
                         if let Some(start) = start {
@@ -3874,23 +4040,12 @@ fn consider_rle(
         let variants = 4;
         code_length_candidates.clear();
         let trees = CodeLengthTrees::new(&frequencies);
-        let (first_lengths, first_is_huffman) =
-            trees.get_with_huffman(CodeLengthBuilder::OrderHeap(0), &mut search.heap_scratch);
-        push_unique(&mut code_length_candidates, first_lengths);
+        let mut tree = |builder| trees.get_tree(builder, &mut search.heap_scratch);
+        let first = tree(CodeLengthBuilder::OrderHeap(0));
+        push_unique_tree(&mut code_length_candidates, first);
         // deft4j's tree builder is slow on the data alphabets but cheap on
         // the code-length alphabet, so every header search includes it.
-        let deft4j_lengths = trees.get(CodeLengthBuilder::Deft4jJavaHeap, &mut search.heap_scratch);
-        consider_deft4j_pruned_header(
-            data_bits,
-            literal_lengths,
-            distance_lengths,
-            &rle,
-            &frequencies,
-            &deft4j_lengths,
-            &mut search.heap_scratch,
-            &mut search.best,
-            &mut search.rewrites,
-        );
+        let deft4j = tree(CodeLengthBuilder::Deft4jJavaHeap);
         // A complete, unrepaired Huffman tree, the first candidate, prices
         // this RLE in the fewest bits: no code spells its symbols more
         // cheaply, and every usable code gives each of them a length, so none
@@ -3901,98 +4056,108 @@ fn consider_rle(
         // exact package-merge code, the cheapest within 7 bits, which the
         // exhaustive search builds anyway; the heap gives lengths only to
         // used symbols, so it sends no more code-length codes than any other.
-        let first_is_cheapest = code_length_tree_shape_is_valid(&first_lengths)
-            && (first_is_huffman
+        let first_is_cheapest = first.valid
+            && (first.huffman
                 || exhaustive && {
-                    let cost = rle_frequency_cost(&frequencies, &first_lengths);
-                    let exact =
-                        trees.get(CodeLengthBuilder::DefluffExact, &mut search.heap_scratch);
-                    cost != INF && cost == rle_frequency_cost(&frequencies, &exact)
+                    let exact = tree(CodeLengthBuilder::DefluffExact);
+                    first.rle_bits() != INF && first.rle_bits() == exact.rle_bits()
                 });
         for variant in (0..variants).filter(|_| !first_is_cheapest) {
             if variant == 0 {
-                push_unique(&mut code_length_candidates, deft4j_lengths);
-                let defluff_limited_lengths =
-                    trees.get(CodeLengthBuilder::DefluffLimited, &mut search.heap_scratch);
-                push_unique(&mut code_length_candidates, defluff_limited_lengths);
+                push_unique_tree(&mut code_length_candidates, deft4j);
+                push_unique_tree(
+                    &mut code_length_candidates,
+                    tree(CodeLengthBuilder::DefluffLimited),
+                );
             } else {
-                // Variant 3 breaks both ties by frequency alone, so on the
-                // same frequencies its order-key tree is the DeflOpt tree the
-                // local rewrite built first.
-                let prescored_order_tree = (pass == 0 && variant == FREQUENCY_ONLY_HEAP_VARIANT)
-                    .then_some(prescored_deflopt_trees[variant as usize])
-                    .flatten();
-                let order_lengths = prescored_order_tree.unwrap_or_else(|| {
-                    trees.get(
-                        CodeLengthBuilder::OrderHeap(variant),
-                        &mut search.heap_scratch,
-                    )
-                });
-                push_unique(&mut code_length_candidates, order_lengths);
+                // Variant 3 breaks both ties by frequency alone, so its
+                // order-key tree is the DeflOpt tree, which in pass 0 the local
+                // rewrite built first.
+                let order = tree(CodeLengthBuilder::OrderHeap(variant));
+                debug_assert!(
+                    pass != 0
+                        || variant != FREQUENCY_ONLY_HEAP_VARIANT
+                        || prescored_deflopt_trees[variant as usize]
+                            .map_or(true, |lengths| lengths == order.lengths)
+                );
+                push_unique_tree(&mut code_length_candidates, order);
             }
             if exhaustive {
                 // In pass 0, reuse the trees that the local DeflOpt rewrite
                 // already built and priced.
                 if pass == 0 {
                     if let Some(lengths) = prescored_deflopt_trees[variant as usize] {
-                        push_unique(&mut code_length_candidates, lengths);
+                        let deflopt = tree(CodeLengthBuilder::DefloptHeap(variant));
+                        debug_assert_eq!(deflopt.lengths, lengths);
+                        push_unique_tree(&mut code_length_candidates, deflopt);
                     }
                 } else if variant != FREQUENCY_ONLY_HEAP_VARIANT {
                     // Variant 3's DeflOpt tree is the order-key tree above.
-                    let deflopt_lengths = trees.get(
-                        CodeLengthBuilder::DefloptHeap(variant),
-                        &mut search.heap_scratch,
+                    push_unique_tree(
+                        &mut code_length_candidates,
+                        tree(CodeLengthBuilder::DefloptHeap(variant)),
                     );
-                    push_unique(&mut code_length_candidates, deflopt_lengths);
                 }
-                let columbo_lengths = trees.get(
-                    CodeLengthBuilder::Columbo(variant),
-                    &mut search.heap_scratch,
+                push_unique_tree(
+                    &mut code_length_candidates,
+                    tree(CodeLengthBuilder::Columbo(variant)),
                 );
-                push_unique(&mut code_length_candidates, columbo_lengths);
 
                 if variant == 0 {
-                    let defluff_lengths =
-                        trees.get(CodeLengthBuilder::DefluffExact, &mut search.heap_scratch);
-                    push_unique(&mut code_length_candidates, defluff_lengths);
+                    push_unique_tree(
+                        &mut code_length_candidates,
+                        tree(CodeLengthBuilder::DefluffExact),
+                    );
                 }
             }
         }
+        // Priced before the candidates, so of equal plans its stays.
+        consider_deft4j_pruned_header(
+            data_bits,
+            literal_lengths,
+            distance_lengths,
+            &rle,
+            &frequencies,
+            &deft4j,
+            &mut search.heap_scratch,
+            &mut search.best,
+            &mut search.rewrites,
+        );
 
         let mut feedback_tree = None;
         let mut feedback_cost = INF;
-        for code_length_lengths in code_length_candidates.iter().copied() {
-            if !code_length_tree_shape_is_valid(&code_length_lengths) {
+        for candidate in code_length_candidates.iter() {
+            if !candidate.valid {
                 continue;
             }
             let was_prescored = pass == 0
                 && prescored_deflopt_trees
                     .iter()
                     .flatten()
-                    .any(|tree| tree == &code_length_lengths);
+                    .any(|tree| tree == &candidate.lengths);
             let valid_header = was_prescored
-                || consider_dynamic_header(
+                || consider_tree_header(
                     data_bits,
                     literal_lengths,
                     distance_lengths,
                     &rle,
-                    &frequencies,
-                    code_length_lengths,
+                    candidate,
                     &mut search.best,
                 )
                 .is_some();
             if valid_header {
-                let candidate_cost = rle_frequency_cost(&frequencies, &code_length_lengths);
+                let candidate_cost = candidate.rle_bits();
                 if candidate_cost < feedback_cost {
                     feedback_cost = candidate_cost;
-                    feedback_tree = Some(code_length_lengths);
+                    feedback_tree = Some(candidate.lengths);
                 }
 
                 // As in DeflOpt, give shorter codes to more frequent RLE
                 // symbols; a changed HCLEN can pay off even when the weighted
-                // symbol cost ties.
-                if !was_prescored {
-                    let mut reordered = code_length_lengths;
+                // symbol cost ties. Lengths that already follow the
+                // frequencies never change.
+                if !was_prescored && !candidate.follows {
+                    let mut reordered = candidate.lengths;
                     if reorder_code_length_lengths(&mut reordered, &frequencies) {
                         consider_dynamic_header(
                             data_bits,
@@ -4019,7 +4184,9 @@ fn consider_rle(
         // cheaper, so an RLE that already costs the shortest's has nothing to
         // rewrite.
         let rle_is_shortest = exhaustive && {
-            let cost = rle_frequency_cost(&frequencies, &tree);
+            // The feedback tree's cost of this RLE.
+            let cost = feedback_cost;
+            debug_assert_eq!(cost, rle_frequency_cost(&frequencies, &tree));
             cost != INF
                 && search
                     .shortest_rle(decoded_lengths.len(), &tree)
@@ -4092,51 +4259,34 @@ fn consider_deft4j_pruned_header(
     distance_lengths: &[u8],
     rle: &[RleToken],
     frequencies: &[u32; 19],
-    deft4j_lengths: &[u8; 19],
+    deft4j: &CodeLengthTree,
     heap_scratch: &mut TreeBuildScratch,
     best: &mut Option<DynamicPlan>,
     [pruned, optimized]: &mut [Vec<RleToken>; 2],
 ) {
-    if !code_length_tree_shape_is_valid(deft4j_lengths) {
-        return;
-    }
-    let code_length_lengths = *deft4j_lengths;
-    if frequencies
-        .iter()
-        .zip(code_length_lengths)
-        .any(|(&frequency, length)| frequency != 0 && length == 0)
-    {
+    // A used symbol without a code makes the cost infinite.
+    if !deft4j.valid || deft4j.rle_bits() == INF {
         return;
     }
 
     let Some(frequencies) =
-        rewrite_rle_deft4j_literals_into(rle, frequencies, &code_length_lengths, true, pruned)
+        rewrite_rle_deft4j_literals_into(rle, frequencies, &deft4j.lengths, true, pruned)
     else {
         return;
     };
-    let code_length_lengths = code_length_tree(
-        CodeLengthBuilder::Deft4jJavaHeap,
-        &frequencies,
-        heap_scratch,
-    );
-    if !code_length_tree_shape_is_valid(&code_length_lengths) {
+    let rebuilt = CodeLengthTrees::new(&frequencies)
+        .get_tree(CodeLengthBuilder::Deft4jJavaHeap, heap_scratch);
+    if !rebuilt.valid || rebuilt.rle_bits() == INF {
         return;
     }
-    if frequencies
-        .iter()
-        .zip(code_length_lengths)
-        .any(|(&frequency, length)| frequency != 0 && length == 0)
-    {
-        return;
-    }
+    let code_length_lengths = rebuilt.lengths;
 
-    consider_dynamic_header(
+    consider_tree_header(
         data_bits,
         literal_lengths,
         distance_lengths,
         pruned,
-        &frequencies,
-        code_length_lengths,
+        &rebuilt,
         best,
     );
 
@@ -4222,14 +4372,14 @@ fn consider_columbo_deflopt_local_rewrite(
             0 => *initial_frequencies,
             _ => steps.states[state - 1].1,
         };
-        let code_length_lengths = code_length_tree(
+        let tree = CodeLengthTrees::new(&frequencies).get_tree(
             CodeLengthBuilder::DefloptHeap(variant),
-            &frequencies,
             &mut search.heap_scratch,
         );
-        if !code_length_tree_shape_is_valid(&code_length_lengths) {
+        if !tree.valid {
             return initial_tree;
         }
+        let code_length_lengths = tree.lengths;
 
         let explored = steps
             .steps
@@ -4256,7 +4406,7 @@ fn consider_columbo_deflopt_local_rewrite(
                     distance_lengths,
                     rle,
                     &frequencies,
-                    code_length_lengths,
+                    &tree,
                     search,
                     &mut next.0,
                 ) {
@@ -4296,28 +4446,29 @@ fn local_rewrite_step(
     distance_lengths: &[u8],
     rle: &[RleToken],
     frequencies: &[u32; 19],
-    code_length_lengths: [u8; 19],
+    tree: &CodeLengthTree,
     search: &mut HeaderPlanSearch,
     rewritten: &mut Vec<RleToken>,
 ) -> LocalRewriteStep {
-    if consider_dynamic_header(
+    if consider_tree_header(
         data_bits,
         literal_lengths,
         distance_lengths,
         rle,
-        frequencies,
-        code_length_lengths,
+        tree,
         &mut search.best,
     )
     .is_none()
     {
         return LocalRewriteStep::Invalid;
     }
+    let code_length_lengths = tree.lengths;
 
     // The rewrite loop follows the unmodified DeflOpt tree, which keeps tie
-    // behavior deterministic.
+    // behavior deterministic. Lengths that follow the frequencies never
+    // change.
     let mut reordered = code_length_lengths;
-    if reorder_code_length_lengths(&mut reordered, frequencies) {
+    if !tree.follows && reorder_code_length_lengths(&mut reordered, frequencies) {
         consider_dynamic_header(
             data_bits,
             literal_lengths,
@@ -4698,16 +4849,41 @@ fn length_runs(lengths: &[u8]) -> Vec<LengthRun> {
 fn length_runs_into(lengths: &[u8], runs: &mut Vec<LengthRun>) {
     runs.clear();
     runs.reserve(lengths.len());
-    let mut index = 0;
-    while index < lengths.len() {
-        let value = lengths[index];
-        let mut run = 1;
-        while index + run < lengths.len() && lengths[index + run] == value {
-            run += 1;
+    let Some(&first) = lengths.first() else {
+        return;
+    };
+    // Eight lengths at a time, each compared with the one before: the high bit
+    // of each nonzero byte of their difference marks a length that starts a
+    // run, without a branch per length.
+    const LOW_SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    let word = |bytes: &[u8]| {
+        let mut word = [0_u8; 8];
+        word[..bytes.len()].copy_from_slice(bytes);
+        u64::from_le_bytes(word)
+    };
+    let mut start = 0;
+    let mut value = first;
+    let mut position = 1;
+    while position < lengths.len() {
+        let count = (lengths.len() - position).min(8);
+        let difference = if count == 8 {
+            word(&lengths[position..position + 8]) ^ word(&lengths[position - 1..position + 7])
+        } else {
+            // The padding of both words is zero, so it marks no start.
+            word(&lengths[position..]) ^ word(&lengths[position - 1..lengths.len() - 1])
+        };
+        let mut starts =
+            (((difference & LOW_SEVEN).wrapping_add(LOW_SEVEN)) | difference) & !LOW_SEVEN;
+        while starts != 0 {
+            let next = position + (starts.trailing_zeros() / 8) as usize;
+            runs.push((value, next - start));
+            start = next;
+            value = lengths[next];
+            starts &= starts - 1;
         }
-        runs.push((value, run));
-        index += run;
+        position += 8;
     }
+    runs.push((value, lengths.len() - start));
 }
 
 fn greedy_rle(lengths: &[u8], no_16: bool, no_17: bool, no_18: bool) -> Vec<RleToken> {
@@ -5060,6 +5236,61 @@ fn consider_dynamic_header(
     let hclen = trim_code_lengths(&code_length_lengths);
     let bits =
         dynamic_bits_from_rle_frequencies(data_bits, hclen, frequencies, &code_length_lengths)?;
+    keep_dynamic_header(
+        bits,
+        literal_lengths,
+        distance_lengths,
+        rle,
+        code_length_lengths,
+        hclen,
+        best,
+    );
+    Some(bits)
+}
+
+/// [`consider_dynamic_header`] under a tree built for the RLE's histogram,
+/// which already knows its HCLEN and the RLE's cost.
+fn consider_tree_header(
+    data_bits: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    rle: &[RleToken],
+    tree: &CodeLengthTree,
+    best: &mut Option<DynamicPlan>,
+) -> Option<u64> {
+    debug_assert_eq!(
+        tree.rle_bits(),
+        rle_frequency_cost(&rle_frequencies(rle), &tree.lengths)
+    );
+    let rle_bits = tree.rle_bits();
+    if rle_bits == INF {
+        return None;
+    }
+    let bits = (3_u64 + 5 + 5 + 4 + u64::from(tree.hclen) * 3)
+        .checked_add(rle_bits)?
+        .checked_add(data_bits)?;
+    keep_dynamic_header(
+        bits,
+        literal_lengths,
+        distance_lengths,
+        rle,
+        tree.lengths,
+        usize::from(tree.hclen),
+        best,
+    );
+    Some(bits)
+}
+
+/// Make the header `bits` long the best plan if it is shorter.
+fn keep_dynamic_header(
+    bits: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    rle: &[RleToken],
+    code_length_lengths: [u8; 19],
+    hclen: usize,
+    best: &mut Option<DynamicPlan>,
+) {
     match best {
         Some(current) if bits >= current.bits => {}
         // A search improves its best plan several times; reuse its buffers.
@@ -5096,7 +5327,6 @@ fn consider_dynamic_header(
             });
         }
     }
-    Some(bits)
 }
 
 // Out of line: each call scans the header's run-length tokens.
