@@ -7315,10 +7315,21 @@ per-thread store with the same key and verification.
   lookup's. A plan is stored only when the planner kept the code lengths it was
   given.
 - The store holds two generations within 16 MiB: each arena's used bytes, which
-  grow in steps bounded by half the budget, and each index's slots. An entry
+  grow in steps bounded by half the budget, and each index's slots. A thread
+  that plans a block exhaustively, which only Max does, raises its budget to
+  64 MiB until the store is emptied. An entry
   takes about a third of the old packed form's charge, without its allocator
   overhead: 155 bytes a plan on `crossroads.png` and 296 on `OwlAlpha-0.5.png`,
   against 528 and 788 before.
+- Long Max searches outgrow 16 MiB: in a completing Max run of `star.png`,
+  half of the 680,000 exhaustive plans that missed the store repeated one it
+  had dropped. With 64 MiB, completing runs of `star.png`, `basi4a16.png` and
+  `crossroads.png` retired 14.8%, 12.0% and 5.9% fewer instructions, against
+  0.0%, 3.0% and 1.1% with 32 MiB and 18.2%, 12.6% and 8.7% with 128 MiB.
+  Peak memory rose by up to 48 MiB for each thread that fills it: on ten Max
+  inputs at 20 seconds, one peak rose by 46 to 51 MiB, and the rest were lower
+  or level
+  ([efficiency review `7d4e44c`](research/efficiency-review.md#7d4e44c-4-november-2026)).
 - Header plans take no stop, so every stored plan is complete.
 - The store is emptied when the top-level `optimize` call returns, and freed
   when a worker thread exits. It is not emptied per stream, so a lane thread
@@ -7339,16 +7350,23 @@ without their plans.
   start lengths get an identifier that is never reused, so a trial kept under
   start lengths that were dropped cannot answer for others. The thread keeps
   4,096 start sequences, then drops them all.
-- Trials sit in slots of 12 bytes: the key is the start identifier, the
-  alphabet and the two symbols, and the value is the header's bits, or that the
-  trial has no plan. A key hashes to a set of four slots kept in order of use;
-  a new trial replaces the set's least recent. On traced runs, four ways kept as
-  many repeats as twice the slots mapped directly.
-- A thread's first swap search allocates 4,096 slots, 48 KiB. Each time they
-  have taken as many new trials as they hold, they grow fourfold, keeping their
-  trials, up to 2^19 slots, 6 MiB, so a short search keeps little. On a traced
-  run 2^19 slots kept 93% of the repeats an unbounded memo would, against 79%
-  with 2^18.
+- Trials sit in slots of 8 bytes: a 48-bit key, made of the start identifier
+  (29 bits), the alphabet and the two symbols (9 bits each), above the
+  header's bits in 16 bits, or a marker that the trial has no plan. A key
+  hashes to a set of eight slots, one 64-byte cache line, kept in order of use;
+  a new trial replaces the set's least recent. Identifiers stay below
+  2^29 − 1: a thread that runs out drops its starts and trials and starts over.
+- A thread's first swap search allocates 4,096 slots, 32 KiB. Each time they
+  have taken half as many new trials as they hold, before many sets are full,
+  they grow fourfold, keeping their trials, up to 2^22 slots, 32 MiB, so a
+  short search keeps little. A completing Max run of `star.png` prices about
+  22 million trials, a quarter of them distinct, and most of the rest repeat
+  100,000 to 1,000,000 trials apart: with the earlier 2^19 slots of 12 bytes,
+  8.2 million repeats were planned again, 30 of the run's 81 seconds.
+- A trial whose cost the thread keeps does not add its plan to the
+  [header-plan store](#header-plan-caches-and-stores): trials are most of the
+  uncached plans (95% on `crossroads.png` in 20 seconds of Max) and pushed the
+  plans that repeat out of it.
 - The pass compares kept and new costs exactly as before. When its cheapest
   trial's cost was kept, it plans that swap again once, which gives the plan the
   trial would have given.
@@ -7362,6 +7380,12 @@ without their plans.
   first two repeated a trial the thread had made, most of them 32,000 to 256,000
   trials earlier
   ([efficiency review `3860542`](research/efficiency-review.md#3860542-2-november-2026)).
+  The 8-byte slots up to 2^22, growing at half full, then took 36.0%, 20.7%
+  and 19.2% of the instructions off completing runs of `star.png`,
+  `basi4a16.png` and `crossroads.png`, against 6.8%, 6.5% and 5.5% for 2^20
+  slots growing when full, and keeping trial plans out of the store another
+  4.7%, 2.7% and 5.5%
+  ([efficiency review `7d4e44c`](research/efficiency-review.md#7d4e44c-4-november-2026)).
 
 **Bypasses.** The terminal header methods R1b, R2 and R3 call the uncached
 header planner directly, and R4 and R8–R11 plan through the advertised-length

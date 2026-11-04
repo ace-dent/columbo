@@ -172,6 +172,12 @@ impl HeaderPlanCache {
 /// 16 MiB raised peak memory by at most 23 MiB and lowered the median.
 const MAX_THREAD_HEADER_PLAN_BYTES: usize = 16 << 20;
 
+/// The budget of a thread that has planned a block exhaustively, which only
+/// Max does. Long Max searches plan hundreds of thousands of distinct headers,
+/// about 100 bytes each when stored, and return to many of them after the
+/// default budget has dropped them.
+const MAX_THREAD_EXHAUSTIVE_HEADER_PLAN_BYTES: usize = 64 << 20;
+
 /// A dynamic plan packed into one allocation: the code lengths two per byte,
 /// then each RLE token as its symbol and extra-bits value.
 pub(crate) struct PackedDynamicPlan {
@@ -581,6 +587,25 @@ fn stored_header_plan_kernel(
     exhaustive: bool,
     rle_mask: u8,
 ) -> Option<DynamicPlan> {
+    stored_header_plan_kernel_keeping(
+        fingerprint,
+        literal_lengths,
+        distance_lengths,
+        exhaustive,
+        rle_mask,
+        true,
+    )
+}
+
+/// [`stored_header_plan_kernel`], storing a newly made plan only if `keep`.
+fn stored_header_plan_kernel_keeping(
+    fingerprint: u64,
+    literal_lengths: &[u8],
+    distance_lengths: &[u8],
+    exhaustive: bool,
+    rle_mask: u8,
+    keep: bool,
+) -> Option<DynamicPlan> {
     let stored = HEADER_PLAN_STORE
         .try_with(|store| {
             store.try_borrow_mut().ok()?.get(
@@ -605,7 +630,8 @@ fn stored_header_plan_kernel(
     )?;
     // The planner keeps the code lengths it is given, which the store then
     // need not hold.
-    if plan.literal_lengths == literal_lengths && plan.distance_lengths == distance_lengths {
+    if keep && plan.literal_lengths == literal_lengths && plan.distance_lengths == distance_lengths
+    {
         let _ = HEADER_PLAN_STORE.try_with(|store| {
             if let Ok(mut store) = store.try_borrow_mut() {
                 store.insert(fingerprint, exhaustive, rle_mask, &plan);
@@ -632,6 +658,16 @@ pub(crate) fn release_thread_header_plans() {
         }
     });
     release_swap_trials();
+}
+
+/// Give this thread's header-plan store Max's budget, which it keeps until
+/// released.
+fn use_exhaustive_header_plan_budget() {
+    let _ = HEADER_PLAN_STORE.try_with(|store| {
+        if let Ok(mut store) = store.try_borrow_mut() {
+            store.max_bytes = store.max_bytes.max(MAX_THREAD_EXHAUSTIVE_HEADER_PLAN_BYTES);
+        }
+    });
 }
 
 /// A builder of code-length codes: 19 symbols, at most 7 bits.
@@ -1164,6 +1200,9 @@ pub(crate) fn best_dynamic_plan_cached(
     });
     let source_is_compatible = source_exact.is_some();
     let mut best = source_exact;
+    if exhaustive {
+        use_exhaustive_header_plan_budget();
+    }
 
     // Also repack the source code lengths (`score_existing_dynamic` keeps the
     // source RLE); DeflOpt tries both.
@@ -3698,12 +3737,21 @@ fn improve_one_tree_by_swaps(
                 let (header_bits, plan) = match kept {
                     Some(header_bits) => (header_bits, None),
                     None => {
-                        let plan = plan_for_trimmed_lengths(
+                        // A trial whose cost is kept here is not stored: trials
+                        // far outnumber other plans and would push them out
+                        // of the thread's store.
+                        let plan = stored_header_plan_kernel_keeping(
+                            header_plan_fingerprint(
+                                &literal_lengths[..hlit],
+                                &distance_lengths[..hdist],
+                                exhaustive,
+                                0x01,
+                            ),
                             &literal_lengths[..hlit],
                             &distance_lengths[..hdist],
-                            0,
                             exhaustive,
                             0x01,
+                            start.is_none(),
                         );
                         let header_bits = plan.as_ref().map(|plan| plan.bits);
                         if let Some(start) = start {

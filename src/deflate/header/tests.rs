@@ -2029,13 +2029,52 @@ fn swap_searches_with_kept_trial_costs_match_cold_searches() {
         assert_eq!(search(tokens), first);
         warm.push(first);
     }
-    assert!(swap_costs::test_support::kept_swap_trial_count() > 0);
+    // The trials' costs are kept, but not their plans: the store holds only
+    // each pass's start and committed plans.
+    let kept_trials = swap_costs::test_support::kept_swap_trial_count();
+    assert!(kept_trials > 0);
+    assert!(stored_header_plan_count() < kept_trials / 4);
     for (tokens, warm) in variants.iter().zip(warm) {
         release_thread_header_plans();
         assert_eq!(search(tokens), warm);
     }
     release_thread_header_plans();
     assert_eq!(swap_costs::test_support::kept_swap_trial_count(), 0);
+}
+
+/// The plans in this thread's header-plan store.
+fn stored_header_plan_count() -> usize {
+    HEADER_PLAN_STORE.with(|store| {
+        let store = store.borrow();
+        store.current.offsets.len() + store.previous.offsets.len()
+    })
+}
+
+#[test]
+fn max_block_planning_keeps_more_header_plans_until_released() {
+    let budget = || HEADER_PLAN_STORE.with(|store| store.borrow().max_bytes);
+    let tokens: Vec<Token> = (0..40_u8).map(|byte| Token::Literal(byte % 7)).collect();
+    let (literal, distance) = count_frequencies(&tokens);
+    release_thread_header_plans();
+    for (exhaustive, expected) in [
+        (false, MAX_THREAD_HEADER_PLAN_BYTES),
+        (true, MAX_THREAD_EXHAUSTIVE_HEADER_PLAN_BYTES),
+        (false, MAX_THREAD_EXHAUSTIVE_HEADER_PLAN_BYTES),
+    ] {
+        best_dynamic_plan(
+            &tokens,
+            &literal,
+            &distance,
+            None,
+            false,
+            exhaustive,
+            &mut SearchStop::never(),
+        )
+        .unwrap();
+        assert_eq!(budget(), expected);
+    }
+    release_thread_header_plans();
+    assert_eq!(budget(), MAX_THREAD_HEADER_PLAN_BYTES);
 }
 
 /// The local rewrite before it counted frequencies and allocated on the first

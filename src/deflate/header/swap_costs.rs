@@ -12,22 +12,26 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// The most trial slots a thread keeps, 12 bytes each, 6 MiB. Repeated trials
-/// on the benchmark sample were mostly 32,000 to 256,000 trials apart, and on
-/// a traced run these slots kept 93% of them, against 79% with half as many.
-const MAX_TRIAL_SLOTS: usize = 1 << 19;
+/// The most trial slots a thread keeps, 8 bytes each, 32 MiB. A completing
+/// Max run of `star.png` prices about 22 million trials, a quarter of them
+/// distinct, and most of the rest repeat 100,000 to 1,000,000 trials apart:
+/// these slots cut that run's instructions by a third, against 7% for 2^20.
+const MAX_TRIAL_SLOTS: usize = 1 << 22;
 /// The slots a thread starts with. They grow fourfold each time they have
-/// taken as many new trials as they hold, so a short search keeps little.
+/// taken half as many new trials as they hold, before many sets are full, so
+/// a short search keeps little.
 const MIN_TRIAL_SLOTS: usize = 1 << 12;
-/// Slots in each set a key hashes to, most recently used first: on a traced
-/// run, four ways kept as many repeats as twice the slots mapped directly.
-const TRIAL_WAYS: usize = 4;
+/// Slots in each set a key hashes to, most recently used first: eight 8-byte
+/// slots fill one 64-byte cache line.
+const TRIAL_WAYS: usize = 8;
 /// Start sequences a thread keeps before dropping them all.
 const MAX_STARTS: usize = 4096;
-/// A slot with no trial: no start reaches the last identifier.
-const EMPTY_KEY: u64 = u64::MAX;
-/// The cost of a trial that has no plan.
-const NO_PLAN: u32 = u32::MAX;
+/// Start identifiers stay below this, so a trial's key fits in 48 bits.
+const START_ID_LIMIT: u32 = (1 << 29) - 1;
+/// A slot with no trial: its key would need the identifier `START_ID_LIMIT`.
+const EMPTY_SLOT: u64 = u64::MAX;
+/// The cost of a trial that has no plan; a header this long is not kept.
+const NO_PLAN: u16 = u16::MAX;
 
 thread_local! {
     static SWAP_TRIAL_COSTS: RefCell<SwapTrialCosts> = RefCell::new(SwapTrialCosts::default());
@@ -47,8 +51,8 @@ struct SwapTrialCosts {
     /// Identifiers are never reused, so a trial kept under a dropped start
     /// cannot answer for another.
     next_id: u32,
-    keys: Vec<u64>,
-    costs: Vec<u32>,
+    /// Each trial's 48-bit key above its 16-bit cost.
+    slots: Vec<u64>,
     /// New trials since the slots last grew.
     inserted: usize,
 }
@@ -71,13 +75,13 @@ impl SwapTrialCosts {
                 return Some(start.id);
             }
         }
-        if self.next_id == u32::MAX {
+        if self.next_id == START_ID_LIMIT {
             *self = Self::default();
         }
         if self.starts.len() >= MAX_STARTS {
             self.starts.clear();
         }
-        if self.keys.is_empty() && !self.resize(MIN_TRIAL_SLOTS) {
+        if self.slots.is_empty() && !self.resize(MIN_TRIAL_SLOTS) {
             return None;
         }
         let mut lengths = Vec::new();
@@ -102,64 +106,55 @@ impl SwapTrialCosts {
 
     /// The first slot of the key's set.
     fn set(&self, key: u64) -> usize {
-        let set_bits = (self.keys.len() / TRIAL_WAYS).trailing_zeros();
+        let set_bits = (self.slots.len() / TRIAL_WAYS).trailing_zeros();
         (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (u64::BITS - set_bits)) as usize * TRIAL_WAYS
     }
 
     /// The kept cost of the trial, which becomes its set's most recent.
-    fn get(&mut self, key: u64) -> Option<u32> {
-        if self.keys.is_empty() {
+    fn get(&mut self, key: u64) -> Option<u16> {
+        if self.slots.is_empty() {
             return None;
         }
         let set = self.set(key);
-        let way = self.keys[set..set + TRIAL_WAYS]
+        let way = self.slots[set..set + TRIAL_WAYS]
             .iter()
-            .position(|&kept| kept == key)?;
-        self.keys[set..=set + way].rotate_right(1);
-        self.costs[set..=set + way].rotate_right(1);
-        Some(self.costs[set])
+            .position(|&slot| slot >> 16 == key)?;
+        self.slots[set..=set + way].rotate_right(1);
+        Some(self.slots[set] as u16)
     }
 
-    fn insert(&mut self, key: u64, cost: u32) {
-        if self.keys.is_empty() {
+    fn insert(&mut self, key: u64, cost: u16) {
+        if self.slots.is_empty() {
             return;
         }
-        self.place(key, cost);
+        self.place(key << 16 | u64::from(cost));
         self.inserted += 1;
-        if self.inserted >= self.keys.len() && self.keys.len() < MAX_TRIAL_SLOTS {
-            self.resize((self.keys.len() * 4).min(MAX_TRIAL_SLOTS));
+        if self.inserted >= self.slots.len() / 2 && self.slots.len() < MAX_TRIAL_SLOTS {
+            self.resize((self.slots.len() * 4).min(MAX_TRIAL_SLOTS));
         }
     }
 
-    /// Make the trial its set's most recent, replacing the least recent.
-    fn place(&mut self, key: u64, cost: u32) {
-        let set = self.set(key);
-        self.keys[set..set + TRIAL_WAYS].rotate_right(1);
-        self.costs[set..set + TRIAL_WAYS].rotate_right(1);
-        self.keys[set] = key;
-        self.costs[set] = cost;
+    /// Make the slot its set's most recent, replacing the least recent.
+    fn place(&mut self, slot: u64) {
+        let set = self.set(slot >> 16);
+        self.slots[set..set + TRIAL_WAYS].rotate_right(1);
+        self.slots[set] = slot;
     }
 
-    /// Move the trials to `slots` slots, each set's least recent first so that
+    /// Move the trials to `count` slots, each set's least recent first so that
     /// its order of use survives, or keep them where they are if the slots
     /// cannot be allocated.
-    fn resize(&mut self, slots: usize) -> bool {
-        let mut keys = Vec::new();
-        let mut costs = Vec::new();
-        if keys.try_reserve_exact(slots).is_err() || costs.try_reserve_exact(slots).is_err() {
+    fn resize(&mut self, count: usize) -> bool {
+        let mut slots = Vec::new();
+        if slots.try_reserve_exact(count).is_err() {
             return false;
         }
-        keys.resize(slots, EMPTY_KEY);
-        costs.resize(slots, NO_PLAN);
-        let old_keys = std::mem::replace(&mut self.keys, keys);
-        let old_costs = std::mem::replace(&mut self.costs, costs);
-        for (keys, costs) in old_keys
-            .chunks_exact(TRIAL_WAYS)
-            .zip(old_costs.chunks_exact(TRIAL_WAYS))
-        {
-            for (&key, &cost) in keys.iter().zip(costs).rev() {
-                if key != EMPTY_KEY {
-                    self.place(key, cost);
+        slots.resize(count, EMPTY_SLOT);
+        let old = std::mem::replace(&mut self.slots, slots);
+        for set in old.chunks_exact(TRIAL_WAYS) {
+            for &slot in set.iter().rev() {
+                if slot != EMPTY_SLOT {
+                    self.place(slot);
                 }
             }
         }
@@ -168,9 +163,11 @@ impl SwapTrialCosts {
     }
 }
 
+/// A trial's 48-bit key: its start, its tree and its pair of symbols, both
+/// below 286.
 fn trial_key(start: u32, literal_tree: bool, a: usize, b: usize) -> u64 {
-    debug_assert!(a < 1 << 15 && b < 1 << 16);
-    (u64::from(start) << 32) | (u64::from(literal_tree) << 31) | ((a as u64) << 16) | b as u64
+    debug_assert!(start < START_ID_LIMIT && a < 1 << 9 && b < 1 << 9);
+    (u64::from(start) << 19) | (u64::from(literal_tree) << 18) | ((a as u64) << 9) | b as u64
 }
 
 /// The identifier of these start lengths under this policy, or `None` when
@@ -221,7 +218,7 @@ pub(super) fn keep_swap_trial(
     b: usize,
     cost: Option<u64>,
 ) {
-    let cost = match cost.map(u32::try_from) {
+    let cost = match cost.map(u16::try_from) {
         Some(Ok(cost)) if cost != NO_PLAN => cost,
         Some(_) => return,
         None => NO_PLAN,

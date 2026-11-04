@@ -92,6 +92,7 @@ gains where established.
 | 3 Nov 2026 | [`58ccf01`](#58ccf01-3-november-2026) | APNG header fit: joint tree and RLE search and symbol-set spellings (`joint.rs`, `symbol_set.rs`) | R4 charges each state's edges at once and relaxes each edge family in its own loop; explicit lengths and zero runs relaxed once per position and capacity from the first cheapest state; reached capacities kept in a bitset; R5 keeps each match's restricted spelling by the banned symbols the solver reads | APNG Default CPU 1.48× and wall time 1.50× (62 inputs, 39.85% fewer instructions, 29.78% fewer cycles); 33 Default inputs 2.72% fewer instructions; completing Max runs 2.3% and 1.4% fewer; APNG peak memory median −6.9 MiB | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 4,168 replayed R4 searches per step; 2,000 R4 comparisons; 677 Rust, 7 Python tests |
 | 3 Nov 2026 | [`4aeb053`](#4aeb053-3-november-2026) | R4 arithmetic, R5 rewrites and header-planning buffers (`joint.rs`, `symbol_set.rs`, `header.rs`, `huffman.rs`) | R4's index and bound arithmetic wraps where it cannot overflow; R5 rewrites only a block's matches, scores the block's counts with their changes and spells tokens only for kept proposals; depth repair, RLE seeds and the first best header plan reuse or reserve their buffers | APNG Default CPU 1.063× and wall time 1.059× (62 inputs, 6.30% fewer instructions, 5.70% fewer cycles); 4,168 replayed R4 searches 19.1% fewer instructions; 33 Default inputs 1.07% fewer; completing Max runs 1.1% and 0.3% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 4,168 replayed R4 searches; full-token rewrite comparisons on 8 blocks; 678 Rust, 7 Python tests |
 | 3 Nov 2026 | [`3bb4834`](#3bb4834-3-november-2026) | Greedy run-length spelling and payload sums (`header.rs`) | The greedy speller writes its tokens in place and spells runs too short for a repeat code without branching; a code's data bits are summed without branches or overflow checks in one out-of-line copy | APNG Default CPU 1.036× and wall time 1.040× (62 inputs, 2.85% fewer instructions, 3.55% fewer cycles); 33 Default inputs 2.27% fewer instructions, 3.27% fewer cycles; completing Max runs 2.8% and 2.5% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 160,000 greedy-spelling and 20,000 payload-sum comparisons; 679 Rust, 7 Python tests |
+| 4 Nov 2026 | [`7d4e44c`](#7d4e44c-4-november-2026) | Max swap-trial costs and header-plan store (`header.rs`, `header/swap_costs.rs`) | Swap-trial costs in 8-byte slots, eight to a cache line, up to 2^22; trials' plans kept out of the header-plan store; 64 MiB store budget once a thread plans a Max block | Completing Max runs of three small PNGs 48.0%, 32.1% and 28.1% fewer instructions (1.85×, 1.44×, 1.39×); 177 completing sprites 1.34% fewer; Default unchanged; one of ten Max inputs at 20 seconds peaked 46–51 MiB higher | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 4 long and 177 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 684 Rust, 7 Python tests |
 
 ## Entries
 
@@ -488,6 +489,112 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `7d4e44c`, 4 November 2026
+
+Batches: one paired run of each build, alternating order, on the three small
+PNGs whose Max search completes within 1,200 seconds; two alternating runs of
+each completing Max run; one paired run of each build on the 177 sprites whose
+Max search completes within 10 seconds and on every sixteenth DeflOpt PNG by
+name (58 files, Max at 10 seconds); peak memory of ten inputs in Max at 20
+seconds; retired instructions and cycles over the 33 stratified Default
+inputs, two alternating rounds, and their CPU and peak memory, one round.
+
+A sampled profile of ten inputs in Max at 20 seconds (236,752 CPU samples) put
+62% under the uncached header planner: 36% of all samples planning the block
+planner's tree-candidate pairs and 25% the greedy length-swap trials.
+Instrumented builds found much of it repeating work the thread had done and
+then dropped. In a completing Max run of `star.png`, 8.2 million of 21.8
+million swap trials repeated a trial whose cost had left the 2^19 slots,
+taking 30 of the run's 81 seconds; most repeats came 100,000 to 1,000,000
+trials apart. Trial plans, 95% of the uncached plans on `crossroads.png` in 20
+seconds, also went into the per-thread header-plan store, and once trials were
+kept, half of the 680,000 exhaustive plans that missed the 16 MiB store in
+the `star.png` run repeated one it had dropped, 9.4 of 49 instrumented
+seconds.
+
+- **Swap-trial costs in 8-byte slots, up to 2^22.** Each slot holds a 48-bit
+  key, made of a 29-bit start identifier, the alphabet and the two 9-bit
+  symbols, above a 16-bit cost, and a key hashes to a set of eight slots, one
+  64-byte cache line. The slots grow fourfold once they have taken half as
+  many trials as they hold, up to 2^22 slots, 32 MiB.
+- **Trial plans kept out of the store.** A trial whose cost the thread keeps
+  no longer adds its plan to the header-plan store, which keeps its room for
+  the plans that repeat.
+- **A 64 MiB header-plan store in Max.** A thread's store keeps its 16 MiB
+  budget until the thread plans a block exhaustively, which only Max does, and
+  64 MiB from then until it is emptied.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| `star.png`, Max completing its search, instructions retired | 1,077.5 billion | 560.1 billion | −48.0% |
+| Same run, user CPU | 68.1 s | 36.8 s | 1.85× |
+| `basi4a16.png`, Max completing its search, instructions retired | 807.6 billion | 548.5 billion | −32.1% |
+| Same run, user CPU | 54.9 s | 38.3 s | 1.44× |
+| `crossroads.png`, Max completing its search, instructions retired | 2,318.9 billion | 1,667.1 billion | −28.1% |
+| Same run, user CPU | 149.1 s | 107.2 s | 1.39× |
+| `test-conversion-truecoloralpha-paletted.png`, Max completing its search, instructions retired | 1,094.2 billion | 664.4 billion | −39.3% |
+| 177 sprites, Max completing its search, instructions retired | 2,753.3 billion | 2,716.4 billion | −1.34% |
+| Same runs, user CPU | 215.9 s | 213.1 s | 1.013× |
+| `036-Clefable-0.png`, Max completing its search, instructions retired | 17.19 billion | 17.14 billion | −0.3% |
+| `114-Tangela-1.png`, Max completing its search, instructions retired | 2.149 billion | 2.142 billion | −0.3% |
+| 33 Default inputs, instructions retired over two rounds | 955.09 billion | 955.06 billion | −0.00% |
+| Same inputs, cycles over two rounds | 231.26 billion | 231.53 billion | +0.12% |
+
+Measured step by step on the three small PNGs, each against the step before,
+the larger trial slots growing at half full took 36.0%, 20.7% and 19.2% of the
+instructions off `star.png`, `basi4a16.png` and `crossroads.png`, keeping
+trial plans out of the store 4.7%, 2.7% and 5.5%, and the 64 MiB store 14.8%,
+12.0% and 5.9%. Trial slots growing when full took 6.8%, 17.0% and 32.8% off
+`star.png` at 2^20, 2^21 and 2^22, and 2^23 only added 1.4% on
+`crossroads.png`. A 32 MiB store took 0.0%, 3.0% and 1.1%, and 128 MiB 18.2%,
+12.6% and 8.7%.
+
+Peak memory of the 177 sprites kept its 26 MiB median, rose by 3 MiB at most,
+and the largest fell from 109 to 85 MiB. Default peak memory fell 0.5 MiB at
+the median. In Max at 20 seconds, nine of ten inputs peaked lower or within
+10 MiB; `4.2.03.png` peaked 46 to 51 MiB higher in three runs of each build
+(44 MiB with macOS malloc's large-block cache off), which the store accounts
+for: a 32 MiB store raised it 15 MiB, and the trial slots alone nothing. Each
+thread that fills its store can hold 48 MiB more, and one that fills its trial
+slots 26 MiB more.
+
+Deadline-bound Max cannot show equivalence, so it was checked for losses: on
+every sixteenth DeflOpt PNG by name, all 58 outputs had the same size and 57
+were identical, in 442.7 instead of 443.1 seconds.
+`test-conversion-truecoloralpha-paletted.png` gave other bytes of the same
+size in each of three runs; run to completion, both builds give the
+candidate's bytes, which it now reaches within 10 seconds. At 20 seconds,
+`Banana512.png` was 1 byte smaller and the other nine inputs identical.
+
+Equivalence: new tests check that the largest trial key leaves the empty-slot
+marker free, that a thread out of identifiers drops its trials and starts
+over, and that exhaustive block planning raises the store's budget until the
+store is released; the swap-search test now also checks that the store holds
+only the passes' start and committed plans (7 against 480 kept trials). API
+comparisons on the 52 inputs, in Default with the 180-second budget and in
+zero-budget Max, matched in all 104 runs, and every Default timing run and
+every completing Max run matched byte for byte. A release build with debug
+assertions completed the five completing Max runs above without a failed
+assertion and matched them byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting and all-feature Clippy with warnings
+denied. `__text` grew from 906,576 to 906,980 bytes; the
+shipped executable keeps its 991,488 bytes, and the final source builds the
+tested executable byte for byte.
+
+Measured and rejected in the same review:
+
+- Skipping header plans that a lower bound shows cannot beat the incumbent:
+  84% to 94% of tree-candidate plans and 99.9% of swap trials lose, but no
+  planned candidate's payload came within 29 bits of the incumbent, the
+  smallest possible header, so only a near-exact bound would prune.
+- A store shared across threads: plans repeated only on another thread were
+  at most 5% of planning time on the ten inputs at 20 seconds.
+- A code-length tree cache four times larger: 0.6% to 0.8% fewer instructions
+  on the three small PNGs.
+
+Artifacts: `work/efficiency-review-max9-20261104/`.
 
 ### `3bb4834`, 3 November 2026
 
