@@ -143,11 +143,39 @@ with formatting and all-target Clippy with warnings denied. A new unit test
 covers the decision for every floor policy and both shares. The shipped
 executable grows by 16 bytes to 991,504, with `__text` 2,040 bytes larger.
 
+<a id="m2c-beside-the-continuation-5-november"></a>
+
+### Measured and not adopted: M2c beside the continuation
+
+On top of the accepted change (`a66ce45`), the no-split continuation
+([M2c](routes-and-methods.md#m2c-changed-no-split-continuation)) ran on its
+own worker beside M7a under the same condition, `CompleteThenBounded` within
+the G0t search share, and the follow-up then skipped it. It started on 123 of
+the 147 deadline-bound PNG rows in the share where M7a ran.
+
+| Check, against `a66ce45`, alternating builds | Result |
+| --- | --- |
+| The 123 rows, one run each | 8 smaller, 5 larger, 110 identical; net −37 bytes / −301 bits; wall time unchanged, CPU +0.9% |
+| The 13 that differed, three runs each | 8 smaller, 4 larger, 1 identical; net −40 bytes / −321 bits; CPU +1.6%. Smaller in every run: `Sock.png` −56 bytes, `Gifts.png` −14, `automator.png` −8, `grayscale_alpha_8_should_be_palette_8.png` −8. Larger: `black817-480x360-3.5.png` +36 in every run, `test-conversion-rgb-canalalpha.png` +8 to +18 |
+| Hundred-file guard | 99 of 100, as with `a66ce45` |
+
+The losses come from the mechanism of
+[29 October](#mango512-step-29-october), which the share condition narrows
+but does not remove. On `black817-480x360-3.5.png` the continued no-split
+candidate, 1,450,626 bits, beats the deft4j refinement's 1,450,719 and becomes
+the parent, and its finish ends at 181,144 bytes, where the replaced deft4j
+lineage ends at 181,107. M14 keeps that lineage, but on a stream of this size
+the terminal share fits only one full finish. Without `Sock.png` the rows
+that repeat smaller save about 33 bytes and those that repeat larger lose
+about 48, so the net rests on one file and some small PNGs grow. The change was
+not adopted; the patch is in the artifacts.
+
 ### Not changed
 
 - `Sock.png`, an instance of the
   [floor-seeded continuation trade-off](#accepted-trade-offs). Running M2c
-  beside M7a was rejected on 29 October and was not retried.
+  beside M7a was rejected on 29 October, and its retry within the search share
+  [above](#m2c-beside-the-continuation-5-november) was not adopted.
 - The early states and host-state rows above, which more time passes.
 - The reference misses, all strict-policy floors.
 - `054-Psyduck-1.png`, the early-lineage parent choice.
@@ -2004,7 +2032,10 @@ Current:
   ([29 October](#mango512-step-29-october)). `Sock.png` saves 815 bytes at
   6–9 seconds and 759 from 10 seconds for the same reason. Source max, which
   M7a starved the same way, now runs beside it within the G0t search share
-  ([5 November](#source-max-beside-the-continuation-5-november)).
+  ([5 November](#source-max-beside-the-continuation-5-november)). M2c beside
+  M7a within that share recovered `Sock.png` but repeated 36 bytes larger on
+  `black817-480x360-3.5.png`, and its net gain rested on `Sock.png` alone
+  ([5 November](#m2c-beside-the-continuation-5-november)).
 - **Kept-candidate order.** M14 finishes a losing contender's kept candidates
   last, since no shorter run is likely to start from them.
   `profile_srgb_allow_gray.png` is 5 bytes larger, because one finished first
