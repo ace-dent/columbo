@@ -6514,6 +6514,12 @@ after M13, so that endpoint cannot redirect the refinement.
   recovered, at doubled time, 68 of 70 prior APNG byte-and-bit floors and was
   1,800 bytes and 14,440 meaningful bits smaller in aggregate
   ([evidence](benchmark-miss-regression-audit.md#accepted-general-changes)).
+  Under `CompleteThenBounded`, the same worker beside the continuation gave
+  `sample_53.png` back the 26 bytes that the continuation had starved source
+  max of. It runs only within the G0t search share: outside it, a source-max
+  win leaves the replaced lineage unfinished, and `IMG_8555.png` ended 405
+  bytes larger in two of three runs
+  ([5 November](benchmark-miss-regression-audit.md#source-max-beside-the-continuation-5-november)).
 - A losing M13 candidate is dropped without the terminal tree floors.
 - The compact split floor (M10c, M10d), which splits compact completed parents,
   floor-seeded ones included, is described under
@@ -8417,7 +8423,7 @@ flowchart TD
     M4SEED -- "Yes" --> M4SEEDRUN["Deterministic balanced-tree / feedback cleanup"]
     M4SEED -- "No" --> M7A
     M4SEEDRUN --> M7A{"M7a: M7 descendant leads,<br/>not a Max fixed point, + G0"}
-    M7A -- "Yes" --> M7ARUN["Continue the M7 descendant with the Max planner first<br/>beside eligible deft4j, compact-split,<br/>or ApngMax source-max workers"]
+    M7A -- "Yes" --> M7ARUN["Continue the M7 descendant with the Max planner first<br/>beside eligible deft4j, compact-split<br/>or ApngMax source-max workers, plus a<br/>source-max worker in the CompleteThenBounded search share"]
     M7A -- "No" --> FOLLOW
     M7ARUN --> FOLLOW["Bounded follow-up + G0<br/>caller refines the deft4j lineage (M10b)<br/>beside the M2c or source-max worker and M10c"]
     FOLLOW --> M2C{"M2c: changed no-split winner<br/>new topology + G0"}
@@ -9417,17 +9423,32 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
   original-source Max on a worker (`ApngMax`, no source-max candidate yet and
   source max not marked as run, G0); the M10b refinement on one worker and any
   pending compact split on another (`CompleteThenBounded`, a refinement
-  pending); any pending compact split on a worker. Otherwise it runs alone. If
-  the continuation changed the descendant under M10b's weak-deft signal, the new
-  parent is prepared as a fresh M10c seed unless it repeats the normal or deft4j
-  seed or the completed parent. If a sibling's worker fails to spawn, the
-  continuation can be dropped ([Multithreading](#multithreading)).
+  pending); any pending compact split on a worker. Otherwise it runs alone.
+  Under `CompleteThenBounded` within the G0t search share, original-source Max
+  also runs on one more worker beside whichever arrangement applies, under the
+  same source-max conditions, so the step uses at most four threads; M12 then
+  reuses its candidate. If the continuation changed the descendant under M10b's
+  weak-deft signal, the new parent is prepared as a fresh M10c seed unless it
+  repeats the normal or deft4j seed or the completed parent. If a sibling's
+  worker fails to spawn, the continuation can be dropped
+  ([Multithreading](#multithreading)).
 - **Why:** the continuation could otherwise use up any longer deadline, and an
   APNG frame has no time left after a continuation that uses its whole window
   (code comments). The 2% rule keeps the continuation from starving a split that
   must wait for it. Parent size does not predict the better endpoint, so the
   independent roots keep getting work
   ([accepted general changes](benchmark-miss-regression-audit.md#accepted-general-changes)).
+  A single PNG image is no different: once the descendant leads, the
+  continuation can use the primary window up to the hard stop, and source max
+  (M12) never starts. Its worker is limited to the search share because a
+  source-max win replaces the continued lineage, which M14 can still finish
+  only in reserved terminal time; under the finalization share no G0 work
+  remains after the primary routes, so the win could move the endpoint either
+  way, as M2c beside M7a did
+  ([5 November](benchmark-miss-regression-audit.md#source-max-beside-the-continuation-5-november),
+  [29 October](benchmark-miss-regression-audit.md#mango512-step-29-october)).
+  The worker's thread stays below the initial bounded phase's caller and four
+  workers.
 - **See:**
   [Floor-seeded and rewritten-seed refinement (M7, M7a, M13)](#floor-seeded-and-rewritten-seed-refinement-m7-m7a-m13).
 
@@ -9656,7 +9677,8 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
 - **Runs:** Max, every policy, after M11 and before M13.
 - **Eligible:** M12 reuses a source-max candidate that an earlier phase
   completed: the initial worker that M8 and M9 started, the `GenericParallel`
-  worker, the `ApngMax` worker beside M7a, or the follow-up worker. Otherwise it
+  worker, the worker beside M7a (`ApngMax`, or `CompleteThenBounded` within the
+  G0t search share), or the follow-up worker. Otherwise it
   starts original-source Max under G0, polling the hard stop and using S0's
   state order, unless an earlier phase marked source max as run;
   `GenericParallel` does so even when the deadline kept its worker from
@@ -10256,9 +10278,12 @@ The Speed column rates the work each site runs, in the classes of the
   with the Max planner to the hard stop, while the first matching sibling
   arrangement of
   [M7a: best-first floor continuation](#m7a-best-first-floor-continuation) runs
-  beside it on at most two workers. Spawn failures differ by worker:
-  - Without the source-max worker, the caller continues alone, and source max
-    stays eligible later.
+  beside it on at most two workers. Under `CompleteThenBounded` within the G0t
+  search share, a source-max worker may run beside that arrangement too, so the
+  step uses at most four threads, the caller included. Spawn failures differ by
+  worker:
+  - Without the source-max worker, the caller continues with any other
+    siblings, or alone under `ApngMax`, and source max stays eligible later.
   - Without the deft4j-refinement worker
     ([M10b](#m10b-bounded-deft-refinement)), the whole step is skipped: the
     continuation is dropped, and only the refinement and any pending split run

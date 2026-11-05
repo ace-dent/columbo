@@ -34,24 +34,25 @@ use super::{
     capture_source_block_report, changed_narrow_parent_should_continue,
     compact_balanced_tree_source_eligible, compact_dependent_deft4j_work_class,
     compact_split_parent_is_completed, complete_png_parallel_source_max_work_class,
-    default_source_topology_eligible, deft4j_source_route_eligible, established_floor_candidate,
-    floor_exposes_new_search_states, floor_seeded_priority_with_structural_sibling, gain_is_below,
-    has_multiple_nonempty_blocks, improve_default_floor_with_feedback,
-    improve_with_final_header_fit, improve_with_terminal_searches,
-    improve_with_terminal_tree_floors, independent_deft4j_refinement_can_overlap,
-    is_strictly_better, join_route, narrow_source_route_eligible, normalize_258_aliases,
-    parallel_route_is_bounded, parse_validated_rewrite, prebuild_bounded_floor,
-    prepare_compact_source_split_seed, refine_bounded_deft4j_lineage,
-    refine_with_compact_balanced_tree_floor, refine_with_compact_proven_feedback,
-    refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
-    refine_with_max_planner, refine_with_no_split_route,
-    refine_with_terminal_source_split_floor_until, release_kept_validated_parse,
-    replace_optional_if_smaller, replace_optional_keeping_parent, source_run_match_count_exceeds,
-    spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy,
-    BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, DefaultFloor, DefaultFloorWork,
-    HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache,
-    TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT,
-    MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    continuation_source_max, default_source_topology_eligible, deft4j_source_route_eligible,
+    established_floor_candidate, floor_exposes_new_search_states,
+    floor_seeded_priority_with_structural_sibling, gain_is_below, has_multiple_nonempty_blocks,
+    improve_default_floor_with_feedback, improve_with_final_header_fit,
+    improve_with_terminal_searches, improve_with_terminal_tree_floors,
+    independent_deft4j_refinement_can_overlap, is_strictly_better, join_route,
+    narrow_source_route_eligible, normalize_258_aliases, parallel_route_is_bounded,
+    parse_validated_rewrite, prebuild_bounded_floor, prepare_compact_source_split_seed,
+    refine_bounded_deft4j_lineage, refine_with_compact_balanced_tree_floor,
+    refine_with_compact_proven_feedback, refine_with_compact_source_split_floor,
+    refine_with_compact_source_split_floor_until, refine_with_max_planner,
+    refine_with_no_split_route, refine_with_terminal_source_split_floor_until,
+    release_kept_validated_parse, replace_optional_if_smaller, replace_optional_keeping_parent,
+    source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
+    BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed,
+    ContinuationSourceMax, DefaultFloor, DefaultFloorWork, HeaderFit, RawInfo, RawOptimization,
+    ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
+    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
+    WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
@@ -259,6 +260,7 @@ struct StreamDeadlines {
     primary: Deadline,
     terminal: Deadline,
     reserve_terminal: bool,
+    share: TerminalShare,
 }
 
 impl StreamDeadlines {
@@ -298,6 +300,7 @@ impl StreamDeadlines {
             primary,
             terminal,
             reserve_terminal,
+            share,
         }
     }
 
@@ -322,10 +325,13 @@ struct RouteEligibility {
     default_source_topology: bool,
     narrow_source: bool,
     parallel_routes: bool,
+    /// G0t reserves a search share, within which M14 can still finish what a
+    /// late route's win replaces.
+    terminal_search_share: bool,
 }
 
 impl RouteEligibility {
-    fn new(context: &RouteContext<'_>) -> Self {
+    fn new(context: &RouteContext<'_>, share: TerminalShare) -> Self {
         let RouteContext {
             source,
             options,
@@ -360,6 +366,7 @@ impl RouteEligibility {
             parallel_routes: options.exhaustive
                 && default_floor.is_bounded()
                 && parallel_route_is_bounded(source),
+            terminal_search_share: share == TerminalShare::Search,
         }
     }
 }
@@ -498,7 +505,7 @@ fn prepare_source_blocks(
 fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> Result<Candidate> {
     let mut state = RouteState::default();
     let guaranteed_floor = build_guaranteed_floor(context, &mut state)?;
-    let eligibility = RouteEligibility::new(context);
+    let eligibility = RouteEligibility::new(context, deadlines.share);
     run_bounded_phase(context, &eligibility, guaranteed_floor, &mut state)?;
     run_proven_feedback_floor(context, &eligibility, &mut state)?;
     prepare_compact_split_seeds(context, &mut state)?;
@@ -932,14 +939,15 @@ fn continue_floor_seeded(
         eligibility.parallel_routes,
         state.weak_deft4j || state.deft4j.is_some(),
     );
-    // An APNG child has no time left after a continuation that uses its
-    // whole window, so run original-source Max beside it.
-    let overlap_source_max = continue_best
-        && default_floor == DefaultFloor::ApngMax
-        && eligibility.parallel_routes
-        && state.source_max.is_none()
-        && !state.suppress_later_source_max
-        && deadline.can_start_route();
+    let source_max = continuation_source_max(
+        default_floor,
+        eligibility.terminal_search_share,
+        continue_best
+            && eligibility.parallel_routes
+            && state.source_max.is_none()
+            && !state.suppress_later_source_max
+            && deadline.can_start_route(),
+    );
     let floor_seeded_step =
         continue_best.then(|| progress.start("Columbo floor-seeded continuation"));
     let split_step = (continue_best && overlap_compact_split)
@@ -947,21 +955,16 @@ fn continue_floor_seeded(
     let deft4j_step = overlap_deft4j.then(|| progress.start("deft4j-derived refinement"));
     let mut floor_seeded_changed = false;
     if continue_best {
-        let refined = if overlap_source_max {
-            continue_beside_source_max(context, state)?
-        } else if overlap_deft4j {
-            continue_beside_deft4j_refinement(context, state, overlap_compact_split)?
-        } else if overlap_compact_split {
-            continue_beside_compact_split(context, state)?
-        } else {
-            let seeded = floor_seeded_parent(state);
-            Some(refine_with_max_planner(
-                seeded,
-                options,
-                decoded_limit,
-                identity,
-                &mut deadline.hard_stop(),
-            )?)
+        let refined = match source_max {
+            ContinuationSourceMax::InsteadOfSiblings => continue_beside_source_max(context, state)?,
+            ContinuationSourceMax::BesideSiblings => {
+                with_source_max_worker(context, state, |state| {
+                    continue_with_siblings(context, state, overlap_deft4j, overlap_compact_split)
+                })?
+            }
+            ContinuationSourceMax::Later => {
+                continue_with_siblings(context, state, overlap_deft4j, overlap_compact_split)?
+            }
         };
         if let Some(refined) = refined {
             let seeded = state
@@ -1008,6 +1011,79 @@ fn floor_seeded_parent(state: &RouteState) -> &Candidate {
         .floor_seeded
         .as_ref()
         .expect("continuation requires a floor-seeded candidate")
+}
+
+/// Continue the floor-seeded parent beside the siblings that can overlap it:
+/// the deft4j refinement, with compact split when that can overlap too, or
+/// compact split alone; otherwise continue it on this thread.
+fn continue_with_siblings(
+    context: &RouteContext<'_>,
+    state: &mut RouteState,
+    overlap_deft4j: bool,
+    overlap_compact_split: bool,
+) -> Result<Option<Candidate>> {
+    if overlap_deft4j {
+        return continue_beside_deft4j_refinement(context, state, overlap_compact_split);
+    }
+    if overlap_compact_split {
+        return continue_beside_compact_split(context, state);
+    }
+    let RouteContext {
+        source,
+        options,
+        deadline,
+        ..
+    } = *context;
+    Ok(Some(refine_with_max_planner(
+        floor_seeded_parent(state),
+        options,
+        source.decoded_limit,
+        source.identity,
+        &mut deadline.hard_stop(),
+    )?))
+}
+
+/// Run `continuation` while an original-source Max worker searches beside it,
+/// and keep the worker's candidate for M12. Without a worker, source max can
+/// still run serially later.
+fn with_source_max_worker(
+    context: &RouteContext<'_>,
+    state: &mut RouteState,
+    continuation: impl FnOnce(&mut RouteState) -> Result<Option<Candidate>>,
+) -> Result<Option<Candidate>> {
+    let RouteContext {
+        source,
+        options,
+        deadline,
+        progress,
+        ..
+    } = *context;
+    let integrated_compact_source_max = state.integrated_compact_source_max;
+    let (refined, source_max) =
+        thread::scope(|scope| -> Result<(Option<Candidate>, Option<Candidate>)> {
+            let source_worker =
+                spawn_route(scope, "columbo-source-max-continuation", deadline, || {
+                    build_source_max_candidate(
+                        source,
+                        options,
+                        progress,
+                        deadline,
+                        integrated_compact_source_max,
+                        &mut deadline.hard_stop(),
+                    )
+                });
+            let refined = continuation(state);
+            if refined.is_err() {
+                deadline.cancel_routes();
+            }
+            let source_max = source_worker.map(join_route).transpose()?;
+            Ok((refined?, source_max))
+        })?;
+    if let Some(source_max) = source_max {
+        state.source_max = Some(source_max);
+        state.suppress_later_source_max = true;
+    }
+    Ok(refined)
 }
 
 /// Continue the floor-seeded parent beside an original-source Max worker.

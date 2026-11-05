@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 3 November 2026 entry, the 31 October entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 5 November 2026 entry, the 3 November entry, the 31 October entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,122 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="source-max-beside-the-continuation-5-november"></a>
+
+## Source max beside the continuation on 5 November 2026
+
+### Starting state
+
+The reports of 4 and 5 November come from `44db3bba…` (`f37b2a9`). Against the
+previous states, DeflOpt and timed deft4j from `85bf564` (29 October) and APNG
+from `c5294e0` (26 October), with rows ordered by bytes, then bits:
+
+| Benchmark | Result |
+| --- | --- |
+| Defluff, 66 pairs | Unchanged; no misses |
+| DeflOpt Default, 957 rows | Byte- and bit-identical; 290.8 → 233.7 s |
+| DeflOpt Max, 957 rows | 348 smaller, 599 identical, 10 larger by 95 bytes in all; net −2,001 bytes / −16,023 bits |
+| Timed deft4j, 1,621 rows | 480 smaller, 1,126 identical, 15 larger by 77 bytes; net −2,050 bytes / −16,325 bits |
+| APNG Max, 2,431 stickers | 2,264 smaller, 106 identical, 61 larger by 661 bytes; net −92,019 bytes / −735,489 bits |
+| APNG Default, 2,431 stickers | 826 smaller, 1,605 identical, none larger; 1,874 → 855 s |
+| Reference misses | DeflOpt's four and timed deft4j's 12 strict-policy floors, the same rows with the same gaps |
+| Hundred-file guard | 98 of 100: `sample_53.png`, which entered with this refresh (+26 bytes), and Psyduck (+1 bit) |
+
+Every larger row is a Max row that used its whole allowance. Rows were rerun
+on scratch copies, alternating builds, with binaries of the intervening
+commits; a library driver gave deadlines below the CLI's 10-second minimum.
+
+### Causes
+
+- **Host state.** The DeflOpt run started just after a reboot.
+  `Sock.png` gave 815 bytes saved on all eight builds from `85bf564` to
+  `f37b2a9` in one set of runs on 5 November and 759–761 in others. The driver
+  places its step between 9 and 10 seconds (815 at 6–9 s, 759 at 10–12 s), so
+  the effective cut moves with host speed. `logo.png`, `4.2.03.PNG` and
+  `2291700_336392…` recover on quiet reruns, and `animation_icos4d.orig.png`
+  and `beautiful_anim_225.png` vary by up to 15 bytes on both builds.
+- **Early states that a faster build passes.** `1347030_203652…` (433 → 413
+  bytes saved) and `1328670_144882…` (270 → 251) change first at `77353bc`,
+  which kept five times as many header plans. `6e6a0c4` gives 416 and 251 at
+  13 seconds, the new build's 10-second values, so its own 10-second results
+  were early states. With more time `f37b2a9` passes the old values: 509 at
+  20 seconds and 273 at 40. At twice their allowances it also passes them on
+  `807120_103960…` (3,356 against 3,226), `1084600_283291…` (627 against
+  588), `2642840_441858…` and `1223590_201839…` (1,873 against 1,852).
+  `1492660_115372…` gives 6,680 on `c5294e0` at 10 seconds but 6,613 at 20;
+  at 20, 40 and 80 seconds `f37b2a9` is ahead (6,638, 6,692 and 7,006 against
+  6,613, 6,656 and 6,702). `268910_80058…` now gives 11,515 on `c5294e0` and
+  11,595 on `f37b2a9`: the report's 11,773 was one run. The same holds for
+  `lens.png` and `merge.png` from 4 November: the earlier build gives the new
+  values at 30 seconds. No route was found unreachable.
+- **The continuation starves source max.** `sample_53.png` saves 135 bytes at
+  3–7 seconds, 107 at 8 and 109 at 9–10, and needs about 60 seconds (141) to
+  pass 135. At 7 seconds the route window cuts the floor's Max descendant
+  ([M7](routes-and-methods.md#m7-floor-descendant)) at 21,466 bytes, the
+  no-split candidate leads, the continuation has nothing to do, and source max
+  ([M12](routes-and-methods.md#m12-later-source-max)) runs for about a second
+  and wins: the finish ends at 170,855 bits. At 8 seconds the descendant leads
+  by 14 bits, so the floor-seeded continuation
+  ([M7a](routes-and-methods.md#m7a-best-first-floor-continuation)) runs beside
+  the deft4j refinement until the primary deadline and gains 1 bit, and source
+  max never starts: 171,077 bits. `ApngMax` already runs source max beside the
+  continuation for this reason.
+- **The continuation starves the no-split continuation.** On `Sock.png` the
+  9-second winner is M2c's continuation of the no-split candidate (85,795
+  bytes), which never starts once the descendant leads at 10 seconds. This is
+  the [Mango512 step](#mango512-step-29-october), and source max beside the
+  continuation does not change it.
+
+### Accepted change
+
+Under `CompleteThenBounded`, within the
+[G0t search share](routes-and-methods.md#g0t-max-terminal-share), M7a starts
+original-source Max on one more worker beside whichever sibling arrangement
+applies, under the conditions of the `ApngMax` worker, and M12 reuses its
+candidate ([M7a](routes-and-methods.md#m7a-best-first-floor-continuation)).
+`ApngMax` is unchanged. A first candidate without the share condition
+showed why it is needed: when source max wins as a parent, M12 keeps the
+continued lineage for M14, which only reserved terminal time lets finish.
+Under the finalization share no G0 work remains after the primary routes, so
+the win can move the endpoint either way, as M2c beside M7a did on
+`Cherry512.png`.
+
+| Check, against `f37b2a9`, alternating builds | Result |
+| --- | --- |
+| Screen of the 353 deadline-bound PNG Max rows of the DeflOpt report | The worker starts on 132 without the share condition, 24 of them outside the search share; with it, on none of those 24 |
+| The 132 rows, one run each, without the share condition | 11 smaller, 12 larger, 109 identical; net −45 bytes / −340 bits; wall time unchanged, CPU +8.1% |
+| The 23 that differed, three runs each, without the share condition | Inside the share (19): net −32 bytes / −257 bits. Outside (4): +318 bytes, `IMG_8555.png` 405 bytes larger in two of three runs and `FsqwhPuaIAIlojU.png` about 40 |
+| The 19 inside the share, two more runs each, with it | 7 smaller, 6 larger, 6 identical; net −30 bytes / −238 bits; wall time unchanged, CPU +6.6%. `sample_53.png` −26 bytes and `sample_42-fs8.png` −8 in every run; `trucsenvrac2-fs8.png` 2–5 bytes larger |
+| Every twentieth deadline-bound (18) and twelfth early-finishing (45) PNG row | Deadline-bound: 2 smaller, none larger. Early-finishing: identical, time unchanged |
+| The 13 PNG rows that grew in this refresh | `sample_53.png` 109 → 135 bytes saved; the others identical |
+| Hundred-file guard | 99 of 100: `sample_53.png` reaches its floor; Psyduck stays at 1,564 bits |
+| Completing Max runs (`036-Clefable-0.png`, `114-Tangela-1.png`) | Identical bytes; instructions within 0.2% |
+| `sample_42-fs8.png` and `trucsenvrac2-fs8.png` at 120 seconds | Identical bytes on both builds |
+| Peak memory, eight large PNGs at 20 seconds | Identical outputs; peaks 10 MiB lower to 30 MiB higher, within run-to-run spread |
+| Default, every ninth DeflOpt row (107: PNG, ZIP, GZIP) | Identical |
+
+On `trucsenvrac2-fs8.png` source max runs beside the continuation and loses by
+259 bits; M12 keeps it and its replay parents for M14, which finishes those
+first, and the run ends 2–5 bytes larger. With more time both builds give the
+same bytes. The cost is CPU time while the worker runs; rows that finish early
+are unchanged.
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with formatting and all-target Clippy with warnings denied. A new unit test
+covers the decision for every floor policy and both shares. The shipped
+executable grows by 16 bytes to 991,504, with `__text` 2,040 bytes larger.
+
+### Not changed
+
+- `Sock.png`, an instance of the
+  [floor-seeded continuation trade-off](#accepted-trade-offs). Running M2c
+  beside M7a was rejected on 29 October and was not retried.
+- The early states and host-state rows above, which more time passes.
+- The reference misses, all strict-policy floors.
+- `054-Psyduck-1.png`, the early-lineage parent choice.
+
+Artifacts: `work/benchmark-fix-20261105/`.
 
 <a id="kept-source-max-losers-3-november"></a>
 
@@ -1885,7 +2001,10 @@ Current:
   gets the descendant ahead within its allowance.
   Running M2c beside M7a recovered it but made `Cherry512.png` 273 bytes
   larger, and was larger in total on a sample of the rows it changes
-  ([29 October](#mango512-step-29-october)).
+  ([29 October](#mango512-step-29-october)). `Sock.png` saves 815 bytes at
+  6–9 seconds and 759 from 10 seconds for the same reason. Source max, which
+  M7a starved the same way, now runs beside it within the G0t search share
+  ([5 November](#source-max-beside-the-continuation-5-november)).
 - **Kept-candidate order.** M14 finishes a losing contender's kept candidates
   last, since no shorter run is likely to start from them.
   `profile_srgb_allow_gray.png` is 5 bytes larger, because one finished first

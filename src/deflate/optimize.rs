@@ -556,6 +556,43 @@ fn independent_deft4j_refinement_can_overlap(
         && refinement_is_pending
 }
 
+/// Where original-source Max runs while the floor-seeded continuation (M7a)
+/// may use the rest of the primary window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationSourceMax {
+    /// Not beside the continuation; the follow-up or M12 may still run it.
+    Later,
+    /// Beside the continuation, in place of its other siblings (`ApngMax`).
+    InsteadOfSiblings,
+    /// Beside the continuation and its other siblings (`CompleteThenBounded`).
+    BesideSiblings,
+}
+
+/// A continuation can use the rest of the primary window, and source max
+/// (M12) would then never start, so a policy that already runs source max
+/// beside other work starts it beside the continuation too. A single PNG image
+/// does so only within G0t's search share: a source-max win replaces the
+/// continued lineage, and only reserved terminal time lets M14 still finish
+/// it. Outside that share only the incumbent gets the terminal stage, so the
+/// win could move the endpoint either way. `pending` holds when the
+/// continuation runs, M5 allows workers, no source-max candidate exists or is
+/// marked as run, and a route may start.
+fn continuation_source_max(
+    default_floor: DefaultFloor,
+    terminal_search_share: bool,
+    pending: bool,
+) -> ContinuationSourceMax {
+    if !pending || !default_floor.allows_parallel_source_follow_up() {
+        ContinuationSourceMax::Later
+    } else if default_floor == DefaultFloor::ApngMax {
+        ContinuationSourceMax::InsteadOfSiblings
+    } else if terminal_search_share {
+        ContinuationSourceMax::BesideSiblings
+    } else {
+        ContinuationSourceMax::Later
+    }
+}
+
 #[derive(Clone, Copy)]
 struct StreamIdentity {
     decoded_size: u64,

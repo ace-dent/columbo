@@ -104,10 +104,18 @@ fn route_families_require_max_and_a_matching_source_topology() {
             deadline: &deadline,
             progress,
         };
-        let eligibility = RouteEligibility::new(&context);
-        // The source is small enough for parallel Max routes, but its only
-        // nonempty block is stored, so no source-graph family applies.
+        let share = DefaultFloor::CompleteThenBounded.terminal_share(
+            &options,
+            parsed.consumed,
+            parsed.decoded_size,
+            parsed.source_block_count,
+        );
+        let eligibility = RouteEligibility::new(&context, share);
+        // The source is small enough for parallel Max routes and for G0t's
+        // search share, but its only nonempty block is stored, so no
+        // source-graph family applies.
         assert_eq!(eligibility.parallel_routes, exhaustive);
+        assert_eq!(eligibility.terminal_search_share, exhaustive);
         assert!(!eligibility.deft4j);
         assert!(!eligibility.narrow_source);
         assert!(!eligibility.compact_tree);

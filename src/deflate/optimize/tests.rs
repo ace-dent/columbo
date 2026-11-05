@@ -3209,6 +3209,49 @@ fn independent_refinement_overlaps_only_inside_the_bounded_parallel_class() {
 }
 
 #[test]
+fn continuation_runs_source_max_beside_it_where_the_policy_runs_it_in_parallel() {
+    // An APNG child runs it in place of the other siblings in either share.
+    for search_share in [false, true] {
+        assert_eq!(
+            continuation_source_max(DefaultFloor::ApngMax, search_share, true),
+            ContinuationSourceMax::InsteadOfSiblings
+        );
+    }
+    // A single PNG image runs it beside them only within the search share.
+    assert_eq!(
+        continuation_source_max(DefaultFloor::CompleteThenBounded, true, true),
+        ContinuationSourceMax::BesideSiblings
+    );
+    assert_eq!(
+        continuation_source_max(DefaultFloor::CompleteThenBounded, false, true),
+        ContinuationSourceMax::Later
+    );
+    for floor in [
+        DefaultFloor::Complete,
+        DefaultFloor::CompleteThenBounded,
+        DefaultFloor::Shared,
+        DefaultFloor::SharedExact,
+        DefaultFloor::ApngDefault,
+        DefaultFloor::ApngMax,
+        DefaultFloor::Established,
+        DefaultFloor::MandatoryComplete,
+    ] {
+        for search_share in [false, true] {
+            assert_eq!(
+                continuation_source_max(floor, search_share, false),
+                ContinuationSourceMax::Later
+            );
+            if !floor.allows_parallel_source_follow_up() {
+                assert_eq!(
+                    continuation_source_max(floor, search_share, true),
+                    ContinuationSourceMax::Later
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn bounded_png_max_policy_follows_available_route_families() {
     assert_eq!(
         bounded_png_max_policy(1, false, true, true),
