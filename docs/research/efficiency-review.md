@@ -2,7 +2,9 @@
 
 A dated log of merged changes that remove repeated calculation and copying
 without changing output: which search routes run, their tie-breaking, work
-budgets and stop checks stay the same.
+budgets and stop checks stay the same. Reviews that merged nothing are
+logged under [Reviews without a merged change](#reviews-without-a-merged-change),
+so that their measured dead ends are not tried again.
 
 ## Methods
 
@@ -3083,3 +3085,60 @@ Measured and rejected in the same review:
   each decoded byte once, so they would not reduce its work.
 
 Artifacts: `work/efficiency-review-block-plan-store/`.
+
+## Reviews without a merged change
+
+### Max header planning, `b190dfc`, 6 November 2026
+
+Batches: sampled profiles of the ten Max inputs at 20 seconds (238,726 CPU
+samples) and of `crossroads.png`, `star.png` and `basi4a16.png` completing
+their searches (151,015 samples), the latter repeated with 29 header-planning
+helpers kept out of line; instrumented probes of `star.png` and
+`basi4a16.png` completing; replays of 11,343 captured swap searches and
+275,887 captured header plans, two rounds alternating the builds. Every
+candidate gave the same replay digests as the baseline.
+
+On the completing runs, 61% of the samples were under `consider_rle`, almost
+all from the greedy length-swap trials' header plans; on `crossroads.png`
+they came through the source-max route's state queue. Its parts were the
+shortest RLE under each feedback tree (about 20% of all samples; 12% at 20
+seconds), the four heap variants' DeflOpt local-rewrite pre-pass (about 18%),
+and code-length tree lookups. At 20 seconds tree building weighed more:
+package-merge, the payload tree candidates and deft4j's code-length heap.
+
+Measured and rejected:
+
+- **The shortest RLE's symbol counts from its run tables, its tokens spelled
+  only when needed.** Each run spelling kept its symbol counts, so a header
+  plan found the shortest RLE's counts without spelling it and spelled the
+  tokens only to copy them into the next feedback pass or compare them with
+  its RLE. The swap replay retired 15.6% more instructions in 8.9% more
+  cycles, and the header replay 5.4% more in 3.7% more. The probe showed why:
+  of 19.7 million shortest RLEs on `star.png`, 58% (74% on `basi4a16.png`)
+  were later copied into a pass, so most of them were walked twice, and the
+  count tables cost work to build.
+- **Each code length's run spellings looked up once per shortest RLE**, for
+  its longest run, instead of per run: 2.7% more instructions and 5.5% more
+  cycles on the swap replay, 0.8% and 0.9% on the header replay. The
+  existing per-value lookup was already cheap and well predicted, and the
+  extra pass over the runs cost more. A first version restarted the lookups
+  whenever a build replaced spellings found earlier; when two lengths' costs
+  share a table slot, which only test costs above 7 bits allow, it never
+  ended, so a replacement falls back to the per-run lookup.
+
+Probed and not pursued:
+
+- **A memo of shortest RLEs across header plans.** Of the 19.7 million on
+  `star.png`, 3.05 million repeated the runs and tree of an earlier plan on
+  the same thread, but only 133,000 of those within the last 65,536, so a
+  memo would need millions of entries.
+- **Reusing the pre-pass's rewrites in the feedback passes.** A feedback
+  pass's DeflOpt rewrite repeats one that the pre-pass stored for the same
+  RLE and tree in 4% of passes on `star.png` and 15% on `basi4a16.png`:
+  about 0.2–0.6% of the samples.
+- **A larger swap-trial cost memo.** Repeated trials after eviction were about
+  7% of `star.png`'s time in the `9a3f174` review and 0.3% of
+  `basi4a16.png`'s, so a 64 MiB memo would trade memory on every Max thread
+  for one file.
+
+Artifacts: `work/efficiency-review-max11-20261106/`.
