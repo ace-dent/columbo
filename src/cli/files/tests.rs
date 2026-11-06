@@ -138,13 +138,14 @@ fn staged_output_is_private_and_commit_preserves_destination_mode() {
 
     let temporary = stage_private_output(&output, b"new").unwrap();
     assert_eq!(fs::read(&temporary.location.path).unwrap(), b"new");
+    // The directory, not the file mode, keeps the staged file private.
     assert_eq!(
         fs::metadata(&temporary.location.path)
             .unwrap()
             .permissions()
             .mode()
             & 0o777,
-        0o600
+        default_creation_mode(&directory)
     );
     assert_eq!(
         fs::metadata(&temporary.location.directory)
@@ -176,20 +177,102 @@ fn output_commit_replaces_a_symlink_without_following_it() {
     let protected = directory.join("protected.bin");
     let output = directory.join("output.bin");
     fs::write(&protected, b"protected").unwrap();
-    fs::set_permissions(&protected, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&protected, fs::Permissions::from_mode(0o604)).unwrap();
     symlink(&protected, &output).unwrap();
 
     write_file(&output, b"optimized").unwrap();
     assert_eq!(fs::read(&protected).unwrap(), b"protected");
+    assert_eq!(
+        fs::metadata(&protected).unwrap().permissions().mode() & 0o777,
+        0o604
+    );
     assert_eq!(fs::read(&output).unwrap(), b"optimized");
     assert!(!fs::symlink_metadata(&output)
         .unwrap()
         .file_type()
         .is_symlink());
+    // A replaced link is a new file: the target's mode is not copied.
     assert_eq!(
         fs::metadata(&output).unwrap().permissions().mode() & 0o777,
-        0o600
+        default_creation_mode(&directory)
     );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+/// The mode `File::create` gives a new file in `directory` (`0666` less the
+/// umask), read back rather than computed because std cannot read the umask.
+#[cfg(unix)]
+fn default_creation_mode(directory: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    let reference = directory.join("reference-mode");
+    fs::write(&reference, b"").unwrap();
+    let mode = fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+    fs::remove_file(reference).unwrap();
+    mode
+}
+
+#[cfg(unix)]
+#[test]
+fn new_outputs_get_the_default_creation_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = unique_test_directory();
+    let expected = default_creation_mode(&directory);
+    let replaced = directory.join("replaced.bin");
+    let created = directory.join("created.bin");
+
+    write_file(&replaced, b"optimized").unwrap();
+    assert!(write_new_file(&created, b"copied").unwrap());
+    for output in [&replaced, &created] {
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o777,
+            expected
+        );
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn replacement_mode_drops_special_bits_and_group_access_it_cannot_keep() {
+    assert_eq!(replacement_mode(0o7751, true), 0o751);
+    assert_eq!(replacement_mode(0o100640, true), 0o640);
+    // A group that could not be kept gets only the access others had.
+    assert_eq!(replacement_mode(0o6750, false), 0o700);
+    assert_eq!(replacement_mode(0o640, false), 0o600);
+    assert_eq!(replacement_mode(0o664, false), 0o644);
+    assert_eq!(replacement_mode(0o604, false), 0o644);
+}
+
+/// Replacement keeps a destination group that differs from the staging
+/// directory's, using a group the test user may choose. There is nothing to
+/// check when the user belongs to no second group in the probed range.
+#[cfg(unix)]
+#[test]
+fn replacement_keeps_a_group_the_user_belongs_to() {
+    use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+
+    let directory = unique_test_directory();
+    let output = directory.join("output.bin");
+    fs::write(&output, b"old").unwrap();
+    let staging_group = fs::metadata(&output).unwrap().gid();
+    let Some(group) = (0..=4096)
+        .filter(|&group| group != staging_group)
+        .find(|&group| chown(&output, None, Some(group)).is_ok())
+    else {
+        fs::remove_dir_all(directory).unwrap();
+        return;
+    };
+    fs::set_permissions(&output, fs::Permissions::from_mode(0o640)).unwrap();
+
+    write_file(&output, b"new").unwrap();
+    let metadata = fs::metadata(&output).unwrap();
+    assert_eq!(fs::read(&output).unwrap(), b"new");
+    assert_eq!(metadata.gid(), group);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
 
     fs::remove_dir_all(directory).unwrap();
 }

@@ -293,7 +293,8 @@ pub(super) fn validate_output_destination(path: &Path) -> io::Result<()> {
 }
 
 /// Stage output in a new sibling directory whose Unix mode stays `0700`, so
-/// the staged file stays private while its permissions and data are finalized.
+/// the staged file stays private while its data, ownership, and permissions
+/// are finalized.
 fn stage_private_output(path: &Path, bytes: &[u8]) -> io::Result<TemporaryOutput> {
     stage_output_with(path, |file| file.write_all(bytes))
 }
@@ -360,7 +361,7 @@ fn publish_output(
 ) -> io::Result<bool> {
     let directory = ParentDirectory::open(output_parent(path))?;
     if matches!(mode, CommitMode::Replace) {
-        prepare_output_permissions(path, &temporary.file)?;
+        prepare_output_access(path, &temporary.file)?;
     }
     temporary.file.sync_all()?;
     // Discover unsupported directory syncs before changing the destination.
@@ -399,9 +400,9 @@ fn publish_output(
     Ok(true)
 }
 
-/// Reject a non-regular destination and, on Unix, copy its access bits to the
-/// staged file.
-fn prepare_output_permissions(path: &Path, file: &File) -> io::Result<()> {
+/// Reject a non-regular destination and, on Unix, give the staged file its
+/// owner, group, and access bits as far as the running user may.
+fn prepare_output_access(path: &Path, file: &File) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -418,30 +419,45 @@ fn prepare_output_permissions(path: &Path, file: &File) -> io::Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{fchown, MetadataExt, PermissionsExt};
 
-        // Copy the rwx bits only; drop setuid, setgid, and sticky bits.
-        file.set_permissions(fs::Permissions::from_mode(
-            metadata.permissions().mode() & 0o777,
-        ))?;
+        // Restore ownership before the mode: the access bits were chosen for
+        // the destination's owner and group. Only root can give a file to
+        // another user, and other users can only choose a group they belong
+        // to, so a refusal is expected and handled by the mode below.
+        let staged = file.metadata()?;
+        let owner = (staged.uid() != metadata.uid()).then_some(metadata.uid());
+        let group = (staged.gid() != metadata.gid()).then_some(metadata.gid());
+        let restored = (owner.is_none() && group.is_none()) || fchown(file, owner, group).is_ok();
+        let group_kept =
+            group.is_none() || restored || (owner.is_some() && fchown(file, None, group).is_ok());
+        file.set_permissions(fs::Permissions::from_mode(replacement_mode(
+            metadata.permissions().mode(),
+            group_kept,
+        )))?;
     }
     #[cfg(not(unix))]
     let _ = file;
     Ok(())
 }
 
+/// The destination's rwx bits, without set-user-ID, set-group-ID, and sticky
+/// bits. When the staged file could not take the destination's group, its
+/// group gets only the access others had, so no one gains access through the
+/// change of group.
 #[cfg(unix)]
-fn create_temporary_output(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
+fn replacement_mode(mode: u32, group_kept: bool) -> u32 {
+    let mode = mode & 0o777;
+    if group_kept {
+        mode
+    } else {
+        (mode & 0o707) | ((mode & 0o007) << 3)
+    }
 }
 
-#[cfg(not(unix))]
+/// The private staging directory keeps the file unreachable by other users,
+/// so it is created with the default mode for new files (`0666` less the
+/// umask on Unix), which a new destination keeps.
 fn create_temporary_output(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }

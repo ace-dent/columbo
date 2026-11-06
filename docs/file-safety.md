@@ -25,10 +25,12 @@ filesystem-specific restrictions.
 The CLI uses the following sequence for an output that should replace a file:
 
 1. Create a unique staging directory beside the destination. On Unix its mode
-   is `0700`; the staged file starts with mode `0600`.
-2. Write the complete output and sync the file. Prepare the destination's
-   ordinary Unix permission bits inside the private staging directory, then
-   sync that metadata before publication.
+   is `0700`, which keeps the staged file private; the file itself starts with
+   the default mode for new files (`0666` less the umask).
+2. Write the complete output and sync the file. When the destination is a
+   regular file, give the staged file that file's owner and group, as far as
+   permitted, and then its ordinary Unix access bits, inside the private
+   staging directory. Sync that metadata before publication.
 3. Open and sync the destination directory on Unix. Failure at this point
    leaves the destination unchanged.
 4. For an in-place replacement, compare the current input bytes with the
@@ -56,7 +58,7 @@ file does not persist its directory entry. Replacement uses Rust's
 | Optimization fails, panics, or is killed | Input and existing output contents remain unchanged. |
 | Staging or pre-commit syncing fails | The existing destination remains unchanged. Cleanup closes the file before removing staging data. |
 | The process is killed before publication | The original remains in place. A private staging directory may remain. |
-| The process is killed immediately after publication | The destination contains the complete replacement, with ordinary Unix access bits already applied. |
+| The process is killed immediately after publication | The destination contains the complete replacement, with its Unix owner, group, and access bits already applied. |
 | The final directory sync fails | The error says output was installed but durability is uncertain. The CLI does not attempt a rollback. |
 | Staging cleanup fails after publication | The complete output remains installed; leftover staging data does not turn a successful publication into a failed write. |
 
@@ -92,9 +94,19 @@ may have different failure and atomicity semantics.
 
 Replacing a symlink replaces the link entry and leaves its target untouched.
 Replacing one hard-link name leaves other names referring to the previous
-inode. Ordinary Unix access bits are preserved for regular destinations;
-set-user-ID, set-group-ID, and sticky bits are not copied. This portable
-implementation does not preserve ownership, ACLs, extended attributes, or
+inode.
+
+On Unix, replacing a regular file keeps its owner, group, and ordinary access
+bits; set-user-ID, set-group-ID, and sticky bits are not copied. Ownership is
+restored before the access bits, as far as the running user may: only root can
+give the file to another user, and other users can only choose a group they
+belong to. When the owner cannot be restored, the running user owns the
+replacement. When the group cannot be restored, the replacement's group gets
+only the access the original gave to others, so no one gains access through the
+change of group. A new destination, including a replaced symlink, is owned by
+the running user and gets the default mode for new files.
+
+This portable implementation does not preserve ACLs, extended attributes, or
 Windows security descriptors; staging on Windows inherits directory security
 settings. When that metadata must be kept, use an explicit output path and a
 native installation step.
