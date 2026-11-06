@@ -94,6 +94,7 @@ gains where established.
 | 3 Nov 2026 | [`3bb4834`](#3bb4834-3-november-2026) | Greedy run-length spelling and payload sums (`header.rs`) | The greedy speller writes its tokens in place and spells runs too short for a repeat code without branching; a code's data bits are summed without branches or overflow checks in one out-of-line copy | APNG Default CPU 1.036× and wall time 1.040× (62 inputs, 2.85% fewer instructions, 3.55% fewer cycles); 33 Default inputs 2.27% fewer instructions, 3.27% fewer cycles; completing Max runs 2.8% and 2.5% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 248 APNG runs at 180 and 4,000 seconds; 62 APNG inputs with debug assertions; 160,000 greedy-spelling and 20,000 payload-sum comparisons; 679 Rust, 7 Python tests |
 | 4 Nov 2026 | [`7d4e44c`](#7d4e44c-4-november-2026) | Max swap-trial costs and header-plan store (`header.rs`, `header/swap_costs.rs`) | Swap-trial costs in 8-byte slots, eight to a cache line, up to 2^22; trials' plans kept out of the header-plan store; 64 MiB store budget once a thread plans a Max block | Completing Max runs of three small PNGs 48.0%, 32.1% and 28.1% fewer instructions (1.85×, 1.44×, 1.39×); 177 completing sprites 1.34% fewer; Default unchanged; one of ten Max inputs at 20 seconds peaked 46–51 MiB higher | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 4 long and 177 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 684 Rust, 7 Python tests |
 | 4 Nov 2026 | [`9a3f174`](#9a3f174-4-november-2026) | Header planning: tree values, runs, shape checks, buffers and the store's hash (`header.rs`) | Cached code-length trees keep their shape, order, HCLEN and RLE cost; runs found eight lengths at a time; known shapes not checked again; the planner's buffers borrowed in place; the store indexed by its fingerprints | Completing Max runs of three small PNGs 9.7%, 7.9% and 11.0% fewer instructions (1.10×, 1.07×, 1.13×); 177 completing sprites 7.24% fewer (1.062×); replayed swap searches 15.6% fewer; APNG 1.31% and Default 1.04% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 58 Max runs at 10 seconds; 124 APNG runs at 4,000 seconds; 66 Default timing runs; three replays; 20,000 run-finder comparisons; 686 Rust, 7 Python tests |
+| 6 Nov 2026 | [`b35e8ee`](#b35e8ee-6-november-2026) | Boundary slide across finishing steps (`slide.rs`) | Each thread keeps the boundaries a stream's last slide left settled, with the left block's offset, both blocks' token buffers and trees; a later slide of the stream starts a pair settled when it matches one in full | Default CPU 1.012× (33 inputs, 2.11% fewer instructions, 1.42% fewer cycles); Partnership card 1.045× (5.87% fewer instructions); peak memory median unchanged, +6.2 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 900 slides through the memo compared with fresh slides; 688 Rust, 7 Python tests |
 
 ## Entries
 
@@ -490,6 +491,92 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `b35e8ee`, 6 November 2026
+
+Batches: retired instructions and cycles from `time -l` over the 33 stratified
+Default inputs, two alternating rounds, for every candidate and for the final
+build; whole-file Default CPU (user plus system) and peak resident memory over
+the same inputs, one round alternating the builds; two alternating runs of
+each completing Max run.
+
+A sampled profile of the 33 Default inputs at `b35e8ee` (30,230 CPU samples)
+was flat after the earlier rounds. Header planning was about half of the
+samples, 22% of them building code-length trees, which probes showed were
+not repeated work: the per-thread tree cache answered 69% of 52.7 million
+lookups, and only 5.9% of its builds and 0.6% of the header store's misses
+were for keys seen before. The boundary slide (R1c) took 5.9% of the samples
+in its own code, 12–14% on the four slowest slide-heavy inputs. A probe that
+fingerprinted every pair the slide searched found that 48% of the 11,264
+pair searches, 36% of the 327 million tokens walked, repeated a pair, with the
+same tokens and trees, that an earlier slide of the stream had found settled.
+Each slide starts afresh, and the finishing steps between two slides change
+few blocks.
+
+- **Settled boundaries kept between slides.** Each thread keeps the
+  boundaries that the stream's last slide left settled: the left block's
+  decoded offset, both blocks' token buffers (shared, not copied) and both
+  blocks' code lengths, in stream order. A later slide finds each boundary's
+  entry by binary search on its offset, compares token counts and trees, then
+  the tokens in full, and starts a pair that matches as settled, so its sweep
+  skips the pair until a block changes, as it already did within a slide. The
+  cut search depends only on the two blocks' tokens, decoded bytes and trees,
+  and every candidate of a stream decodes to the same bytes, so the offset
+  fixes the decoded bytes. The memo belongs to the stream's identity (decoded
+  size, CRC-32, Adler-32), keeps one slide's boundaries and is released after
+  the stream.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| 33 Default inputs, instructions retired over two rounds | 945.7 billion | 925.7 billion | −2.11% |
+| Same inputs, cycles over two rounds | 230.9 billion | 227.6 billion | −1.42% |
+| Same inputs, CPU over one round | 37.8 s | 37.4 s | 1.012× |
+| `Partnership_Card___John_Lewis_Finance.png`, instructions retired over two rounds | | | −5.87% |
+| Same input, cycles over two rounds | | | −4.47% |
+| Same input, Default CPU | 8.77 s | 8.40 s | 1.045× |
+| `036-Clefable-0.png` and `114-Tangela-1.png`, Max completing its search | | | Instructions within 0.2% |
+
+The skipped walks run at about four and a half instructions a cycle, so
+cycles fall by less than instructions. Median Default peak memory did not
+change; `download_webp__260×280_.png` peaked 6.2 MiB and `Lemon512.png` 5.5 MiB
+higher, the token buffers the memo keeps from one slide to the next.
+
+Equivalence: a new test slides 300 random streams through the memo and
+compares each result with a slide without it: the same blocks slid again,
+and the last slide's output reparsed with fresh buffers, 900 comparisons with
+more than 300 boundaries taken from the memo. API comparisons on the 52
+inputs, in Default with the 180-second budget and in zero-budget Max, matched
+in all 104 runs, and every Default timing and instruction run and every
+completing Max run matched byte for byte. Rust tests, including the private
+corpus, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting and all-feature Clippy with warnings denied.
+`__text` grew from 911,552 to 915,708 bytes; the shipped executable keeps its
+991,504 bytes, and the final source builds the tested executable byte for
+byte.
+
+Measured and rejected in the same review:
+
+- A first version of the memo that hashed every block's tokens on each slide
+  and looked boundaries up in a hash table: 1.71% fewer instructions but only
+  0.18–0.34% fewer cycles, and 16 KiB more executable, one page step.
+- deft4j's code-length tree builder on stack arrays of the alphabet's size:
+  5–8% faster alone, but 0.28% more instructions and 0.64% more cycles in the
+  whole program. The build's cost is the heap work that reproduces deft4j's
+  ties.
+- A 256-entry literal-cost table and cheapest-literal bound in the slide's
+  pricing: 0.5% more instructions and 0.1–0.4% fewer cycles, within noise,
+  since the byte-by-byte sum already stopped after one or two bytes.
+
+Not changed in the same review:
+
+- deft4j's code-length tree could take a heap variant's tree when no
+  comparison was decided by a tie, but no tie being noted does not prove a
+  unique merge order: a heap can choose between equal weights it never
+  compared.
+- Ranges cut from a composite still copy their tokens (about 2% of samples);
+  sharing its storage needs a slice-view token model.
+
+Artifacts: `work/efficiency-review-default9-20261106/`.
 
 ### `9a3f174`, 4 November 2026
 

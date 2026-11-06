@@ -10,6 +10,7 @@
 //! Moved blocks are then re-planned, and the slide repeats under any new trees
 //! until no block moves.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use crate::Options;
@@ -108,6 +109,168 @@ impl Slot<'_> {
         }
         Some(())
     }
+}
+
+/// The stream a slide belongs to: its decoded size and checksums, the identity
+/// every candidate of the stream is validated against. All its candidates
+/// decode to the same bytes, so a block's decoded bytes are those at its
+/// offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlideStream {
+    pub(crate) decoded_size: u64,
+    pub(crate) crc32: u32,
+    pub(crate) adler32: u32,
+}
+
+/// A boundary that a slide of the stream found settled: no cut is cheaper
+/// under its blocks' trees. [`cheaper_cut`] depends only on the two blocks'
+/// tokens, decoded bytes and trees, so a later slide that finds the same
+/// tokens and trees at the same offset need not walk the boundary again.
+struct SettledBoundary {
+    /// The left block's decoded offset.
+    offset: usize,
+    left: Arc<Vec<Token>>,
+    right: Arc<Vec<Token>>,
+    /// The left block's literal/length and distance code lengths, then the
+    /// right block's, with where the first three end.
+    trees: Vec<u8>,
+    ends: [usize; 3],
+}
+
+impl SettledBoundary {
+    fn new(offset: usize, left: &Slot<'_>, right: &Slot<'_>) -> Option<Self> {
+        let (left_literal, left_distance) = left.code.trees()?;
+        let (right_literal, right_distance) = right.code.trees()?;
+        let mut trees = Vec::new();
+        trees
+            .try_reserve_exact(
+                left_literal.len()
+                    + left_distance.len()
+                    + right_literal.len()
+                    + right_distance.len(),
+            )
+            .ok()?;
+        let mut ends = [0; 3];
+        for (index, lengths) in [left_literal, left_distance, right_literal]
+            .into_iter()
+            .enumerate()
+        {
+            trees.extend_from_slice(lengths);
+            ends[index] = trees.len();
+        }
+        trees.extend_from_slice(right_distance);
+        Some(Self {
+            offset,
+            left: Arc::clone(&left.tokens),
+            right: Arc::clone(&right.tokens),
+            trees,
+            ends,
+        })
+    }
+
+    /// Whether `left` and `right` are this boundary, compared in full: the
+    /// token counts and trees first, which tell most changed blocks apart.
+    fn matches(&self, left: &Slot<'_>, right: &Slot<'_>) -> bool {
+        let (Some(left_trees), Some(right_trees)) = (left.code.trees(), right.code.trees()) else {
+            return false;
+        };
+        let [a, b, c] = self.ends;
+        self.left.len() == left.tokens.len()
+            && self.right.len() == right.tokens.len()
+            && self.trees[..a] == *left_trees.0
+            && self.trees[a..b] == *left_trees.1
+            && self.trees[b..c] == *right_trees.0
+            && self.trees[c..] == *right_trees.1
+            && same_tokens(&self.left, &left.tokens)
+            && same_tokens(&self.right, &right.tokens)
+    }
+}
+
+fn same_tokens(stored: &Arc<Vec<Token>>, tokens: &Arc<Vec<Token>>) -> bool {
+    Arc::ptr_eq(stored, tokens) || stored[..] == tokens[..]
+}
+
+/// The boundaries the stream's last slide on this thread left settled, in
+/// stream order, so by offset.
+struct SlideMemo {
+    stream: SlideStream,
+    boundaries: Vec<SettledBoundary>,
+}
+
+thread_local! {
+    /// Settled boundaries kept from one slide of a stream to the next. A
+    /// stream's later finishing steps change few blocks, so a slide after
+    /// them meets most boundaries an earlier slide settled.
+    static SLIDE_MEMO: RefCell<Option<SlideMemo>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Boundaries this thread's slides have taken as settled from the memo.
+    static MEMO_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Drop this thread's settled boundaries, which belong to one stream.
+pub(crate) fn release_thread_slide_memo() {
+    let _ = SLIDE_MEMO.try_with(|memo| {
+        if let Ok(mut memo) = memo.try_borrow_mut() {
+            *memo = None;
+        }
+    });
+}
+
+/// Mark settled each boundary of `slots` that the stream's last slide on this
+/// thread left settled. Each slot's decoded bytes start at its offset.
+fn settle_from_memo(stream: SlideStream, slots: &[Slot<'_>], settled: &mut [Option<(u32, u32)>]) {
+    let _ = SLIDE_MEMO.try_with(|memo| {
+        let Ok(memo) = memo.try_borrow() else {
+            return;
+        };
+        let Some(memo) = memo.as_ref().filter(|memo| memo.stream == stream) else {
+            return;
+        };
+        let mut offset = 0;
+        for (k, state) in settled.iter_mut().enumerate() {
+            let left_offset = offset;
+            offset += slots[k].plain.len();
+            let Ok(index) = memo
+                .boundaries
+                .binary_search_by_key(&left_offset, |boundary| boundary.offset)
+            else {
+                continue;
+            };
+            if memo.boundaries[index].matches(&slots[k], &slots[k + 1]) {
+                *state = Some((slots[k].generation, slots[k + 1].generation));
+                #[cfg(test)]
+                MEMO_HITS.with(|hits| hits.set(hits.get() + 1));
+            }
+        }
+    });
+}
+
+/// Keep the boundaries this slide leaves settled for the stream's next slide,
+/// in place of the last slide's.
+fn record_in_memo(stream: SlideStream, slots: &[Slot<'_>], settled: &[Option<(u32, u32)>]) {
+    let mut boundaries = Vec::new();
+    let mut offset = 0;
+    for (k, &state) in settled.iter().enumerate() {
+        let left_offset = offset;
+        offset += slots[k].plain.len();
+        if state != Some((slots[k].generation, slots[k + 1].generation)) {
+            continue;
+        }
+        if let Some(boundary) = SettledBoundary::new(left_offset, &slots[k], &slots[k + 1]) {
+            if boundaries.try_reserve(1).is_err() {
+                break;
+            }
+            boundaries.push(boundary);
+        }
+    }
+    let _ = SLIDE_MEMO.try_with(|memo| {
+        if let Ok(mut memo) = memo.try_borrow_mut() {
+            *memo = Some(SlideMemo { stream, boundaries });
+        }
+    });
 }
 
 fn payload_bits(tokens: &[Token], (literal, distances): Trees<'_>) -> Option<u64> {
@@ -334,6 +497,7 @@ fn split_pair<T: Copy>(left: &[T], right: &[T], cut: usize) -> Option<(Vec<T>, V
 /// keeps at least one token, preserving the block layout later terminal methods
 /// need. The caller must compare the complete emission because stored padding
 /// can absorb a saving.
+#[cfg(test)]
 pub(crate) fn plan_boundary_slide(
     blocks: &[ParsedBlock],
     options: &Options,
@@ -342,13 +506,38 @@ pub(crate) fn plan_boundary_slide(
     plan_slide(blocks, options, true, MAX_ROUNDS, stop)
 }
 
+/// [`plan_boundary_slide`] for a candidate of `stream`, skipping the
+/// boundaries the stream's last slide on this thread left settled.
+pub(crate) fn plan_boundary_slide_in_stream(
+    blocks: &[ParsedBlock],
+    options: &Options,
+    stream: SlideStream,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    plan_slide_with_memo(blocks, options, true, MAX_ROUNDS, Some(stream), stop)
+}
+
 /// Run the slide. Without `refit`, moved blocks keep their transmitted trees,
 /// so one round suffices; tests check that result by brute force.
+#[cfg(test)]
 fn plan_slide(
     blocks: &[ParsedBlock],
     options: &Options,
     refit: bool,
     max_rounds: usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    plan_slide_with_memo(blocks, options, refit, max_rounds, None, stop)
+}
+
+/// [`plan_slide`], and with `stream`, through the stream's settled-boundary
+/// memo.
+fn plan_slide_with_memo(
+    blocks: &[ParsedBlock],
+    options: &Options,
+    refit: bool,
+    max_rounds: usize,
+    stream: Option<SlideStream>,
     stop: &mut SearchStop<'_>,
 ) -> Option<Vec<PlannedBlock>> {
     let strict = options.strict;
@@ -391,16 +580,45 @@ fn plan_slide(
         });
     }
 
-    // Another round helps only after a re-plan changes some trees.
-    let mut plans = None;
     let mut settled = Vec::new();
     settled.try_reserve_exact(slots.len() - 1).ok()?;
     settled.resize(slots.len() - 1, None);
+    if let Some(stream) = stream {
+        settle_from_memo(stream, &slots, &mut settled);
+    }
+    let plans = slide_rounds(
+        blocks,
+        &mut slots,
+        &mut settled,
+        options,
+        refit,
+        max_rounds,
+        stop,
+    );
+    if let Some(stream) = stream {
+        record_in_memo(stream, &slots, &settled);
+    }
+    plans
+}
+
+/// Sweep and re-plan until no block moves, no re-plan changes trees, or
+/// `max_rounds` rounds have run.
+fn slide_rounds(
+    blocks: &[ParsedBlock],
+    slots: &mut [Slot<'_>],
+    settled: &mut [Option<(u32, u32)>],
+    options: &Options,
+    refit: bool,
+    max_rounds: usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    // Another round helps only after a re-plan changes some trees.
+    let mut plans = None;
     for _ in 0..max_rounds {
-        if !sweep(&mut slots, &mut settled, stop)? {
+        if !sweep(slots, settled, stop)? {
             break;
         }
-        let (round, refitted) = assemble(blocks, &mut slots, options, refit, stop)?;
+        let (round, refitted) = assemble(blocks, slots, options, refit, stop)?;
         plans = Some(round);
         if !refitted {
             break;

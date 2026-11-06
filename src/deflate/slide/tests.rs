@@ -497,6 +497,60 @@ fn iterated_slide_equals_repeated_slides_and_reaches_a_fixed_point() {
 }
 
 #[test]
+fn settled_boundary_memo_leaves_every_slide_unchanged() {
+    // Slides through the memo give exactly the bytes of slides without it:
+    // the same blocks slid again, and the next candidate, the last slide's
+    // output reparsed with fresh buffers.
+    let mut seed = 0x6a09_e667_f3bc_c908_u64;
+    let hits_before = MEMO_HITS.with(std::cell::Cell::get);
+    let mut compared = 0;
+    for round in 0..300 {
+        let options = Options {
+            strict: round % 4 != 3,
+            ..Options::default()
+        };
+        let mut blocks = Vec::new();
+        for part in 0..2 + round % 4 {
+            if part == 1 && round % 5 == 4 {
+                blocks.push(literals(&(0..=255).collect::<Vec<u8>>()));
+            }
+            let (tokens, plain) = random_tokens(&mut seed, 20 + (round * 13 + part * 29) % 150);
+            blocks.push(block(tokens, plain));
+        }
+        let (data, source) = planned_stream(&blocks);
+        let stream = SlideStream {
+            decoded_size: source.decoded_size,
+            crc32: source.crc32,
+            adler32: source.adler32,
+        };
+        let never = &mut SearchStop::never();
+        let slide = |blocks: &[ParsedBlock], memo: bool, stop: &mut SearchStop<'_>| {
+            let plans = if memo {
+                plan_slide_with_memo(blocks, &options, true, MAX_ROUNDS, Some(stream), stop)
+            } else {
+                plan_slide(blocks, &options, true, MAX_ROUNDS, stop)
+            };
+            plans.map(|plans| emitted(&data, &plans))
+        };
+        release_thread_slide_memo();
+        let first = slide(&source.blocks, true, never);
+        assert_eq!(first, slide(&source.blocks, false, never), "round {round}");
+        let next = parse_stream(first.as_ref().unwrap_or(&data), 1 << 20).unwrap();
+        for blocks in [&source.blocks, &next.blocks, &source.blocks] {
+            assert_eq!(
+                slide(blocks, true, never),
+                slide(blocks, false, never),
+                "round {round}"
+            );
+            compared += 1;
+        }
+    }
+    release_thread_slide_memo();
+    let hits = MEMO_HITS.with(std::cell::Cell::get) - hits_before;
+    assert!(compared == 900 && hits > 300, "{hits} memo hits");
+}
+
+#[test]
 fn early_stopping_joining_price_matches_the_full_sum() {
     let reference =
         |token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool| -> Option<(u64, bool)> {

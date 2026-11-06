@@ -73,11 +73,12 @@ pub(crate) fn optimize_raw_prefix_with_floor_and_grace(
     grace: Duration,
 ) -> Result<RawOptimization> {
     let result = optimize_stream(input, options, decoded_limit, default_floor, grace);
-    // Block plans and parses repeat within a stream, rarely across streams,
-    // and APNG frames and ZIP members reuse worker threads: release this
-    // thread's.
+    // Block plans, parses and settled slide boundaries repeat within a
+    // stream, rarely across streams, and APNG frames and ZIP members reuse
+    // worker threads: release this thread's.
     release_thread_block_plans();
     release_kept_validated_parse();
+    crate::deflate::slide::release_thread_slide_memo();
     result
 }
 

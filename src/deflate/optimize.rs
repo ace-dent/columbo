@@ -2809,9 +2809,16 @@ fn refine_with_terminal_header_search_cached(
         return Ok(None);
     }
     let plans = match search {
-        TerminalHeaderSearch::BoundarySlide => {
-            super::slide::plan_boundary_slide(&selected.blocks, options, stop)
-        }
+        TerminalHeaderSearch::BoundarySlide => super::slide::plan_boundary_slide_in_stream(
+            &selected.blocks,
+            options,
+            super::slide::SlideStream {
+                decoded_size: identity.decoded_size,
+                crc32: identity.crc32,
+                adler32: identity.adler32,
+            },
+            stop,
+        ),
         TerminalHeaderSearch::Merges => {
             super::stream::plan_terminal_merges(&selected.blocks, options, stop)
         }

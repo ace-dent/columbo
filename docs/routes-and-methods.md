@@ -5467,7 +5467,13 @@ token cut against the selected trees.
    each joining token spelled as priced.
 5. Repeat sweeps while any boundary moves, at most 16 per round. A pair
    unchanged since its last complete search, tracked by per-block generation
-   counters, is skipped.
+   counters, is skipped. So is a pair that the stream's previous slide on the
+   same thread left settled: each thread keeps those boundaries, each with its
+   left block's decoded offset, both blocks' tokens and both blocks' trees, and
+   a pair at the same offset with the same tokens and trees, compared in full,
+   starts settled. Every candidate of a stream decodes to the same bytes, so
+   the offset fixes both blocks' decoded bytes; the memo belongs to the stream's
+   identity and is released after the stream.
 6. Assemble at real alignments: unchanged blocks reuse their original bits,
    stored blocks are repriced for their new padding, and each moved block is
    re-planned from its new counts with the run's own options (so Max uses its
@@ -5545,7 +5551,9 @@ Max at 60 seconds the results depended on timing; the one steady gain was
   strict policy. Only boundaries between two non-stored blocks move; stored
   blocks, and blocks re-planned as stored, keep theirs.
 - **Bounds:** at most 16 sweeps per round and 16 rounds, each sweep linear in
-  tokens; unchanged pairs are skipped. The stop (the hard stop in timed work) is
+  tokens; unchanged pairs, and pairs the stream's previous slide left settled,
+  are skipped. The memo holds one slide's settled boundaries, sharing their
+  blocks' token buffers. The stop (the hard stop in timed work) is
   polled before each boundary, every 65,536 cut positions and before each
   re-plan; completed moves are kept.
 - **After a win:** the sweep continues with R13; in Max, the strict improvement
@@ -7125,8 +7133,8 @@ Columbo follows four rules:
    are always complete.
 4. **Bound memory, and release it when reuse ends.** Route-local caches live for
    one planning call, per-thread stores keep two generations within a byte
-   charge, the block-plan store is emptied after each stream, and the header
-   store after each top-level call.
+   charge, the block-plan store and the slide's settled boundaries are emptied
+   after each stream, and the header store after each top-level call.
 
 Columbo has two general-purpose route-local plan caches, the block-plan cache
 (`CanonicalPlanCache`) and the header-plan cache (`HeaderPlanCache`), with
@@ -7135,7 +7143,9 @@ thread also keeps a code-length tree cache, RLE run tables and the header costs
 of greedy length-swap trials, and a few methods
 keep local memos: R6 and R15 a range cache, the terminal sequence a one-entry
 parse cache, and the deft4j route its state memos; each thread keeps its last
-validated parse. There is no global route DAG
+validated parse and the boundaries its last boundary slide (R1c) of the stream
+left settled
+([Fixed-tree boundary slide (R1c)](#fixed-tree-boundary-slide-r1c)). There is no global route DAG
 and no interval cache shared across routes or methods. Every cache and store
 belongs to one thread, so none needs a lock.
 
