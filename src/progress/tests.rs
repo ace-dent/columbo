@@ -16,21 +16,24 @@ fn verbose_reports_print_the_format_summary_rows() {
 #[test]
 fn verbose_reports_print_selected_zip_store_changes() {
     let mut report = Vec::new();
-    write_zip_store_changes(
+    write_store_changes(
         &mut report,
         &[
-            ZipStoreProgress {
+            StoreProgress {
                 stream_id: 2,
+                change: StoreChange::ZipEntry,
                 deflate_bytes: 50,
                 stored_bytes: 45,
             },
-            ZipStoreProgress {
+            StoreProgress {
                 stream_id: 7,
+                change: StoreChange::ZipEntry,
                 deflate_bytes: 6,
                 stored_bytes: 1,
             },
-            ZipStoreProgress {
+            StoreProgress {
                 stream_id: 9,
+                change: StoreChange::ZipEntry,
                 deflate_bytes: 4,
                 stored_bytes: 4,
             },
@@ -43,6 +46,35 @@ fn verbose_reports_print_selected_zip_store_changes() {
          \x20 S2 Final wrapper · Deflate 50 bytes → Store 45 bytes · saved 5 bytes (10.0%)\n\
          \x20 S7 Final wrapper · Deflate 6 bytes → Store 1 byte · saved 5 bytes (83.3%)\n\
          \x20 S9 Final wrapper · Deflate 4 bytes → Store 4 bytes · saved 0 bytes (0.0%)\n"
+    );
+}
+
+#[test]
+fn verbose_reports_print_selected_png_text_changes() {
+    let mut report = Vec::new();
+    write_store_changes(
+        &mut report,
+        &[
+            StoreProgress {
+                stream_id: 2,
+                change: StoreChange::PngText,
+                deflate_bytes: 36,
+                stored_bytes: 27,
+            },
+            StoreProgress {
+                stream_id: 3,
+                change: StoreChange::PngInternationalText,
+                deflate_bytes: 44,
+                stored_bytes: 36,
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(report).unwrap(),
+        "\nPNG chunk changes  2 chunks\n\
+         \x20 S2 Final wrapper · zTXt 36 bytes → tEXt 27 bytes · saved 9 bytes (25.0%)\n\
+         \x20 S3 Final wrapper · compressed iTXt 44 bytes → uncompressed iTXt 36 bytes · saved 8 bytes (18.2%)\n"
     );
 }
 

@@ -23,12 +23,26 @@ static REPORT_COORDINATOR: OnceLock<Mutex<ReportCoordinator>> = OnceLock::new();
 static REPORT_EMITTER: OnceLock<Mutex<()>> = OnceLock::new();
 static REPORT_SPINNER: OnceLock<Mutex<Option<Spinner>>> = OnceLock::new();
 
-/// A ZIP entry rewritten from Deflate to Store after all Deflate work.
+/// A stream replaced by its decoded bytes after all Deflate work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ZipStoreProgress {
+pub(crate) struct StoreProgress {
     pub(crate) stream_id: usize,
+    pub(crate) change: StoreChange,
+    /// The compressed ZIP payload or PNG chunk data.
     pub(crate) deflate_bytes: u32,
+    /// The stored ZIP payload or uncompressed PNG chunk data.
     pub(crate) stored_bytes: u32,
+}
+
+/// What a [`StoreProgress`] rewrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreChange {
+    /// A ZIP entry from Deflate to Store.
+    ZipEntry,
+    /// A PNG zTXt chunk to tEXt.
+    PngText,
+    /// A PNG iTXt chunk from compressed to uncompressed text.
+    PngInternationalText,
 }
 
 /// A set of report producers, one bit per `u8` tag.
@@ -66,7 +80,7 @@ pub(super) struct ReportCoordinator {
     /// Indexed by stream ID, which runs from 1 to `total_streams`; grown on
     /// demand.
     streams: Vec<StreamState>,
-    zip_store_changes: Vec<ZipStoreProgress>,
+    store_changes: Vec<StoreProgress>,
     total_streams: usize,
 }
 
@@ -78,7 +92,7 @@ impl Default for ReportCoordinator {
             expected_producers: ProducerSet::default(),
             next_stream_id: 1,
             streams: Vec::new(),
-            zip_store_changes: Vec::new(),
+            store_changes: Vec::new(),
             total_streams: 0,
         }
     }
@@ -92,7 +106,7 @@ impl ReportCoordinator {
         self.expected_producers.insert(PRIMARY_STREAM_PRODUCER);
         self.next_stream_id = 1;
         self.streams.clear();
-        self.zip_store_changes.clear();
+        self.store_changes.clear();
         self.total_streams = total_streams;
     }
 
@@ -192,12 +206,12 @@ pub(super) fn begin_file(total_streams: usize, timeout: Duration) {
     }
 }
 
-/// Print every stream left and return the selected ZIP lineage's Store
+/// Print every stream left and return the selected lineage's Store
 /// conversions.
-pub(super) fn finish_file() -> Vec<ZipStoreProgress> {
+pub(super) fn finish_file() -> Vec<StoreProgress> {
     let store_changes = with_report_coordinator(|coordinator| {
         coordinator.finish();
-        std::mem::take(&mut coordinator.zip_store_changes)
+        std::mem::take(&mut coordinator.store_changes)
     });
     stop_report_spinner();
     emit_ready_streams();
@@ -225,15 +239,15 @@ pub(crate) fn complete_all_stream_producers(producer: u8) {
     emit_ready_streams();
 }
 
-/// Record the Store conversions of the selected ZIP lineage, after selection,
-/// so reports never show a discarded lineage's changes.
-pub(crate) fn record_zip_store_changes(options: &Options, changes: &[ZipStoreProgress]) {
+/// Record the Store conversions of the selected ZIP or PNG lineage, after
+/// selection, so reports never show a discarded lineage's changes.
+pub(crate) fn record_store_changes(options: &Options, changes: &[StoreProgress]) {
     if changes.is_empty() || !super::reports_enabled(options) {
         return;
     }
     with_report_coordinator(|coordinator| {
-        coordinator.zip_store_changes.clear();
-        coordinator.zip_store_changes.extend_from_slice(changes);
+        coordinator.store_changes.clear();
+        coordinator.store_changes.extend_from_slice(changes);
     });
 }
 

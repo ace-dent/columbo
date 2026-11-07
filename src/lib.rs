@@ -42,9 +42,10 @@ pub struct Optimization {
     /// A shorter file saves eight bits per removed byte. When the byte length
     /// is unchanged, this is the total reduction in meaningful payload bits
     /// across all optimized streams: Deflate bits excluding final-byte padding,
-    /// with a ZIP member converted to Store counted as its decoded size in
-    /// bits. Call [`Optimization::should_replace`] to also account for a
-    /// mandatory, equal-sized wrapper normalization.
+    /// with a ZIP member converted to Store, or a PNG text chunk written
+    /// uncompressed, counted as its decoded size in bits. Call
+    /// [`Optimization::should_replace`] to also account for a mandatory,
+    /// equal-sized wrapper normalization.
     pub bits_saved: u64,
     /// Whether search reached its deadline.
     pub timed_out: bool,

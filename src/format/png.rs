@@ -8,10 +8,12 @@ mod chunks;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::checksum::adler32_update;
 use crate::deflate::{
     decoded_bytes_for_comparison, inspect_early_max_lineage, raw_stream_decodes_to, DefaultFloor,
     RawInfo,
 };
+use crate::progress::{StoreChange, StoreProgress};
 use crate::sort::{sort_indices_unstable, SortShared};
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
@@ -45,6 +47,8 @@ struct PngOptimization {
     output_deflate_bits: u64,
     timed_out: bool,
     removed_data_bytes: usize,
+    /// Compressed text chunks written uncompressed, for the verbose report.
+    store_changes: Vec<StoreProgress>,
 }
 
 impl PngOptimization {
@@ -52,7 +56,8 @@ impl PngOptimization {
         self.data.len() <= floor.data.len() && self.output_deflate_bits <= floor.output_deflate_bits
     }
 
-    fn into_public(self, source_bytes: usize) -> Optimization {
+    fn into_public(self, source_bytes: usize, options: &Options) -> Optimization {
+        crate::progress::record_store_changes(options, &self.store_changes);
         Optimization::from_metrics(
             source_bytes,
             self.data,
@@ -191,11 +196,12 @@ pub(super) fn optimize_preflight(
             let maximum = maximum?;
             let selected =
                 retain_dominating_maximum(floor, maximum, started.elapsed() >= options.timeout);
-            Ok(selected.into_public(input.len()))
+            Ok(selected.into_public(input.len(), options))
         });
     }
 
-    optimize_preflight_once(input, options, &parsed).map(|result| result.into_public(input.len()))
+    optimize_preflight_once(input, options, &parsed)
+        .map(|result| result.into_public(input.len(), options))
 }
 
 /// Whether the complete Default APNG pass may run beside Max. It holds its own
@@ -444,6 +450,7 @@ fn optimize_preflight_once(
     let mut frame_index = 0_usize;
     let mut frame_written = false;
     let mut animation_sequence = 0_u32;
+    let mut store_changes = Vec::new();
 
     for (index, chunk) in parsed.chunks.iter().enumerate() {
         if chunk.discard_on_output || should_strip(chunk.kind, options) {
@@ -524,14 +531,32 @@ fn optimize_preflight_once(
                 source_deflate_bits = source_deflate_bits
                     .checked_add(replacement.source_deflate_bits)
                     .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
+                let body = replacement.replacement.as_deref().unwrap_or(chunk.data);
+                let text = uncompressed_text_chunk(chunk.kind, body, replacement.decoded_size);
+                // Like a ZIP member converted to Store, uncompressed text counts
+                // its decoded size in bits.
+                let written_bits = text
+                    .as_ref()
+                    .map_or(replacement.output_deflate_bits, |text| text.text_bits);
                 output_deflate_bits = output_deflate_bits
-                    .checked_add(replacement.output_deflate_bits)
+                    .checked_add(written_bits)
                     .ok_or_else(|| Error::new("PNG Deflate bit count is too large"))?;
-                append_chunk(
-                    &mut output,
-                    chunk.kind,
-                    replacement.replacement.as_deref().unwrap_or(chunk.data),
-                )?;
+                if let Some(text) = text {
+                    append_chunk(&mut output, text.kind, &text.data)?;
+                    if let Some(stream_id) = metadata_stream_ids[index] {
+                        store_changes
+                            .try_reserve(1)
+                            .map_err(|_| Error::allocation("PNG Store report"))?;
+                        store_changes.push(StoreProgress {
+                            stream_id,
+                            change: text.change,
+                            deflate_bytes: chunk_data_len(body)?,
+                            stored_bytes: chunk_data_len(&text.data)?,
+                        });
+                    }
+                } else {
+                    append_chunk(&mut output, chunk.kind, body)?;
+                }
             }
             _ => {
                 output
@@ -544,6 +569,7 @@ fn optimize_preflight_once(
 
     if output.len() > datastream_len && !options.strict && !options.strip_metadata {
         output.clear();
+        store_changes.clear();
         if parsed.has_vestigial_rgba_trns {
             output.extend_from_slice(SIGNATURE);
             for chunk in &parsed.chunks {
@@ -579,6 +605,7 @@ fn optimize_preflight_once(
         output_deflate_bits,
         timed_out: budget.deadline.is_expired(),
         removed_data_bytes,
+        store_changes,
     })
 }
 
@@ -1978,6 +2005,81 @@ fn optimize_compressed_body(
         output_deflate_bits,
         decoded_size,
     }))
+}
+
+/// A zTXt or compressed iTXt chunk rewritten without compression.
+struct UncompressedText {
+    kind: [u8; 4],
+    data: Vec<u8>,
+    /// The decoded text in bits, the uncompressed counterpart of Deflate bits.
+    text_bits: u64,
+    change: StoreChange,
+}
+
+/// The uncompressed form of a zTXt chunk (as tEXt) or compressed iTXt chunk
+/// (with its compression flag cleared), when it is at least one byte smaller
+/// than `body`, the compressed chunk data that would otherwise be written.
+/// Both forms share the same 12 bytes of chunk framing, and the text is
+/// copied unchanged, so this needs only the decoded size to decide and is
+/// never larger.
+///
+/// The text stays compressed when it contains a NUL byte. tEXt forbids it,
+/// and a reader that ends text at a NUL would read less of it in either
+/// uncompressed form.
+fn uncompressed_text_chunk(
+    kind: [u8; 4],
+    body: &[u8],
+    decoded_size: Option<u64>,
+) -> Option<UncompressedText> {
+    let (target, change) = match &kind {
+        b"zTXt" => (*b"tEXt", StoreChange::PngText),
+        b"iTXt" => (*b"iTXt", StoreChange::PngInternationalText),
+        _ => return None,
+    };
+    let zlib_offset = compressed_zlib_offset(kind, body)?;
+    let keyword_end = body.iter().position(|&byte| byte == 0)?;
+    // tEXt keeps the keyword and its NUL and drops zTXt's compression method.
+    // iTXt keeps every field before the text.
+    let prefix_len = if change == StoreChange::PngText {
+        keyword_end + 1
+    } else {
+        zlib_offset
+    };
+    let text_len = usize::try_from(decoded_size?).ok()?;
+    if prefix_len.checked_add(text_len)? >= body.len() {
+        return None;
+    }
+
+    // The text is shorter than its zlib stream, so decoding it is cheap.
+    let zlib = &body[zlib_offset..];
+    let text = decoded_bytes_for_comparison(zlib_raw_payload(zlib)?, decoded_size?, text_len)?;
+    let adler32 = u32::from_be_bytes(zlib[zlib.len() - 4..].try_into().ok()?);
+    if text.len() != text_len || adler32_update(1, &text) != adler32 || text.contains(&0) {
+        return None;
+    }
+
+    let mut data = Vec::new();
+    data.try_reserve_exact(prefix_len + text_len).ok()?;
+    if change == StoreChange::PngText {
+        data.extend_from_slice(&body[..prefix_len]);
+    } else {
+        // Clear the compression flag; the method byte stays 0, as the PNG
+        // specification requires of uncompressed text.
+        data.extend_from_slice(&body[..=keyword_end]);
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&body[keyword_end + 3..zlib_offset]);
+    }
+    data.extend_from_slice(&text);
+    Some(UncompressedText {
+        kind: target,
+        data,
+        text_bits: (text_len as u64).checked_mul(8)?,
+        change,
+    })
+}
+
+fn chunk_data_len(data: &[u8]) -> Result<u32> {
+    u32::try_from(data.len()).map_err(|_| Error::new("PNG chunk too large"))
 }
 
 fn should_strip(kind: [u8; 4], options: &Options) -> bool {

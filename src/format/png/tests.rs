@@ -820,6 +820,7 @@ fn apng_max_file_floor_requires_no_worse_bytes_and_bits() {
         output_deflate_bits: bits,
         timed_out,
         removed_data_bytes: 0,
+        store_changes: Vec::new(),
     };
 
     let selected =
@@ -1459,12 +1460,13 @@ fn rebuilds_apng_frame_streams_and_sequence_numbers() {
 
 #[test]
 fn relaxed_compressed_metadata_retains_flevel_only_improvement() {
+    // iCCP stays compressed; an empty zTXt would become a smaller tEXt.
     let empty_zlib = [0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01];
-    let mut metadata = b"Comment\0\0".to_vec();
+    let mut metadata = b"Profile\0\0".to_vec();
     metadata.extend_from_slice(&empty_zlib);
     let mut input = SIGNATURE.to_vec();
     input.extend(chunk(*b"IHDR", &ihdr()));
-    input.extend(chunk(*b"zTXt", &metadata));
+    input.extend(chunk(*b"iCCP", &metadata));
     input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
     input.extend(chunk(*b"IEND", &[]));
 
@@ -1480,10 +1482,135 @@ fn relaxed_compressed_metadata_retains_flevel_only_improvement() {
     let metadata = parsed
         .chunks
         .iter()
-        .find(|chunk| chunk.kind == *b"zTXt")
+        .find(|chunk| chunk.kind == *b"iCCP")
         .expect("compressed metadata should be retained");
     let offset = compressed_zlib_offset(metadata.kind, metadata.data).unwrap();
     assert_maximum_flevel(&metadata.data[offset..]);
+}
+
+#[test]
+fn text_chunk_is_written_uncompressed_only_when_one_byte_smaller() {
+    // zlib streams of 10, 11 and 12 'a' bytes, each 11 bytes long. zTXt
+    // saves its method byte too: 1 + 11 - 11 = 1 byte for 11 letters, none
+    // for 12. Compressed iTXt saves 11 - 10 = 1 byte for 10 letters, none
+    // for 11.
+    let letters_10 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x84, 0x01, 0x00, 0x14, 0xe1, 0x03, 0xcb,
+    ];
+    let letters_11 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x84, 0x03, 0x00, 0x19, 0x0d, 0x04, 0x2c,
+    ];
+    let letters_12 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x44, 0x00, 0x00, 0x1d, 0x9a, 0x04, 0x8d,
+    ];
+    let ztxt = |zlib: &[u8]| [b"Comment\0\0".as_slice(), zlib].concat();
+    let itxt = |zlib: &[u8]| [b"Comment\0\x01\0en\0Note\0".as_slice(), zlib].concat();
+
+    let text = uncompressed_text_chunk(*b"zTXt", &ztxt(&letters_11), Some(11))
+        .expect("one byte smaller as tEXt");
+    assert_eq!(text.kind, *b"tEXt");
+    assert_eq!(text.data, b"Comment\0aaaaaaaaaaa");
+    assert_eq!(text.data.len() + 1, ztxt(&letters_11).len());
+    assert_eq!(text.text_bits, 88);
+    assert_eq!(text.change, StoreChange::PngText);
+    assert!(uncompressed_text_chunk(*b"zTXt", &ztxt(&letters_12), Some(12)).is_none());
+
+    let text = uncompressed_text_chunk(*b"iTXt", &itxt(&letters_10), Some(10))
+        .expect("one byte smaller uncompressed");
+    assert_eq!(text.kind, *b"iTXt");
+    assert_eq!(text.data, b"Comment\0\0\0en\0Note\0aaaaaaaaaa");
+    assert_eq!(text.data.len() + 1, itxt(&letters_10).len());
+    assert_eq!(text.change, StoreChange::PngInternationalText);
+    assert!(uncompressed_text_chunk(*b"iTXt", &itxt(&letters_11), Some(11)).is_none());
+
+    // A decoded size that does not match the stream keeps it compressed.
+    assert!(uncompressed_text_chunk(*b"zTXt", &ztxt(&letters_11), Some(10)).is_none());
+    // iCCP and uncompressed iTXt have no uncompressed form to choose.
+    assert!(uncompressed_text_chunk(*b"iCCP", &ztxt(&letters_11), Some(11)).is_none());
+    let plain = b"Comment\0\0\0en\0Note\0aaaaaaaaaa";
+    assert!(uncompressed_text_chunk(*b"iTXt", plain, Some(10)).is_none());
+}
+
+#[test]
+fn small_text_chunks_are_written_uncompressed_in_every_mode() {
+    // "Just one more thing" (19 bytes) as a 27-byte zlib stream.
+    let phrase = [
+        0x78, 0xda, 0xf3, 0x2a, 0x2d, 0x2e, 0x51, 0xc8, 0xcf, 0x4b, 0x55, 0xc8, 0xcd, 0x2f, 0x4a,
+        0x55, 0x28, 0xc9, 0xc8, 0xcc, 0x4b, 0x07, 0x00, 0x45, 0xf0, 0x07, 0x16,
+    ];
+    // 200 'a' bytes in 12 bytes: compression wins, so it stays zTXt.
+    let letters_200 = [
+        0x78, 0xda, 0x4b, 0x4c, 0x1c, 0x1e, 0x00, 0x00, 0xc2, 0x7f, 0x4b, 0xc9,
+    ];
+    // "a\0b": tEXt forbids the NUL, so it stays zTXt despite being smaller.
+    let with_nul = [
+        0x78, 0xda, 0x4b, 0x64, 0x48, 0x02, 0x00, 0x01, 0x88, 0x00, 0xc4,
+    ];
+    let mut input = SIGNATURE.to_vec();
+    input.extend(chunk(*b"IHDR", &ihdr()));
+    input.extend(chunk(
+        *b"zTXt",
+        &[b"Comment\0\0".as_slice(), &phrase].concat(),
+    ));
+    input.extend(chunk(
+        *b"iTXt",
+        &[b"Title\0\x01\0en\0Title\0".as_slice(), &phrase].concat(),
+    ));
+    input.extend(chunk(
+        *b"zTXt",
+        &[b"Letters\0\0".as_slice(), &letters_200].concat(),
+    ));
+    input.extend(chunk(
+        *b"zTXt",
+        &[b"Nul\0\0".as_slice(), &with_nul].concat(),
+    ));
+    input.extend(chunk(*b"IDAT", &black_scanline_zlib()));
+    input.extend(chunk(*b"IEND", &[]));
+
+    for exhaustive in [false, true] {
+        for strict in [true, false] {
+            let options = Options {
+                exhaustive,
+                strict,
+                timeout: Duration::from_secs(10),
+                ..Options::default()
+            };
+            let result = optimize(&input, &options).unwrap();
+            assert!(result.data.len() < input.len());
+            assert!(result.should_replace());
+            let parsed = parse(&result.data, false).unwrap();
+            let text: Vec<_> = parsed
+                .chunks
+                .iter()
+                .filter(|chunk| matches!(&chunk.kind, b"tEXt" | b"zTXt" | b"iTXt"))
+                .map(|chunk| (chunk.kind, chunk.data))
+                .collect();
+            assert_eq!(text.len(), 4);
+            assert_eq!(
+                text[0],
+                (*b"tEXt", b"Comment\0Just one more thing".as_slice())
+            );
+            assert_eq!(
+                text[1],
+                (
+                    *b"iTXt",
+                    b"Title\0\0\0en\0Title\0Just one more thing".as_slice()
+                )
+            );
+            assert_eq!(text[2].0, *b"zTXt");
+            assert!(text[2].1.starts_with(b"Letters\0\0"));
+            assert_eq!(text[3].0, *b"zTXt");
+            assert!(text[3].1.starts_with(b"Nul\0\0"));
+
+            // The rewritten chunks are final: another pass keeps them.
+            let again = optimize(&result.data, &options).unwrap();
+            let reparsed = parse(&again.data, false).unwrap();
+            let kinds = |chunks: &[Chunk<'_>]| -> Vec<[u8; 4]> {
+                chunks.iter().map(|chunk| chunk.kind).collect()
+            };
+            assert_eq!(kinds(&reparsed.chunks), kinds(&parsed.chunks));
+        }
+    }
 }
 
 #[test]

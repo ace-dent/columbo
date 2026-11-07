@@ -499,7 +499,8 @@ The public saving, `Optimization::bits_saved`, counts bytes first
 - 8 bits per removed byte when the output is shorter;
 - when the length is unchanged, the reduction in total meaningful bits over all
   of the file's Deflate streams, or 0 if that total did not fall (a ZIP member
-  converted to Store counts as its decoded size in bits; see [ZIP](#zip));
+  converted to Store, or a PNG text chunk written uncompressed, counts as its
+  decoded size in bits; see [ZIP](#zip) and [PNG and APNG](#png-and-apng));
 - 0 when the output is longer.
 
 For example, take a 1,000-byte raw source stream with 7,996 meaningful bits. A
@@ -1797,6 +1798,7 @@ The terminal methods R1–R18 close the second table in label order; the
 | [Container lineages](#candidate-ordering), [floor policies](#floor-policies) and [frame reuse](#png-and-apng) | Each stream gets a floor policy; ZIP, PNG-metadata and APNG-file lineages compete by dominance over bytes and bits; frames that decode alike share a spelling. | Both | 🟢–🔴 | **Columbo** |
 | [Fair slices, member lanes, and APNG budgets](#container-methods) | Weighted time slices and reclaim for GZIP members, PNG jobs and ZIP Max members; [parallel lanes](#multithreading); [`ApngDefault`](#floor-policies); the APNG Max file floor. | Both | 🟡–🔴 | **Columbo Rust** |
 | [PNG compressed-metadata scheduling](#png-and-apng) | Default: a short bounded probe of small metadata streams. Max: cached complete Default floors, then [`Established`](#floor-policies) descendants in leftover time. | Both | 🟡 | Original **Columbo C** probe limits; **Columbo Rust** floor preservation |
+| [PNG uncompressed text](#png-and-apng) | Writes a zTXt chunk as tEXt, or a compressed iTXt chunk with its compression flag cleared, when that is at least one byte smaller than the final compressed chunk and the text has no NUL byte. | Both | 🟢 | **PNG specification** / **Columbo** |
 | [PNG invalid-exporter repair](#png-and-apng) | Accepts and drops a palette's `tRNS` chunk left in an RGBA image, where PNG forbids it, instead of rejecting the file. | Both | 🟢 | **PNG specification** / **Columbo Rust** |
 | [PNG geometry, chunk coalescing, and APNG renumbering](#png-and-apng) | Checks IHDR/fcTL decoded sizes, Adam7 included; writes one IDAT and one fdAT per frame, saving 12 bytes per removed IDAT, 16 per fdAT; renumbers sequences. | Both | 🟢 | **PNG/APNG** / **Columbo** |
 | [ZIP members and Store](#zip) | Optimizes unencrypted method-8 members; members decoding to 0–4 bytes always become Store; Max stores larger ones only at a ≥10% payload saving. | Both | 🟡–🔴 | **Columbo** |
@@ -6597,8 +6599,9 @@ optimizer under a share of one file-wide deadline, checks the result against the
 wrapper's own records, and rebuilds the wrapper around the selected streams.
 Wrappers also save bytes of their own: PNG writes each stream as one chunk and
 drops a `tRNS` chunk that some exporters leave in invalidly, APNG reuses the
-best spelling among frames that decode alike, ZIP can store a member instead of
-deflating it, and every wrapper can drop metadata with `--strip`.
+best spelling among frames that decode alike, PNG can write a small text chunk
+without compression, ZIP can store a member instead of deflating it, and every
+wrapper can drop metadata with `--strip`.
 
 This section explains how each wrapper works. Which floor policy each stream
 gets, when lineages race, and the exact gates of those races are in
@@ -6832,6 +6835,38 @@ Max stream runs `SharedExact` instead.
 [Wrapper and floor-policy routing](#wrapper-and-floor-policy-routing) gives the
 limits, budgets and order.
 
+**Uncompressed text.** Text compresses badly when it is short or has few
+repeats, and then the zlib wrapper and Deflate block overhead outweigh any
+saving: a short comment usually ends up larger compressed. PNG defines an
+uncompressed form for both compressed text chunks, with the same keyword and
+text: tEXt for zTXt (both Latin-1), and iTXt with its compression flag cleared
+(the language tag, translated keyword and UTF-8 text are unchanged). After a
+zTXt or compressed iTXt stream's final pass, reconstruction compares the
+uncompressed chunk with the selected compressed chunk. Both have the same 12
+bytes of framing, so for decoded text of T bytes and a final zlib stream of Z
+bytes:
+
+- zTXt becomes tEXt when T ≤ Z, saving 1 + Z − T bytes, since tEXt also drops
+  the compression method byte;
+- compressed iTXt becomes uncompressed when T < Z, saving Z − T bytes; the
+  compression method byte stays 0, as the specification requires for
+  uncompressed text.
+
+For example, PngSuite's `ctzn0g04.png` holds a 9-byte disclaimer as a 17-byte
+zlib stream, which becomes a tEXt chunk 9 bytes smaller. The comparison uses the
+final compressed stream in both modes, so a stream that Columbo shrinks far
+enough stays compressed. Text that contains a NUL byte stays compressed: tEXt
+forbids it, and a reader that ends text at a NUL would read less of it in
+either uncompressed form. The written text is the stream's decoded bytes,
+checked against its Adler-32. The size test needs only the decoded size, and a
+text that passes it is shorter than its compressed stream, so decoding it costs
+no search time and runs after the deadline too. Each conversion counts the text as 8 bits
+per byte in the meaningful-bit total, as a ZIP Store conversion does, and
+verbose output lists the conversions of the selected file under `PNG chunk
+changes`. The rewritten chunk keeps its position, and a later run leaves it
+unchanged, since tEXt and uncompressed iTXt hold no zlib stream. iCCP has no
+uncompressed form, so a profile relies on the planner's stored blocks.
+
 **Max lineage races.** PNG Max can race two lineages side by side. Their gates,
 time shares and selection rules are under **PNG single-image Max** and **APNG
 whole-file race** in
@@ -6968,8 +7003,9 @@ and, in physical order, converts each member the two rules select:
 Default runs the pass once, on its single archive; Max runs it on every lineage,
 its Default floor included, before the lineages are compared. Verbose output
 lists each Deflate-to-Store change in the selected archive, with its Deflate and
-Store sizes and the saving, zero-saving normalizations included. Other formats
-need Deflate data and rely on the planner's stored blocks instead.
+Store sizes and the saving, zero-saving normalizations included. GZIP and zlib
+need Deflate data and rely on the planner's stored blocks instead; PNG writes
+small text chunks uncompressed ([PNG and APNG](#png-and-apng)).
 
 **Aggregate meaningful bits.** An archive's meaningful bits are the sum over its
 Deflate members. A member converted to Store counts 8 bits per stored byte in
@@ -8070,6 +8106,10 @@ input while `--raw` keeps trailing data.
   reconstruction with the remaining file time.
 - Max reserves no image time for metadata: metadata refinement uses only the
   time image search leaves.
+- After each zTXt or compressed iTXt stream's final pass, in both modes,
+  reconstruction writes the chunk uncompressed when that is at least one byte
+  smaller ([PNG and APNG](#png-and-apng)). The comparison takes no search time
+  and runs after the deadline too.
 
 **PNG and APNG image data:**
 

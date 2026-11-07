@@ -11,7 +11,7 @@ use crate::checksum::crc32_update;
 use crate::deflate::{
     decoded_bytes_for_storage, optimize_raw_prefix_with_floor_and_grace, DefaultFloor,
 };
-use crate::progress::{StreamNote, ZipStoreProgress};
+use crate::progress::{StoreChange, StoreProgress, StreamNote};
 use crate::sort::sort_indices_unstable;
 use crate::{Error, ErrorKind, Optimization, Options, Result};
 
@@ -48,7 +48,7 @@ struct ZipOptimization {
     data: Vec<u8>,
     source_deflate_bits: u64,
     output_deflate_bits: u64,
-    store_changes: Vec<ZipStoreProgress>,
+    store_changes: Vec<StoreProgress>,
     forced_store_change: bool,
     timed_out: bool,
 }
@@ -337,7 +337,7 @@ pub(super) fn optimize_preflight(
     } else {
         optimize_max_sequential(input, options, parsed)
     }?;
-    crate::progress::record_zip_store_changes(options, &optimized.store_changes);
+    crate::progress::record_store_changes(options, &optimized.store_changes);
     let removed_data = if options.strip_metadata {
         let local_bytes: usize = parsed
             .entries
@@ -846,8 +846,9 @@ fn rebuild_archive(
 }
 
 /// After an archive's Deflate work, replace Deflate members (method 8) with
-/// stored members (method 0) where allowed. Other formats require Deflate data
-/// and rely on the planner's stored blocks.
+/// stored members (method 0) where allowed. GZIP and zlib require Deflate data
+/// and rely on the planner's stored blocks; PNG writes small text chunks
+/// uncompressed.
 fn finalize_store_fallback(
     mut optimized: ZipOptimization,
     options: &Options,
@@ -940,10 +941,11 @@ fn finalize_store_fallback(
             entry.compressed_size_after = entry.uncompressed_size;
             forced_store_change |= always_store;
             if report_store_changes {
-                store_changes.push(ZipStoreProgress {
+                store_changes.push(StoreProgress {
                     stream_id: stream_ids[index].ok_or_else(|| {
                         Error::internal("ZIP Store report lost its stream identity")
                     })?,
+                    change: StoreChange::ZipEntry,
                     deflate_bytes: entry.compressed_size_before,
                     stored_bytes: entry.uncompressed_size,
                 });

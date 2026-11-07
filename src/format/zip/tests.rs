@@ -874,8 +874,9 @@ fn parallel_max_selection_requires_byte_and_bit_dominance() {
         data: vec![1; 10],
         source_deflate_bits: 120,
         output_deflate_bits: 99,
-        store_changes: vec![ZipStoreProgress {
+        store_changes: vec![StoreProgress {
             stream_id: 1,
+            change: StoreChange::ZipEntry,
             deflate_bytes: 10,
             stored_bytes: 8,
         }],

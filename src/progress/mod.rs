@@ -35,7 +35,8 @@ pub(crate) use context::{
 };
 pub(crate) use coordinator::{
     complete_all_stream_producers, complete_stream_group, complete_stream_producer,
-    record_zip_store_changes, set_stream_producers, ZipStoreProgress, PRIMARY_STREAM_PRODUCER,
+    record_store_changes, set_stream_producers, StoreChange, StoreProgress,
+    PRIMARY_STREAM_PRODUCER,
 };
 pub(crate) use route::RouteProgress;
 pub(crate) use stream::{Progress, StreamProgress};
@@ -99,7 +100,7 @@ pub(crate) fn finish_file(options: &Options) {
     }
     let store_changes = coordinator::finish_file();
     buffer::flush();
-    terminal::write_report(&mut |output| write_zip_store_changes(output, &store_changes));
+    terminal::write_report(&mut |output| write_store_changes(output, &store_changes));
 }
 
 fn write_format_summary(
@@ -114,24 +115,36 @@ fn write_format_summary(
     Ok(())
 }
 
-fn write_zip_store_changes(output: &mut dyn Write, changes: &[ZipStoreProgress]) -> io::Result<()> {
-    if changes.is_empty() {
+/// One file's changes all come from one wrapper, so the first names the list.
+fn write_store_changes(output: &mut dyn Write, changes: &[StoreProgress]) -> io::Result<()> {
+    let Some(first) = changes.first() else {
         return Ok(());
-    }
+    };
+    let (heading, singular, plural_unit) = match first.change {
+        StoreChange::ZipEntry => ("ZIP method changes", "entry", "entries"),
+        StoreChange::PngText | StoreChange::PngInternationalText => {
+            ("PNG chunk changes", "chunk", "chunks")
+        }
+    };
     writeln!(output)?;
     writeln!(
         output,
-        "ZIP method changes  {} {}",
+        "{heading}  {} {}",
         changes.len(),
-        plural(changes.len(), "entry", "entries")
+        plural(changes.len(), singular, plural_unit)
     )?;
     for change in changes {
+        let (compressed, stored) = match change.change {
+            StoreChange::ZipEntry => ("Deflate", "Store"),
+            StoreChange::PngText => ("zTXt", "tEXt"),
+            StoreChange::PngInternationalText => ("compressed iTXt", "uncompressed iTXt"),
+        };
         let saved = change.deflate_bytes - change.stored_bytes;
         let tenths = (u64::from(saved) * 1_000 + u64::from(change.deflate_bytes) / 2)
             / u64::from(change.deflate_bytes);
         writeln!(
             output,
-            "  S{} Final wrapper · Deflate {} bytes → Store {} {} · saved {} {} ({}.{:01}%)",
+            "  S{} Final wrapper · {compressed} {} bytes → {stored} {} {} · saved {} {} ({}.{:01}%)",
             change.stream_id,
             change.deflate_bytes,
             change.stored_bytes,
