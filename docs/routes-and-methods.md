@@ -1468,9 +1468,9 @@ can, and it may replace that result only by winning against it:
   starting size, so that endpoint can be smaller than the complete route's:
   over 980 streams (GZIP and zlib fixtures, sampled PNG image streams and
   synthetic GZIP members) it was smaller on 20 in strict mode, by 147 bytes in
-  all and at most 27 on one stream. A GZIP member whose time slice is shorter than its first
-  route gets exactly that endpoint, and the reclaim pass keeps it when it beats
-  the rerun. So the exact policies also build it, as mandatory work from the
+  all and at most 27 on one stream. A GZIP member whose first route ends after
+  its time slice but before its hard stop gets exactly that endpoint, and the
+  reclaim pass keeps it when it beats the rerun. So the exact policies also build it, as mandatory work from the
   same first route, and keep it as a final competitor when it is strictly
   smaller than Default's exact endpoint. With equal timeouts, Max then ended no
   larger than either endpoint on all 980 streams, in strict and relaxed mode,
@@ -6666,15 +6666,15 @@ Rules shared by the wrappers:
   and ZIP members and scheduled PNG image streams are still parsed, decoded,
   checksum-checked, charged to the decoded budget and given a complete output.
   Max's mandatory Default floors still run, since they ignore the clock except
-  for the steps listed in [Time limits](#time-limits). Otherwise, a GZIP member
-  or PNG image stream gets a zero slice with no grace, so its planner starts
-  with its stop already reached. In relaxed mode it then keeps the source
-  stream, or a repack when every block is stored; in strict mode it builds a
-  direct structural re-plan, because strict output must be compatible
-  ([Strict and relaxed output](#strict-and-relaxed-output)). A ZIP member still
-  gets the rest of the file's grace, so work that polls only the hard stop, such
-  as its ordinary planner and linear finalization, runs until the file's hard
-  stop. Duplicate fdAT frames reuse their validated representative but charge
+  for the steps listed in [Time limits](#time-limits). Otherwise, a PNG image
+  stream gets a zero slice with no grace, so its planner starts with its stop
+  already reached. In relaxed mode it then keeps the source stream, or a repack
+  when every block is stored; in strict mode it builds a direct structural
+  re-plan, because strict output must be compatible
+  ([Strict and relaxed output](#strict-and-relaxed-output)). A GZIP or ZIP
+  member still gets the rest of the file's grace, so work that polls only the
+  hard stop, such as its ordinary planner and linear finalization, runs until
+  the file's hard stop. Duplicate fdAT frames reuse their validated representative but charge
   the decoded budget once per occurrence. Only the PNG unsafe-ancillary early
   return stops after the chunk parse, before any stream is decoded.
 - **When checks run.** GZIP preflight decodes every member and checks its
@@ -8192,9 +8192,9 @@ member first, so a member there yields only at the file deadline and the reclaim
 pass never runs. Only expiry of the file deadline sets the public timeout result
 ([Scheduling and observability](#scheduling-and-observability)).
 
-Each GZIP and PNG stream gets the raw optimizer's usual grace, computed from the
-timeout its call receives: 1 second plus 10% of that timeout, or none for a zero
-timeout ([Time limits](#time-limits)). ZIP members share the file's grace
+Each PNG stream gets the raw optimizer's usual grace, computed from the timeout
+its call receives: 1 second plus 10% of that timeout, or none for a zero timeout
+([Time limits](#time-limits)). GZIP and ZIP members share the file's grace
 instead, as **ZIP member scheduling** below states.
 
 | Wrapper route | Default policy | Max policy | Order and time |
@@ -8230,7 +8230,20 @@ input while `--raw` keeps trailing data.
 - Each member but the last in that order gets min(0.90 × timeout × its decoded
   share, 0.98 × remaining file time), where a member's weight is its decoded
   size (at least 1). The last, largest member gets 0.98 × the remaining time.
-  Yielded members get the reclaim pass above.
+  Yielded members get the reclaim pass above; one whose retry slice rounds to
+  zero stays pending for the next round.
+- Grace: members share the file's grace as ZIP members do (**ZIP member
+  scheduling** below), reclaim retries included. With the raw optimizer's own
+  grace of 1 second plus 10% of each slice, a file of many short members could
+  run past its hard stop by about a second per member: at 10 seconds, Max took
+  18.7 seconds on 2,000 log members and 19.5 seconds on 500. With the shared
+  grace, the 18 synthetic files in [GZIP](#gzip) kept the same Max bytes, Max
+  CPU fell 14%, and no file ran past 12 seconds. Default lost 18 and 19 bytes
+  on two concatenated pairs, whose smaller member had kept a cut result
+  (Default's first-route cut in
+  [Floors and the Max guarantee](#floors-and-the-max-guarantee)) only because
+  the old grace let its first route finish after its slice; it now matches
+  Default at 20 seconds.
 - With `--strip`, members merge after the reclaim pass ([GZIP](#gzip)). In Max,
   each member also returns its Default endpoint where it differs from the
   member's stream. Those endpoints are merged too, serially and after the Max
@@ -8368,9 +8381,10 @@ deadline, Default stops at it), are under [PNG and APNG](#png-and-apng).
   (compressed size at least 98% of decoded size), every weight becomes the
   compression slack plus 5% of the compressed size, at least 1, so large
   stored-like members do not crowd out small compressible ones.
-- Grace: ZIP shares the file's grace among its member calls, reclaim retries
-  included, instead of giving each call the raw optimizer's usual grace, so that
-  together their graces stay within the file's (code comment). A call whose
+- Grace: ZIP, like GZIP, shares the file's grace among its member calls,
+  reclaim retries included, instead of giving each call the raw optimizer's
+  usual grace, so that together their graces stay within the file's (code
+  comment). A call whose
   timeout is shorter than the file time left gets the file's grace scaled by the
   ratio of its timeout to the file timeout. A call given all the time left gets
   the rest of the file's grace, so it ends at the file's hard stop. In ZIP Max,

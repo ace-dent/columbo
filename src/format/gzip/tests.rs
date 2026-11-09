@@ -291,7 +291,8 @@ fn concatenated_member_slice_is_reclaimed_without_a_file_timeout() {
     let deadline = SearchDeadline::new(&options);
     let mut slice_options = options.clone();
     slice_options.timeout = Duration::ZERO;
-    let initial = optimize_member(&input, members[0], &slice_options, false).unwrap();
+    let initial =
+        optimize_member(&input, members[0], &slice_options, Duration::ZERO, false).unwrap();
     assert!(initial.timed_out);
 
     let mut results = Vec::new();
@@ -602,6 +603,7 @@ fn strip_max_keeps_the_merged_default_endpoints_when_they_are_smaller() {
             exhaustive: false,
             ..options.clone()
         },
+        Duration::ZERO,
         false,
     )
     .unwrap()
@@ -664,6 +666,6 @@ fn members_keep_only_a_requested_default_endpoint_that_differs() {
         timeout: Duration::from_secs(1),
         ..Options::default()
     };
-    let raw = optimize_member(&input, members[0], &options, true).unwrap();
+    let raw = optimize_member(&input, members[0], &options, Duration::ZERO, true).unwrap();
     assert!(raw.default_endpoint.is_none());
 }

@@ -4,9 +4,11 @@
 //! Concatenated GZIP member validation, scheduling, and wrapper reconstruction.
 
 use crate::checksum::crc32_update;
+use std::time::Duration;
+
 use crate::deflate::{
-    inspect_raw_prefix, optimize_raw_prefix_with_floor, DefaultFloor, JoinPart, RawOptimization,
-    StreamJoiner,
+    inspect_raw_prefix, optimize_raw_prefix_with_floor_and_grace, DefaultFloor, JoinPart,
+    RawOptimization, StreamJoiner,
 };
 use crate::progress::MemberMergeProgress;
 use crate::sort::sort_indices_unstable;
@@ -115,7 +117,18 @@ pub(super) fn optimize_preflight(
             total_weight,
             position + 1 == order.len(),
         );
-        let run = || optimize_member(input, members[index], &call_options, keep_default_endpoints);
+        // Members share the file's grace, as ZIP members do, so a file of
+        // many short slices cannot run past its own hard stop.
+        let grace = deadline.grace_for_call(call_options.timeout);
+        let run = || {
+            optimize_member(
+                input,
+                members[index],
+                &call_options,
+                grace,
+                keep_default_endpoints,
+            )
+        };
         let raw = if call_options.timeout < file_remaining {
             crate::progress::with_stream_slice(index + 1, &[], None, run)?
         } else {
@@ -500,20 +513,23 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     Ok(members)
 }
 
-/// Optimize one member. Max keeps the member's Default endpoint only when
-/// `keep_default_endpoint` asks for it and it differs from Max's stream.
+/// Optimize one member with `grace` after its timeout. Max keeps the
+/// member's Default endpoint only when `keep_default_endpoint` asks for it and
+/// it differs from Max's stream.
 fn optimize_member(
     input: &[u8],
     member: Member,
     options: &Options,
+    grace: Duration,
     keep_default_endpoint: bool,
 ) -> Result<RawOptimization> {
     let default_floor = member_default_floor(options.exhaustive);
-    let mut raw = optimize_raw_prefix_with_floor(
+    let mut raw = optimize_raw_prefix_with_floor_and_grace(
         &input[member.payload_start..],
         options,
         member.decoded_size,
         default_floor,
+        grace,
     )?;
     if member.payload_start.checked_add(raw.consumed) != Some(member.trailer_start)
         || raw.info.size != member.decoded_size
@@ -605,15 +621,19 @@ fn reclaim_timed_out_members(
             };
             remaining_weight = remaining_weight.saturating_sub(weight);
             if timeout.is_zero() {
+                // Members after it may finish early and leave it time.
+                still_pending.push(index);
                 continue;
             }
             let mut retry_options = options.clone();
             retry_options.timeout = timeout;
+            let grace = deadline.grace_for_call(timeout);
             let run = || {
                 optimize_member(
                     input,
                     members[index],
                     &retry_options,
+                    grace,
                     keep_default_endpoints,
                 )
             };
