@@ -152,3 +152,46 @@ fn completed_merges_survive_an_exhausted_budget() {
     )
     .is_none());
 }
+
+#[test]
+fn boundary_merges_remove_only_the_listed_boundaries() {
+    let part = regime(0..8, 300);
+    let blocks = parsed_blocks(
+        &[
+            (&part, false),
+            (&part, false),
+            (&part, false),
+            (&part, false),
+        ],
+        true,
+    );
+    let options = Options::default();
+    let lengths = |plans: Vec<PlannedBlock>| -> Vec<usize> {
+        plans.iter().map(|plan| plan.plain.len()).collect()
+    };
+    // Only the boundaries in front of blocks 1 and 3 may go.
+    let plans = plan_boundary_merges(&blocks, &[1, 3], &options, &mut SearchStop::never()).unwrap();
+    assert_eq!(lengths(plans), [600, 600]);
+    // Later rounds merge merged blocks across the remaining listed boundary.
+    let plans =
+        plan_boundary_merges(&blocks, &[1, 2, 3], &options, &mut SearchStop::never()).unwrap();
+    let expected: Vec<u8> = [&part[..], &part, &part, &part].concat();
+    assert_eq!(decoded(&plans), expected);
+    assert_eq!(lengths(plans), [1200]);
+    assert!(plan_boundary_merges(&blocks, &[], &options, &mut SearchStop::never()).is_none());
+    assert!(
+        plan_boundary_merges(&blocks, &[1, 2, 3], &options, &mut SearchStop::always()).is_none()
+    );
+}
+
+#[test]
+fn boundary_merges_keep_neighbors_whose_statistics_differ() {
+    let blocks = parsed_blocks(
+        &[(&regime(0..8, 300), false), (&regime(200..208, 300), false)],
+        true,
+    );
+    assert!(
+        plan_boundary_merges(&blocks, &[1], &Options::default(), &mut SearchStop::never())
+            .is_none()
+    );
+}

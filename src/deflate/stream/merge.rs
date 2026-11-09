@@ -159,5 +159,130 @@ fn plan_terminal_merges_with_work(
     changed.then_some(plans)
 }
 
+/// A block's bits at `alignment`: a merged stored plan's padding follows its
+/// alignment, which earlier merges in a later round can change.
+fn group_bits(group: &Pending, alignment: u8, strict: bool) -> Option<u64> {
+    match &group.plan {
+        Some((Representation::Stored, _)) => {
+            Some(stored_block_bits(alignment, group.block.plain.len()))
+        }
+        _ => pending_bits(group, alignment, strict),
+    }
+}
+
+/// R16 limited to the boundaries in front of the blocks at `boundaries`
+/// (ascending indices), such as where joined streams meet, since each
+/// stream's own R16 priced every other pair. A left-to-right chain re-plans
+/// its growing block at every step, which is quadratic over many short
+/// streams, so merges run in balanced rounds instead: each round prices
+/// neighbors across the remaining listed boundaries once, left to right at
+/// their real bit alignment, and keeps a merge only when it is strictly
+/// smaller than the pair as encoded. A round costs at most one pass over the
+/// blocks, so a run of n similar streams merges in about log2(n) rounds.
+/// Rounds stop when one keeps no merge or R16's work budget runs out.
+pub(crate) fn plan_boundary_merges(
+    blocks: &[ParsedBlock],
+    boundaries: &[usize],
+    options: &Options,
+    stop: &mut SearchStop<'_>,
+) -> Option<Vec<PlannedBlock>> {
+    let bounded = Options {
+        exhaustive: false,
+        ..options.clone()
+    };
+    let strict = options.strict;
+    let mut work_left = terminal_layout_work(blocks);
+    // Each group with whether the boundary in front of it may be removed.
+    let mut groups = Vec::new();
+    groups.try_reserve_exact(blocks.len()).ok()?;
+    for (index, block) in blocks.iter().enumerate() {
+        let pending = Pending {
+            block: block.try_clone_shared()?,
+            plan: None,
+        };
+        groups.push((
+            pending,
+            index != 0 && boundaries.binary_search(&index).is_ok(),
+        ));
+    }
+
+    let mut changed = false;
+    loop {
+        let mut merged = false;
+        let mut next_groups = Vec::new();
+        next_groups.try_reserve_exact(groups.len()).ok()?;
+        let mut bits = 0_u64;
+        let mut groups_left = groups.into_iter();
+        let mut current = groups_left.next();
+        while let Some((left, left_removable)) = current.take() {
+            let alignment = (bits % 8) as u8;
+            let left_bits = group_bits(&left, alignment, strict)?;
+            let next = groups_left.next();
+            if let Some((right, true)) = &next {
+                let pair_work = left
+                    .block
+                    .tokens
+                    .len()
+                    .checked_add(right.block.tokens.len())?
+                    .checked_mul(std::mem::size_of::<Token>())?
+                    .checked_add(left.block.plain.len())?
+                    .checked_add(right.block.plain.len())?;
+                if left.block.source_type != SourceBlockType::Stored
+                    && right.block.source_type != SourceBlockType::Stored
+                    && pair_work <= work_left
+                    && !stop.reached()
+                {
+                    work_left -= pair_work;
+                    let right_alignment = ((u64::from(alignment) + left_bits) % 8) as u8;
+                    let right_bits = group_bits(right, right_alignment, strict)?;
+                    if let Some(block) = merge(&left.block, &right.block) {
+                        let plan = plan_reusable_block(&block, &bounded, stop).at_alignment(
+                            block.plain.len(),
+                            alignment,
+                            reusable_original_bits(&block, alignment, strict),
+                        );
+                        if plan.1 < left_bits.checked_add(right_bits)? {
+                            bits = bits.checked_add(plan.1)?;
+                            let group = Pending {
+                                block,
+                                plan: Some(plan),
+                            };
+                            next_groups.push((group, left_removable));
+                            merged = true;
+                            current = groups_left.next();
+                            continue;
+                        }
+                    }
+                }
+            }
+            bits = bits.checked_add(left_bits)?;
+            next_groups.push((left, left_removable));
+            current = next;
+        }
+        groups = next_groups;
+        changed |= merged;
+        if !merged {
+            break;
+        }
+    }
+    if !changed {
+        return None;
+    }
+
+    let mut plans = Vec::new();
+    plans.try_reserve_exact(groups.len()).ok()?;
+    let mut bits = 0_u64;
+    for (mut group, _) in groups {
+        let alignment = (bits % 8) as u8;
+        if let Some((Representation::Stored, stored_bits)) = &mut group.plan {
+            *stored_bits = stored_block_bits(alignment, group.block.plain.len());
+        }
+        let plan = finish(group, alignment, strict)?;
+        bits = bits.checked_add(plan.bits)?;
+        plans.push(plan);
+    }
+    Some(plans)
+}
+
 #[cfg(test)]
 mod tests;

@@ -5,13 +5,16 @@
 
 use crate::checksum::crc32_update;
 use crate::deflate::{
-    inspect_raw_prefix, optimize_raw_prefix_with_floor, DefaultFloor, RawOptimization,
+    inspect_raw_prefix, optimize_raw_prefix_with_floor, DefaultFloor, JoinPart, RawOptimization,
+    StreamJoiner,
 };
+use crate::progress::MemberMergeProgress;
 use crate::sort::sort_indices_unstable;
 use crate::{Error, Optimization, Options, Result};
 
 use super::{scale_duration, try_append_bytes, try_vec_with_capacity, SearchDeadline};
 
+const FTEXT: u8 = 0x01;
 const FHCRC: u8 = 0x02;
 const FEXTRA: u8 = 0x04;
 const FNAME: u8 = 0x08;
@@ -40,12 +43,43 @@ pub(super) fn preflight(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Memb
     parse_members(input, max_decoded_bytes)
 }
 
+/// One member's stream as it is written: Max's or Default's result.
+#[derive(Clone, Copy)]
+struct MemberStream<'a> {
+    data: &'a [u8],
+    deflate_bits: u64,
+}
+
+impl<'a> MemberStream<'a> {
+    fn optimized(raw: &'a RawOptimization) -> Self {
+        Self {
+            data: &raw.data,
+            deflate_bits: raw.info.deflate_bits,
+        }
+    }
+
+    /// Default's result for the member: the endpoint Max kept where it
+    /// differs, otherwise the member's own stream.
+    fn default_endpoint(raw: &'a RawOptimization) -> Self {
+        raw.default_endpoint.as_ref().map_or_else(
+            || Self::optimized(raw),
+            |endpoint| Self {
+                data: &endpoint.data,
+                deflate_bits: endpoint.deflate_bits,
+            },
+        )
+    }
+}
+
 pub(super) fn optimize_preflight(
     input: &[u8],
     options: &Options,
     members: Vec<Member>,
 ) -> Result<Optimization> {
+    let members = members.as_slice();
     let deadline = SearchDeadline::new(options);
+    // Max merges against Default's members as well, below.
+    let keep_default_endpoints = options.exhaustive && options.strip_metadata && members.len() > 1;
     let mut order = Vec::new();
     order
         .try_reserve_exact(members.len())
@@ -81,7 +115,7 @@ pub(super) fn optimize_preflight(
             total_weight,
             position + 1 == order.len(),
         );
-        let run = || optimize_member(input, members[index], &call_options);
+        let run = || optimize_member(input, members[index], &call_options, keep_default_endpoints);
         let raw = if call_options.timeout < file_remaining {
             crate::progress::with_stream_slice(index + 1, &[], None, run)?
         } else {
@@ -95,46 +129,47 @@ pub(super) fn optimize_preflight(
         results[index] = Some(raw);
     }
 
-    reclaim_timed_out_members(input, &members, &mut results, pending, options, &deadline)?;
+    reclaim_timed_out_members(
+        input,
+        members,
+        &mut results,
+        pending,
+        options,
+        &deadline,
+        keep_default_endpoints,
+    )?;
     if options.verbose {
         for index in 0..members.len() {
             crate::progress::complete_stream_group(index + 1, &[]);
         }
     }
 
-    let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION)?;
+    let results: Vec<RawOptimization> = results
+        .into_iter()
+        .map(|raw| raw.expect("every GZIP member has one optimization result"))
+        .collect();
     let mut source_deflate_bits = 0_u64;
-    let mut output_deflate_bits = 0_u64;
-    for (index, member) in members.iter().enumerate() {
-        let raw = results[index]
-            .take()
-            .expect("every GZIP member has one optimization result");
+    for raw in &results {
         source_deflate_bits = source_deflate_bits
             .checked_add(raw.info.source_deflate_bits)
             .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))?;
-        output_deflate_bits = output_deflate_bits
-            .checked_add(raw.info.deflate_bits)
-            .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))?;
-        let has_optional_metadata = member.flags & (FEXTRA | FNAME | FCOMMENT | FHCRC) != 0;
-        if options.strip_metadata && has_optional_metadata {
-            let mut header = input[member.start..member.start + 10].to_vec();
-            // Keep FTEXT, a content hint; clear only the flags of dropped fields.
-            header[3] = member.flags & !(FEXTRA | FNAME | FCOMMENT | FHCRC);
-            try_append_bytes(&mut output, &header, OUTPUT_ALLOCATION)?;
-        } else {
-            try_append_bytes(
-                &mut output,
-                &input[member.start..member.payload_start],
-                OUTPUT_ALLOCATION,
-            )?;
-        }
-        try_append_bytes(&mut output, &raw.data, OUTPUT_ALLOCATION)?;
-        try_append_bytes(
-            &mut output,
-            &input[member.trailer_start..member.end],
-            OUTPUT_ALLOCATION,
-        )?;
     }
+    let mut output = try_vec_with_capacity(input.len(), OUTPUT_ALLOCATION)?;
+    let mut output_deflate_bits = if options.strip_metadata && members.len() > 1 {
+        let (bits, merge) =
+            write_merged_file(input, members, &results, options, &deadline, &mut output)?;
+        crate::progress::record_member_merge(options, merge);
+        bits
+    } else {
+        let mut bits = 0_u64;
+        for (member, raw) in members.iter().zip(&results) {
+            bits = bits
+                .checked_add(raw.info.deflate_bits)
+                .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))?;
+            write_member(input, member, &raw.data, options, &mut output)?;
+        }
+        bits
+    };
 
     let stream_end = members
         .last()
@@ -161,6 +196,202 @@ pub(super) fn optimize_preflight(
     } else {
         0
     }))
+}
+
+/// Write one member with its optimized Deflate stream; `--strip` drops its
+/// optional header fields.
+fn write_member(
+    input: &[u8],
+    member: &Member,
+    payload: &[u8],
+    options: &Options,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    let has_optional_metadata = member.flags & (FEXTRA | FNAME | FCOMMENT | FHCRC) != 0;
+    if options.strip_metadata && has_optional_metadata {
+        let mut header = [0_u8; 10];
+        header.copy_from_slice(&input[member.start..member.start + 10]);
+        // Keep FTEXT, a content hint; clear only the flags of dropped fields.
+        header[3] = member.flags & !(FEXTRA | FNAME | FCOMMENT | FHCRC);
+        try_append_bytes(output, &header, OUTPUT_ALLOCATION)?;
+    } else {
+        try_append_bytes(
+            output,
+            &input[member.start..member.payload_start],
+            OUTPUT_ALLOCATION,
+        )?;
+    }
+    try_append_bytes(output, payload, OUTPUT_ALLOCATION)?;
+    try_append_bytes(
+        output,
+        &input[member.trailer_start..member.end],
+        OUTPUT_ALLOCATION,
+    )
+}
+
+/// Under `--strip`, write the members merged, as [`write_merged_members`]
+/// does. Each Max member is no worse than its Default endpoint, but tokens
+/// chosen for one member's codes can price worse once its boundaries are
+/// re-planned in a merged block. So Max also merges the members' Default
+/// endpoints, which every Max member keeps as mandatory work, and keeps that
+/// file unless its own is no worse in bytes and Deflate bits. Once Default
+/// finishes its members and boundary merges, it writes the same file.
+fn write_merged_file(
+    input: &[u8],
+    members: &[Member],
+    results: &[RawOptimization],
+    options: &Options,
+    deadline: &SearchDeadline,
+    output: &mut Vec<u8>,
+) -> Result<(u64, MemberMergeProgress)> {
+    let start = output.len();
+    let streams = member_streams(results, MemberStream::optimized)?;
+    let merged = write_merged_members(input, members, &streams, options, deadline, output)?;
+    if results.iter().all(|raw| raw.default_endpoint.is_none()) {
+        return Ok(merged);
+    }
+    let streams = member_streams(results, MemberStream::default_endpoint)?;
+    let mut floor = try_vec_with_capacity(output.len() - start, OUTPUT_ALLOCATION)?;
+    let floor_merged =
+        write_merged_members(input, members, &streams, options, deadline, &mut floor)?;
+    if output.len() - start <= floor.len() && merged.0 <= floor_merged.0 {
+        return Ok(merged);
+    }
+    output.truncate(start);
+    try_append_bytes(output, &floor, OUTPUT_ALLOCATION)?;
+    Ok(floor_merged)
+}
+
+/// Write runs of consecutive members as one member each. A
+/// member's boundary carries no data once its optional fields are dropped,
+/// and the joined Deflate stream decodes to the members' output in order and
+/// is never longer than their streams, so each removed member saves at least
+/// its 10-byte header and 8-byte trailer. A run grows while its joined stream
+/// stays within the parser's limits, so that Columbo can check the stream and
+/// parse it again; greedy runs leave the fewest members. Returns the output's
+/// meaningful Deflate bits and the merge's report.
+fn write_merged_members(
+    input: &[u8],
+    members: &[Member],
+    results: &[MemberStream<'_>],
+    options: &Options,
+    deadline: &SearchDeadline,
+    output: &mut Vec<u8>,
+) -> Result<(u64, MemberMergeProgress)> {
+    let start = output.len();
+    let mut bits = 0_u64;
+    let mut merged_members = 0_usize;
+    let mut run_start = 0_usize;
+    let mut joiner = StreamJoiner::default();
+    for (index, (member, raw)) in members.iter().zip(results).enumerate() {
+        let part = JoinPart::parse(raw.data, member.decoded_size)?;
+        if !joiner.is_empty() && !joiner.fits(&part) {
+            let run = run_start..index;
+            let joined = std::mem::take(&mut joiner);
+            bits = add_bits(
+                bits,
+                write_member_run(
+                    input,
+                    &members[run.clone()],
+                    &results[run],
+                    joined,
+                    options,
+                    deadline,
+                    output,
+                )?,
+            )?;
+            merged_members += 1;
+            run_start = index;
+        }
+        joiner.push(part)?;
+    }
+    let run = run_start..members.len();
+    bits = add_bits(
+        bits,
+        write_member_run(
+            input,
+            &members[run.clone()],
+            &results[run],
+            joiner,
+            options,
+            deadline,
+            output,
+        )?,
+    )?;
+    merged_members += 1;
+
+    let separate_bytes = results.iter().try_fold(0_u64, |total, raw| {
+        total.checked_add(raw.data.len() as u64 + 18)
+    });
+    let merged_bytes = (output.len() - start) as u64;
+    let merge = MemberMergeProgress {
+        members: members.len(),
+        merged_members,
+        saved_bytes: separate_bytes.map_or(0, |bytes| bytes.saturating_sub(merged_bytes)),
+    };
+    Ok((bits, merge))
+}
+
+/// Write one run of members as one member: the first member's header and
+/// the joined stream with its CRC-32 and size. A run of one keeps its own
+/// stream.
+fn write_member_run(
+    input: &[u8],
+    members: &[Member],
+    results: &[MemberStream<'_>],
+    joiner: StreamJoiner<'_>,
+    options: &Options,
+    deadline: &SearchDeadline,
+    output: &mut Vec<u8>,
+) -> Result<u64> {
+    if let ([member], [raw]) = (members, results) {
+        write_member(input, member, raw.data, options, output)?;
+        return Ok(raw.deflate_bits);
+    }
+    // Max finishes the boundary merges after the deadline too, as it does
+    // APNG frame reuse, so that it keeps every saving Default finds; Default
+    // stops at the deadline.
+    let mut expired = || !options.exhaustive && deadline.is_expired();
+    let joined = joiner.finish(options, &mut expired)?;
+    let first = members[0];
+    let mut header = [0_u8; 10];
+    header.copy_from_slice(&input[first.start..first.start + 10]);
+    // FTEXT says the decoded data is probably text, so the merged member keeps
+    // it only when every member set it. MTIME, XFL and OS are the first
+    // member's, which is the header gzip itself reads for the whole file.
+    header[3] = if members.iter().all(|member| member.flags & FTEXT != 0) {
+        FTEXT
+    } else {
+        0
+    };
+    try_append_bytes(output, &header, OUTPUT_ALLOCATION)?;
+    try_append_bytes(output, &joined.data, OUTPUT_ALLOCATION)?;
+    try_append_bytes(output, &joined.crc32.to_le_bytes(), OUTPUT_ALLOCATION)?;
+    // ISIZE is the decoded size modulo 2^32.
+    try_append_bytes(
+        output,
+        &(joined.decoded_size as u32).to_le_bytes(),
+        OUTPUT_ALLOCATION,
+    )?;
+    Ok(joined.meaningful_bits)
+}
+
+fn member_streams<'a>(
+    results: &'a [RawOptimization],
+    stream: fn(&'a RawOptimization) -> MemberStream<'a>,
+) -> Result<Vec<MemberStream<'a>>> {
+    let mut streams = Vec::new();
+    streams
+        .try_reserve_exact(results.len())
+        .map_err(|_| Error::allocation("GZIP member streams"))?;
+    streams.extend(results.iter().map(stream));
+    Ok(streams)
+}
+
+fn add_bits(total: u64, bits: u64) -> Result<u64> {
+    total
+        .checked_add(bits)
+        .ok_or_else(|| Error::new("GZIP Deflate bit count is too large"))
 }
 
 pub(super) fn has_rfc1952_header(input: &[u8]) -> bool {
@@ -269,9 +500,16 @@ fn parse_members(input: &[u8], max_decoded_bytes: u64) -> Result<Vec<Member>> {
     Ok(members)
 }
 
-fn optimize_member(input: &[u8], member: Member, options: &Options) -> Result<RawOptimization> {
+/// Optimize one member. Max keeps the member's Default endpoint only when
+/// `keep_default_endpoint` asks for it and it differs from Max's stream.
+fn optimize_member(
+    input: &[u8],
+    member: Member,
+    options: &Options,
+    keep_default_endpoint: bool,
+) -> Result<RawOptimization> {
     let default_floor = member_default_floor(options.exhaustive);
-    let raw = optimize_raw_prefix_with_floor(
+    let mut raw = optimize_raw_prefix_with_floor(
         &input[member.payload_start..],
         options,
         member.decoded_size,
@@ -282,7 +520,21 @@ fn optimize_member(input: &[u8], member: Member, options: &Options) -> Result<Ra
     {
         return Err(Error::new("invalid GZIP deflate member"));
     }
+    settle_default_endpoint(&mut raw, keep_default_endpoint);
     Ok(raw)
+}
+
+/// Keep a member's Default endpoint only when `keep` asks for it and it
+/// differs from the member's own stream, which then stands in for it.
+fn settle_default_endpoint(raw: &mut RawOptimization, keep: bool) {
+    if !keep
+        || raw
+            .default_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.data == raw.data)
+    {
+        raw.default_endpoint = None;
+    }
 }
 
 fn member_default_floor(exhaustive: bool) -> DefaultFloor {
@@ -323,6 +575,7 @@ fn reclaim_timed_out_members(
     mut pending: Vec<usize>,
     options: &Options,
     deadline: &SearchDeadline,
+    keep_default_endpoints: bool,
 ) -> Result<()> {
     while !pending.is_empty() && !deadline.is_expired() {
         let mut remaining_weight = pending
@@ -356,7 +609,14 @@ fn reclaim_timed_out_members(
             }
             let mut retry_options = options.clone();
             retry_options.timeout = timeout;
-            let run = || optimize_member(input, members[index], &retry_options);
+            let run = || {
+                optimize_member(
+                    input,
+                    members[index],
+                    &retry_options,
+                    keep_default_endpoints,
+                )
+            };
             let retry = crate::progress::with_stream_reclaim(index + 1, &[], !last, run)?;
             let retry_timed_out = retry.timed_out;
             let incumbent = results[index]

@@ -601,6 +601,9 @@ bytes and aggregate meaningful bits (the sum over the container's streams):
 - In PNG Max, each Max candidate for a compressed metadata chunk body replaces
   the best body so far, starting from its Default floor, only when it strictly
   dominates it in the same sense ([PNG and APNG](#png-and-apng)).
+- Under `--strip`, GZIP Max merges its members twice, from Max's streams and
+  from their Default endpoints, and keeps its own file when it is no larger in
+  both measures, so a tie keeps the Max file ([GZIP](#gzip)).
 - Under these rules, a contender with fewer bytes but more aggregate bits loses,
   and a tie keeps the floor.
 - The APNG whole-file race is the exception. Per-stream floors cannot guarantee
@@ -972,8 +975,9 @@ What happens to one stream:
      which is compared whatever the deadline, discards the kept list when it
      wins ([M14: replaced-candidate close](#m14-replaced-candidate-close)).
    - **Max, last:** Default's own finish of the complete Default endpoint (R1c,
-     R13–R18), and any R1b win, are kept only as final competitors. They are
-     compared after Max's terminal stage, so that Max does not end above Default
+     R13–R18), any R1b win, and Default's endpoint after a deadline during its
+     first route are kept only as final competitors. They are compared after
+     Max's terminal stage, so that Max does not end above Default
      ([Floors and the Max guarantee](#floors-and-the-max-guarantee)).
 9. **Fall back to the source.** In relaxed mode, Columbo keeps the exact source
    bytes, original padding bits included, unless the finished winner is strictly
@@ -996,9 +1000,10 @@ What happens to one stream:
 11. **Choose and report.** In relaxed mode without `--strip`, a wrapper whose
     rebuilt result is larger than its input falls back to its source data
     ([Strict and relaxed output](#strict-and-relaxed-output)). ZIP's Max
-    archives, PNG's Max metadata bodies and the APNG whole-file race then choose
-    between their lineages by dominance over file bytes and aggregate meaningful
-    bits, while PNG image-stream lineages keep the per-stream rule of step 7
+    archives, PNG's Max metadata bodies, GZIP's merged Max file and the APNG
+    whole-file race then choose between their lineages by dominance over file
+    bytes and aggregate meaningful bits, while PNG image-stream lineages keep
+    the per-stream rule of step 7
     ([Candidate ordering](#candidate-ordering)). The CLI replaces the file only
     when the output is shorter or saves at least one meaningful bit, when
     `--strip` changed the bytes, or when ZIP's mandatory Store normalization of
@@ -1456,6 +1461,24 @@ can, and it may replace that result only by winning against it:
   uniform distance tree changes the header that R2–R9 start from and can lead
   them to a worse fixed point
   ([strict completion as a final competitor](benchmark-miss-regression-audit.md#strict-completion-as-a-final-competitor)).
+- **Default's first-route cut.** When Default's deadline passes during its first
+  route, the ordinary planner, no later route can start: Default skips D1, D2,
+  R1–R5, D4 and the route families, and runs D3, the tree floors and its finish
+  (R1c, R13–R18) on that route's candidate. The finish is not monotone in its
+  starting size, so that endpoint can be smaller than the complete route's:
+  over 980 streams (GZIP and zlib fixtures, sampled PNG image streams and
+  synthetic GZIP members) it was smaller on 20 in strict mode, by 147 bytes in
+  all and at most 27 on one stream. A GZIP member whose time slice is shorter than its first
+  route gets exactly that endpoint, and the reclaim pass keeps it when it beats
+  the rerun. So the exact policies also build it, as mandatory work from the
+  same first route, and keep it as a final competitor when it is strictly
+  smaller than Default's exact endpoint. With equal timeouts, Max then ended no
+  larger than either endpoint on all 980 streams, in strict and relaxed mode,
+  under `Complete` and `SharedExact`. Max at 10 seconds saved 41 bytes on the 21
+  GZIP fixtures, none larger, for 0.3% more CPU, and 94 static PNGs were
+  unchanged once rerun on a quieter host. A deadline that passes later in
+  Default's route hands the finish another candidate, which this does not
+  cover.
 - **APNG.** For a multi-image APNG, each `ApngMax` frame keeps the complete APNG
   Default endpoint and, when smaller, the exact endpoint of `ApngDefault`'s
   finish as a final competitor ([Floor policies](#floor-policies)). Both
@@ -1467,6 +1490,12 @@ can, and it may replace that result only by winning against it:
   therefore also races a complete Default pass of the whole file, each side with
   the full allowance. The Max file is kept only if it is no larger in file bytes
   and in aggregate meaningful bits ([PNG and APNG](#png-and-apng)).
+- **GZIP with `--strip`.** Each Max member keeps its complete Default endpoint
+  (`SharedExact`), but merging joins the members and re-plans their boundaries,
+  and tokens chosen for one member's codes can price worse in the merged block.
+  So each member also returns that endpoint, Max merges the endpoints as Default
+  merges its members, and the Max file is kept only if it is no larger in file
+  bytes and aggregate meaningful bits ([GZIP](#gzip)).
 - **ZIP and PNG metadata.** ZIP Max builds the complete Default archive
   (`MandatoryComplete`), and a Max archive replaces it only when it is no worse
   in file bytes and aggregate meaningful bits and better in one ([ZIP](#zip)).
@@ -1488,7 +1517,9 @@ whole-file race is the exception. Its Default pass gets the same full allowance
 as Max, and the Max file is kept only if it is no larger in file bytes and
 aggregate meaningful bits. So even under a short nonzero timeout, the result is
 never larger than that Default pass
-([APNG whole-file race](#wrapper-and-floor-policy-routing)).
+([APNG whole-file race](#wrapper-and-floor-policy-routing)). GZIP's merged
+Default endpoints are mandatory work like the other floors, so they are
+Default's own file only when Default finishes its members.
 
 **Evidence.** On the DeflOpt benchmark, with Max given Default's runtime rounded
 up plus 5 seconds, no Max row is worse than Default across 957 pairs
@@ -1801,6 +1832,7 @@ The terminal methods R1–R18 close the second table in label order; the
 | [PNG uncompressed text](#png-and-apng) | Writes a zTXt chunk as tEXt, or a compressed iTXt chunk with its compression flag cleared, when that is at least one byte smaller than the final compressed chunk and the text has no NUL byte. | Both | 🟢 | **PNG specification** / **Columbo** |
 | [PNG invalid-exporter repair](#png-and-apng) | Accepts and drops a palette's `tRNS` chunk left in an RGBA image, where PNG forbids it, instead of rejecting the file. | Both | 🟢 | **PNG specification** / **Columbo Rust** |
 | [PNG geometry, chunk coalescing, and APNG renumbering](#png-and-apng) | Checks IHDR/fcTL decoded sizes, Adam7 included; writes one IDAT and one fdAT per frame, saving 12 bytes per removed IDAT, 16 per fdAT; renumbers sequences. | Both | 🟢 | **PNG/APNG** / **Columbo** |
+| [GZIP member merging](#gzip) | Under `--strip`, joins consecutive members' optimized streams into one member within the parser's single-stream limits, then runs R16 at the former boundaries in balanced rounds; Max also merges the members' Default endpoints and keeps the smaller file. | Both | 🟢–🔴 | **RFC 1952** / **Columbo** |
 | [ZIP members and Store](#zip) | Optimizes unencrypted method-8 members; members decoding to 0–4 bytes always become Store; Max stores larger ones only at a ≥10% payload saving. | Both | 🟡–🔴 | **Columbo** |
 | [zlib header normalization](#zlib-and-raw-deflate) | Rebuilds the header: FLEVEL 3, smallest CINFO covering the output's largest distance, valid FCHECK; rejects preset dictionaries; without `--strip`, the CLI writes no header-only change. | Both | 🟢 | **RFC 1950** / **Columbo** |
 | [GZIP member scheduling](#gzip) | Optimizes members serially, smallest compressed member first, with decoded-size-weighted slices and reclaim; writes them in physical order; `--strip` drops optional header fields. | Both | 🟡 | **RFC 1952** / **Columbo** |
@@ -5793,6 +5825,11 @@ together.
 **Acceptance.** The rebuilt stream must be strictly smaller, in bytes and then
 meaningful bits.
 
+**At joined-stream boundaries.** GZIP member merging runs R16's pricing only at
+the boundaries between joined members, in balanced rounds rather than one
+left-to-right chain, so that many small members do not make the merged block's
+re-planning quadratic ([GZIP](#gzip)).
+
 **Pitfalls and lessons.**
 
 - Placement matters. Merging before R15 grew one ZIP output by 62 bytes, and
@@ -6600,8 +6637,8 @@ wrapper's own records, and rebuilds the wrapper around the selected streams.
 Wrappers also save bytes of their own: PNG writes each stream as one chunk and
 drops a `tRNS` chunk that some exporters leave in invalidly, APNG reuses the
 best spelling among frames that decode alike, PNG can write a small text chunk
-without compression, ZIP can store a member instead of deflating it, and every
-wrapper can drop metadata with `--strip`.
+without compression, ZIP can store a member instead of deflating it, every
+wrapper can drop metadata with `--strip`, and GZIP then merges its members.
 
 This section explains how each wrapper works. Which floor policy each stream
 gets, when lineages race, and the exact gates of those races are in
@@ -7066,7 +7103,8 @@ Provenance: **ZIP APPNOTE** and **Columbo**; largest-first Default order from
 
 A GZIP file is one or more concatenated members, each a header, a raw Deflate
 stream and an 8-byte trailer holding the CRC-32 and ISIZE. Columbo re-encodes
-each member's Deflate stream and copies its header and trailer.
+each member's Deflate stream and copies its header and trailer; with `--strip`
+it merges the members.
 
 **How it works**
 
@@ -7087,8 +7125,121 @@ each member's Deflate stream and copies its header and trailer.
    a result larger than the input returns the input.
 
 **`--strip`** drops the FEXTRA, FNAME, FCOMMENT and FHCRC fields and clears
-their flags, keeps FTEXT (a content hint), MTIME, XFL and OS, and drops data
-after the last member.
+their flags, keeps FTEXT (a content hint), MTIME, XFL and OS, drops data
+after the last member, and merges the members.
+
+**Member merging.** Once `--strip` drops the optional fields, a member boundary
+carries no data: a decoder outputs the members' decoded data in order either
+way. So after every member's own search, consecutive members are rewritten as
+one member ([`src/deflate/concat.rs`](../src/deflate/concat.rs)):
+
+1. Join their optimized Deflate streams in physical order. Each non-empty block
+   keeps its bits except BFINAL, which only the last block sets; a stored block
+   is written again at its new position, and empty blocks are dropped. A match
+   in a later member reaches back only into that member's own output, which the
+   output in front of it does not change.
+2. Run R16 at the boundaries between the members (below).
+3. Parse the joined stream and check its decoded size, CRC-32 and meaningful
+   bits. Write the first member's 10-byte header, the stream, and the CRC-32 and
+   ISIZE (the size modulo 2^32) of the concatenated data. MTIME, XFL and OS are
+   the first member's, the header gzip itself reads for the whole file. FTEXT,
+   which says the data is probably text, stays only if every member set it.
+
+The joined stream is never longer than the members' streams, each padded to a
+byte: Huffman-coded bits do not depend on their position, so a block that
+starts earlier ends earlier, and a stored block that starts earlier ends on the
+same or an earlier byte boundary. Each removed member therefore saves at least
+its 10-byte header and 8-byte trailer, and the joined stream saves the final-byte
+padding of every member but the last. For example, a member whose stream ends 3
+bits into its last byte loses its 5 padding bits at the join, besides 18 bytes of
+wrapper.
+
+A run of members grows while its joined stream stays within the parser's
+single-stream limits (a 256 MiB model and 262,144 source blocks), so that
+Columbo can check the stream and parse it again. Greedy runs from the first
+member leave the fewest members, and a run of one keeps its own stream. Joining
+needs no search time and runs after the deadline too.
+
+**Boundary merges.** Joining makes the last block of one member and the first
+block of the next neighbors, a pair no member's own search could price; every
+other pair of neighbors was priced by its member's own R16. The joined stream
+therefore gets R16 restricted to those boundaries, in balanced rounds
+([`src/deflate/stream/merge.rs`](../src/deflate/stream/merge.rs)). Each round
+prices neighbors across the remaining boundaries once, left to right at their
+real bit alignment and with the bounded planner, and keeps a merge only when it
+is strictly smaller than the pair as encoded. A merged block's internal
+boundaries are gone, so the next round prices it against its own neighbors. A
+left-to-right chain, as in R16 itself, re-plans its growing block at every step,
+which is quadratic over many small members: on 2,000 one-block log members it
+used up R16's work budget after about 630 of them. A round costs at most one
+pass over the blocks, so n similar members merge in about log2(n) rounds, and
+the same 2,000 members became one block. Rounds stop when one keeps no merge,
+when R16's work budget runs out or, in Default only, at the deadline. Max
+finishes them after the deadline, as it finishes APNG frame reuse, so that it
+keeps every saving Default finds. If the rebuilt stream is not smaller, the
+joined stream is kept.
+
+**Max.** Each Max member keeps its complete Default result (`SharedExact`), but
+tokens chosen for one member's codes can price worse in a merged block. Merging
+Max's members alone, Max ended 4–549 bytes above Default on 5 of 8 synthetic log
+files. Every Max member already builds Default's exact result as mandatory work,
+so it returns a copy of that result beside its own stream where the two differ
+([Floor policies](#floor-policies)). Max then merges those Default endpoints the
+same way, boundary merges included, and keeps its own merged file only if it is
+no larger in bytes and meaningful bits. Once Default finishes its members and
+boundary merges, the endpoints' file is the file Default writes; a member that
+Default cuts at its slice can end elsewhere (see the pitfalls). On 6,004
+streams (GZIP members, zlib fixtures and sampled PNG image streams), each
+endpoint was byte-identical to Default's result, in strict and relaxed mode.
+Members whose endpoint equals their Max stream need no copy, and if every member
+is such, the second merge is skipped.
+
+Verbose output reports the selected file's merge, against writing its optimized
+members separately, for example `GZIP member merge  400 members → 1 member ·
+saved 16695 bytes`.
+
+**Evidence.** No fixture has more than one member, so the measurements use
+synthetic files: pairs of concatenated GZIP fixtures, BGZF-style files of
+65,280-byte members (as `bgzip` writes them), and log-style files of small
+appended members. With `--strip` against `f3c1cce`, every output decoded to its
+source's data:
+
+| Files | Members | Saved in Default | Max |
+| --- | ---: | --- | --- |
+| 5 concatenated pairs | 2 each | 18–19 bytes each | 18–19 bytes each |
+| 2 BGZF-style files | 5 and 6 | 106 and 110 bytes | the same |
+| 3 log-style files | 50, 400, 2,000 | 36.7%, 50.1%, 42.3% (2,486, 16,695 and 98,254 bytes) | the same |
+
+Default CPU rose 1.6%, and Max CPU 2.1% (114.8 seconds, against 112.4 in an
+earlier run of `f3c1cce`), about 1 point of it for Default's first-route cut
+(see the pitfalls). On these files and 8 further log files of 100–1,200 members, Max
+ended no larger than Default at 10 and at 20 seconds. On 220 single-member
+fixtures, outputs with and without `--strip` were byte-identical to `f3c1cce`.
+
+**Pitfalls and lessons.**
+
+- Optimizing the joined source streams once, before any member search, saved
+  more on some files (142 more bytes on a BGZF-style file), but left two of five
+  concatenated pairs 11–19 bytes larger than not merging at all, through the
+  planner's path effects on a larger stream. Joining after the member searches
+  is never larger than not merging.
+- Racing a complete Default pass of the whole file beside Max, as APNG does,
+  cost Max about one Default run per file: Max CPU rose 29% over `f3c1cce` on
+  the files above. Merging the Default endpoints that Max members already keep
+  gave the same bytes for 21% less Max CPU on the 18 files, except on two
+  concatenated pairs, 17 and 18 bytes above Default at 10 seconds. There the
+  smaller member's 0.56-second Default slice ends its search after the normal
+  route, so Default skips R1–R5 and runs only its finish (R1c, R13–R18). The
+  reclaim pass reruns the member to the end and keeps the earlier result, 18
+  bytes smaller than the complete route. `f3c1cce` without `--strip` had the
+  same gap. Max now keeps that endpoint too, as Default's first-route cut
+  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)), which brought
+  both pairs level with Default.
+- A full second pass over the merged file found little more on large members:
+  the 42–377 bytes it saved on the pairs are about what a second pass over the
+  unmerged members saved (74–376), a re-run effect. On small members almost all
+  of its saving came from block merges across the old boundaries, which the
+  boundary merges keep for a fraction of the time.
 
 Provenance: **RFC 1952** and **Columbo**.
 
@@ -7811,7 +7962,9 @@ and `Established` occur only in Max.
 
 The **exact policies** are the four that keep a complete Default endpoint in
 Max, and with it Default's slid final competitor: `Complete`,
-`CompleteThenBounded`, `SharedExact` and `ApngMax`. `Shared` and `Established`
+`CompleteThenBounded`, `SharedExact` and `ApngMax`. All but `ApngMax` also keep
+Default's first-route cut as a final competitor
+([Floors and the Max guarantee](#floors-and-the-max-guarantee)). `Shared` and `Established`
 keep none, and `ApngDefault` and `MandatoryComplete` run only with Default
 options.
 
@@ -7855,7 +8008,11 @@ allowance, or a shorter part of it when the stream reserves a G0t terminal share
   (untimed, D4 included) and the Max seed. The bounded phase starts from the Max
   seed, and the endpoint joins the incumbent at the comparison floor. Its
   untimed endpoint can therefore overrun the member's slice and use time meant
-  for later members.
+  for later members. Max also returns a copy of the exact result Default
+  selects, taken before R6–R9 strengthen the endpoint and finished as Default
+  finishes its own (the source kept when no smaller, padding normalized under
+  `--strip`), which GZIP member merging compares against
+  ([GZIP](#gzip)).
 - `ApngDefault` runs the stream planner once under the hard stop, with no replay
   and no
   [endpoint-proven lineage](#proven-submatch-resegmentation-and-feedback-d1-d2).
@@ -8067,6 +8224,11 @@ input while `--raw` keeps trailing data.
   share, 0.98 × remaining file time), where a member's weight is its decoded
   size (at least 1). The last, largest member gets 0.98 × the remaining time.
   Yielded members get the reclaim pass above.
+- With `--strip`, members merge after the reclaim pass ([GZIP](#gzip)). In Max,
+  each member also returns its Default endpoint where it differs from the
+  member's stream. Those endpoints are merged too, serially and after the Max
+  file, and the Max file is kept only if its bytes and aggregate meaningful bits
+  are both no larger; ties keep Max.
 
 **PNG compressed metadata** (`zTXt`, compressed `iTXt` and `iCCP` zlib streams):
 
@@ -8281,8 +8443,9 @@ the relaxed-mode check in step 15 do work; every other step runs only in Max.
 14. The terminal stage: R1–R18 on the incumbent. Max first runs the terminal
     tree floors, and afterward M14's finishes of its kept candidates and the
     closes of sweep-replaced candidates. Default then finishes the D4 lineage.
-15. Max's exact policies compare Default's slid final competitor; in relaxed
-    mode the source is kept unless the result is strictly smaller.
+15. Max's exact policies compare Default's slid final competitor, or its
+    first-route cut when smaller; in relaxed mode the source is kept unless the
+    result is strictly smaller.
 
 The diagrams below show these phases as decisions.
 [Default and standalone max](#default-and-standalone-max) draws Default's steps
@@ -8748,6 +8911,12 @@ splits it into two candidates, and only the first then gets the timed R6–R9:
   is kept as a final competitor when R1b won, or when it is strictly smaller
   than the parent before R6–R9, and it is compared only after Max's own terminal
   stage, so it never becomes the parent of Max's terminal searches.
+- Default's first-route cut, except under `ApngMax`: D3 and the tree floors on
+  the ordinary planner's candidate, then Default's closing sweep and R18 under a
+  deadline that lets no route start and never stops finalization, so only R1c
+  and R13–R18 run. It replaces the exact endpoint as the final competitor when
+  strictly smaller than it, and the exact endpoint is still what `SharedExact`
+  returns to GZIP member merging.
 - The reason for the split is given under **Final competitors** in
   [Floors and the Max guarantee](#floors-and-the-max-guarantee). Max's own sweep
   applies R1b, R1c and R13–R18 to its final incumbent instead.

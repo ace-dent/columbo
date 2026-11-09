@@ -1560,6 +1560,134 @@ fn zero_budget_max_floors_retain_their_exact_default_endpoint() {
 }
 
 #[test]
+fn shared_exact_max_returns_the_exact_default_result() {
+    // A stored block Default rewrites, and a stream with feedback wins.
+    let stored = [0x01, 0x05, 0x00, 0xfa, 0xff, b'h', b'e', b'l', b'l', b'o'];
+    for (input, size) in [(FEEDBACK_RAW, 86), (stored.as_slice(), 5)] {
+        for strict in [true, false] {
+            for strip_metadata in [true, false] {
+                let default_options = Options {
+                    strict,
+                    strip_metadata,
+                    timeout: Duration::from_secs(10),
+                    ..Options::default()
+                };
+                let default = optimize_raw_prefix_with_floor(
+                    input,
+                    &default_options,
+                    size,
+                    DefaultFloor::Shared,
+                )
+                .unwrap();
+                assert!(!default.timed_out);
+                assert!(default.default_endpoint.is_none());
+                // The endpoint is mandatory work, so even a zero Max budget
+                // returns it.
+                let max_options = Options {
+                    exhaustive: true,
+                    timeout: Duration::ZERO,
+                    ..default_options
+                };
+                let endpoint = optimize_raw_prefix_with_floor(
+                    input,
+                    &max_options,
+                    size,
+                    DefaultFloor::SharedExact,
+                )
+                .unwrap()
+                .default_endpoint
+                .expect("SharedExact returns Default's endpoint");
+                assert_eq!(endpoint.data, default.data, "strict={strict}");
+                assert_eq!(endpoint.deflate_bits, default.info.deflate_bits);
+                assert!(optimize_raw_prefix_with_floor(
+                    input,
+                    &max_options,
+                    size,
+                    DefaultFloor::Complete,
+                )
+                .unwrap()
+                .default_endpoint
+                .is_none());
+            }
+        }
+    }
+}
+
+/// A short appended log line pair, as a GZIP member (synthetic): Default's
+/// finish alone, after a deadline during its first route, ends smaller than
+/// its complete route.
+const FIRST_ROUTE_CUT_RAW: &[u8] = &[
+    0x33, 0x32, 0x30, 0x32, 0xd3, 0x35, 0x34, 0xd4, 0x35, 0x32, 0x51, 0x30, 0x32, 0xb6, 0x32, 0x36,
+    0x54, 0xc8, 0x2c, 0xb0, 0x35, 0xb4, 0x34, 0xd2, 0x33, 0x34, 0xb3, 0xd0, 0x33, 0xd4, 0x33, 0x57,
+    0x30, 0x32, 0x30, 0x50, 0x30, 0x31, 0x30, 0x51, 0x48, 0x4e, 0x4c, 0xce, 0x48, 0xb5, 0xcd, 0xcd,
+    0x2c, 0x2e, 0x56, 0xc8, 0x49, 0x2c, 0x49, 0xcd, 0x4b, 0xae, 0xb4, 0x35, 0x32, 0x35, 0xc8, 0x2d,
+    0xe6, 0x32, 0x42, 0x18, 0x60, 0x68, 0x66, 0x65, 0x62, 0xa6, 0x10, 0xe0, 0x1f, 0x1c, 0xa2, 0x60,
+    0x0c, 0xd4, 0x02, 0xd2, 0x8a, 0x66, 0x1a, 0x88, 0x6b, 0xa0, 0x07, 0x82, 0x86, 0x5c, 0x00,
+];
+
+#[test]
+fn max_keeps_defaults_first_route_cut_endpoint() {
+    let size = 122;
+    for strict in [true, false] {
+        let complete_options = Options {
+            strict,
+            timeout: Duration::from_secs(10),
+            ..Options::default()
+        };
+        let complete = optimize_raw_prefix_with_floor(
+            FIRST_ROUTE_CUT_RAW,
+            &complete_options,
+            size,
+            DefaultFloor::Shared,
+        )
+        .unwrap();
+        assert!(!complete.timed_out);
+        // The soft deadline passes during the first route and the hard stop
+        // is far off, as when a container's time slice is shorter than that
+        // route.
+        let cut_options = Options {
+            timeout: Duration::from_micros(1),
+            ..complete_options
+        };
+        let cut = optimize_raw_prefix_with_floor_and_grace(
+            FIRST_ROUTE_CUT_RAW,
+            &cut_options,
+            size,
+            DefaultFloor::Shared,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        assert!(
+            is_strictly_better(
+                cut.data.len(),
+                cut.info.deflate_bits,
+                complete.data.len(),
+                complete.info.deflate_bits,
+            ),
+            "strict={strict}"
+        );
+        let max_options = Options {
+            exhaustive: true,
+            ..cut_options.clone()
+        };
+        for floor in [DefaultFloor::Complete, DefaultFloor::SharedExact] {
+            let maximum =
+                optimize_raw_prefix_with_floor(FIRST_ROUTE_CUT_RAW, &max_options, size, floor)
+                    .unwrap();
+            assert!(
+                !is_strictly_better(
+                    cut.data.len(),
+                    cut.info.deflate_bits,
+                    maximum.data.len(),
+                    maximum.info.deflate_bits,
+                ),
+                "{floor:?}, strict={strict}"
+            );
+        }
+    }
+}
+
+#[test]
 fn optimizes_a_dynamic_header_with_all_32_distance_code_lengths() {
     // This empty dynamic block advertises the full RFC 1951 HDIST range
     // with complete literal/length and distance trees. Reserved distance
@@ -4153,6 +4281,7 @@ fn coupled_swaps_preserve_tokens_histograms_and_stored_alignment() {
 #[test]
 fn coupled_swaps_do_not_change_zero_budget_default_floor() {
     let data = crate::deflate::header::test_support::coupled_swap_test_stream();
+    let decoded_size = parse_stream(&data, 1 << 20).unwrap().decoded_size;
     for strict in [false, true] {
         let ordinary = optimize_raw(
             &data,
@@ -4160,6 +4289,20 @@ fn coupled_swaps_do_not_change_zero_budget_default_floor() {
                 strict,
                 ..Options::default()
             },
+        )
+        .unwrap();
+        // Default's first-route cut at the same zero timeout, which zero-budget
+        // Max keeps as a final competitor.
+        let cut = optimize_raw_prefix_with_floor_and_grace(
+            &data,
+            &Options {
+                strict,
+                timeout: Duration::ZERO,
+                ..Options::default()
+            },
+            decoded_size,
+            DefaultFloor::Complete,
+            Duration::from_secs(3600),
         )
         .unwrap();
         let zero = optimize_raw(
@@ -4172,7 +4315,17 @@ fn coupled_swaps_do_not_change_zero_budget_default_floor() {
             },
         )
         .unwrap();
-        assert_eq!(ordinary.data, zero.data);
+        let expected = if is_strictly_better(
+            cut.data.len(),
+            cut.info.deflate_bits,
+            ordinary.data.len(),
+            ordinary.info.deflate_bits,
+        ) {
+            &cut.data
+        } else {
+            &ordinary.data
+        };
+        assert_eq!(&zero.data, expected, "strict={strict}");
     }
 }
 

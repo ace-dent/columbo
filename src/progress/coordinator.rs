@@ -45,6 +45,15 @@ pub(crate) enum StoreChange {
     PngInternationalText,
 }
 
+/// Concatenated GZIP members written as fewer members under `--strip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MemberMergeProgress {
+    pub(crate) members: usize,
+    pub(crate) merged_members: usize,
+    /// Bytes saved against writing every optimized member separately.
+    pub(crate) saved_bytes: u64,
+}
+
 /// A set of report producers, one bit per `u8` tag.
 #[derive(Clone, Copy, Default)]
 struct ProducerSet([u64; 4]);
@@ -81,6 +90,7 @@ pub(super) struct ReportCoordinator {
     /// demand.
     streams: Vec<StreamState>,
     store_changes: Vec<StoreProgress>,
+    member_merge: Option<MemberMergeProgress>,
     total_streams: usize,
 }
 
@@ -93,6 +103,7 @@ impl Default for ReportCoordinator {
             next_stream_id: 1,
             streams: Vec::new(),
             store_changes: Vec::new(),
+            member_merge: None,
             total_streams: 0,
         }
     }
@@ -107,6 +118,7 @@ impl ReportCoordinator {
         self.next_stream_id = 1;
         self.streams.clear();
         self.store_changes.clear();
+        self.member_merge = None;
         self.total_streams = total_streams;
     }
 
@@ -207,15 +219,18 @@ pub(super) fn begin_file(total_streams: usize, timeout: Duration) {
 }
 
 /// Print every stream left and return the selected lineage's Store
-/// conversions.
-pub(super) fn finish_file() -> Vec<StoreProgress> {
-    let store_changes = with_report_coordinator(|coordinator| {
+/// conversions and member merge.
+pub(super) fn finish_file() -> (Vec<StoreProgress>, Option<MemberMergeProgress>) {
+    let changes = with_report_coordinator(|coordinator| {
         coordinator.finish();
-        std::mem::take(&mut coordinator.store_changes)
+        (
+            std::mem::take(&mut coordinator.store_changes),
+            coordinator.member_merge.take(),
+        )
     });
     stop_report_spinner();
     emit_ready_streams();
-    store_changes
+    changes
 }
 
 /// Declare the producers (such as ZIP Max's archive lineages) of every
@@ -249,6 +264,14 @@ pub(crate) fn record_store_changes(options: &Options, changes: &[StoreProgress])
         coordinator.store_changes.clear();
         coordinator.store_changes.extend_from_slice(changes);
     });
+}
+
+/// Record a GZIP file's member merge for the report.
+pub(crate) fn record_member_merge(options: &Options, merge: MemberMergeProgress) {
+    if !super::reports_enabled(options) {
+        return;
+    }
+    with_report_coordinator(|coordinator| coordinator.member_merge = Some(merge));
 }
 
 /// Print every sealed stream that is next in order.

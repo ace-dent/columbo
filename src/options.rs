@@ -49,8 +49,9 @@ pub struct Options {
     /// output.
     pub verbose: bool,
     /// Remove supported metadata, credentials, signatures, and extraneous
-    /// payloads while rebuilding the file. Preserve decoded content; reject
-    /// ambiguous layouts and unsupported compound ZIP stripping.
+    /// payloads while rebuilding the file, and merge concatenated GZIP members.
+    /// Preserve decoded content; reject ambiguous layouts and unsupported
+    /// compound ZIP stripping.
     pub strip_metadata: bool,
     /// Emit conservative Deflate that is accepted by strict and older decoders.
     ///

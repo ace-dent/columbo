@@ -28,10 +28,10 @@ use super::{
     build_bounded_generic_max_candidates, build_bounded_phase_candidates, build_candidate,
     build_candidate_from_plans, build_compact_proven_feedback_candidate,
     build_complementary_narrow_source_candidate, build_complete_apng_default_floor_candidate,
-    build_complete_default_floor_candidate, build_deft4j_source_candidate,
-    build_prepared_compact_source_split_floors, build_source_family_candidate,
-    build_source_max_candidate, candidate_exposes_new_parent, candidate_progress,
-    capture_source_block_report, changed_narrow_parent_should_continue,
+    build_complete_default_floor, build_complete_default_floor_candidate,
+    build_deft4j_source_candidate, build_prepared_compact_source_split_floors,
+    build_source_family_candidate, build_source_max_candidate, candidate_exposes_new_parent,
+    candidate_progress, capture_source_block_report, changed_narrow_parent_should_continue,
     compact_balanced_tree_source_eligible, compact_dependent_deft4j_work_class,
     compact_split_parent_is_completed, complete_png_parallel_source_max_work_class,
     continuation_source_max, default_source_topology_eligible, deft4j_source_route_eligible,
@@ -49,8 +49,8 @@ use super::{
     release_kept_validated_parse, replace_optional_if_smaller, replace_optional_keeping_parent,
     source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
     BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed,
-    ContinuationSourceMax, DefaultFloor, DefaultFloorWork, HeaderFit, RawInfo, RawOptimization,
-    ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
+    ContinuationSourceMax, DefaultEndpoint, DefaultFloor, DefaultFloorWork, HeaderFit, RawInfo,
+    RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
     COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
     WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
@@ -143,7 +143,7 @@ fn optimize_stream(
         deadline: &deadlines.primary,
         progress,
     };
-    let mut candidate = select_candidate(&context, &deadlines)?;
+    let (mut candidate, exact_default) = select_candidate(&context, &deadlines)?;
 
     let keep_original = !options.strict && !candidate.is_strictly_smaller_than_source(source);
     let deflate_bits = if keep_original {
@@ -203,6 +203,32 @@ fn optimize_stream(
     if options.strip_metadata {
         crate::deflate::parse::normalize_padding(&mut data, decoded_limit)?;
     }
+    // Finish Default's endpoint as Default finishes its own selection.
+    let default_endpoint = match exact_default {
+        Some(mut endpoint) => {
+            if !options.strict
+                && !is_strictly_better(
+                    endpoint.data.len(),
+                    endpoint.deflate_bits,
+                    original.len(),
+                    parsed.meaningful_bits,
+                )
+            {
+                endpoint.data.clear();
+                endpoint
+                    .data
+                    .try_reserve_exact(original.len())
+                    .map_err(|_| Error::allocation("Default endpoint"))?;
+                endpoint.data.extend_from_slice(original);
+                endpoint.deflate_bits = parsed.meaningful_bits;
+            }
+            if options.strip_metadata {
+                crate::deflate::parse::normalize_padding(&mut endpoint.data, decoded_limit)?;
+            }
+            Some(endpoint)
+        }
+        None => None,
+    };
 
     Ok(RawOptimization {
         data,
@@ -219,6 +245,7 @@ fn optimize_stream(
         },
         output_max_distance,
         timed_out,
+        default_endpoint,
     })
 }
 
@@ -386,6 +413,9 @@ struct RouteState {
     /// R2–R5, or with R1b). It is compared only after Max's terminal searches,
     /// so it never becomes their parent.
     slid_default: Option<Candidate>,
+    /// Under `SharedExact`, a copy of the endpoint Default itself selects,
+    /// which the caller receives beside Max's result.
+    exact_default: Option<DefaultEndpoint>,
     /// The Default comparison floor, which also seeds Max's routes.
     floor: Option<Candidate>,
     floor_seeded: Option<Candidate>,
@@ -503,7 +533,10 @@ fn prepare_source_blocks(
 /// Max lineages beside the ordinary floor. [`establish_comparison_floor`] then
 /// fixes the incumbent, which each later phase may only replace with a
 /// strictly smaller complete candidate.
-fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> Result<Candidate> {
+fn select_candidate(
+    context: &RouteContext<'_>,
+    deadlines: &StreamDeadlines,
+) -> Result<(Candidate, Option<DefaultEndpoint>)> {
     let mut state = RouteState::default();
     let guaranteed_floor = build_guaranteed_floor(context, &mut state)?;
     let eligibility = RouteEligibility::new(context, deadlines.share);
@@ -545,7 +578,7 @@ fn select_candidate(context: &RouteContext<'_>, deadlines: &StreamDeadlines) -> 
     if let Some(slid_default) = state.slid_default.take() {
         candidate.replace_if_smaller(slid_default);
     }
-    Ok(candidate)
+    Ok((candidate, state.exact_default))
 }
 
 /// Build Default's source topology (D4), returned only when it is already
@@ -614,14 +647,16 @@ fn build_guaranteed_floor(
     } else if prebuild_floor_first {
         Some(match default_floor {
             DefaultFloor::CompleteThenBounded | DefaultFloor::SharedExact => {
-                let floors = build_complete_default_floor_candidate(
+                let floors = build_complete_default_floor(
                     source,
                     options,
                     progress,
                     context.timed(),
+                    default_floor == DefaultFloor::SharedExact,
                 )?;
                 state.complete_default = Some(floors.complete);
                 state.slid_default = floors.slid;
+                state.exact_default = floors.exact;
                 floors.max_seed
             }
             // APNG's initial planner and terminal methods define its exact

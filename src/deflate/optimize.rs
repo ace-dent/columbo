@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::progress::{
     reports_enabled, BlockEncoding, BlockProgress, BlockReport, CandidateProgress, Progress,
@@ -148,6 +148,15 @@ pub(crate) struct RawOptimization {
     pub(crate) info: RawInfo,
     pub(crate) output_max_distance: u16,
     pub(crate) timed_out: bool,
+    /// Under Max's `SharedExact`, the stream Default returns once its whole
+    /// route finishes, for callers that combine streams after optimization.
+    pub(crate) default_endpoint: Option<DefaultEndpoint>,
+}
+
+/// A complete Default result, in the form Default returns it.
+pub(crate) struct DefaultEndpoint {
+    pub(crate) data: Vec<u8>,
+    pub(crate) deflate_bits: u64,
 }
 
 /// Where Default runs R2–R5. R2–R4 fit code lengths and headers to the codes a
@@ -2859,8 +2868,12 @@ struct CompleteDefaultFloor {
     complete: Candidate,
     /// Default's exact endpoint when it differs from `complete` (after its
     /// final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`], R2–R5, or
-    /// with R1b), kept only as a final competitor.
+    /// with R1b), kept only as a final competitor; or Default's endpoint after
+    /// a deadline during its first route, when that is smaller.
     slid: Option<Candidate>,
+    /// When asked for, a copy of the exact endpoint Default itself selects,
+    /// taken before the Max-only R6–R9 strengthen `complete`.
+    exact: Option<DefaultEndpoint>,
 }
 
 /// Default's final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`], R2–R5
@@ -3153,6 +3166,18 @@ fn build_complete_default_floor_candidate(
     progress: Progress,
     terminal_work: DefaultFloorWork<'_>,
 ) -> Result<CompleteDefaultFloor> {
+    build_complete_default_floor(source, options, progress, terminal_work, false)
+}
+
+/// [`build_complete_default_floor_candidate`], also keeping a copy of
+/// Default's exact endpoint when `retain_exact` is set.
+fn build_complete_default_floor(
+    source: CandidateInput<'_>,
+    options: &Options,
+    progress: Progress,
+    terminal_work: DefaultFloorWork<'_>,
+    retain_exact: bool,
+) -> Result<CompleteDefaultFloor> {
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     let candidate = build_candidate(
@@ -3162,6 +3187,8 @@ fn build_complete_default_floor_candidate(
         &mut SearchStop::never(),
     )?;
     let max_seed = candidate.clone().named("Normal floor");
+    let first_route_cut =
+        finish_first_route_cut(source, &floor_options, progress, candidate.clone())?;
     let complete = improve_default_floor_with_feedback(
         source,
         &floor_options,
@@ -3170,7 +3197,7 @@ fn build_complete_default_floor_candidate(
         candidate,
     )?;
     let mut parse_cache = TerminalParseCache::default();
-    let (mut complete, slid) = finish_complete_default_lineages(
+    let (mut complete, mut slid) = finish_complete_default_lineages(
         source,
         &floor_options,
         progress,
@@ -3178,6 +3205,26 @@ fn build_complete_default_floor_candidate(
         complete,
         HeaderFit::InSweep,
     )?;
+    // Default selects the slid endpoint when it is smaller, as Max's final
+    // comparison does.
+    let exact = if retain_exact {
+        let endpoint = slid.as_ref().unwrap_or(&complete);
+        let mut data = Vec::new();
+        data.try_reserve_exact(endpoint.data.len())
+            .map_err(|_| Error::allocation("Default endpoint"))?;
+        data.extend_from_slice(&endpoint.data);
+        Some(DefaultEndpoint {
+            data,
+            deflate_bits: endpoint.bits,
+        })
+    } else {
+        None
+    };
+    // Default reaches the cut endpoint too when its deadline passes during
+    // its first route, so it is a final competitor beside the slid endpoint.
+    if first_route_cut.is_strictly_smaller_than(slid.as_ref().unwrap_or(&complete)) {
+        slid = Some(first_route_cut);
+    }
     // R6–R9 run under the caller's Max allowance, not as mandatory work.
     for search in [
         TerminalHeaderSearch::AlphabetBoundaries,
@@ -3200,7 +3247,41 @@ fn build_complete_default_floor_candidate(
         max_seed,
         complete,
         slid,
+        exact,
     })
+}
+
+/// Default's endpoint when its deadline passes during its first route (the
+/// ordinary planner): no later route starts, so D1, D2, R1–R5, D4 and the
+/// route families are skipped, and D3, the tree floors and the finishing steps
+/// (R1c, R13–R18) run on that route's candidate. The finishing steps are not
+/// monotone in their starting size, so this endpoint can be smaller than the
+/// complete route's, and a container that reclaims a member's time slice
+/// keeps whichever of the two is smaller.
+fn finish_first_route_cut(
+    source: CandidateInput<'_>,
+    floor_options: &Options,
+    progress: Progress,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    // A soft deadline that has passed, with no hard stop: no route starts,
+    // and linear finalization always finishes.
+    let deadline = Deadline::with_grace(Instant::now(), Duration::ZERO, Duration::MAX);
+    let work = DefaultFloorWork::Timed(&deadline);
+    let candidate =
+        improve_default_floor_with_feedback(source, floor_options, work, progress, candidate)?;
+    // Default's closing sweep and R18, as its finish runs them.
+    let candidate = improve_with_terminal_searches(
+        source,
+        floor_options,
+        work,
+        work,
+        progress,
+        HeaderFit::InSweep,
+        false,
+        candidate,
+    )?;
+    improve_with_terminal_tree_floors(source, floor_options, work, progress, candidate)
 }
 
 /// Build APNG's complete Default endpoint, with D4 as `ApngDefault` runs it, and

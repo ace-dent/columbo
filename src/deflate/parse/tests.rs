@@ -433,3 +433,22 @@ fn bounds_many_nonempty_source_blocks() {
             .unwrap_err();
     assert!(error.message().contains("memory safety limit"));
 }
+
+#[test]
+fn parser_limit_check_matches_the_model_and_block_limits() {
+    let token = std::mem::size_of::<Token>();
+    // Retained blocks reach the model limit long before the source-block
+    // limit, which also counts empty blocks.
+    let blocks = MAX_PARSED_MODEL_BYTES / PARSED_BLOCK_MODEL_BYTES;
+    assert!(blocks < MAX_SOURCE_BLOCKS);
+    assert!(fits_parser_limits(0, 0, blocks));
+    assert!(!fits_parser_limits(0, 0, blocks + 1));
+    assert!(!fits_parser_limits(0, 0, MAX_SOURCE_BLOCKS + 1));
+
+    let block_bytes = PARSED_BLOCK_MODEL_BYTES as u64;
+    let decoded = MAX_PARSED_MODEL_BYTES as u64 - block_bytes - token as u64;
+    assert!(fits_parser_limits(decoded, 1, 1));
+    assert!(!fits_parser_limits(decoded + 1, 1, 1));
+    assert!(!fits_parser_limits(decoded, 2, 1));
+    assert!(!fits_parser_limits(u64::MAX, 0, 1));
+}

@@ -79,6 +79,25 @@ fn verbose_reports_print_selected_png_text_changes() {
 }
 
 #[test]
+fn verbose_reports_print_a_gzip_member_merge() {
+    let mut report = Vec::new();
+    write_member_merge(
+        &mut report,
+        Some(MemberMergeProgress {
+            members: 400,
+            merged_members: 1,
+            saved_bytes: 16_695,
+        }),
+    )
+    .unwrap();
+    write_member_merge(&mut report, None).unwrap();
+    assert_eq!(
+        String::from_utf8(report).unwrap(),
+        "\nGZIP member merge  400 members → 1 member · saved 16695 bytes\n"
+    );
+}
+
+#[test]
 fn bit_change_wording_handles_savings_ties_and_growth() {
     assert_eq!(describe_bit_change(100, 99), "saved 1 bit vs source");
     assert_eq!(describe_bit_change(100, 90), "saved 10 bits vs source");

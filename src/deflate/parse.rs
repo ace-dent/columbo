@@ -118,6 +118,20 @@ pub(crate) fn parsed_model_bytes(
         })
 }
 
+/// Whether one stream of non-empty blocks with these totals stays within
+/// [`parse_stream`]'s model and source-block limits.
+pub(crate) fn fits_parser_limits(
+    decoded_bytes: u64,
+    token_count: usize,
+    block_count: usize,
+) -> bool {
+    block_count <= MAX_SOURCE_BLOCKS
+        && usize::try_from(decoded_bytes)
+            .ok()
+            .and_then(|decoded| parsed_model_bytes(decoded, token_count, block_count))
+            .is_some_and(|bytes| bytes <= MAX_PARSED_MODEL_BYTES)
+}
+
 pub(crate) fn parse_stream(input: &[u8], decoded_limit: u64) -> Result<ParsedStream> {
     parse_stream_with_model_limit(input, decoded_limit, MAX_PARSED_MODEL_BYTES)
 }

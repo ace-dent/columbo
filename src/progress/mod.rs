@@ -35,8 +35,8 @@ pub(crate) use context::{
 };
 pub(crate) use coordinator::{
     complete_all_stream_producers, complete_stream_group, complete_stream_producer,
-    record_store_changes, set_stream_producers, StoreChange, StoreProgress,
-    PRIMARY_STREAM_PRODUCER,
+    record_member_merge, record_store_changes, set_stream_producers, MemberMergeProgress,
+    StoreChange, StoreProgress, PRIMARY_STREAM_PRODUCER,
 };
 pub(crate) use route::RouteProgress;
 pub(crate) use stream::{Progress, StreamProgress};
@@ -98,9 +98,12 @@ pub(crate) fn finish_file(options: &Options) {
     if !reports_enabled(options) {
         return;
     }
-    let store_changes = coordinator::finish_file();
+    let (store_changes, member_merge) = coordinator::finish_file();
     buffer::flush();
-    terminal::write_report(&mut |output| write_store_changes(output, &store_changes));
+    terminal::write_report(&mut |output| {
+        write_store_changes(output, &store_changes)?;
+        write_member_merge(output, member_merge)
+    });
 }
 
 fn write_format_summary(
@@ -155,6 +158,27 @@ fn write_store_changes(output: &mut dyn Write, changes: &[StoreProgress]) -> io:
             tenths % 10,
         )?;
     }
+    output.flush()
+}
+
+fn write_member_merge(
+    output: &mut dyn Write,
+    merge: Option<MemberMergeProgress>,
+) -> io::Result<()> {
+    let Some(merge) = merge else {
+        return Ok(());
+    };
+    writeln!(output)?;
+    writeln!(
+        output,
+        "GZIP member merge  {} {} → {} {} · saved {} {}",
+        merge.members,
+        plural(merge.members, "member", "members"),
+        merge.merged_members,
+        plural(merge.merged_members, "member", "members"),
+        merge.saved_bytes,
+        plural_u64(merge.saved_bytes, "byte", "bytes"),
+    )?;
     output.flush()
 }
 

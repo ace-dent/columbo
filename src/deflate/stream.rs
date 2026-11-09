@@ -19,7 +19,7 @@ mod entropy_cut;
 mod merge;
 pub(crate) use alphabet::{plan_alphabet_boundaries, AlphabetBudget};
 pub(crate) use entropy_cut::{plan_entropy_cuts, EntropyCutBudget};
-pub(crate) use merge::plan_terminal_merges;
+pub(crate) use merge::{plan_boundary_merges, plan_terminal_merges};
 
 /// Smallest work budget for one R15 or R16 pass.
 const MIN_TERMINAL_LAYOUT_WORK: usize = 1 << 28;

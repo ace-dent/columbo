@@ -43,10 +43,11 @@ never skips validation or produces partial output.
 | `huffman` | Construct length-limited code lengths, canonical codes, and decoding tables. |
 | `header` | Construct dynamic headers and count header and payload bits, reusing completed header plans per thread. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11); `swap_costs` keeps the header costs of greedy length-swap trials per thread. |
 | `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache and completed plans reused per thread. |
+| `concat` | Join complete raw streams into one stream, as GZIP member merging does. |
 | `plan_store` | Bound the per-thread stores of completed block and header plans: two generations within a byte budget. |
 | `minima` | Share range-minimum lookups between searches over match-length families. |
 | `search` | Change token spelling within existing matches. |
-| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), `stream/entropy_cut` cuts blocks where their symbol statistics change (R15), and `stream/merge` merges neighbors after the finish (R16). |
+| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), `stream/entropy_cut` cuts blocks where their symbol statistics change (R15), and `stream/merge` merges neighbors after the finish (R16) and at the boundaries of joined streams. |
 | `source_recode` | Run the deft4j-derived source-order recoding and merge route. |
 | `restore` | Restore original match choices after other routes settle (R1). |
 | `joint` | Search payload code lengths and header run-length encoding together (R4). |
