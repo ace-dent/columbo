@@ -1059,6 +1059,7 @@ fn extra_field(id: u16, data: &[u8]) -> Vec<u8> {
 /// One member of `archive_with_extras`. Its payload is interpreted only for
 /// Stored and Deflate.
 struct ExtraMember<'a> {
+    name: &'a [u8],
     method: u16,
     flags: u16,
     payload: &'a [u8],
@@ -1068,11 +1069,11 @@ struct ExtraMember<'a> {
     central_extra: &'a [u8],
 }
 
-/// Build an archive of one-letter members, each with the file comment "note".
+/// Build an archive of members, each with the file comment "note".
 fn archive_with_extras(members: &[ExtraMember]) -> Vec<u8> {
     let mut output = Vec::new();
     let mut local_offsets = Vec::new();
-    for (index, member) in members.iter().enumerate() {
+    for member in members {
         local_offsets.push(output.len() as u32);
         output.extend_from_slice(&LOCAL_FILE_HEADER.to_le_bytes());
         output.extend_from_slice(&20_u16.to_le_bytes()); // version needed
@@ -1082,9 +1083,9 @@ fn archive_with_extras(members: &[ExtraMember]) -> Vec<u8> {
         output.extend_from_slice(&member.crc.to_le_bytes());
         output.extend_from_slice(&(member.payload.len() as u32).to_le_bytes());
         output.extend_from_slice(&member.uncompressed_size.to_le_bytes());
-        output.extend_from_slice(&1_u16.to_le_bytes()); // name length
+        output.extend_from_slice(&(member.name.len() as u16).to_le_bytes());
         output.extend_from_slice(&(member.local_extra.len() as u16).to_le_bytes());
-        output.push(b'a' + index as u8);
+        output.extend_from_slice(member.name);
         output.extend_from_slice(member.local_extra);
         output.extend_from_slice(member.payload);
     }
@@ -1100,12 +1101,12 @@ fn archive_with_extras(members: &[ExtraMember]) -> Vec<u8> {
         output.extend_from_slice(&member.crc.to_le_bytes());
         output.extend_from_slice(&(member.payload.len() as u32).to_le_bytes());
         output.extend_from_slice(&member.uncompressed_size.to_le_bytes());
-        output.extend_from_slice(&1_u16.to_le_bytes()); // name length
+        output.extend_from_slice(&(member.name.len() as u16).to_le_bytes());
         output.extend_from_slice(&(member.central_extra.len() as u16).to_le_bytes());
         output.extend_from_slice(&4_u16.to_le_bytes()); // comment length
         output.extend_from_slice(&[0; 8]); // disk and attributes
         output.extend_from_slice(&local_offsets[index].to_le_bytes());
-        output.push(b'a' + index as u8);
+        output.extend_from_slice(member.name);
         output.extend_from_slice(member.central_extra);
         output.extend_from_slice(b"note");
     }
@@ -1172,6 +1173,7 @@ fn strip_removes_only_metadata_extras_from_members_it_cannot_decode() {
     .concat();
     let input = archive_with_extras(&[
         ExtraMember {
+            name: b"a",
             method: 14,
             flags: 0,
             payload: lzma_payload,
@@ -1181,6 +1183,7 @@ fn strip_removes_only_metadata_extras_from_members_it_cannot_decode() {
             central_extra: &lzma_central,
         },
         ExtraMember {
+            name: b"b",
             method: 0,
             flags: 0,
             payload: b"columbo",
@@ -1217,11 +1220,115 @@ fn strip_removes_only_metadata_extras_from_members_it_cannot_decode() {
 }
 
 #[test]
+fn strip_keeps_the_unicode_path_of_a_name_not_flagged_utf8() {
+    // "\x82" is "\u{e9}" in code page 437; the field carries its UTF-8 form.
+    let name = b"r\x82sum\x82.txt";
+    let unicode_path = extra_field(
+        UNICODE_PATH_EXTRA_ID,
+        &[
+            &[1][..],
+            &crc32_update(0, name).to_le_bytes(),
+            "r\u{e9}sum\u{e9}.txt".as_bytes(),
+        ]
+        .concat(),
+    );
+    let extra = [extra_field(0x000a, &[0; 32]), unicode_path.clone()].concat();
+    let member = |flags| ExtraMember {
+        name,
+        method: 0,
+        flags,
+        payload: b"columbo",
+        crc: crc32_update(0, b"columbo"),
+        uncompressed_size: 7,
+        local_extra: &extra,
+        central_extra: &extra,
+    };
+    let input = archive_with_extras(&[member(0), member(FLAG_UTF8_NAME)]);
+    let options = Options {
+        strip_metadata: true,
+        ..Options::default()
+    };
+
+    let stripped = optimize(&input, &options).unwrap();
+    // A name flagged UTF-8 needs no Unicode Path.
+    assert_eq!(
+        member_extras(&stripped.data),
+        [
+            (unicode_path.clone(), unicode_path, Vec::new()),
+            (Vec::new(), Vec::new(), Vec::new())
+        ]
+    );
+    assert_eq!(
+        optimize(&stripped.data, &options).unwrap().data,
+        stripped.data
+    );
+}
+
+#[test]
+fn strip_keeps_directory_entries_that_hold_no_other_entry() {
+    let directory = |name| ExtraMember {
+        name,
+        method: 0,
+        flags: 0,
+        payload: b"",
+        crc: 0,
+        uncompressed_size: 0,
+        local_extra: &[],
+        central_extra: &[],
+    };
+    let file = |name| ExtraMember {
+        payload: b"hi",
+        crc: crc32_update(0, b"hi"),
+        uncompressed_size: 2,
+        ..directory(name)
+    };
+    let input = archive_with_extras(&[
+        directory(b"full/"),
+        directory(b"full/empty/"),
+        file(b"full/file"),
+        directory(b"empty/"),
+        directory(b"empty/"),
+        // Sorts right after "empty/" but lies outside it.
+        file(b"empty0"),
+    ]);
+    let names = |data: &[u8]| -> Vec<Vec<u8>> {
+        preflight(data, false, u64::MAX)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry_name(data, entry).to_vec())
+            .collect()
+    };
+    let options = Options {
+        strip_metadata: true,
+        ..Options::default()
+    };
+
+    let stripped = optimize(&input, &options).unwrap();
+    // Only "full/" goes: extracting "full/empty/" and "full/file" creates it.
+    assert_eq!(
+        names(&stripped.data),
+        [
+            &b"full/empty/"[..],
+            b"full/file",
+            b"empty/",
+            b"empty/",
+            b"empty0"
+        ]
+    );
+    assert_eq!(
+        optimize(&stripped.data, &options).unwrap().data,
+        stripped.data
+    );
+}
+
+#[test]
 fn strip_keeps_every_extra_on_encrypted_members() {
     // WinZip AES keeps the real method in its extra field.
     let aes = extra_field(0x9901, &[2, 0, b'A', b'E', 3, 8, 0]);
     let extra = [aes, extra_field(0x000a, &[0; 32])].concat();
     let input = archive_with_extras(&[ExtraMember {
+        name: b"a",
         method: 99,
         flags: FLAG_ENCRYPTED,
         payload: &[0x5a; 24],
@@ -1239,6 +1346,31 @@ fn strip_keeps_every_extra_on_encrypted_members() {
     assert_eq!(
         member_extras(&stripped.data),
         [(extra.clone(), extra, Vec::new())]
+    );
+}
+
+#[test]
+fn unicode_path_filter_keeps_only_whole_unicode_path_fields() {
+    let ntfs = extra_field(0x000a, &[0; 32]);
+    let unicode_path = extra_field(UNICODE_PATH_EXTRA_ID, &[1, 0, 0, 0, 0, b'a']);
+    let filter = |extra: &[u8]| {
+        kept_extra(extra, ExtraPolicy::KeepUnicodePath, "test extra")
+            .unwrap()
+            .into_owned()
+    };
+
+    assert_eq!(filter(&[]), b"");
+    assert_eq!(filter(&ntfs), b"");
+    assert_eq!(filter(&unicode_path), unicode_path);
+    assert_eq!(
+        filter(&[ntfs.clone(), unicode_path.clone(), ntfs].concat()),
+        unicode_path
+    );
+    // A tail that does not parse as fields goes.
+    assert_eq!(filter(&[0xca, 0xfe]), b"");
+    assert_eq!(
+        filter(&[unicode_path.clone(), vec![0xca, 0xfe]].concat()),
+        unicode_path
     );
 }
 

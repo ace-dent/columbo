@@ -27,6 +27,10 @@ const ZIP64_END_OF_CENTRAL_DIRECTORY: u32 = 0x0606_4b50;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+const FLAG_UTF8_NAME: u16 = 0x0800;
+/// Info-ZIP Unicode Path: the member's UTF-8 name, which extractors use when
+/// it matches the header name's CRC-32 and the UTF-8 flag is clear.
+const UNICODE_PATH_EXTRA_ID: u16 = 0x7075;
 const OUTPUT_ALLOCATION: &str = "ZIP output";
 const MODEL_ALLOCATION: &str = "ZIP entry model";
 const LOCAL_ALLOCATION: &str = "ZIP local entry";
@@ -93,6 +97,9 @@ enum ExtraPolicy {
     Keep,
     /// Remove every field: Stored and Deflate members decode without any.
     RemoveAll,
+    /// `RemoveAll`, but keep the Unicode Path field, which names a member
+    /// whose name is not flagged UTF-8.
+    KeepUnicodePath,
     /// Remove only `METADATA_EXTRA_IDS`: other methods may need the rest.
     RemoveMetadata,
 }
@@ -1606,10 +1613,12 @@ fn parse_central_entries(
         let name = &input[position + 46..position + 46 + name_length];
         let extra_policy = if !strip_metadata || flags & FLAG_ENCRYPTED != 0 {
             ExtraPolicy::Keep
-        } else if matches!(method, 0 | 8) {
-            ExtraPolicy::RemoveAll
-        } else {
+        } else if !matches!(method, 0 | 8) {
             ExtraPolicy::RemoveMetadata
+        } else if flags & FLAG_UTF8_NAME == 0 {
+            ExtraPolicy::KeepUnicodePath
+        } else {
+            ExtraPolicy::RemoveAll
         };
         entries.push(Entry {
             local: Vec::new(),
@@ -1624,6 +1633,8 @@ fn parse_central_entries(
             uncompressed_size,
             method,
             flags,
+            // A directory entry is dropped only if another entry lies inside
+            // it; see `keep_empty_directories`.
             skip: strip_metadata
                 && name.last() == Some(&b'/')
                 && compressed_size == 0
@@ -1638,7 +1649,42 @@ fn parse_central_entries(
     if position != eocd_offset {
         return Err(Error::new("bad ZIP central directory"));
     }
+    keep_empty_directories(input, &mut entries)?;
     Ok(entries)
+}
+
+/// Keep each directory entry marked for `--strip` unless another entry's name
+/// lies inside it, so that extraction still creates every directory: one that
+/// holds nothing exists only through its own entry. Sorted by name, the names
+/// inside a directory directly follow the directory's own.
+fn keep_empty_directories(input: &[u8], entries: &mut [Entry]) -> Result<()> {
+    if !entries.iter().any(|entry| entry.skip) {
+        return Ok(());
+    }
+    let mut order = try_vec_with_capacity(entries.len(), MODEL_ALLOCATION)?;
+    order.extend(0..entries.len());
+    sort_indices_unstable(&mut order, &mut |left, right| {
+        entry_name(input, &entries[left]).cmp(entry_name(input, &entries[right]))
+    });
+    // Walking back, the nearest later name that differs from the current one.
+    let mut current: Option<&[u8]> = None;
+    let mut following: Option<&[u8]> = None;
+    for &index in order.iter().rev() {
+        let name = entry_name(input, &entries[index]);
+        if current != Some(name) {
+            following = current;
+            current = Some(name);
+        }
+        let entry = &mut entries[index];
+        entry.skip &= following.is_some_and(|following| following.starts_with(name));
+    }
+    Ok(())
+}
+
+/// An entry's name in its central directory record.
+fn entry_name<'a>(input: &'a [u8], entry: &Entry) -> &'a [u8] {
+    let record = &input[entry.central_offset..];
+    &record[46..46 + le16(record, 28) as usize]
 }
 
 /// Build one complete local record. The returned boolean is the raw
@@ -1849,42 +1895,45 @@ fn output_flags(entry: &Entry) -> u16 {
     }
 }
 
-/// The part of an extra field block that `policy` keeps. A block that is not
-/// a whole sequence of fields is kept as it is, since its layout is unknown.
+/// The part of an extra field block that `policy` keeps. Under
+/// `RemoveMetadata`, a block that is not a whole sequence of fields is kept as
+/// it is, since its layout is unknown; `KeepUnicodePath` keeps only the whole
+/// fields before the point where the block stops parsing.
 fn kept_extra<'a>(
     extra: &'a [u8],
     policy: ExtraPolicy,
     what: &'static str,
 ) -> Result<Cow<'a, [u8]>> {
-    match policy {
+    let (keeps, keep_unparsed): (fn(u16) -> bool, bool) = match policy {
         ExtraPolicy::Keep => return Ok(Cow::Borrowed(extra)),
         ExtraPolicy::RemoveAll => return Ok(Cow::Borrowed(&[])),
-        ExtraPolicy::RemoveMetadata => {}
-    }
-    let mut removed = 0_usize;
-    let mut position = 0_usize;
-    while position < extra.len() {
-        let (Some(id), Some(size)) = (read_le16(extra, position), read_le16(extra, position + 2))
+        ExtraPolicy::KeepUnicodePath => (|id| id == UNICODE_PATH_EXTRA_ID, false),
+        ExtraPolicy::RemoveMetadata => (|id| !METADATA_EXTRA_IDS.contains(&id), true),
+    };
+    let mut kept_bytes = 0_usize;
+    let mut parsed = 0_usize;
+    while parsed < extra.len() {
+        let (Some(id), Some(size)) = (read_le16(extra, parsed), read_le16(extra, parsed + 2))
         else {
-            return Ok(Cow::Borrowed(extra));
+            break;
         };
-        let end = position + 4 + size as usize;
+        let end = parsed + 4 + size as usize;
         if end > extra.len() {
-            return Ok(Cow::Borrowed(extra));
+            break;
         }
-        if METADATA_EXTRA_IDS.contains(&id) {
-            removed += end - position;
+        if keeps(id) {
+            kept_bytes += end - parsed;
         }
-        position = end;
+        parsed = end;
     }
-    if removed == 0 {
+    if (keep_unparsed && parsed < extra.len()) || kept_bytes == extra.len() {
         return Ok(Cow::Borrowed(extra));
     }
-    let mut kept = try_vec_with_capacity(extra.len() - removed, what)?;
+    let mut kept = try_vec_with_capacity(kept_bytes, what)?;
     let mut position = 0_usize;
-    while position < extra.len() {
+    while position < parsed {
         let end = position + 4 + le16(extra, position + 2) as usize;
-        if !METADATA_EXTRA_IDS.contains(&le16(extra, position)) {
+        if keeps(le16(extra, position)) {
             kept.extend_from_slice(&extra[position..end]);
         }
         position = end;
