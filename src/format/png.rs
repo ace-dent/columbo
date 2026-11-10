@@ -716,8 +716,14 @@ fn refine_cached_compressed_body(
     if !direct_allowance.is_zero() {
         let mut direct_options = budget.deadline.options_for_call(options);
         direct_options.timeout = direct_options.timeout.min(direct_allowance);
-        let mut direct =
-            optimize_cached_compressed_parent(kind, source_data, decoded_size, &direct_options)?;
+        let grace = budget.deadline.grace_for_call(direct_options.timeout);
+        let mut direct = optimize_cached_compressed_parent(
+            kind,
+            source_data,
+            decoded_size,
+            &direct_options,
+            grace,
+        )?;
         direct.source_deflate_bits = floor.source_deflate_bits;
         if compressed_body_strictly_dominates(&direct, &best, source_data.len()) {
             best = direct;
@@ -726,8 +732,14 @@ fn refine_cached_compressed_body(
 
     if !budget.deadline.remaining().is_zero() {
         let call_options = budget.deadline.options_for_call(options);
-        let mut refined =
-            optimize_cached_compressed_parent(kind, floor_data, decoded_size, &call_options)?;
+        let grace = budget.deadline.grace_for_call(call_options.timeout);
+        let mut refined = optimize_cached_compressed_parent(
+            kind,
+            floor_data,
+            decoded_size,
+            &call_options,
+            grace,
+        )?;
         refined.source_deflate_bits = floor.source_deflate_bits;
         if compressed_body_strictly_dominates(&refined, &best, source_data.len()) {
             best = refined;
@@ -742,6 +754,7 @@ fn optimize_cached_compressed_parent(
     parent_data: &[u8],
     decoded_size: u64,
     options: &Options,
+    grace: Duration,
 ) -> Result<CompressedBodyOptimization> {
     let zlib_offset = compressed_zlib_offset(kind, parent_data)
         .ok_or_else(|| Error::new("invalid compressed PNG metadata"))?;
@@ -751,6 +764,7 @@ fn optimize_cached_compressed_parent(
         decoded_size,
         true,
         DefaultFloor::Established,
+        grace,
     )?;
     let info = optimized
         .info
@@ -979,9 +993,10 @@ fn optimize_image_streams(
             image_floor,
             (!options.exhaustive).then_some(default_timeouts.as_slice()),
             // Only Max uses the phase timeout, and Max reserves no time for
-            // later streams. The margin beyond the raw optimizer's grace is for
-            // parsing, joining workers and reconstruction.
+            // later streams. The margin beyond the jobs' share of the file's
+            // grace is for parsing, joining workers and reconstruction.
             scale_duration(budget.deadline.remaining(), 0.96),
+            &budget.deadline,
         )?;
         // Workers only cap each stream at its IHDR/fcTL size; require the exact
         // size here. Charge all frames, duplicates included, after the join so
@@ -1221,10 +1236,18 @@ fn reclaim_timed_out_image_jobs(
 
             let mut retry_options = options.clone();
             retry_options.timeout = timeout;
+            let grace = deadline.grace_for_call(timeout);
             let (stream, expected_decoded_size) =
                 image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
-            let retry_job =
-                || run_png_image_zlib(stream, &retry_options, expected_decoded_size, default_floor);
+            let retry_job = || {
+                run_png_image_zlib(
+                    stream,
+                    &retry_options,
+                    expected_decoded_size,
+                    default_floor,
+                    grace,
+                )
+            };
             let retry = if options.verbose {
                 let (stream_id, duplicates) = image_job_stream_group(job, representatives);
                 crate::progress::with_stream_reclaim(stream_id, &duplicates, !last, retry_job)?
@@ -1287,6 +1310,7 @@ fn optimize_image_jobs_parallel(
     image_floor: DefaultFloor,
     default_timeouts: Option<&[Duration]>,
     phase_timeout: Duration,
+    deadline: &SearchDeadline,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
     let worker_limit = if options.exhaustive {
         PARALLEL_MAX_IMAGE_WORKERS
@@ -1326,6 +1350,7 @@ fn optimize_image_jobs_parallel(
                         image_floor,
                         worker_timeouts,
                         phase_timeout,
+                        deadline,
                     )
                 });
             match worker {
@@ -1343,6 +1368,7 @@ fn optimize_image_jobs_parallel(
                         image_floor,
                         worker_timeouts,
                         phase_timeout,
+                        deadline,
                     )?;
                     fallback_results.append(&mut results);
                 }
@@ -1373,6 +1399,7 @@ fn optimize_image_job_slice(
     image_floor: DefaultFloor,
     default_timeouts: Option<&[Duration]>,
     phase_timeout: Duration,
+    deadline: &SearchDeadline,
 ) -> Result<Vec<(ImageJob, zlib::StreamOptimization)>> {
     let total_weight = jobs.iter().try_fold(0_usize, |total, &job| {
         total.checked_add(image_job_weight(job, idat, representative_weights))
@@ -1386,13 +1413,21 @@ fn optimize_image_job_slice(
         let weight = image_job_weight(job, idat, representative_weights);
         let mut call_options = options.clone();
         call_options.timeout = default_timeouts.map_or_else(
-            || parallel_image_job_timeout(phase_timeout, jobs.len(), weight, total_weight),
+            || parallel_image_job_timeout(phase_timeout, weight, total_weight),
             |timeouts| timeouts[index],
         );
+        let grace = deadline.grace_for_call(call_options.timeout);
         let (stream, expected_decoded_size) =
             image_job_source(job, idat, idat_decoded_size, frames, frame_decoded_sizes);
-        let optimize_job =
-            || run_png_image_zlib(stream, &call_options, expected_decoded_size, image_floor);
+        let optimize_job = || {
+            run_png_image_zlib(
+                stream,
+                &call_options,
+                expected_decoded_size,
+                image_floor,
+                grace,
+            )
+        };
         let (stream_id, duplicates) = image_job_stream_group(job, representatives);
         let optimized =
             crate::progress::with_stream_slice(stream_id, &duplicates, None, optimize_job)?;
@@ -1404,24 +1439,18 @@ fn optimize_image_job_slice(
     Ok(results)
 }
 
-/// Split one worker's phase allowance across its jobs by weight, so the job
-/// timeouts plus their raw-optimizer grace (10% plus one second each) fit
-/// within the phase timeout plus its grace.
+/// Split one worker's phase allowance across its jobs by weight. Each job's
+/// grace is its timeout's share of the file's grace, so the worker's jobs
+/// together end within the phase plus that share.
 fn parallel_image_job_timeout(
     phase_timeout: Duration,
-    job_count: usize,
     weight: usize,
     total_weight: usize,
 ) -> Duration {
-    if phase_timeout.is_zero() || job_count == 0 || weight == 0 || total_weight == 0 {
+    if phase_timeout.is_zero() || weight == 0 || total_weight == 0 {
         return Duration::ZERO;
     }
-    let hard_budget = phase_timeout
-        .saturating_add(scale_duration(phase_timeout, 0.10))
-        .saturating_add(Duration::from_secs(1));
-    let fixed_graces = Duration::from_secs(job_count as u64);
-    let soft_budget = scale_duration(hard_budget.saturating_sub(fixed_graces), 1.0 / 1.10);
-    scale_duration(soft_budget, weight as f64 / total_weight as f64)
+    scale_duration(phase_timeout, weight as f64 / total_weight as f64)
 }
 
 /// Map each frame to the earliest frame with identical compressed bytes and
@@ -1741,10 +1770,16 @@ fn optimize_single_image_max_parallel(
                 // The worker has no progress context.
                 let mut quiet_options = options.clone();
                 quiet_options.verbose = false;
+                let deadline = budget.deadline;
                 thread::Builder::new()
                     .name("columbo-png-early-max".into())
                     .spawn_scoped(scope, move || {
-                        optimize_quick_image_floor_lineage(input, &quiet_options, decoded_limit)
+                        optimize_quick_image_floor_lineage(
+                            input,
+                            &quiet_options,
+                            decoded_limit,
+                            &deadline,
+                        )
                     })
                     .ok()
             })
@@ -1755,6 +1790,7 @@ fn optimize_single_image_max_parallel(
             options,
             decoded_limit,
             DefaultFloor::CompleteThenBounded,
+            budget.deadline.grace_for_call(options.timeout),
         )?;
         if let Some(early_worker) = early_worker {
             let early = match early_worker.join() {
@@ -1774,13 +1810,20 @@ fn optimize_quick_image_floor_lineage(
     input: &[u8],
     options: &Options,
     decoded_limit: u64,
+    deadline: &SearchDeadline,
 ) -> Result<zlib::StreamOptimization> {
     let started = Instant::now();
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     floor_options.timeout = scale_duration(options.timeout, QUICK_FLOOR_SEARCH_FRACTION);
-    let floor = run_png_image_zlib(input, &floor_options, decoded_limit, DefaultFloor::Complete)?;
-    refine_single_image_floor(floor, options, started, decoded_limit)
+    let floor = run_png_image_zlib(
+        input,
+        &floor_options,
+        decoded_limit,
+        DefaultFloor::Complete,
+        deadline.grace_for_call(floor_options.timeout),
+    )?;
+    refine_single_image_floor(floor, options, started, decoded_limit, deadline)
 }
 
 fn refine_single_image_floor(
@@ -1788,6 +1831,7 @@ fn refine_single_image_floor(
     options: &Options,
     started: Instant,
     decoded_limit: u64,
+    deadline: &SearchDeadline,
 ) -> Result<zlib::StreamOptimization> {
     let remaining = options.timeout.saturating_sub(started.elapsed());
     if remaining.is_zero() {
@@ -1802,6 +1846,7 @@ fn refine_single_image_floor(
         &refine_options,
         decoded_limit,
         DefaultFloor::Established,
+        deadline.grace_for_call(remaining),
     )?;
     if !zlib_optimization_is_better(&refined, &floor) {
         floor.timed_out |= refined.timed_out;
@@ -1839,15 +1884,26 @@ fn zlib_optimization_is_better(
                 < incumbent.info.as_ref().map(|info| info.deflate_bits))
 }
 
+/// Optimize one PNG zlib stream. Like GZIP and ZIP members, each call gets
+/// its share of the file's grace (`SearchDeadline::grace_for_call`), so many
+/// short streams cannot run past the file's hard stop.
 fn run_png_zlib(
     input: &[u8],
     options: &Options,
     decoded_limit: u64,
     lenient_header: bool,
     default_floor: DefaultFloor,
+    grace: Duration,
 ) -> Result<zlib::StreamOptimization> {
-    zlib::optimize_embedded(input, options, decoded_limit, lenient_header, default_floor)
-        .map_err(map_png_zlib_error)
+    zlib::optimize_embedded(
+        input,
+        options,
+        decoded_limit,
+        lenient_header,
+        default_floor,
+        grace,
+    )
+    .map_err(map_png_zlib_error)
 }
 
 fn run_png_image_zlib(
@@ -1855,9 +1911,17 @@ fn run_png_image_zlib(
     options: &Options,
     expected_decoded_size: u64,
     default_floor: DefaultFloor,
+    grace: Duration,
 ) -> Result<zlib::StreamOptimization> {
-    run_png_zlib(input, options, expected_decoded_size, false, default_floor)
-        .map_err(map_png_image_zlib_error)
+    run_png_zlib(
+        input,
+        options,
+        expected_decoded_size,
+        false,
+        default_floor,
+        grace,
+    )
+    .map_err(map_png_image_zlib_error)
 }
 
 fn map_png_image_zlib_error(error: Error) -> Error {
@@ -1886,7 +1950,15 @@ fn optimize_png_zlib(
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
     let call_options = budget.deadline.options_for_call(options);
-    optimize_png_zlib_with_options(input, &call_options, lenient_header, default_floor, budget)
+    let grace = budget.deadline.grace_for_call(call_options.timeout);
+    optimize_png_zlib_with_options(
+        input,
+        &call_options,
+        lenient_header,
+        default_floor,
+        grace,
+        budget,
+    )
 }
 
 fn optimize_scheduled_png_image_zlib(
@@ -1897,7 +1969,8 @@ fn optimize_scheduled_png_image_zlib(
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
     reserve_image_budget(expected_decoded_size, budget)?;
-    let result = run_png_image_zlib(input, options, expected_decoded_size, default_floor)?;
+    let grace = budget.deadline.grace_for_call(options.timeout);
+    let result = run_png_image_zlib(input, options, expected_decoded_size, default_floor, grace)?;
     charge_image_stream(&result, expected_decoded_size, budget)?;
     Ok(result)
 }
@@ -1939,6 +2012,7 @@ fn optimize_png_zlib_with_options(
     call_options: &Options,
     lenient_header: bool,
     default_floor: DefaultFloor,
+    grace: Duration,
     budget: &mut DecodeBudget,
 ) -> Result<zlib::StreamOptimization> {
     let result = run_png_zlib(
@@ -1947,6 +2021,7 @@ fn optimize_png_zlib_with_options(
         budget.remaining,
         lenient_header,
         default_floor,
+        grace,
     )?;
     if let Some(info) = &result.info {
         if info.size > budget.remaining {

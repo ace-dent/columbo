@@ -3,7 +3,11 @@
 
 //! zlib validation and window normalization for standalone or embedded streams.
 
-use crate::deflate::{optimize_raw_prefix_with_floor, DefaultFloor, RawInfo};
+use std::time::Duration;
+
+use crate::deflate::{
+    optimize_raw_prefix_with_floor_and_grace, timeout_grace, DefaultFloor, RawInfo,
+};
 use crate::{Error, Optimization, Options, Result};
 
 use super::{try_append_bytes, try_copy_bytes, try_vec_with_capacity};
@@ -29,6 +33,7 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
         options.max_decoded_bytes,
         false,
         DefaultFloor::Complete,
+        timeout_grace(options.timeout),
     )?;
     let info = optimized
         .info
@@ -44,7 +49,8 @@ pub(super) fn optimize(input: &[u8], options: &Options) -> Result<Optimization> 
     .with_removed_data(optimized.removed_data_bytes))
 }
 
-/// Optimize a zlib stream embedded in another container.
+/// Optimize a zlib stream embedded in another container, with `grace` after
+/// its timeout.
 ///
 /// PNG metadata may contain data that only resembles a zlib stream. With
 /// `lenient_header`, such data is returned unchanged; the top-level zlib
@@ -55,6 +61,7 @@ pub(super) fn optimize_embedded(
     decoded_limit: u64,
     lenient_header: bool,
     default_floor: DefaultFloor,
+    grace: Duration,
 ) -> Result<StreamOptimization> {
     let unsupported_dictionary = has_rfc1950_header(input) && input[1] & 0x20 != 0;
     if input.len() < 6 || !has_rfc1950_header(input) || unsupported_dictionary {
@@ -76,7 +83,13 @@ pub(super) fn optimize_embedded(
     }
 
     let raw_input = &input[2..];
-    let mut raw = optimize_raw_prefix_with_floor(raw_input, options, decoded_limit, default_floor)?;
+    let mut raw = optimize_raw_prefix_with_floor_and_grace(
+        raw_input,
+        options,
+        decoded_limit,
+        default_floor,
+        grace,
+    )?;
     let checksum_start = 2 + raw.consumed;
     let stream_end = checksum_start
         .checked_add(4)

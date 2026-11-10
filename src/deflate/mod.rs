@@ -35,7 +35,7 @@ pub(crate) use header::release_thread_header_plans;
 #[cfg(test)]
 pub(crate) use optimize::DefaultEndpoint;
 pub(crate) use optimize::{
-    inspect_early_max_lineage, inspect_raw_prefix, optimize_raw, optimize_raw_prefix_with_floor,
+    inspect_early_max_lineage, inspect_raw_prefix, optimize_raw,
     optimize_raw_prefix_with_floor_and_grace, DefaultFloor, RawInfo, RawOptimization,
 };
 pub(crate) use parse::{

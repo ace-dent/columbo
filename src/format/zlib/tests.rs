@@ -184,6 +184,7 @@ fn lenient_metadata_preserves_zlib_lookalikes_with_trailing_data() {
         1024,
         true,
         DefaultFloor::Shared,
+        Duration::ZERO,
     )
     .unwrap();
     assert_eq!(result.data, input);

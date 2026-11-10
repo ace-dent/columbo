@@ -6666,15 +6666,14 @@ Rules shared by the wrappers:
   and ZIP members and scheduled PNG image streams are still parsed, decoded,
   checksum-checked, charged to the decoded budget and given a complete output.
   Max's mandatory Default floors still run, since they ignore the clock except
-  for the steps listed in [Time limits](#time-limits). Otherwise, a PNG image
-  stream gets a zero slice with no grace, so its planner starts with its stop
-  already reached. In relaxed mode it then keeps the source stream, or a repack
-  when every block is stored; in strict mode it builds a direct structural
-  re-plan, because strict output must be compatible
-  ([Strict and relaxed output](#strict-and-relaxed-output)). A GZIP or ZIP
-  member still gets the rest of the file's grace, so work that polls only the
-  hard stop, such as its ordinary planner and linear finalization, runs until
-  the file's hard stop. Duplicate fdAT frames reuse their validated representative but charge
+  for the steps listed in [Time limits](#time-limits). Otherwise, a GZIP or ZIP
+  member or a PNG stream gets a zero slice but the rest of the file's grace, so
+  work that polls only the hard stop, such as its ordinary planner and linear
+  finalization, runs until the file's hard stop. After that, its planner starts
+  with its stop already reached. In relaxed mode it then keeps the source
+  stream, or a repack when every block is stored; in strict mode it builds a
+  direct structural re-plan, because strict output must be compatible
+  ([Strict and relaxed output](#strict-and-relaxed-output)). Duplicate fdAT frames reuse their validated representative but charge
   the decoded budget once per occurrence. Only the PNG unsafe-ancillary early
   return stops after the chunk parse, before any stream is decoded.
 - **When checks run.** GZIP preflight decodes every member and checks its
@@ -8192,10 +8191,11 @@ member first, so a member there yields only at the file deadline and the reclaim
 pass never runs. Only expiry of the file deadline sets the public timeout result
 ([Scheduling and observability](#scheduling-and-observability)).
 
-Each PNG stream gets the raw optimizer's usual grace, computed from the timeout
-its call receives: 1 second plus 10% of that timeout, or none for a zero timeout
-([Time limits](#time-limits)). GZIP and ZIP members share the file's grace
-instead, as **ZIP member scheduling** below states.
+A raw Deflate or top-level zlib stream is the whole file, so it gets the file's
+grace: 1 second plus 10% of the timeout, or none for a zero timeout
+([Time limits](#time-limits)). Every stream of a PNG, GZIP or ZIP file shares
+that grace instead, as **ZIP member scheduling** below states, so many short
+streams cannot run past the file's hard stop.
 
 | Wrapper route | Default policy | Max policy | Order and time |
 | --- | --- | --- | --- |
@@ -8256,7 +8256,9 @@ input while `--raw` keeps trailing data.
   work, whatever its chunk position. Only Default's probes and Max's cached
   floors (below) run before or beside image work.
 - Default, before image work: each unstripped stream of at most 4,096 zlib bytes
-  gets a `Shared` probe with min(timeout, 100 ms). All probes share one 64 MiB
+  gets a `Shared` probe with min(timeout, 100 ms) and that time's share of the
+  file's grace: 20 ms at the CLI's minimum 10-second timeout, where the raw
+  optimizer's own grace was over a second. All probes share one 64 MiB
   compressed-plus-decoded work allowance. A probe that finds no replacement is
   not charged to the file's decoded-size budget, because its stream is decoded
   again later. A winning probe is kept and charged to the decoded budget; every
@@ -8381,8 +8383,8 @@ deadline, Default stops at it), are under [PNG and APNG](#png-and-apng).
   (compressed size at least 98% of decoded size), every weight becomes the
   compression slack plus 5% of the compressed size, at least 1, so large
   stored-like members do not crowd out small compressible ones.
-- Grace: ZIP, like GZIP, shares the file's grace among its member calls,
-  reclaim retries included, instead of giving each call the raw optimizer's
+- Grace: ZIP, like GZIP and PNG, shares the file's grace among its member
+  calls, reclaim retries included, instead of giving each call the raw optimizer's
   usual grace, so that together their graces stay within the file's (code
   comment). A call whose
   timeout is shorter than the file time left gets the file's grace scaled by the
@@ -10468,14 +10470,20 @@ The Speed column rates the work each site runs, in the classes of the
     parallel does not change Default's search (code comment).
   - Max lanes share a phase of 96% of the remaining file time; the other 4%
     covers parsing, joining and reconstruction (code comment). Within a lane,
-    job j gets share_j × (phase × 1.1 + 1 s − n × 1 s) / 1.1, where share_j is
-    the job's share of its lane's total weight and n is the lane's job count.
-    The job timeouts plus their graces (1 s + 10% each) then fit within the
-    phase plus its grace.
-  - For example, with 10 s of file time left the phase is 9.6 s. A lane of two
-    jobs weighted 1 and 3 then splits (9.6 × 1.1 + 1 − 2) / 1.1 = 8.69 s between
-    them: 2.17 s and 6.52 s. With their graces of 1.22 s and 1.65 s, the total
-    is 11.56 s, exactly the phase's 9.6 s plus its 1.96 s grace.
+    job j gets share_j × phase, where share_j is the job's share of its lane's
+    total weight. Each job's grace is its timeout's share of the file's grace,
+    so a lane's jobs end within the phase plus the phase's share of that grace.
+  - For example, with a 10 s timeout and all of it left, the phase is 9.6 s and
+    the file's grace 2 s. A lane of two jobs weighted 1 and 3 gets 2.4 s and
+    7.2 s, with graces of 0.48 s and 1.44 s: 11.52 s in all, within the file's
+    12 s hard stop. Each job used to get the raw optimizer's own grace of 1 s
+    plus 10%, so the formula set 1 s aside per job; a lane of twelve or more
+    jobs at a 10 s timeout then had no search time left, and its jobs waited for
+    the reclaim pass. Sharing the file's grace instead, on 149 sampled PNGs at
+    10 s: 55 APNGs ended 297 bytes smaller in Max (21 smaller, 11 larger, a
+    deadline-bound run), for 5.4% more CPU in the same wall time, and identical
+    in Default with 1.9% less CPU; 94 static PNGs were identical in Default and
+    4 bytes smaller in Max, with flat CPU.
   - Workers check each stream only against its IHDR/fcTL size cap; the exact
     size check and the decoded-budget charge for every frame, duplicates
     included, happen after the join.

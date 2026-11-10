@@ -781,13 +781,24 @@ fn cached_metadata_max_requires_byte_and_bit_dominance() {
 }
 
 #[test]
-fn parallel_image_timeout_accounts_for_each_child_grace() {
-    let timeout = parallel_image_job_timeout(Duration::from_secs(10), 2, 1, 2);
-    assert!(timeout >= Duration::from_millis(4_540));
-    assert!(timeout <= Duration::from_millis(4_550));
+fn parallel_image_timeout_splits_the_phase_by_weight() {
     assert_eq!(
-        parallel_image_job_timeout(Duration::from_secs(10), 1, 1, 1),
+        parallel_image_job_timeout(Duration::from_secs(10), 1, 4),
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(
+        parallel_image_job_timeout(Duration::from_secs(10), 1, 1),
         Duration::from_secs(10)
+    );
+    // Many jobs no longer each reserve a second of grace, which could leave
+    // a worker's jobs no search time at all.
+    assert_eq!(
+        parallel_image_job_timeout(Duration::from_secs(10), 1, 40),
+        Duration::from_millis(250)
+    );
+    assert_eq!(
+        parallel_image_job_timeout(Duration::ZERO, 1, 1),
+        Duration::ZERO
     );
 }
 
@@ -948,6 +959,7 @@ fn cross_frame_reuse_preserves_each_members_source_bit_count() {
         2,
         false,
         DefaultFloor::Complete,
+        Duration::ZERO,
     )
     .unwrap();
     assert!(optimized.data.len() < source.len());
@@ -1143,7 +1155,14 @@ fn image_scheduler_reclaims_a_local_slice_without_a_file_timeout() {
         timeout: Duration::ZERO,
         ..Options::default()
     };
-    let initial = run_png_image_zlib(&idat, &slice_options, 2, DefaultFloor::Shared).unwrap();
+    let initial = run_png_image_zlib(
+        &idat,
+        &slice_options,
+        2,
+        DefaultFloor::Shared,
+        Duration::ZERO,
+    )
+    .unwrap();
     assert!(initial.timed_out);
 
     let options = Options {
@@ -1805,6 +1824,7 @@ fn compressed_metadata_contributes_same_byte_bit_savings_in_both_policies() {
         2,
         false,
         DefaultFloor::Complete,
+        Duration::ZERO,
     )
     .unwrap()
     .data;
