@@ -49,10 +49,10 @@ use super::{
     release_kept_validated_parse, replace_optional_if_smaller, replace_optional_keeping_parent,
     source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
     BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed,
-    ContinuationSourceMax, DefaultEndpoint, DefaultFloor, DefaultFloorWork, HeaderFit, RawInfo,
-    RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
-    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
-    WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    CompleteDefaultFloor, ContinuationSourceMax, DefaultEndpoint, DefaultFloor, DefaultFloorWork,
+    HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache,
+    TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT,
+    MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
@@ -406,16 +406,8 @@ impl RouteEligibility {
 /// at the assignment says otherwise.
 #[derive(Default)]
 struct RouteState {
-    /// The exact Default endpoint that Max must never lose.
-    complete_default: Option<Candidate>,
-    /// Default's exact endpoint where it differs from `complete_default`
-    /// (after its final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`],
-    /// R2–R5, or with R1b). It is compared only after Max's terminal searches,
-    /// so it never becomes their parent.
-    slid_default: Option<Candidate>,
-    /// Under `SharedExact`, a copy of the endpoint Default itself selects,
-    /// which the caller receives beside Max's result.
-    exact_default: Option<DefaultEndpoint>,
+    /// Default's own endpoints, which Max must never lose.
+    default: DefaultEndpoints,
     /// The Default comparison floor, which also seeds Max's routes.
     floor: Option<Candidate>,
     floor_seeded: Option<Candidate>,
@@ -434,6 +426,36 @@ struct RouteState {
     suppress_later_source_max: bool,
     compact_split_attempted: bool,
     deft4j_refinement_completed: bool,
+}
+
+/// Default's own endpoints, which Max compares at fixed points so that it
+/// never selects a larger stream than Default would. Each field says where it
+/// is used.
+#[derive(Default)]
+struct DefaultEndpoints {
+    /// The exact Default endpoint that Max must never lose. It joins the
+    /// comparison in [`establish_comparison_floor`], after the bounded Max
+    /// routes; under `Complete`, which builds it there, after Max's later
+    /// routes and before the terminal searches.
+    complete: Option<Candidate>,
+    /// Default's exact endpoint where it differs from `complete` (after its
+    /// final R1c, R13–R18 and, for [`HeaderFit::AfterTreeFloors`], R2–R5, or
+    /// with R1b). It is compared only after Max's terminal searches, so it
+    /// never becomes their parent.
+    slid: Option<Candidate>,
+    /// Under `SharedExact`, a copy of the endpoint Default itself selects,
+    /// which the caller receives beside Max's result.
+    exact: Option<DefaultEndpoint>,
+}
+
+impl DefaultEndpoints {
+    /// Retain a complete Default floor's endpoints and return its Max seed.
+    fn retain(&mut self, floors: CompleteDefaultFloor) -> Candidate {
+        self.complete = Some(floors.complete);
+        self.slid = floors.slid;
+        self.exact = floors.exact;
+        floors.max_seed
+    }
 }
 
 /// Prepared compact-split parents, one per distinct structural lineage.
@@ -563,7 +585,7 @@ fn select_candidate(
     // redirect the rewritten-seed refinement. The comparison runs whatever the
     // deadline, so no shorter run finishes what it replaces, and Max keeps
     // nothing here.
-    if let Some(complete_default) = state.complete_default.take() {
+    if let Some(complete_default) = state.default.complete.take() {
         candidate.replace_if_smaller(complete_default);
     }
     if let Some(parent) = deferred_split_parent {
@@ -575,10 +597,10 @@ fn select_candidate(
         let finished = finish_terminal_searches(context, deadlines, source_topology)?;
         candidate.replace_if_smaller(finished);
     }
-    if let Some(slid_default) = state.slid_default.take() {
+    if let Some(slid_default) = state.default.slid.take() {
         candidate.replace_if_smaller(slid_default);
     }
-    Ok((candidate, state.exact_default))
+    Ok((candidate, state.default.exact))
 }
 
 /// Build Default's source topology (D4), returned only when it is already
@@ -654,10 +676,7 @@ fn build_guaranteed_floor(
                     context.timed(),
                     default_floor == DefaultFloor::SharedExact,
                 )?;
-                state.complete_default = Some(floors.complete);
-                state.slid_default = floors.slid;
-                state.exact_default = floors.exact;
-                floors.max_seed
+                state.default.retain(floors)
             }
             // APNG's initial planner and terminal methods define its exact
             // Default endpoint. The replay-bounded seed is a separate lineage:
@@ -669,8 +688,8 @@ fn build_guaranteed_floor(
                     progress,
                     context.timed(),
                 )?;
-                state.complete_default = Some(complete);
-                state.slid_default = slid;
+                state.default.complete = Some(complete);
+                state.default.slid = slid;
                 build_bounded_floor_candidate(source, options, &mut SearchStop::never())?
             }
             _ => build_bounded_floor_candidate(source, options, &mut deadline.hard_stop())?,
@@ -679,7 +698,7 @@ fn build_guaranteed_floor(
         None
     };
     if let Some(step) = step {
-        let reported_floor = state.complete_default.as_ref().or(floor.as_ref());
+        let reported_floor = state.default.complete.as_ref().or(floor.as_ref());
         step.finish(context.report_optional(reported_floor));
     }
     Ok(floor)
@@ -758,7 +777,7 @@ fn run_bounded_phase(
     };
     state.floor = candidates.floor;
     // The bounded phase builds a slid copy only when no endpoint was prebuilt.
-    state.slid_default = candidates.slid_default.or(state.slid_default.take());
+    state.default.slid = candidates.slid_default.or(state.default.slid.take());
     state.floor_seeded = candidates.floor_seeded;
     state.deft4j = candidates.deft4j;
     state.narrow = candidates.narrow;
@@ -1652,7 +1671,7 @@ fn close_no_split_lineage(context: &RouteContext<'_>, state: &mut RouteState) ->
             state.floor_seeded.as_ref(),
             state.deft4j.as_ref(),
             state.source_max.as_ref(),
-            state.complete_default.as_ref(),
+            state.default.complete.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1685,7 +1704,7 @@ fn establish_comparison_floor(
         deadline,
         progress,
     } = *context;
-    if let Some(complete_default) = state.complete_default.take() {
+    if let Some(complete_default) = state.default.complete.take() {
         replace_optional_if_smaller(&mut state.floor, complete_default);
     }
 
@@ -1709,9 +1728,7 @@ fn establish_comparison_floor(
                     progress,
                     context.timed(),
                 )?;
-                state.complete_default = Some(floors.complete);
-                state.slid_default = floors.slid;
-                floors.max_seed
+                state.default.retain(floors)
             }
             DefaultFloor::MandatoryComplete => build_candidate(
                 source,
