@@ -41,6 +41,8 @@ fn timeout_is_clamped_and_rounded_up() {
     assert_eq!(parse_timeout(OsStr::new("10.")), None);
     assert_eq!(parse_timeout(OsStr::new(".1")), None);
     assert_eq!(parse_timeout(OsStr::new("1.2.3")), None);
+    assert_eq!(parse_timeout(OsStr::new(" 10")), None);
+    assert_eq!(parse_timeout(OsStr::new("10 ")), None);
 }
 
 #[test]
@@ -57,6 +59,10 @@ fn strict_mode_defaults_on_and_accepts_only_zero_or_one() {
         vec!["--strict=+1", "in"],
         vec!["--strict=01", "in"],
         vec!["--strict=-0", "in"],
+        vec!["--strict", " 1", "in"],
+        vec!["--strict", "1 ", "in"],
+        vec!["--strict= 0", "in"],
+        vec!["--strict=0\n", "in"],
         vec!["--strict"],
     ] {
         let error = match parse_args(arguments.into_iter().map(OsString::from)) {

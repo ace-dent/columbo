@@ -302,7 +302,7 @@ fn parse_timeout(value: &OsStr) -> Option<Duration> {
 }
 
 fn parse_strict(value: &OsStr) -> Option<bool> {
-    match value.to_str()?.trim_start() {
+    match value.to_str()? {
         "0" => Some(false),
         "1" => Some(true),
         _ => None,
