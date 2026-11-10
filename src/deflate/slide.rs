@@ -491,12 +491,7 @@ fn split_pair<T: Copy>(left: &[T], right: &[T], cut: usize) -> Option<(Vec<T>, V
     Some((first, second))
 }
 
-/// Run the slide with re-planning.
-///
-/// Stored blocks and their boundaries stay in place, and every Huffman block
-/// keeps at least one token, preserving the block layout later terminal methods
-/// need. The caller must compare the complete emission because stored padding
-/// can absorb a saving.
+/// [`plan_boundary_slide_in_stream`] without a stream's settled-boundary memo.
 #[cfg(test)]
 pub(crate) fn plan_boundary_slide(
     blocks: &[ParsedBlock],
@@ -506,8 +501,13 @@ pub(crate) fn plan_boundary_slide(
     plan_slide(blocks, options, true, MAX_ROUNDS, stop)
 }
 
-/// [`plan_boundary_slide`] for a candidate of `stream`, skipping the
+/// Run the slide with re-planning for a candidate of `stream`, skipping the
 /// boundaries the stream's last slide on this thread left settled.
+///
+/// Stored blocks and their boundaries stay in place, and every Huffman block
+/// keeps at least one token, preserving the block layout later terminal methods
+/// need. The caller must compare the complete emission because stored padding
+/// can absorb a saving.
 pub(crate) fn plan_boundary_slide_in_stream(
     blocks: &[ParsedBlock],
     options: &Options,
@@ -517,8 +517,9 @@ pub(crate) fn plan_boundary_slide_in_stream(
     plan_slide_with_memo(blocks, options, true, MAX_ROUNDS, Some(stream), stop)
 }
 
-/// Run the slide. Without `refit`, moved blocks keep their transmitted trees,
-/// so one round suffices; tests check that result by brute force.
+/// [`plan_slide_with_memo`] without a stream memo. Without `refit`, moved
+/// blocks keep their transmitted trees, so one round suffices; tests check
+/// that result by brute force.
 #[cfg(test)]
 fn plan_slide(
     blocks: &[ParsedBlock],
@@ -530,7 +531,8 @@ fn plan_slide(
     plan_slide_with_memo(blocks, options, refit, max_rounds, None, stop)
 }
 
-/// [`plan_slide`], and with `stream`, through the stream's settled-boundary
+/// Run the slide, re-planning moved blocks when `refit` is set, for at most
+/// `max_rounds` rounds; with `stream`, through the stream's settled-boundary
 /// memo.
 fn plan_slide_with_memo(
     blocks: &[ParsedBlock],

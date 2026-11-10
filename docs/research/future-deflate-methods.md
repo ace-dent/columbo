@@ -434,18 +434,18 @@ The 25 August 2026 audit used ECT commit
 
 | Source | Responsibility |
 | --- | --- |
-| [`header.rs`](../../src/deflate/header.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE, finished-tree moves, positive-payload swaps (R2), literal-span search (R3) and smoothed-tree candidates (compact floor, R14) |
+| [`header.rs`](../../src/deflate/header.rs), [`header/payload_trees.rs`](../../src/deflate/header/payload_trees.rs), [`header/rle_seeds.rs`](../../src/deflate/header/rle_seeds.rs), [`header/rle_rewrite.rs`](../../src/deflate/header/rle_rewrite.rs), [`header/shortest_rle.rs`](../../src/deflate/header/shortest_rle.rs), [`header/balanced_tree.rs`](../../src/deflate/header/balanced_tree.rs), [`header/length_adjustments.rs`](../../src/deflate/header/length_adjustments.rs), [`header/terminal.rs`](../../src/deflate/header/terminal.rs) | Data-tree candidates, exact payload pricing, dynamic-header RLE, finished-tree moves, positive-payload swaps (R2), literal-span search (R3) and smoothed-tree candidates (compact floor, R14) |
 | [`header/tree.rs`](../../src/deflate/header/tree.rs) | Joint CL-tree/RLE optimization using run costs and complete Kraft capacity (R7) |
 | [`header/rotate.rs`](../../src/deflate/header/rotate.rs) | Bounded three-symbol payload-length rotations with full header pricing (R8) |
 | [`header/coupled.rs`](../../src/deflate/header/coupled.rs) | Bounded paired literal/length and distance swaps under the shared header price (R9) |
 | [`header/response.rs`](../../src/deflate/header/response.rs) | Bounded Max tree proposals with exact certified token responses and complete header pricing (R10) |
 | [`header/response/exchange.rs`](../../src/deflate/header/response/exchange.rs) | Bounded Max length-symbol reassignment with header-first pricing and certified payload bounds (R11) |
 | [`huffman.rs`](../../src/deflate/huffman.rs) | Length-limited builders, pseudo-frequencies, decode tables |
-| [`search.rs`](../../src/deflate/search.rs) | Same-distance, match-family, proven-submatch, feedback, and composition searches |
+| [`search.rs`](../../src/deflate/search.rs), [`search/same_distance.rs`](../../src/deflate/search/same_distance.rs), [`search/proven_submatch.rs`](../../src/deflate/search/proven_submatch.rs), [`search/proven_submatch/composition.rs`](../../src/deflate/search/proven_submatch/composition.rs) | Same-distance, match-family, proven-submatch, feedback, and composition searches |
 | [`restore.rs`](../../src/deflate/restore.rs) | Terminal restoration of original matches under unchanged trees (R1) |
 | [`joint.rs`](../../src/deflate/joint.rs) | Joint payload code lengths and RLE under a fixed code-length tree (R4) |
 | [`symbol_set.rs`](../../src/deflate/symbol_set.rs) | Joint removal of small payload symbol sets (R5) |
-| [`stream.rs`](../../src/deflate/stream.rs) | Grouping, splitting, entropy-state scout, boundary graph, reseat, forced split, range caches |
+| [`stream.rs`](../../src/deflate/stream.rs), [`stream/grouping.rs`](../../src/deflate/stream/grouping.rs), [`stream/source_split.rs`](../../src/deflate/stream/source_split.rs), [`stream/adaptive_split.rs`](../../src/deflate/stream/adaptive_split.rs), [`stream/entropy_scout.rs`](../../src/deflate/stream/entropy_scout.rs), [`stream/boundary_graph.rs`](../../src/deflate/stream/boundary_graph.rs), [`stream/selected_plan.rs`](../../src/deflate/stream/selected_plan.rs) | Grouping, splitting, entropy-state scout, boundary graph, reseat, forced split, range caches |
 | [`stream/alphabet.rs`](../../src/deflate/stream/alphabet.rs) | Alphabet-support boundary pairs (R6) |
 | [`slide.rs`](../../src/deflate/slide.rs) | Terminal fixed-tree boundary slide, joining-match literal respelling and moved-block re-planning to a fixed point (R1c) |
 | [`distance_band.rs`](../../src/deflate/distance_band.rs) | Distance-alphabet ladder (R13) |

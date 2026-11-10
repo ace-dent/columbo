@@ -29,10 +29,11 @@ not need to expose CLI implementation details as public API.
 
 ## Deflate engine
 
-`optimize.rs` holds the route builders, eligibility rules, and candidate
-comparison. Its child module `optimize/schedule.rs` validates one raw stream,
-then runs the route phases in a fixed order: each phase reads a shared route
-context and updates the complete candidates carried between phases. Max
+`optimize.rs` holds the floor policies, the shared candidate builders, and
+candidate comparison; its child modules hold the route gates and the route
+builders, one family each. The child `optimize/schedule.rs` validates one raw
+stream, then runs the route phases in a fixed order: each phase reads a shared
+route context and updates the complete candidates carried between phases. Max
 retains the Default comparison floor. A timeout limits optional search; it
 never skips validation or produces partial output.
 
@@ -41,13 +42,13 @@ never skips validation or produces partial output.
 | `bitstream` | Read and write least-significant-bit-first Deflate fields. |
 | `parse`, `model` | Validate the stream and retain decoded bytes, source symbols, and block metadata. |
 | `huffman` | Construct length-limited code lengths, canonical codes, and decoding tables. |
-| `header` | Construct dynamic headers and count header and payload bits, reusing completed header plans per thread. Child modules hold Max code-length searches: `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11); `swap_costs` keeps the header costs of greedy length-swap trials per thread. |
+| `header` | Construct dynamic headers and count header and payload bits. The parent runs the header search; `plan_cache` reuses completed header plans per route and per thread, `code_length_tree` builds and caches code-length codes, `rle_seeds`, `rle_rewrite`, and `shortest_rle` seed, rewrite, and spell code-length runs, `payload_trees` and `length_adjustments` build and adjust data trees, `balanced_tree` finds D3 and M4 moves, `deft4j` builds M1's headers, and `terminal` holds R1b, R2, and R3. Max code-length searches are `tree` (R7), `rotate` (R8), `coupled` (R9), `response` (R10), and `response/exchange` (R11); `swap_costs` keeps the header costs of greedy length-swap trials per thread. |
 | `block` | Price and emit original, stored, fixed, or dynamic block representations, with a route-local plan cache and completed plans reused per thread. |
 | `concat` | Join complete raw streams into one stream, as GZIP member merging does. |
 | `plan_store` | Bound the per-thread stores of completed block and header plans: two generations within a byte budget. |
 | `minima` | Share range-minimum lookups between searches over match-length families. |
-| `search` | Change token spelling within existing matches. |
-| `stream` | Plan block merges, splits, and boundary changes; `stream/alphabet` finds alphabet-support cuts (R6), `stream/entropy_cut` cuts blocks where their symbol statistics change (R15), and `stream/merge` merges neighbors after the finish (R16) and at the boundaries of joined streams. |
+| `search` | Change token spelling within existing matches. The parent runs the per-block token search and block floor; `same_distance` normalizes same-distance match runs, `proven_submatch` resegments matches into proven submatches (D1, D2) with Max's compositions in `proven_submatch/composition`, `short_bands` prices cumulative short-length bands, `deft4j_prune` holds the deft4j tree floor and D4's length-family chain, `match_groups` holds Max's match groups, and `terminal` replays terminal tokens (R17). |
+| `stream` | Plan block merges, splits, and boundary changes. The parent holds the planner's entry points and shared floors; `grouping` builds greedy, bounded, and collected layouts, `sequential_walk` walks source blocks with adjacent merges, `source_split` and `adaptive_split` split source blocks, `entropy_scout` proposes entropy-state cuts, `boundary_graph` runs the source-aligned floor and the global boundary graph, `selected_plan` reseats and cleans up a selected plan, `compact_split` is the compact split floor (M10c, M10d), and `routes` holds the whole-stream routes (M2, D1, D2, M11, and the terminal merge). `alphabet` finds alphabet-support cuts (R6), `entropy_cut` cuts blocks where their symbol statistics change (R15), and `merge` merges neighbors after the finish (R16) and at the boundaries of joined streams. |
 | `source_recode` | Run the deft4j-derived source-order recoding and merge route. |
 | `restore` | Restore original match choices after other routes settle (R1). |
 | `joint` | Search payload code lengths and header run-length encoding together (R4). |
@@ -55,7 +56,7 @@ never skips validation or produces partial output.
 | `slide` | Slide block boundaries under the transmitted Huffman trees (R1c). |
 | `distance_band` | Collapse a block's distance alphabet to a kept set of distance symbols (R13). |
 | `stop` | Apply shared deadlines, grace periods, and cooperative cancellation. |
-| `optimize` | Build, schedule, and compare complete candidates, as described above. |
+| `optimize` | Build, schedule, and compare complete candidates, as described above. `schedule` runs the phases, `gates` holds the route gates, `default_floor` builds the complete Default floor, `bounded` runs the bounded phase, `source_routes` builds M1, M2, D4, and source max, `compact_split` holds M10c and M10d, `proven_feedback` holds D1, D2, and M3, `tree_floor` holds the terminal tree floors, and `terminal` runs the terminal sweep (R1 to R17). |
 
 The engine never discovers new LZ77 matches. Keep source-proof checks, fallible
 allocation, work limits, exact candidate pricing, and tie order visible when

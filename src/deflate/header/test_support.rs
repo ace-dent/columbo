@@ -3,19 +3,16 @@
 
 //! Header fixtures and cache observations shared by optimizer tests.
 
-use super::{plan_for_explicit_lengths, HeaderPlanCache, HeaderPlanCacheStats};
+use super::plan_cache::HeaderPlanCacheStats;
+use super::{best_dynamic_plan_cached, plan_for_explicit_lengths, HeaderPlanCache};
 use crate::deflate::huffman::make_lengths;
-use crate::deflate::model::{count_frequencies, ParsedBlock, SourceBlockType, Token};
+use crate::deflate::model::{
+    count_frequencies, token_extra_bits, DynamicPlan, ParsedBlock, SourceBlockType, Token,
+};
 use crate::deflate::parse::parse_stream;
+use crate::deflate::stop::SearchStop;
 
 impl HeaderPlanCache {
-    pub(super) fn with_limit(max_entries: usize) -> Self {
-        Self {
-            max_entries,
-            ..Self::new()
-        }
-    }
-
     pub(crate) fn stats(&self) -> HeaderPlanCacheStats {
         self.stats
     }
@@ -230,4 +227,26 @@ pub(crate) fn length_exchange_test_stream() -> Vec<u8> {
         155, 88, 174, 6, 164, 230, 218, 172, 30, 61, 117, 52, 90, 99, 72, 228, 178, 60, 249, 15,
         69, 100, 223,
     ]
+}
+
+pub(super) fn best_dynamic_plan(
+    tokens: &[Token],
+    literal_frequencies: &[u32; 286],
+    distance_frequencies: &[u32; 30],
+    original: Option<&DynamicPlan>,
+    strict: bool,
+    exhaustive: bool,
+    stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    best_dynamic_plan_cached(
+        tokens,
+        literal_frequencies,
+        distance_frequencies,
+        token_extra_bits(tokens),
+        original,
+        strict,
+        exhaustive,
+        stop,
+        &mut HeaderPlanCache::new(),
+    )
 }

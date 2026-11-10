@@ -76,7 +76,7 @@ cargo test --all-targets -- --include-ignored
 ```
 
 `tests/local_corpus.rs` contains the public-API corpus regressions; four additional
-raw-optimizer regressions live in `src/deflate/optimize/tests.rs`. A corpus
+raw-optimizer regressions live in the unit tests under `src/deflate/optimize/`. A corpus
 test run with `--ignored` or `--include-ignored` fails if its fixture is missing
 rather than passing silently. The relative fixture names in these tests describe
 the expected local layout under `tests/fixtures/`.

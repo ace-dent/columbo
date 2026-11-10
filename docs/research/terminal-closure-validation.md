@@ -3,7 +3,7 @@
 # Terminal time and method closure in Max
 
 11 September 2026. Baseline: `2e77f21`. **Accepted after matched validation.**
-The implementation is in `src/deflate/optimize.rs`; the R12 and G0t rows in
+The implementation is in `src/deflate/optimize/terminal.rs`; the R12 and G0t rows in
 [routes and methods](../routes-and-methods.md) describe the current method. The
 accepted [13 September extension](#follow-up-on-13-september-2026-the-larger-max-work-class)
 widens the time reservation to the existing larger Max size class.

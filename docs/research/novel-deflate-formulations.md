@@ -30,7 +30,7 @@ An earlier match-to-literal rewrite may make a different tree attractive, and th
 
 ### Concrete source gap
 
-`ParsedBlock` and `PlannedBlock` retain the selected token/plain arrays, without a separate immutable original-match certificate map. [`parsed_block_from_plan`](../../src/deflate/search.rs) and [`parsed_from_selected_plan`](../../src/deflate/stream.rs) construct later states from the selected tokens. `solve_proven_submatch` requires a `Token::Match` as its source, so a token that is now a literal does not expose the match that previously covered it.
+`ParsedBlock` and `PlannedBlock` retain the selected token/plain arrays, without a separate immutable original-match certificate map. [`parsed_block_from_plan`](../../src/deflate/search/terminal.rs) and [`parsed_from_selected_plan`](../../src/deflate/stream/selected_plan.rs) construct later states from the selected tokens. `solve_proven_submatch` requires a `Token::Match` as its source, so a token that is now a literal does not expose the match that previously covered it.
 
 Columbo keeps independent original and endpoint lineages, so the optimizer as a whole does not lose its input. The gap is restoring selected original edges inside a later mixed state without restarting a lineage and rediscovering the same decisions. R1 recovers the certificates from the original parse for its terminal pass; intermediate search states still do not carry them.
 
@@ -120,7 +120,7 @@ The split makes both streams larger in this simple construction. It proves a 12-
 
 ### Concrete source gap and proposed search
 
-[`same_proven_composition_frequency_state`](../../src/deflate/search.rs) identifies states by global frequencies and extra bits. That suits immediate fixed-block pricing but does not preserve every regional distribution for later boundary search. Existing boundary routes may recover some of them; the witness alone does not prove they miss one.
+[`same_proven_composition_frequency_state`](../../src/deflate/search/proven_submatch/composition.rs) identifies states by global frequencies and extra bits. That suits immediate fixed-block pricing but does not preserve every regional distribution for later boundary search. Existing boundary routes may recover some of them; the witness alone does not prove they miss one.
 
 Bucket local rewrite deltas and look for exact opposites. Add a bounded search for three-way zero sums only if pair exchanges prove useful. Record their effects on prefix histograms at a small set of potential cuts. Under proposed regional trees, rank exchanges by the difference between their left/right costs, then evaluate the exchange and boundary change together.
 

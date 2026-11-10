@@ -113,7 +113,7 @@ A run of adjacent matches at one distance has the same property over its whole
 length: every byte of the run copies from that distance, overlapping copies
 included. Its internal boundaries can therefore move anywhere, as long as each
 resulting match keeps a legal length of 3–258 bytes
-([`src/deflate/search.rs`](../src/deflate/search.rs)).
+([`src/deflate/search/same_distance.rs`](../src/deflate/search/same_distance.rs)).
 
 Block boundaries change neither the decoded bytes nor the 32 KiB history window,
 so a boundary may move anywhere, even into a match. A cut inside a match splits
@@ -2003,9 +2003,10 @@ These methods run in three places:
 Some trees stay out of the block planner on purpose. Tree prices steer later
 token feedback, so replacing an intermediate winner with a locally cheaper tree
 can lead feedback to a worse fixed point (comments in
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs) and
-[`src/deflate/header.rs`](../src/deflate/header.rs)). The floors and terminal
-methods work on finished blocks, where no later search depends on the tree.
+[`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs) and
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs)).
+The floors and terminal methods work on finished blocks, where no later search
+depends on the tree.
 
 Header plans, code-length codes and run spellings are cached per route and per
 thread; [Header-plan caches and stores](#header-plan-caches-and-stores) and
@@ -2016,6 +2017,8 @@ give the keys and limits.
 
 🔴 Default and Max · block planner ·
 [`src/deflate/header.rs`](../src/deflate/header.rs),
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs),
+[`src/deflate/header/length_adjustments.rs`](../src/deflate/header/length_adjustments.rs),
 [`src/deflate/huffman.rs`](../src/deflate/huffman.rs)
 
 The block planner chooses one dynamic plan per block from three kinds of
@@ -2149,8 +2152,8 @@ order-key heap, equal-frequency rearrangement and swaps **Columbo**.
 ### Bounded-depth terminal tree floor
 
 🟡 Default and Max · terminal tree floor ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs),
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs)
 
 This floor re-prices every dynamic block of a completed candidate with trees
 whose longest codeword is limited below 15 bits. A shallower tree costs some
@@ -2269,8 +2272,8 @@ generalized **Columbo** implementation.
 ### Compact payload-tree floor
 
 🟡 Default and Max · terminal tree floor ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs),
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs)
 
 On small Huffman streams this floor prices trees built from smoothed counts
 beside the bounded-depth trees. Smoothing makes nearly equal neighboring counts
@@ -2349,7 +2352,7 @@ implementation.
 
 🟡 Default and Max · tree builders ·
 [`src/deflate/huffman.rs`](../src/deflate/huffman.rs),
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs)
 
 These methods build a tree from adjusted counts, called pseudo-counts, and price
 it on the true counts. Nearly equal counts give irregular lengths that the
@@ -2442,8 +2445,8 @@ also uses.
 ### Smoothed-tree finish (R14)
 
 🟡 Default and Max · terminal method ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/optimize/terminal.rs`](../src/deflate/optimize/terminal.rs),
+[`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs)
 
 R14 prices the Brotli and Zopfli smoothed families for every completed block,
 not only in compact streams. A probe found that these families beat the
@@ -2522,7 +2525,7 @@ placement.
 
 🟡 Default and Max · terminal method ·
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs)
 
 R18 runs the terminal tree floors once more at the very end of the finish: the
 compact payload-tree floor and its closure, or else the bounded-depth floor or
@@ -2584,7 +2587,10 @@ Provenance: **Columbo** placement of the existing tree floors.
 ### Dynamic header encoding
 
 🔴 Default and Max · header planner ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header.rs`](../src/deflate/header.rs),
+[`src/deflate/header/rle_seeds.rs`](../src/deflate/header/rle_seeds.rs),
+[`src/deflate/header/rle_rewrite.rs`](../src/deflate/header/rle_rewrite.rs),
+[`src/deflate/header/shortest_rle.rs`](../src/deflate/header/shortest_rle.rs)
 
 Given fixed literal/length and distance code lengths, the header planner finds a
 cheap legal header for them. The header sends HLIT, HDIST and HCLEN, then a
@@ -2736,7 +2742,7 @@ balanced and zero-repeat seeds; shortest spelling).
 ### Payload/header tradeoff (R2)
 
 🟡 Default and Max · terminal method ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/terminal.rs`](../src/deflate/header/terminal.rs)
 
 R2 swaps the code lengths of two symbols in one alphabet when the payload grows
 a little but the header shrinks more. Swapping two nonzero lengths keeps the
@@ -2822,7 +2828,7 @@ Validation:
 ### Literal/length span (R3)
 
 🟡 Default and Max · terminal method ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/terminal.rs`](../src/deflate/header/terminal.rs)
 
 R3 changes only HLIT, by advertising extra zero literal/length lengths. HLIT
 costs 5 bits whatever its value, so the extra entries are free in that field.
@@ -3117,7 +3123,7 @@ Validation: [rotations](research/code-length-rotation-validation.md),
 ### Strict distance completion (R1b)
 
 🟢 Default and Max, strict mode only · terminal method ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/terminal.rs`](../src/deflate/header/terminal.rs)
 
 Strict mode must send a complete distance code with at least two codes. Planning
 therefore completes an empty or one-symbol distance alphabet with two one-bit
@@ -3198,8 +3204,8 @@ Provenance: **Columbo**, from the reference-miss audit of 30 September 2026.
 ### Tree lengthening and balanced-tree cleanup (D3)
 
 🟡 Default and Max · tree cleanup ·
-[`src/deflate/header.rs`](../src/deflate/header.rs),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/header/balanced_tree.rs`](../src/deflate/header/balanced_tree.rs),
+[`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs)
 
 These moves trade a few payload bits for a cheaper header while keeping the code
 complete. The new lengths can form runs, or drop a length value from the header.
@@ -3548,7 +3554,7 @@ normalization), **deft4j** (heap trees with prune and rebuild), **libdeflate**
 ### Same-distance match-run normalization
 
 🟢 Default and Max · block search and floors ·
-[`src/deflate/search.rs`](../src/deflate/search.rs)
+[`src/deflate/search/same_distance.rs`](../src/deflate/search/same_distance.rs)
 (`repack_same_distance_runs`)
 
 A run of adjacent matches that share one distance copies every byte from that
@@ -3774,7 +3780,7 @@ trees, prune and rebuild), **libdeflate** (all-literals idea).
 ### Cumulative short-length bands
 
 🟡 Default and Max · floors and narrow search ·
-[`src/deflate/search.rs`](../src/deflate/search.rs)
+[`src/deflate/search/short_bands.rs`](../src/deflate/search/short_bands.rs)
 
 Expanding every match of a set of length symbols removes those symbols from the
 literal/length alphabet. That frees code space for the remaining symbols and can
@@ -3823,9 +3829,11 @@ that choice, while these bands price fixed families.
 ### Proven-submatch resegmentation and feedback (D1, D2)
 
 🟡–🔴 Default and Max · block search, lineages, D1, D2 and M3 ·
-[`src/deflate/search.rs`](../src/deflate/search.rs),
+[`src/deflate/search/proven_submatch.rs`](../src/deflate/search/proven_submatch.rs),
+[`src/deflate/search/proven_submatch/composition.rs`](../src/deflate/search/proven_submatch/composition.rs),
 [`src/deflate/stream.rs`](../src/deflate/stream.rs),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/stream/routes.rs`](../src/deflate/stream/routes.rs),
+[`src/deflate/optimize/proven_feedback.rs`](../src/deflate/optimize/proven_feedback.rs)
 
 An existing match of length `L` at distance `D` proves that its `L` decoded
 bytes repeat at distance `D`. Any literal inside that interval, and any shorter
@@ -4482,7 +4490,7 @@ headers first, then fit certified spellings).
 ### Terminal token replay (R17)
 
 🟡 Default and Max · terminal method ·
-[`src/deflate/search.rs`](../src/deflate/search.rs)
+[`src/deflate/search/terminal.rs`](../src/deflate/search/terminal.rs)
 (`plan_terminal_token_replay`)
 
 The main planner chose each block's spelling together with its trees. R13–R16
@@ -5413,7 +5421,7 @@ of inside-match cuts is small
 ([boundary slide](research/boundary-slide-validation.md#rejected-cuts-inside-matches-at-length-code-thresholds)).
 
 **Compact split floor (M10c, M10d).** 🟡 Max ·
-[`src/deflate/stream.rs`](../src/deflate/stream.rs)
+[`src/deflate/stream/compact_split.rs`](../src/deflate/stream/compact_split.rs)
 (`plan_compact_source_split_floor_until`) · provenance **Columbo**
 
 The compact split floor adds at most one cut per block of a compact completed
@@ -5914,7 +5922,7 @@ its entry below.
 ### Source topology (D4)
 
 🟡 Default, and mandatory in Max's complete Default floors · whole-stream route ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
+[`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs),
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs)
 
 D4 builds a second Default candidate in the source's own block layout. It
@@ -6050,7 +6058,7 @@ route and placement.
 ### Length-family chain and re-spell from literals
 
 🟡 D4 seeds only (Default, and Max's complete Default floor) · block token
-methods · [`src/deflate/search.rs`](../src/deflate/search.rs)
+methods · [`src/deflate/search/deft4j_prune.rs`](../src/deflate/search/deft4j_prune.rs)
 (`plan_length_family_chain`, `plan_respell_from_literals`)
 
 Both methods change which of one block's existing matches are spelled as
@@ -6277,8 +6285,8 @@ traversal and alignment accounting.
 ### No-split source route (M2, M2c)
 
 🟡 Max (`CompleteThenBounded`) · whole-stream route ·
-[`src/deflate/stream.rs`](../src/deflate/stream.rs),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/stream/routes.rs`](../src/deflate/stream/routes.rs),
+[`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs)
 
 M2 keeps the source's block boundaries, apart from merging neighbors in source
 order. Each block is re-spelled from a deft4j-derived seed with the narrow
@@ -6368,7 +6376,7 @@ pruning variants and merge policy.
 
 🔴 Max · whole-stream route ·
 [`src/deflate/stream.rs`](../src/deflate/stream.rs),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
+[`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs),
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs)
 
 Source max runs the ordinary planner with Max options on the original parsed
@@ -6452,7 +6460,7 @@ Provenance: **Columbo**; the escape's pushed-split concept from
 
 ### Fragmented collection and replay (M11)
 
-🔴 Max · whole-stream route · [`src/deflate/stream.rs`](../src/deflate/stream.rs)
+🔴 Max · whole-stream route · [`src/deflate/stream/routes.rs`](../src/deflate/stream/routes.rs)
 (`fragmented_collect_seed`, `plan_fragmented_replay`),
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs)
 
@@ -6497,7 +6505,8 @@ Provenance: **Columbo**.
 ### Floor-seeded and rewritten-seed refinement (M7, M7a, M13)
 
 🔴 Max · lineage refinement ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
+[`src/deflate/optimize/bounded.rs`](../src/deflate/optimize/bounded.rs),
+[`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs),
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs)
 
 These routes start Max search from an already rewritten candidate instead of the
@@ -6577,9 +6586,9 @@ Gates: [M7](#m7-floor-descendant), [M7a](#m7a-best-first-floor-continuation),
 
 ### Terminal merge route and fixed points
 
-🟡 Max · lineage refinement · [`src/deflate/stream.rs`](../src/deflate/stream.rs)
+🟡 Max · lineage refinement · [`src/deflate/stream/routes.rs`](../src/deflate/stream/routes.rs)
 (`plan_terminal_merge_route`),
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs)
 (`refine_with_terminal_merge`)
 
 **Terminal merge route.** This is a merge cleanup for one lineage, not the
@@ -7485,7 +7494,7 @@ grown logarithm table and per-stream release, went from 164.5 to 128.0 seconds
 ### Header-plan caches and stores
 
 🟢 Default and Max · plan reuse ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/plan_cache.rs`](../src/deflate/header/plan_cache.rs)
 
 A header's cost depends only on the trimmed literal/length and distance
 code-length sequences and the search policy; payload bits shift every
@@ -7631,7 +7640,8 @@ Default inputs 1.03×
 ### Code-length codes and RLE run tables
 
 🟢 Default and Max · plan reuse ·
-[`src/deflate/header.rs`](../src/deflate/header.rs)
+[`src/deflate/header/code_length_tree.rs`](../src/deflate/header/code_length_tree.rs),
+[`src/deflate/header/shortest_rle.rs`](../src/deflate/header/shortest_rle.rs)
 
 Inside an uncached header plan, most work is building code-length codes and
 respelling the RLE under them
@@ -7829,6 +7839,8 @@ instead of 13.3 seconds (1.56×)
 
 🟢 Default and Max · duplicate-work control ·
 [`src/deflate/optimize.rs`](../src/deflate/optimize.rs),
+[`src/deflate/optimize/terminal.rs`](../src/deflate/optimize/terminal.rs),
+[`src/deflate/optimize/bounded.rs`](../src/deflate/optimize/bounded.rs),
 [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs)
 
 Several gates skip repeated routes:
@@ -8977,7 +8989,7 @@ stickers smaller by 5,225 bytes, none larger, for 0.6% more CPU
 #### Sweep repetition (R12)
 
 🟢–🟡 Max only · terminal sweep closure ·
-[`src/deflate/optimize.rs`](../src/deflate/optimize.rs)
+[`src/deflate/optimize/terminal.rs`](../src/deflate/optimize/terminal.rs)
 (`improve_with_terminal_searches`)
 
 R12 repeats the terminal sweep on Max's incumbent after any strict whole-stream
@@ -9116,9 +9128,10 @@ Terms used below:
   can finish it.
 - Sizes are inclusive and refer to the stream each rule names. Source code:
   [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs) (the
-  schedule), [`src/deflate/optimize.rs`](../src/deflate/optimize.rs) (route
-  builders and gates), [`src/deflate/stop.rs`](../src/deflate/stop.rs)
-  (deadlines and windows).
+  schedule), [`src/deflate/optimize/gates.rs`](../src/deflate/optimize/gates.rs)
+  (gates), the other children of
+  [`src/deflate/optimize.rs`](../src/deflate/optimize.rs) (route builders),
+  [`src/deflate/stop.rs`](../src/deflate/stop.rs) (deadlines and windows).
 
 ### Label index
 
@@ -10683,13 +10696,19 @@ explains its part.
 | Validating parser, parsed model, bit I/O and checksums | [`src/deflate/parse.rs`](../src/deflate/parse.rs), [`src/deflate/model.rs`](../src/deflate/model.rs), [`src/deflate/bitstream.rs`](../src/deflate/bitstream.rs), [`src/checksum.rs`](../src/checksum.rs) |
 | Deadlines, grace, route windows and cancellation (G0) | [`src/deflate/stop.rs`](../src/deflate/stop.rs) |
 | Raw-stream phase order, terminal share (G0t), source-max state order (S0), replaced-candidate close (M14) and the R18 schedule | [`src/deflate/optimize/schedule.rs`](../src/deflate/optimize/schedule.rs) |
-| Route builders and eligibility gates (D1–D4, M0–M13), floor policies, the terminal sweep (R12, R14), terminal tree floors and candidate comparison | [`src/deflate/optimize.rs`](../src/deflate/optimize.rs) |
-| Stream planner: grouping, merging, splitting and boundary graphs | [`src/deflate/stream.rs`](../src/deflate/stream.rs) |
+| Floor policies, shared candidate builders and candidate comparison | [`src/deflate/optimize.rs`](../src/deflate/optimize.rs) |
+| Route eligibility gates (D1–D4, M0–M13) | [`src/deflate/optimize/gates.rs`](../src/deflate/optimize/gates.rs) |
+| Route builders: the complete Default floor, the bounded phase, source routes (M1, M2, D4, source max), compact split (M10c, M10d) and proven feedback (D1, D2, M3) | [`src/deflate/optimize/default_floor.rs`](../src/deflate/optimize/default_floor.rs), [`src/deflate/optimize/bounded.rs`](../src/deflate/optimize/bounded.rs), [`src/deflate/optimize/source_routes.rs`](../src/deflate/optimize/source_routes.rs), [`src/deflate/optimize/compact_split.rs`](../src/deflate/optimize/compact_split.rs), [`src/deflate/optimize/proven_feedback.rs`](../src/deflate/optimize/proven_feedback.rs) |
+| The terminal sweep (R12, R14) and terminal tree floors | [`src/deflate/optimize/terminal.rs`](../src/deflate/optimize/terminal.rs), [`src/deflate/optimize/tree_floor.rs`](../src/deflate/optimize/tree_floor.rs) |
+| Stream planner: grouping, merging, splitting and boundary graphs | [`src/deflate/stream.rs`](../src/deflate/stream.rs), [`src/deflate/stream/grouping.rs`](../src/deflate/stream/grouping.rs), [`src/deflate/stream/sequential_walk.rs`](../src/deflate/stream/sequential_walk.rs), [`src/deflate/stream/source_split.rs`](../src/deflate/stream/source_split.rs), [`src/deflate/stream/adaptive_split.rs`](../src/deflate/stream/adaptive_split.rs), [`src/deflate/stream/entropy_scout.rs`](../src/deflate/stream/entropy_scout.rs), [`src/deflate/stream/boundary_graph.rs`](../src/deflate/stream/boundary_graph.rs), [`src/deflate/stream/selected_plan.rs`](../src/deflate/stream/selected_plan.rs), [`src/deflate/stream/compact_split.rs`](../src/deflate/stream/compact_split.rs), [`src/deflate/stream/routes.rs`](../src/deflate/stream/routes.rs) |
 | Terminal layout methods: alphabet boundaries (R6), entropy cuts (R15), terminal merges (R16) | [`src/deflate/stream/alphabet.rs`](../src/deflate/stream/alphabet.rs), [`src/deflate/stream/entropy_cut.rs`](../src/deflate/stream/entropy_cut.rs), [`src/deflate/stream/merge.rs`](../src/deflate/stream/merge.rs) |
-| Token spelling, block floors, proven submatches and terminal token replay (R17) | [`src/deflate/search.rs`](../src/deflate/search.rs), [`src/deflate/minima.rs`](../src/deflate/minima.rs) |
+| Token spelling, block floors, proven submatches and terminal token replay (R17) | [`src/deflate/search.rs`](../src/deflate/search.rs), [`src/deflate/search/same_distance.rs`](../src/deflate/search/same_distance.rs), [`src/deflate/search/proven_submatch.rs`](../src/deflate/search/proven_submatch.rs), [`src/deflate/search/proven_submatch/composition.rs`](../src/deflate/search/proven_submatch/composition.rs), [`src/deflate/search/short_bands.rs`](../src/deflate/search/short_bands.rs), [`src/deflate/search/deft4j_prune.rs`](../src/deflate/search/deft4j_prune.rs), [`src/deflate/search/match_groups.rs`](../src/deflate/search/match_groups.rs), [`src/deflate/search/terminal.rs`](../src/deflate/search/terminal.rs), [`src/deflate/minima.rs`](../src/deflate/minima.rs) |
 | Block representation selection and emission, the route-local block-plan cache and the per-thread block-plan store | [`src/deflate/block.rs`](../src/deflate/block.rs) |
 | Huffman construction and count smoothers | [`src/deflate/huffman.rs`](../src/deflate/huffman.rs) |
-| Dynamic headers, the header-plan cache and per-thread header-plan store, tree floors, R1b, R2 and R3 | [`src/deflate/header.rs`](../src/deflate/header.rs) |
+| Dynamic headers: the header search, code-length codes and their runs | [`src/deflate/header.rs`](../src/deflate/header.rs), [`src/deflate/header/code_length_tree.rs`](../src/deflate/header/code_length_tree.rs), [`src/deflate/header/rle_seeds.rs`](../src/deflate/header/rle_seeds.rs), [`src/deflate/header/rle_rewrite.rs`](../src/deflate/header/rle_rewrite.rs), [`src/deflate/header/shortest_rle.rs`](../src/deflate/header/shortest_rle.rs) |
+| The header-plan cache and per-thread header-plan store | [`src/deflate/header/plan_cache.rs`](../src/deflate/header/plan_cache.rs) |
+| Data-tree families, tree floors and balanced-tree moves (D3, M4), and deft4j headers (M1) | [`src/deflate/header/payload_trees.rs`](../src/deflate/header/payload_trees.rs), [`src/deflate/header/length_adjustments.rs`](../src/deflate/header/length_adjustments.rs), [`src/deflate/header/balanced_tree.rs`](../src/deflate/header/balanced_tree.rs), [`src/deflate/header/deft4j.rs`](../src/deflate/header/deft4j.rs) |
+| R1b, R2 and R3 | [`src/deflate/header/terminal.rs`](../src/deflate/header/terminal.rs) |
 | Per-thread header costs of greedy length-swap trials | [`src/deflate/header/swap_costs.rs`](../src/deflate/header/swap_costs.rs) |
 | Max code-length searches: R7, R8, R9, R10 and R11 | [`src/deflate/header/tree.rs`](../src/deflate/header/tree.rs), [`src/deflate/header/rotate.rs`](../src/deflate/header/rotate.rs), [`src/deflate/header/coupled.rs`](../src/deflate/header/coupled.rs), [`src/deflate/header/response.rs`](../src/deflate/header/response.rs), [`src/deflate/header/response/exchange.rs`](../src/deflate/header/response/exchange.rs) |
 | Bounded two-generation store type behind both per-thread plan stores | [`src/deflate/plan_store.rs`](../src/deflate/plan_store.rs) |

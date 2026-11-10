@@ -317,7 +317,7 @@ accounting are independent.
 
 Columbo's `add_adaptive_split_cut`, `adaptive_histogram_split_search`,
 `coarse_to_fine_split_search`, and `cached_adaptive_split_score` in
-[`src/deflate/stream.rs`](../../src/deflate/stream.rs) independently implement
+[`src/deflate/stream/adaptive_split.rs`](../../src/deflate/stream/adaptive_split.rs) independently implement
 the sample/smooth/narrow/scan skeleton of `turtledeflate_best_block_split`:
 
 ```text
@@ -353,7 +353,7 @@ Columbo's `estimate_boundary_block_bits` in
 Huffman score for the adaptive search. It prices the fixed tree and one simple
 dynamic candidate: DeflOpt variant-zero heap trees with one greedy
 code-length RLE spelling. Its caller, `estimate_histogram_range_bits` in
-[`src/deflate/stream.rs`](../../src/deflate/stream.rs), takes the smaller of
+[`src/deflate/stream/adaptive_split.rs`](../../src/deflate/stream/adaptive_split.rs), takes the smaller of
 that score and the stored-block size.
 
 This fills the role of Turtledeflate's histogram block-cost estimator without
@@ -363,7 +363,7 @@ Columbo-specific or separately attributed.
 ### Bounded reseat and forced-split escape
 
 Max mode runs two boundary routes in
-[`src/deflate/stream.rs`](../../src/deflate/stream.rs), each far more bounded
+[`src/deflate/stream/selected_plan.rs`](../../src/deflate/stream/selected_plan.rs), each far more bounded
 than its Turtledeflate counterpart. Both accept only a strictly smaller
 complete plan.
 
