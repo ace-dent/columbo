@@ -43,6 +43,38 @@ fn only_a_child_owning_the_file_remainder_receives_global_grace() {
 }
 
 #[test]
+fn a_stage_keeps_its_own_grace_within_the_file_hard_stop() {
+    let fresh = SearchDeadline {
+        started: Instant::now(),
+        timeout: Duration::from_secs(10),
+    };
+    // A 2-second stage keeps the raw optimizer's 1 + 0.2 seconds, where a
+    // sibling slice of the same length gets 2/10 of the file's 2 seconds.
+    assert_eq!(
+        fresh.grace_for_stage(Duration::from_secs(2)),
+        Duration::from_millis(1_200)
+    );
+    assert_eq!(
+        fresh.grace_for_call(Duration::from_secs(2)),
+        Duration::from_millis(400)
+    );
+
+    // Eleven seconds into a 10-second file, the hard stop is 1 second away.
+    let late = SearchDeadline {
+        started: Instant::now() - Duration::from_secs(11),
+        timeout: Duration::from_secs(10),
+    };
+    assert!(late.grace_for_stage(Duration::from_millis(500)) <= Duration::from_millis(500));
+    assert_eq!(late.grace_for_stage(Duration::from_secs(1)), Duration::ZERO);
+
+    let zero = SearchDeadline {
+        started: Instant::now(),
+        timeout: Duration::ZERO,
+    };
+    assert_eq!(zero.grace_for_stage(Duration::ZERO), Duration::ZERO);
+}
+
+#[test]
 fn duration_scaling_handles_extreme_public_options() {
     let scaled = scale_duration(Duration::MAX, 0.98);
     assert!(scaled < Duration::MAX);

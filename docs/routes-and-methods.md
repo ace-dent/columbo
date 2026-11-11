@@ -8209,6 +8209,22 @@ grace: 1 second plus 10% of the timeout, or none for a zero timeout
 that grace instead, as **ZIP member scheduling** below states, so many short
 streams cannot run past the file's hard stop.
 
+One PNG Max call is a stage rather than a stream: the single-image early
+lineage's quick parent. Its refinement starts from that parent and takes the
+lineage's remaining time from the clock, so the parent's overrun shortens the
+refinement instead of adding to later streams' time, and the finish it buys is
+the refinement's starting point. The quick parent therefore keeps the raw
+optimizer's grace for its own timeout, capped at the file's hard stop
+(`SearchDeadline::grace_for_stage` in
+[`src/format/deadline.rs`](../src/format/deadline.rs)). At a 10-second timeout
+its 2-second pass keeps 1.2 seconds of grace, where the file's share would give
+it 0.4; with 0.4 seconds a large image's quick parent lost its finish, and Max
+ended up to 245 bytes larger on `IMG_8555.png`. A metadata stream's
+original-source branch keeps the file's share: its result only competes with
+the continuation, which starts from the cached floor, so a longer grace there
+would only take time from the continuation
+([audit](benchmark-miss-regression-audit.md#stage-grace-10-november)).
+
 | Wrapper route | Default policy | Max policy | Order and time |
 | --- | --- | --- | --- |
 | Raw Deflate, top-level zlib | `Complete` | `Complete` | One stream; every route family runs serially |
@@ -8291,8 +8307,9 @@ input while `--raw` keeps trailing data.
   work.
 - Max refinement: as reconstruction reaches each cached stream, in chunk order,
   an `Established` original-source branch runs with min(timeout, half the file
-  time then remaining), and then an `Established` continuation of the cached
-  floor runs with all the file time still left. Both decode against the known
+  time then remaining) and that time's share of the file's grace, and then an
+  `Established` continuation of the cached floor runs with all the file time
+  still left. Both decode against the known
   size without charging the budget again. Each result replaces the best so far
   only if it is no worse in metadata bytes and meaningful bits and better in
   one. With no file time left the cached floor is kept, so an early stream's
@@ -8345,7 +8362,8 @@ input while `--raw` keeps trailing data.
   multi-block stream would otherwise build exact Default serially before any Max
   route (M0).
 - The early lineage's quiet worker runs a complete Default-mode pass
-  (`Complete`) with 1/5 of the allowance, then refines its output through
+  (`Complete`) with 1/5 of the allowance and the raw optimizer's grace for that
+  fifth (the stage grace above), then refines its output through
   `Established` with the time left. The refinement replaces that quick parent
   only if strictly smaller (bytes, then meaningful bits); otherwise the quick
   parent is the lineage's result. The 1/5 share was chosen from measurements,

@@ -9,7 +9,7 @@ means Columbo is larger. A guard failure means only that the build did not
 reproduce an older Columbo result; its output can still be much smaller than
 DeflOpt's, Defluff's or deft4j's.
 
-The 5 November 2026 entry, the 3 November entry, the 31 October entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
+The 10 November 2026 entry, the 5 November entry, the 3 November entry, the 31 October entry, the 30 October entry, the two 29 October entries, the 27 October entry, the 26 October entry, the two of 25 October and the three of 24 October are the current state. Entries from 30 September keep
 their evidence; older ones are summarized under
 [Earlier refreshes](#earlier-refreshes), and their full text is in this file's
 Git history.
@@ -37,6 +37,102 @@ Conventions:
   floors for the latest 100 unique `(format, source)` identities; a recurring
   file is deduplicated on insertion.
 - Private machine-readable states live under `work/`, which Git ignores.
+
+<a id="stage-grace-10-november"></a>
+
+## Quick-parent grace on 10 November 2026
+
+### Starting state
+
+The reports of 10 November come from `cb4641a1…` (`bf80a75`, whose source
+`a884c1b` re-commits). Against the states of 4 and 5 November from `44db3bba…`
+(`f37b2a9`), with rows ordered by bytes, then bits:
+
+| Benchmark | Result |
+| --- | --- |
+| Defluff, 66 pairs | Byte- and bit-identical; no misses |
+| DeflOpt Default, 957 rows | 956 identical; `ctzn0g04.png` 25 bytes smaller from uncompressed text chunks (`f3c1cce`); 233.7 → 230.1 s |
+| DeflOpt Max, 957 rows | 35 smaller, 910 identical, 12 larger; net +242 bytes / +1,248 bits; no row worse than Default |
+| Timed deft4j, 1,621 rows | 61 smaller, 1,531 identical, 29 larger (one of them 4 bits smaller); net −585 bytes / −5,372 bits |
+| Reference misses | DeflOpt's four and timed deft4j's 12 strict-policy floors, the same rows with the same gaps |
+| Hundred-file guard | `wolf.png` entered with this refresh; `racingflags.png` (DeflOpt Default) left at the cap |
+
+Every larger row is a Max row, and all but four used their whole allowance.
+The timed deft4j run started 20 minutes after a reboot, and 25 of its 29 larger
+rows are in `medium/` and `oxipng/`, which ran back to back about two hours in.
+Rows were rerun on scratch copies with alternating builds, and a bisect covered
+seven builds from `f37b2a9` to `bf80a75`.
+
+### Causes
+
+- **Host state.** The new build reproduces the earlier sizes in three runs each
+  of `black817-480x360-3.5.png` (+60 bytes in the report), `filter_0_for_rgb_8.png`
+  (+43) and `wolf.png` (+25) from timed deft4j, and `file09.png` (+177) and
+  `merge.png` (+2) from DeflOpt Max; `grayscale_alpha_8_should_be_grayscale_8.png`
+  lands within 1–4 bytes.
+- **The quick parent's grace.** `7bfd336` gave every PNG call its share of the
+  file's grace. The single-image early lineage's quick parent is a Default pass
+  with 1/5 of the allowance, so at 10 seconds its grace fell from the raw
+  optimizer's 1.2 seconds to 0.4, and on large images it lost the finish that
+  its refinement starts from. In the bisect `IMG_8555.png` is 100–245 bytes
+  larger from `7bfd336` on and `FsqwhPuaIAIlojU.png` 65–75 bytes; the builds
+  before it agree.
+- **A load-dependent step.** At 10 seconds `BNDT_on_X…png` lands on one of
+  several states between 50,373 and 50,845 bytes below DeflOpt on every build,
+  depending on host load: `f3c1cce` alone gave 50,828, 50,600 and 50,415 in one
+  set of runs. `7bfd336` moves that spread down. From 12 seconds the accepted
+  build passes `f3c1cce`, and from 15 seconds every build gives 50,834.
+- **Source max beside the continuation.** `a66ce45` makes
+  `sample-bumblebee-400x300.png` 31 bytes smaller and
+  `sample-clouds2-400x300.png` 2 bytes larger at 10 seconds. The latter
+  finishes at 8.6 seconds, and at its 35-second deft4j allowance both builds
+  give the same bytes. `trucsenvrac2-fs8.png` stays 2 bytes larger, as on
+  [5 November](#source-max-beside-the-continuation-5-november).
+- **Reference misses.** Unchanged
+  [strict-policy floors](#reference-misses-30-september).
+
+### Accepted change
+
+The quick parent keeps the raw optimizer's grace for its own timeout, capped
+at the file's hard stop (`SearchDeadline::grace_for_stage`). The file's scaled
+share keeps sibling streams' overruns from adding up past the file's hard
+stop. The quick parent's overrun only shortens its own refinement, and the
+finish it buys is the refinement's starting point
+([routes and methods](routes-and-methods.md#wrapper-and-floor-policy-routing)).
+
+A first candidate also gave this grace to a metadata stream's original-source
+branch, which `7bfd336` had cut the same way. On `badsrgb.png` that undid a
+6-byte gain of `7bfd336` in both runs. That branch only competes with the
+continuation of the cached floor, so its overrun takes time from the
+continuation and buys it nothing; it keeps the file's share.
+
+| Check | Result |
+| --- | --- |
+| The 13 DeflOpt rows whose quick parent is cut at 10 seconds (Default runtime 1.5 seconds or more), two passes, against `bf80a75` | 4 smaller, none larger; net −254.5 bytes / −2,040.5 bits; CPU −0.6%. `IMG_8555.png` −106 bytes in both runs, `FsqwhPuaIAIlojU.png` −65, `BNDT…` −79, `y2rc2_large.png` −4.5 |
+| The 41 rows that grew, two passes, against `f37b2a9` | 8 smaller, 7 larger, 23 identical; net +41 bytes, all from `BNDT…`, whose runs overlap (`f37b2a9` 50,599 and 50,410 bytes below DeflOpt, this build 50,448 and 50,446); −16.5 bytes without it. `trucsenvrac2-fs8.png` and `sample-clouds2-400x300.png` +2 each |
+| The 18 DeflOpt rows with compressed metadata, two passes, against `bf80a75` | 14 identical; `file01.png`, `file02.png` and `profile_gray_disallow_color.png` 1–19 bytes smaller in one run each; `badsrgb.png` identical (6 bytes larger in both runs of the first candidate). `IMG_8555.png` ran under a host load of 5 on both builds; the next row repeats it |
+| `IMG_8555.png` on a quiet host, three passes | `f3c1cce` 14,663, 14,726 and 14,726 bytes below DeflOpt; this build 14,726, 14,663 and 14,726; `bf80a75` 14,557 in every run |
+| Hundred-file guard | 99 of 100: Psyduck stays 1 bit above, as before; `wolf.png` reaches its floor |
+| Completing Max run (`036-Clefable-0.png`) | Identical bytes; instructions within 0.2% |
+| Default, 48 PNGs (every 30th DeflOpt row and the 18 with compressed metadata) | Identical; both changed calls are Max-only |
+
+Rust tests, including the private corpus, passed in release and debug modes,
+with formatting, all-target Clippy with warnings denied and rustdoc. A new unit
+test covers the stage grace at the start of a file, near its hard stop and at
+a zero timeout. The shipped executable is unchanged at 1,024,448 bytes.
+
+### Not changed
+
+- The reference misses, all strict-policy floors.
+- `BNDT…` at 10 seconds and the host-state rows above, which more time or a
+  quiet host passes.
+- `sample-clouds2-400x300.png` and `trucsenvrac2-fs8.png`, the source-max
+  trade-off of 5 November.
+- `054-Psyduck-1.png`, the early-lineage parent choice. Its Max run completes
+  in 0.9 seconds and gives the same 1,564 bits at 10 and 60 seconds, so no
+  allowance recovers its 1,563-bit floor.
+
+Artifacts: `work/benchmark-fix-20261110/`.
 
 <a id="source-max-beside-the-continuation-5-november"></a>
 
@@ -2043,8 +2139,10 @@ Current:
   `sample_65-fs8.png` 10–15 bytes ([30 October](#kept-replacements-30-october)).
 - **Timing.** `sample_61-fs8.png` and `LevelLoading.png` reach their floors
   only with more time ([guard](#guard-9-october)), and `my-computer-on-fs8.png`
-  is time-nonmonotonic ([30 September](#more-time-and-reachability)). None gets
-  a file-specific rule. Poliwrath, listed here until 31 October, now reaches
+  is time-nonmonotonic ([30 September](#more-time-and-reachability)).
+  `BNDT_on_X…png` lands on a load-dependent state at 10 seconds and on one
+  result from 15 ([10 November](#stage-grace-10-november)). None gets a
+  file-specific rule. Poliwrath, listed here until 31 October, now reaches
   its floor through a kept candidate
   ([31 October](#kept-refinements-31-october)).
 - **Source-max replay parent.** `074-Geodude-1.png` ends better from a

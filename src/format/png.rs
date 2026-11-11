@@ -716,6 +716,9 @@ fn refine_cached_compressed_body(
     if !direct_allowance.is_zero() {
         let mut direct_options = budget.deadline.options_for_call(options);
         direct_options.timeout = direct_options.timeout.min(direct_allowance);
+        // This branch only competes with the continuation below, which starts
+        // from the cached floor, so it keeps the file's scaled share: any
+        // overrun would only take time from the continuation.
         let grace = budget.deadline.grace_for_call(direct_options.timeout);
         let mut direct = optimize_cached_compressed_parent(
             kind,
@@ -1816,12 +1819,15 @@ fn optimize_quick_image_floor_lineage(
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     floor_options.timeout = scale_duration(options.timeout, QUICK_FLOOR_SEARCH_FRACTION);
+    // The refinement starts from this quick parent and takes the rest of the
+    // lineage's time, so the parent keeps the grace its finish needs: its
+    // overrun only shortens the refinement.
     let floor = run_png_image_zlib(
         input,
         &floor_options,
         decoded_limit,
         DefaultFloor::Complete,
-        deadline.grace_for_call(floor_options.timeout),
+        deadline.grace_for_stage(floor_options.timeout),
     )?;
     refine_single_image_floor(floor, options, started, decoded_limit, deadline)
 }

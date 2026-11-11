@@ -77,6 +77,26 @@ impl SearchDeadline {
                 call_timeout.as_secs_f64() / self.timeout.as_secs_f64(),
             );
         }
+        self.hard_time_after(call_timeout, elapsed)
+    }
+
+    /// Grace period for a stage whose output the next stage of the same
+    /// lineage starts from, when that next stage takes the lineage's remaining
+    /// time from the clock.
+    ///
+    /// The scaled share of [`Self::grace_for_call`] keeps sibling streams'
+    /// overruns from adding up past the file's hard stop. A stage's overrun
+    /// shortens its own next stage instead, and the finish it buys is the next
+    /// stage's starting point, so the stage keeps the raw optimizer's grace
+    /// for its timeout, capped at the file's hard stop.
+    pub(super) fn grace_for_stage(&self, call_timeout: Duration) -> Duration {
+        crate::deflate::timeout_grace(call_timeout)
+            .min(self.hard_time_after(call_timeout, self.started.elapsed()))
+    }
+
+    /// Time from the end of a `call_timeout` starting now, `elapsed` into the
+    /// file, to the file's hard stop.
+    fn hard_time_after(&self, call_timeout: Duration, elapsed: Duration) -> Duration {
         self.timeout
             .saturating_add(crate::deflate::timeout_grace(self.timeout))
             .saturating_sub(elapsed)
