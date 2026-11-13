@@ -8,7 +8,7 @@
 //! describes a partly decoded member. The only accepted extension to RFC 1951
 //! is Defluff's length-258 alias (symbol 284 with extra value 31).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use crate::checksum::{adler32_update, crc32_update};
 use crate::{Error, Result};
@@ -19,23 +19,39 @@ use super::huffman::{
     FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS, LITERAL_LENGTH_DECODE_ROOT_BITS,
 };
 use super::model::{
-    DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, RleToken, SourceBlockType, Token,
-    CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA_BITS, LENGTH_BASE, LENGTH_EXTRA_BITS,
+    DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, PlannedBlock, RleToken, SourceBlockType,
+    Token, CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA_BITS, LENGTH_BASE, LENGTH_EXTRA_BITS,
     RFC_DISTANCE_CODE_COUNT, USABLE_DISTANCE_CODE_COUNT,
 };
 
 struct BlockPayload {
-    tokens: Vec<Token>,
-    plain: Vec<u8>,
+    tokens: Arc<Vec<Token>>,
+    plain: Arc<Vec<u8>>,
     literal_frequencies: [u32; 286],
     distance_frequencies: [u32; 30],
     dynamic: Option<DynamicPlan>,
 }
 
-/// Memory limit for the parsed model, shared with transformed-token candidates.
-/// Input size cannot bound the model: a tiny stream can hold hundreds of
-/// thousands of one-literal blocks.
-pub(crate) const MAX_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
+/// Parsed-model memory any stream may use, however small its input. It is also
+/// the limit for one transformed-token candidate.
+pub(crate) const BASE_PARSED_MODEL_BYTES: usize = 256 * 1024 * 1024;
+/// Parsed-model memory a stream may use while its block records stay within
+/// [`BLOCK_RECORD_EXPANSION_RATIO`]: 4 GiB, enough for a stream at the 1 GiB
+/// decoded limit whose tokens average five decoded bytes. A 32-bit target
+/// keeps the base limit.
+pub(crate) const MAX_PARSED_MODEL_BYTES: usize = if usize::BITS > 32 {
+    BASE_PARSED_MODEL_BYTES << 4
+} else {
+    BASE_PARSED_MODEL_BYTES
+};
+/// Block-record bytes allowed per compressed byte read, beyond the base
+/// limit. Records are the one part of the model that a small stream can
+/// inflate: decoded bytes have their own limit and a token costs at least one
+/// bit, but a one-literal fixed block charges a whole record for 18 bits. The
+/// decoded-data expansion ratio (`MAX_EXPANSION_RATIO`) is reused, so records
+/// expand no further than decoded data may; blocks that average 12 or more
+/// compressed bytes always qualify.
+const BLOCK_RECORD_EXPANSION_RATIO: usize = crate::options::MAX_EXPANSION_RATIO as usize;
 /// Empty blocks (10 bits when fixed) are dropped from the model, so this bounds
 /// parser work on a small hostile stream.
 const MAX_SOURCE_BLOCKS: usize = 262_144;
@@ -43,6 +59,39 @@ const PARSED_BLOCK_MODEL_BYTES: usize = std::mem::size_of::<ParsedBlock>() + 4 *
 const WINDOW_SIZE: usize = 32_768;
 const WINDOW_MASK: u64 = (WINDOW_SIZE - 1) as u64;
 const MAX_MATCH_LENGTH: usize = 258;
+
+/// The two parsed-model limits of one parse.
+#[derive(Clone, Copy)]
+struct ModelLimits {
+    /// Applies to every stream.
+    base: usize,
+    /// Applies while block records are proportionate to the compressed bytes.
+    scaled: usize,
+}
+
+impl ModelLimits {
+    const STREAM: Self = Self {
+        base: BASE_PARSED_MODEL_BYTES,
+        scaled: MAX_PARSED_MODEL_BYTES,
+    };
+
+    /// Model bytes left for tokens and decoded data once `block_count`
+    /// records are charged against the first `compressed_bytes` of the
+    /// stream. `None` when the records alone exceed the limit.
+    fn payload_limit(self, block_count: usize, compressed_bytes: u64) -> Option<usize> {
+        let record_bytes = block_count.checked_mul(PARSED_BLOCK_MODEL_BYTES)?;
+        let proportionate = usize::try_from(compressed_bytes)
+            .ok()
+            .and_then(|bytes| bytes.checked_mul(BLOCK_RECORD_EXPANSION_RATIO))
+            .map_or(true, |allowed| record_bytes <= allowed);
+        let limit = if proportionate {
+            self.scaled.max(self.base)
+        } else {
+            self.base
+        };
+        limit.checked_sub(record_bytes)
+    }
+}
 
 /// Expand one validated match into `scratch`. Doubling the first
 /// min(distance, length) bytes reproduces Deflate's overlapping copy.
@@ -101,8 +150,8 @@ fn fixed_payload_trees() -> (&'static Huffman, &'static Huffman) {
     (literal, distance)
 }
 
-/// Model size charged against [`MAX_PARSED_MODEL_BYTES`]; search candidates
-/// use the same formula.
+/// Model size charged against the parsed-model limits; search candidates use
+/// the same formula against [`BASE_PARSED_MODEL_BYTES`].
 pub(crate) fn parsed_model_bytes(
     decoded_bytes: usize,
     token_count: usize,
@@ -119,7 +168,8 @@ pub(crate) fn parsed_model_bytes(
 }
 
 /// Whether one stream of non-empty blocks with these totals stays within
-/// [`parse_stream`]'s model and source-block limits.
+/// [`parse_stream`]'s source-block limit and its base model limit, which
+/// holds whatever the stream's compressed size turns out to be.
 pub(crate) fn fits_parser_limits(
     decoded_bytes: u64,
     token_count: usize,
@@ -129,35 +179,53 @@ pub(crate) fn fits_parser_limits(
         && usize::try_from(decoded_bytes)
             .ok()
             .and_then(|decoded| parsed_model_bytes(decoded, token_count, block_count))
-            .is_some_and(|bytes| bytes <= MAX_PARSED_MODEL_BYTES)
+            .is_some_and(|bytes| bytes <= BASE_PARSED_MODEL_BYTES)
 }
 
 pub(crate) fn parse_stream(input: &[u8], decoded_limit: u64) -> Result<ParsedStream> {
-    parse_stream_with_model_limit(input, decoded_limit, MAX_PARSED_MODEL_BYTES)
+    parse_stream_with_model_limits(input, decoded_limit, ModelLimits::STREAM)
 }
 
-fn parse_stream_with_model_limit(
+/// [`parse_stream`] for bytes emitted from `plans`: a block that reproduces
+/// the tokens and decoded bytes of the plan starting at its decoded offset
+/// shares that plan's buffers instead of holding a copy. Validation and limits
+/// are unchanged; only where the payload is stored differs.
+pub(crate) fn parse_stream_sharing(
     input: &[u8],
     decoded_limit: u64,
-    model_limit: usize,
+    plans: &[PlannedBlock],
 ) -> Result<ParsedStream> {
-    parse_stream_with_padding(input, decoded_limit, model_limit, |_, _| Ok(()))
+    parse_stream_with_padding(input, decoded_limit, ModelLimits::STREAM, plans, |_, _| {
+        Ok(())
+    })
+}
+
+fn parse_stream_with_model_limits(
+    input: &[u8],
+    decoded_limit: u64,
+    model_limits: ModelLimits,
+) -> Result<ParsedStream> {
+    parse_stream_with_padding(input, decoded_limit, model_limits, &[], |_, _| Ok(()))
 }
 
 /// Parse and validate every block, calling `padding(start, end)` for each bit
 /// range a decoder ignores: stored-block alignment and final-byte padding.
-fn parse_stream_with_padding(
-    input: &[u8],
+fn parse_stream_with_padding<'a>(
+    input: &'a [u8],
     decoded_limit: u64,
-    model_limit: usize,
+    model_limits: ModelLimits,
+    expected_plans: &'a [PlannedBlock],
     mut padding: impl FnMut(u64, u64) -> Result<()>,
 ) -> Result<ParsedStream> {
     let mut parser = Parser {
         reader: BitReader::new(input),
+        expected_plans,
+        expected_index: 0,
+        expected_start: 0,
         window: [0; WINDOW_SIZE],
         decoded_position: 0,
         decoded_limit,
-        model_limit,
+        model_limits,
         model_payload_bytes: 0,
         current_model_payload_limit: None,
         retained_blocks: 0,
@@ -245,7 +313,8 @@ pub(crate) fn normalize_padding(input: &mut [u8], decoded_limit: u64) -> Result<
     let parsed = parse_stream_with_padding(
         input,
         decoded_limit,
-        MAX_PARSED_MODEL_BYTES,
+        ModelLimits::STREAM,
+        &[],
         |start, end| {
             if start != end {
                 let offset = (start / 8) as usize;
@@ -269,10 +338,15 @@ pub(crate) fn normalize_padding(input: &mut [u8], decoded_limit: u64) -> Result<
 
 struct Parser<'a> {
     reader: BitReader<'a>,
+    /// Plans whose buffers matching blocks share, with the index and decoded
+    /// offset of the first plan not yet passed.
+    expected_plans: &'a [PlannedBlock],
+    expected_index: usize,
+    expected_start: u64,
     window: [u8; WINDOW_SIZE],
     decoded_position: u64,
     decoded_limit: u64,
-    model_limit: usize,
+    model_limits: ModelLimits,
     model_payload_bytes: usize,
     current_model_payload_limit: Option<usize>,
     retained_blocks: usize,
@@ -281,14 +355,11 @@ struct Parser<'a> {
     max_distance: u16,
 }
 
-impl Parser<'_> {
+impl<'a> Parser<'a> {
     fn parse_block(&mut self) -> Result<(ParsedBlock, bool)> {
-        self.current_model_payload_limit = self
-            .retained_blocks
-            .checked_add(1)
-            .and_then(|blocks| blocks.checked_mul(PARSED_BLOCK_MODEL_BYTES))
-            .and_then(|block_bytes| self.model_limit.checked_sub(block_bytes));
         let start = self.reader.bit_position();
+        self.refresh_model_payload_limit();
+        let expected = self.expected_block();
         let final_block = self.reader.read(1)? != 0;
         let block_type = match self.reader.read(2)? {
             0 => SourceBlockType::Stored,
@@ -298,14 +369,14 @@ impl Parser<'_> {
         };
 
         let payload = match block_type {
-            SourceBlockType::Stored => self.parse_stored_block()?,
+            SourceBlockType::Stored => self.parse_stored_block(expected)?,
             SourceBlockType::Fixed => {
                 let (literal, distance) = fixed_payload_trees();
-                self.parse_huffman_payload(literal, distance)?
+                self.parse_huffman_payload(literal, distance, expected)?
             }
             SourceBlockType::Dynamic => {
                 let (literal, distance, plan) = self.parse_dynamic_header()?;
-                let mut payload = self.parse_huffman_payload(&literal, &distance)?;
+                let mut payload = self.parse_huffman_payload(&literal, &distance, expected)?;
                 payload.dynamic = Some(plan);
                 payload
             }
@@ -342,8 +413,8 @@ impl Parser<'_> {
 
         Ok((
             ParsedBlock {
-                tokens: tokens.into(),
-                plain: plain.into(),
+                tokens,
+                plain,
                 literal_frequencies,
                 distance_frequencies,
                 original_literal_lengths,
@@ -357,7 +428,7 @@ impl Parser<'_> {
         ))
     }
 
-    fn parse_stored_block(&mut self) -> Result<BlockPayload> {
+    fn parse_stored_block(&mut self, expected: Option<&PlannedBlock>) -> Result<BlockPayload> {
         self.reader.align_to_byte()?;
         let length = self.reader.read(16)? as u16;
         let complement = self.reader.read(16)? as u16;
@@ -365,24 +436,41 @@ impl Parser<'_> {
             return Err(Error::new("bad stored block length"));
         }
 
-        self.reserve_payload(u64::from(length), usize::from(length))?;
+        // The payload is borrowed, so it counts as read before it is charged.
         let source = self.reader.read_aligned_bytes(usize::from(length))?;
-        let mut plain = Vec::new();
-        plain
-            .try_reserve_exact(source.len())
-            .map_err(|_| model_limit_error())?;
-        plain.extend_from_slice(source);
-        let mut tokens = Vec::new();
-        tokens
-            .try_reserve_exact(plain.len())
-            .map_err(|_| model_limit_error())?;
+        self.reserve_payload(u64::from(length), usize::from(length))?;
         let mut literal_frequencies = [0_u32; 286];
-        for &byte in &plain {
-            tokens.push(Token::Literal(byte));
+        for &byte in source {
             literal_frequencies[usize::from(byte)] += 1;
         }
         literal_frequencies[256] = 1;
-        self.append_history(&plain);
+        let (tokens, plain) = match expected {
+            Some(expected)
+                if expected.plain.as_slice() == source
+                    && expected.tokens.len() == source.len()
+                    && expected
+                        .tokens
+                        .iter()
+                        .zip(source)
+                        .all(|(&token, &byte)| token == Token::Literal(byte)) =>
+            {
+                (Arc::clone(&expected.tokens), Arc::clone(&expected.plain))
+            }
+            _ => {
+                let mut plain = Vec::new();
+                plain
+                    .try_reserve_exact(source.len())
+                    .map_err(|_| model_limit_error())?;
+                plain.extend_from_slice(source);
+                let mut tokens = Vec::new();
+                tokens
+                    .try_reserve_exact(source.len())
+                    .map_err(|_| model_limit_error())?;
+                tokens.extend(source.iter().map(|&byte| Token::Literal(byte)));
+                (Arc::new(tokens), Arc::new(plain))
+            }
+        };
+        self.append_history(source);
         Ok(BlockPayload {
             tokens,
             plain,
@@ -507,9 +595,9 @@ impl Parser<'_> {
         &mut self,
         literal_tree: &Huffman,
         distance_tree: &Huffman,
+        expected: Option<&PlannedBlock>,
     ) -> Result<BlockPayload> {
-        let mut tokens = Vec::new();
-        let mut plain = Vec::new();
+        let mut buffers = PayloadBuffers::new(expected);
         let mut literal_frequencies = [0_u32; 286];
         let mut distance_frequencies = [0_u32; 30];
         // `expand_match` writes every byte it returns, so one buffer serves
@@ -522,17 +610,14 @@ impl Parser<'_> {
             if symbol > 285 {
                 return Err(Error::new("invalid literal/length code"));
             }
-            // The model limit keeps every count far below `u32::MAX`.
+            // The model limits keep every count far below `u32::MAX`.
             let count = &mut literal_frequencies[usize::from(symbol)];
             *count = count.wrapping_add(1);
             match symbol {
                 0..=255 => {
                     self.reserve_payload(1, 1)?;
-                    tokens.try_reserve(1).map_err(|_| model_limit_error())?;
-                    plain.try_reserve(1).map_err(|_| model_limit_error())?;
                     let byte = symbol as u8;
-                    tokens.push(Token::Literal(byte));
-                    plain.push(byte);
+                    buffers.push_literal(byte)?;
                     self.push_history(byte);
                 }
                 256 => break,
@@ -554,13 +639,9 @@ impl Parser<'_> {
                     }
                     self.max_distance = self.max_distance.max(distance);
                     self.reserve_payload(u64::from(length), 1)?;
-                    tokens.try_reserve(1).map_err(|_| model_limit_error())?;
-                    plain
-                        .try_reserve(usize::from(length))
-                        .map_err(|_| model_limit_error())?;
                     let count = &mut distance_frequencies[distance_index];
                     *count = count.wrapping_add(1);
-                    tokens.push(Token::Match {
+                    let token = Token::Match {
                         length,
                         distance,
                         length_symbol: symbol,
@@ -569,7 +650,7 @@ impl Parser<'_> {
                         distance_extra: decoded_distance.extra,
                         length_extra_bits: decoded.extra_bits,
                         distance_extra_bits: decoded_distance.extra_bits,
-                    });
+                    };
 
                     let expanded = expand_match(
                         &self.window,
@@ -578,13 +659,14 @@ impl Parser<'_> {
                         length,
                         &mut scratch,
                     );
-                    plain.extend_from_slice(expanded);
+                    buffers.push_match(token, expanded)?;
                     self.append_history(expanded);
                 }
                 _ => unreachable!(),
             }
         }
 
+        let (tokens, plain) = buffers.finish()?;
         Ok(BlockPayload {
             tokens,
             plain,
@@ -611,14 +693,44 @@ impl Parser<'_> {
             .model_payload_bytes
             .checked_add(added_model_bytes)
             .ok_or_else(model_limit_error)?;
-        if self
-            .current_model_payload_limit
-            .map_or(true, |limit| model_payload_bytes > limit)
-        {
-            return Err(model_limit_error());
+        let exceeds =
+            |limit: Option<usize>| limit.map_or(true, |limit| model_payload_bytes > limit);
+        if exceeds(self.current_model_payload_limit) {
+            // The current block's own bytes may now pay for its record.
+            self.refresh_model_payload_limit();
+            if exceeds(self.current_model_payload_limit) {
+                return Err(model_limit_error());
+            }
         }
         self.model_payload_bytes = model_payload_bytes;
         Ok(())
+    }
+
+    /// Set the payload limit for the current block, whose record is charged
+    /// against every compressed byte read so far, its own included. Records
+    /// stay fixed within a block while bytes read only grow, so the limit can
+    /// only rise until the next block.
+    fn refresh_model_payload_limit(&mut self) {
+        self.current_model_payload_limit = self.retained_blocks.checked_add(1).and_then(|blocks| {
+            self.model_limits
+                .payload_limit(blocks, self.reader.bit_position() / 8)
+        });
+    }
+
+    /// The expected plan that starts at the current decoded offset, if any.
+    /// Plans are walked once, in decoded order; empty plans and plans that
+    /// start before this offset are passed.
+    fn expected_block(&mut self) -> Option<&'a PlannedBlock> {
+        let plans = self.expected_plans;
+        while let Some(plan) = plans.get(self.expected_index) {
+            if self.expected_start >= self.decoded_position && !plan.plain.is_empty() {
+                break;
+            }
+            self.expected_start += plan.plain.len() as u64;
+            self.expected_index += 1;
+        }
+        let plan = plans.get(self.expected_index)?;
+        (self.expected_start == self.decoded_position).then_some(plan)
     }
 
     fn push_history(&mut self, byte: u8) {
@@ -652,6 +764,113 @@ impl Parser<'_> {
     fn update_checksums(&mut self, bytes: &[u8]) {
         self.crc32 = crc32_update(self.crc32, bytes);
         self.adler32 = adler32_update(self.adler32, bytes);
+    }
+}
+
+/// A block's token and decoded-byte buffers.
+type SharedPayload = (Arc<Vec<Token>>, Arc<Vec<u8>>);
+
+/// A Huffman block's tokens and decoded bytes. While they reproduce an
+/// expected plan's buffers they are compared rather than stored, and the block
+/// then shares those buffers. At the first difference the reproduced prefix is
+/// copied and the block continues in its own buffers.
+struct PayloadBuffers<'a> {
+    tokens: Vec<Token>,
+    plain: Vec<u8>,
+    expected: Option<&'a PlannedBlock>,
+    /// Tokens and decoded bytes of `expected` reproduced so far.
+    matched_tokens: usize,
+    matched_plain: usize,
+}
+
+impl<'a> PayloadBuffers<'a> {
+    fn new(expected: Option<&'a PlannedBlock>) -> Self {
+        Self {
+            tokens: Vec::new(),
+            plain: Vec::new(),
+            expected,
+            matched_tokens: 0,
+            matched_plain: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn push_literal(&mut self, byte: u8) -> Result<()> {
+        if let Some(expected) = self.expected {
+            if expected.tokens.get(self.matched_tokens) == Some(&Token::Literal(byte))
+                && expected.plain.get(self.matched_plain) == Some(&byte)
+            {
+                self.matched_tokens += 1;
+                self.matched_plain += 1;
+                return Ok(());
+            }
+            self.copy_reproduced()?;
+        }
+        self.tokens
+            .try_reserve(1)
+            .map_err(|_| model_limit_error())?;
+        self.plain.try_reserve(1).map_err(|_| model_limit_error())?;
+        self.tokens.push(Token::Literal(byte));
+        self.plain.push(byte);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn push_match(&mut self, token: Token, expanded: &[u8]) -> Result<()> {
+        if let Some(expected) = self.expected {
+            let plain_end = self.matched_plain + expanded.len();
+            if expected.tokens.get(self.matched_tokens) == Some(&token)
+                && expected.plain.get(self.matched_plain..plain_end) == Some(expanded)
+            {
+                self.matched_tokens += 1;
+                self.matched_plain = plain_end;
+                return Ok(());
+            }
+            self.copy_reproduced()?;
+        }
+        self.tokens
+            .try_reserve(1)
+            .map_err(|_| model_limit_error())?;
+        self.plain
+            .try_reserve(expanded.len())
+            .map_err(|_| model_limit_error())?;
+        self.tokens.push(token);
+        self.plain.extend_from_slice(expanded);
+        Ok(())
+    }
+
+    /// Stop comparing and copy the reproduced prefix into own buffers.
+    #[cold]
+    #[inline(never)]
+    fn copy_reproduced(&mut self) -> Result<()> {
+        let Some(expected) = self.expected.take() else {
+            return Ok(());
+        };
+        let tokens = &expected.tokens[..self.matched_tokens];
+        let plain = &expected.plain[..self.matched_plain];
+        self.tokens
+            .try_reserve(tokens.len())
+            .map_err(|_| model_limit_error())?;
+        self.plain
+            .try_reserve(plain.len())
+            .map_err(|_| model_limit_error())?;
+        self.tokens.extend_from_slice(tokens);
+        self.plain.extend_from_slice(plain);
+        Ok(())
+    }
+
+    /// The expected plan's buffers when the block reproduced all of them,
+    /// otherwise the block's own.
+    fn finish(mut self) -> Result<SharedPayload> {
+        if let Some(expected) = self.expected {
+            if self.matched_tokens == expected.tokens.len()
+                && self.matched_plain == expected.plain.len()
+            {
+                return Ok((Arc::clone(&expected.tokens), Arc::clone(&expected.plain)));
+            }
+            self.copy_reproduced()?;
+        }
+        Ok((Arc::new(self.tokens), Arc::new(self.plain)))
     }
 }
 

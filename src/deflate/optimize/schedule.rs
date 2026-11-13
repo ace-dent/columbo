@@ -173,7 +173,8 @@ fn optimize_stream(
     } else {
         // A known-losing child skipped its validation parse, but an outer
         // route selected its bytes, so validate them now.
-        parse_validated_rewrite(&candidate.data, decoded_limit, identity)?.max_distance
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?
+            .max_distance
     };
     debug_assert!(output_max_distance <= parsed.max_distance);
     let timed_out = default_floor != DefaultFloor::MandatoryComplete

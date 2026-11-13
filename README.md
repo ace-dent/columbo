@@ -53,7 +53,9 @@ Options that take a value also accept the `--option=value` form.
 
 ### Limits
 
-Input and decoded data are each limited to 1 GiB per file, and decoded data to 512 times the input size or 64 MiB, whichever is larger. Peak memory is typically 10–125 times the decoded size, highest with `--max`!
+- Each file may be up to 1 GiB and decode to at most 1 GiB. A file of 2 MiB or more may decode to the full 1 GiB; a smaller one is held to 512 times its size, but always at least 64 MiB, to guard against decompression bombs.
+- Each Deflate stream is held in memory as its decoded bytes plus 14 bytes per literal or match and about 6 KB per block, up to 4 GiB; beyond that Columbo reports `Deflate structure exceeds internal memory safety limit`. A large stream that compresses poorly can reach this before the 1 GiB limit: one made only of literals stops at about 270 MiB decoded. Streams split into very small blocks (under 12 compressed bytes each on average) can be held to 256 MiB, as are all streams on 32-bit systems.
+- Peak memory is typically 10–125 times the decoded size, highest with `--max`!
 
 ## Documentation
 

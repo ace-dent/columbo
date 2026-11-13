@@ -106,7 +106,7 @@ fn terminal_headers_preserve_tokens_and_price_stored_alignment() {
                 if let Some(result) = result {
                     assert_eq!((parent.data.len() - result.data.len()) as u64, bytes_saved);
                     assert_eq!(parent.bits - result.bits, 8 * bytes_saved);
-                    let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
+                    let check = parse_validated_rewrite(&result.data, 1024, identity, &[]).unwrap();
                     assert_eq!(result.output_max_distance, Some(check.max_distance));
                     assert_eq!(check.blocks.len(), parsed.blocks.len());
                     for (a, b) in check.blocks.iter().zip(&parsed.blocks) {
@@ -202,7 +202,7 @@ fn boundary_slide_runs_as_a_terminal_method_in_both_modes() {
         .unwrap()
         .expect("the z run is cheaper under the right-hand tree");
         assert!(result.is_strictly_smaller_than(&parent));
-        let check = parse_validated_rewrite(&result.data, 1 << 20, identity).unwrap();
+        let check = parse_validated_rewrite(&result.data, 1 << 20, identity, &[]).unwrap();
         assert_eq!(check.blocks.len(), 2);
         assert_eq!(check.blocks[0].plain.as_slice(), &[b'a'; 733]);
         // The moved left block is re-planned without its z code.
@@ -366,7 +366,7 @@ fn max_terminal_headers_reach_small_blocks_inside_larger_streams() {
                 }
                 let result = result.expect("Max must reach the admitted header problem");
                 assert_eq!(parent.bits - result.bits, saving);
-                let checked = parse_validated_rewrite(&result.data, limit, identity).unwrap();
+                let checked = parse_validated_rewrite(&result.data, limit, identity, &[]).unwrap();
                 assert_eq!(checked.meaningful_bits, result.bits);
                 assert_eq!(checked.blocks.len(), parsed.blocks.len());
                 for (before, after) in parsed.blocks.iter().zip(&checked.blocks) {
@@ -446,7 +446,7 @@ fn payload_tradeoff_improves_a_recorded_completed_max_parent() {
     .unwrap()
     .unwrap();
     assert_eq!((result.data.len(), result.bits), (200, 1597));
-    let checked = parse_validated_rewrite(&result.data, 1 << 20, identity).unwrap();
+    let checked = parse_validated_rewrite(&result.data, 1 << 20, identity, &[]).unwrap();
     // The cache keeps the validated parse of the smaller candidate, so the next
     // method does not reparse its bytes.
     let (bytes, kept) = cache.entry.as_ref().unwrap();
@@ -608,7 +608,7 @@ fn original_match_restoration_improves_a_completed_max_fixed_point() {
         .unwrap();
         assert_eq!(restored.bits, 1737);
         assert_eq!(restored.data.len(), 218);
-        let output = parse_validated_rewrite(&restored.data, 1 << 20, identity).unwrap();
+        let output = parse_validated_rewrite(&restored.data, 1 << 20, identity, &[]).unwrap();
         assert_eq!(restored.output_max_distance, Some(output.max_distance));
         assert!(output.max_distance <= original.max_distance);
         assert_eq!(output.blocks.len(), selected.blocks.len());
@@ -729,7 +729,7 @@ fn alphabet_boundaries_preserve_history_and_reprice_later_stored_padding() {
             .unwrap()
             .unwrap();
             assert!(result.data.len() < parent.data.len());
-            let check = parse_validated_rewrite(&result.data, 1024, identity).unwrap();
+            let check = parse_validated_rewrite(&result.data, 1024, identity, &[]).unwrap();
             assert!(check.blocks.len() > parsed.blocks.len());
             assert_eq!(
                 check.blocks.last().unwrap().source_type,
@@ -850,7 +850,7 @@ fn header_tree_search_preserves_payload_and_stored_alignment() {
             .unwrap();
             let selected = result.as_ref().unwrap_or(&parent);
             gains += usize::from(result.is_some());
-            let check = parse_validated_rewrite(&selected.data, 4096, identity).unwrap();
+            let check = parse_validated_rewrite(&selected.data, 4096, identity, &[]).unwrap();
             assert_eq!(check.blocks.len(), parsed.blocks.len());
             assert_eq!(check.max_distance, parsed.max_distance);
             assert_eq!(selected.output_max_distance, Some(parsed.max_distance));
@@ -952,7 +952,7 @@ fn code_length_rotations_preserve_tokens_and_stored_alignment() {
             .unwrap();
             let selected = result.as_ref().unwrap_or(&parent);
             gains += usize::from(result.is_some());
-            let check = parse_validated_rewrite(&selected.data, 4096, identity).unwrap();
+            let check = parse_validated_rewrite(&selected.data, 4096, identity, &[]).unwrap();
             assert_eq!(check.blocks.len(), parsed.blocks.len());
             assert_eq!(check.max_distance, parsed.max_distance);
             assert_eq!(selected.output_max_distance, Some(parsed.max_distance));
@@ -1067,7 +1067,7 @@ fn coupled_swaps_preserve_tokens_histograms_and_stored_alignment() {
             .unwrap();
             let selected = result.as_ref().unwrap_or(&parent);
             gains += usize::from(result.is_some());
-            let check = parse_validated_rewrite(&selected.data, 16384, identity).unwrap();
+            let check = parse_validated_rewrite(&selected.data, 16384, identity, &[]).unwrap();
             assert_eq!(check.blocks.len(), parsed.blocks.len());
             assert_eq!(check.max_distance, parsed.max_distance);
             assert_eq!(selected.output_max_distance, Some(parsed.max_distance));
@@ -1247,7 +1247,7 @@ fn terminal_max_closure_revisits_methods_after_a_later_tree_or_split_win() {
         closed.bits
     );
     assert!(closed.is_strictly_smaller_than(&parent));
-    let check = parse_validated_rewrite(&closed.data, 16384, identity).unwrap();
+    let check = parse_validated_rewrite(&closed.data, 16384, identity, &[]).unwrap();
     assert_eq!(closed.bits, check.meaningful_bits);
     assert_eq!(closed.output_max_distance, Some(check.max_distance));
     assert!(check
@@ -1391,7 +1391,8 @@ fn tree_response_searches_keep_history_and_stored_alignment_at_every_bit_offset(
                 if let Some(candidate) = result {
                     wins += 1;
                     assert!(candidate.is_strictly_smaller_than(&parent));
-                    let check = parse_validated_rewrite(&candidate.data, 1024, identity).unwrap();
+                    let check =
+                        parse_validated_rewrite(&candidate.data, 1024, identity, &[]).unwrap();
                     assert_eq!(check.blocks.len(), 3);
                     assert_eq!(check.blocks[2].plain, stored.plain);
                     assert_proven_rewrite(&parsed.blocks[1], &check.blocks[1].tokens);
@@ -1428,17 +1429,20 @@ fn terminal_parse_cache_reuses_only_identical_validated_bytes() {
     let stored = [0x01, 0x00, 0x00, 0xff, 0xff];
     let mut cache = TerminalParseCache::default();
 
-    let first = &*cache.parse(&fixed, 1, empty).unwrap() as *const ParsedStream;
-    let again = &*cache.parse(&fixed, 1, empty).unwrap() as *const ParsedStream;
+    let first = &*cache.parse(&fixed, 1, empty, &[]).unwrap() as *const ParsedStream;
+    let again = &*cache.parse(&fixed, 1, empty, &[]).unwrap() as *const ParsedStream;
     assert_eq!(first, again);
 
     assert_eq!(
-        cache.parse(&stored, 1, empty).unwrap().consumed,
+        cache.parse(&stored, 1, empty, &[]).unwrap().consumed,
         stored.len()
     );
-    assert_eq!(cache.parse(&fixed, 1, empty).unwrap().consumed, fixed.len());
+    assert_eq!(
+        cache.parse(&fixed, 1, empty, &[]).unwrap().consumed,
+        fixed.len()
+    );
 
     // Invalid bytes are still rejected, and leave no stale entry behind.
-    assert!(cache.parse(&[0x03, 0x00, 0x00], 1, empty).is_err());
+    assert!(cache.parse(&[0x03, 0x00, 0x00], 1, empty, &[]).is_err());
     assert!(cache.entry.is_none());
 }

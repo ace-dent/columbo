@@ -279,7 +279,8 @@ pub(super) fn build_deft4j_seed_candidate(
     identity: StreamIdentity,
     expired: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     if !deft4j_source_route_eligible(&stream.blocks) {
         return Ok(None);
     }
@@ -307,7 +308,8 @@ pub(super) fn refine_with_default_planner_and_change(
     identity: StreamIdentity,
     expired: &mut SearchStop<'_>,
 ) -> Result<(Candidate, bool)> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
@@ -325,7 +327,8 @@ pub(super) fn refine_with_no_split_route(
     route_stop: &mut SearchStop<'_>,
     refinement_stop: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     if !narrow_source_route_eligible(&stream.blocks, candidate.data.len()) {
         return Ok(None);
     }
@@ -362,7 +365,8 @@ pub(super) fn refine_with_max_planner(
     identity: StreamIdentity,
     expired: &mut SearchStop<'_>,
 ) -> Result<Candidate> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     build_candidate(source, options, MAX_RAW_REPLAY_LIMIT, expired)
         .map(|candidate| candidate.named("Columbo max refinement"))
@@ -381,7 +385,8 @@ pub(super) fn refine_with_terminal_merge(
     if expired.reached() {
         return Ok(None);
     }
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     let mut floor_options = options.clone();
     floor_options.exhaustive = false;
     let Some(plans) = plan_terminal_merge_route(&stream.blocks, 0, &floor_options, expired) else {

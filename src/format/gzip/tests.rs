@@ -486,8 +486,9 @@ fn one_literal_blocks(count: usize) -> Vec<u8> {
 #[test]
 fn strip_splits_a_merge_where_the_joined_stream_would_exceed_the_parser_limits() {
     // A zero timeout keeps each relaxed member's source stream of 16,000
-    // blocks. Together the five members exceed the parser's model limit, so
-    // they merge into several members, each a stream Columbo can parse again.
+    // blocks. Together the five members exceed the parser's base model limit,
+    // so they merge into several members, each a stream Columbo can parse
+    // again.
     const BLOCKS: usize = 16_000;
     let decoded = vec![b'a'; BLOCKS];
     let raw = one_literal_blocks(BLOCKS);

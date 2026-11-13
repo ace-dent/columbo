@@ -93,8 +93,10 @@ impl<'a> StreamJoiner<'a> {
     }
 
     /// Whether `part` can join while the joined stream stays within the
-    /// parser's model and block limits, so that Columbo can check it and parse
-    /// it again. A part alone always fits, since it was parsed under them.
+    /// parser's base model limit and block limit, so that Columbo can check it
+    /// and parse it again whatever its compressed size. A part that exceeds
+    /// the base limit was admitted under the scaled limit; it forms a run of
+    /// one and keeps its own stream.
     pub(crate) fn fits(&self, part: &JoinPart<'_>) -> bool {
         let (tokens, blocks) = part.counts();
         match (

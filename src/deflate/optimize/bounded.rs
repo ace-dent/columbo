@@ -722,9 +722,15 @@ fn continue_bounded_floor_lineage(
         return Ok((floor, None));
     }
 
-    // Release the floor's plans before parsing it.
+    // The parse shares the floor's plan buffers it reproduces; release the
+    // plans themselves once it is made.
+    let stream = parse_validated_rewrite(
+        &floor.data,
+        source.decoded_limit,
+        source.identity,
+        &floor.plans,
+    )?;
     floor.plans.clear();
-    let stream = parse_validated_rewrite(&floor.data, source.decoded_limit, source.identity)?;
     let rewritten = rewritten_input(&floor, &stream, source.decoded_limit, source.identity);
     let mut descendant = None;
 

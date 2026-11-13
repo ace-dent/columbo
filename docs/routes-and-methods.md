@@ -650,11 +650,16 @@ parse:
   64 MiB). The ratio defaults to 512, and `None` disables the ratio limit. It is
   applied once per input, so container members share one allowance
   ([`src/format/mod.rs`](../src/format/mod.rs)).
-- The parsed model is at most 256 MiB, charged as tokens × token size + decoded
-  bytes + blocks × (block size + 4 KiB), and at most 262,144 source blocks,
-  empty blocks included. These two limits are not configurable: a tiny stream
-  can hold hundreds of thousands of one-literal blocks, so input size cannot
-  bound the model.
+- The parsed model is charged as tokens × token size + decoded bytes + blocks ×
+  (block size + 4 KiB). Any stream may use 256 MiB of it, and a stream may use
+  up to 4 GiB while its block records (the last term) take at most 512 bytes
+  for each compressed byte read so far, the current block's included, the
+  ratio that also limits decoded data. A stream holds at most 262,144 source blocks, empty blocks included.
+  These limits are not configurable. Block records are the part of the model
+  that a small stream can inflate: a one-literal fixed block charges a whole
+  record for 18 bits, whereas decoded bytes have their own limit and a token
+  costs at least one bit. Only a stream whose blocks average under 12
+  compressed bytes is held to 256 MiB, as is every stream on a 32-bit target.
 - Model and output buffers are reserved fallibly, so an allocation failure
   becomes an error rather than an abort.
 
@@ -678,6 +683,15 @@ Comparisons use the emitter's exact bit count; the reparse only proves identity.
 The validated parse is kept, because it supplies the output's largest distance,
 which the zlib wrapper uses for its window field, and the model that the next
 replay or terminal method starts from.
+
+The reparse is given the plans that emitted the bytes. A block that starts
+where a plan starts is compared with that plan's tokens and decoded bytes as it
+is decoded, instead of being copied; if it reproduces them all, it shares the
+plan's buffers, and at the first difference it copies the matched prefix and
+continues on its own. Decoding, checksums and limits are unchanged, so a
+candidate and its validated parse hold one copy of each unchanged block rather
+than two ([`src/deflate/parse.rs`](../src/deflate/parse.rs)
+`parse_stream_sharing`).
 
 A verbatim copy refers to bit ranges of the bytes its model was parsed from.
 After an accepted replay, those references point into the wrong bytes, so
@@ -7170,7 +7184,7 @@ bits into its last byte loses its 5 padding bits at the join, besides 18 bytes o
 wrapper.
 
 A run of members grows while its joined stream stays within the parser's
-single-stream limits (a 256 MiB model and 262,144 source blocks), so that
+single-stream limits (the 256 MiB base model and 262,144 source blocks), so that
 Columbo can check the stream and parse it again. Greedy runs from the first
 member leave the fewest members, and a run of one keeps its own stream. Joining
 needs no search time and runs after the deadline too.
@@ -9474,7 +9488,7 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
 - **Eligible:** at least 2 nonempty source blocks of any type, or exactly one
   nonempty block that is fixed or dynamic. An all-empty stream and a lone
   nonempty stored block are rejected, since the graph has nothing to improve.
-- **Bounds:** one 128 MiB route arena, half the 256 MiB parsed-model limit; no
+- **Bounds:** one 128 MiB route arena, half the 256 MiB base model limit; no
   size or block-count cap.
 - **Effect:** adds the direct deft4j-derived candidate, emitted with no replay.
   Under the bounded policies M10a (when it runs) and M10b refine it, M10c may

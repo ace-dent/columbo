@@ -148,7 +148,8 @@ pub(super) fn refine_with_compact_balanced_tree_floor(
     decoded_limit: u64,
     identity: StreamIdentity,
 ) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     let [block] = stream.blocks.as_slice() else {
         return Ok(None);
     };
@@ -230,7 +231,8 @@ pub(super) fn refine_with_bounded_depth_tree_floor(
     identity: StreamIdentity,
     expired: &mut SearchStop<'_>,
 ) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     if stream.blocks.is_empty() {
         return Ok(None);
     }
@@ -302,7 +304,8 @@ fn refine_with_bounded_depth_tree_rescue(
     {
         return Ok(None);
     }
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     if stream.blocks.len() > NARROW_SOURCE_LIST_MAX_BLOCKS {
         return Ok(None);
     }
@@ -387,7 +390,8 @@ pub(super) fn refine_with_compact_payload_tree_floor(
     decoded_limit: u64,
     identity: StreamIdentity,
 ) -> Result<(bool, Option<Candidate>)> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     if stream.blocks.is_empty()
         || stream.blocks.len() > RLE_SMOOTHED_TREE_FLOOR_MAX_BLOCKS
         || stream

@@ -121,9 +121,9 @@ impl Optimization {
 ///
 /// The output is never larger than the input, except in strict mode when it
 /// must complete an incomplete dynamic Huffman code or rewrite the
-/// non-standard symbol-284 spelling of length 258. Highly fragmented streams
-/// can exceed an internal memory budget for the parsed model before reaching
-/// the configurable byte limits.
+/// non-standard symbol-284 spelling of length 258. Highly fragmented streams,
+/// and very large streams of short tokens, can exceed an internal memory
+/// budget for the parsed model before reaching the configurable byte limits.
 pub fn optimize(input: &[u8], format: Format, options: &Options) -> Result<Optimization> {
     let result = format::optimize(input, format, options);
     deflate::release_thread_header_plans();

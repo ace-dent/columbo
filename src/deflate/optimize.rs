@@ -24,9 +24,10 @@ use super::block::emit_block;
 use super::model::{
     ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
 };
-use super::parse::parse_stream;
+use super::parse::{parse_stream, parse_stream_sharing};
 use super::search::{
-    plan_block_with_integrated_proven_search, rewrite_258_symbols, PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
+    normalize_258_symbols, plan_block_with_integrated_proven_search,
+    PROVEN_SUBMATCH_FULL_MATCH_LIMIT,
 };
 use super::stop::{timeout_grace, Deadline, RouteWindow, SearchStop};
 use super::stream::{
@@ -341,7 +342,7 @@ fn normalize_258_aliases(blocks: &mut [ParsedBlock]) -> Result<usize> {
         }
 
         normalized_blocks += 1;
-        let tokens = rewrite_258_symbols(&block.tokens, block.plain.len(), false)
+        let tokens = normalize_258_symbols(&block.tokens)
             .ok_or_else(|| Error::allocation("strict Deflate token normalization"))?;
         block.tokens = tokens.into();
         block.recount_frequencies();
@@ -710,9 +711,12 @@ fn build_candidate_with_proven_policy(
         // use the parse of these exact bytes that validated them, or make one.
         let replayed = match validated {
             Some(validated) => validated,
-            None => {
-                parse_validated_rewrite(&candidate.data, source.decoded_limit, source.identity)?
-            }
+            None => parse_validated_rewrite(
+                &candidate.data,
+                source.decoded_limit,
+                source.identity,
+                &candidate.plans,
+            )?,
         };
         let proven_source =
             rewritten_input(&candidate, &replayed, source.decoded_limit, source.identity);
@@ -881,7 +885,8 @@ fn build_candidate_and_parse(
             progress.replay_started(round, replay_limit, plans.len(), bits);
             Instant::now()
         });
-        let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
+        let replayed =
+            parse_validated_rewrite(&data, source.decoded_limit, source.identity, &plans)?;
         output_max_distance = Some(replayed.max_distance);
 
         let replay_plans = match replay_planner {
@@ -988,7 +993,8 @@ fn build_candidate_and_parse(
     // The loop may stop right after an accepted replay. A known-losing relaxed
     // stream is skipped, since the caller keeps the validated source bytes.
     if (!initial_loses || options.strict) && validated.is_none() {
-        let replayed = parse_validated_rewrite(&data, source.decoded_limit, source.identity)?;
+        let replayed =
+            parse_validated_rewrite(&data, source.decoded_limit, source.identity, &plans)?;
         output_max_distance = Some(replayed.max_distance);
         validated = Some(replayed);
     }
@@ -1035,10 +1041,13 @@ fn source_candidate(source: CandidateInput<'_>, options: &Options) -> Result<Can
 }
 
 /// Parse a generated stream and fail closed if it changed the decoded data.
+/// `plans` are the plans that emitted `data`, if known: blocks that reproduce
+/// them share their buffers.
 fn parse_validated_rewrite(
     data: &[u8],
     decoded_limit: u64,
     identity: StreamIdentity,
+    plans: &[PlannedBlock],
 ) -> Result<ParsedStream> {
     let kept = KEPT_VALIDATED_PARSE
         .try_with(|kept| {
@@ -1056,7 +1065,7 @@ fn parse_validated_rewrite(
     }
     // Release a stale model before building its replacement.
     release_kept_validated_parse();
-    let stream = parse_stream(data, decoded_limit)?;
+    let stream = parse_stream_sharing(data, decoded_limit, plans)?;
     validate_replayed_stream(&stream, data.len(), identity)?;
     let _ = KEPT_VALIDATED_PARSE.try_with(|kept| {
         let Ok(mut kept) = kept.try_borrow_mut() else {

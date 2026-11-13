@@ -179,9 +179,9 @@ fn a_kept_validated_parse_is_the_parse_it_replaces() {
     };
 
     release_kept_validated_parse();
-    let first = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    let first = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity, &[]).unwrap();
     // The second parse is the kept one, sharing the first's buffers.
-    let kept = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    let kept = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity, &[]).unwrap();
     same(&first, &fresh);
     same(&kept, &fresh);
     assert!(Arc::ptr_eq(&first.blocks[0].tokens, &kept.blocks[0].tokens));
@@ -192,16 +192,16 @@ fn a_kept_validated_parse_is_the_parse_it_replaces() {
         crc32: identity.crc32 ^ 1,
         ..identity
     };
-    assert!(parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, changed).is_err());
+    assert!(parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, changed, &[]).is_err());
     let short = fresh.decoded_size - 1;
     assert_eq!(
-        parse_validated_rewrite(FEEDBACK_RAW, short, identity)
+        parse_validated_rewrite(FEEDBACK_RAW, short, identity, &[])
             .unwrap_err()
             .message(),
         parse_stream(FEEDBACK_RAW, short).unwrap_err().message()
     );
     release_kept_validated_parse();
-    let after = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity).unwrap();
+    let after = parse_validated_rewrite(FEEDBACK_RAW, 1 << 20, identity, &[]).unwrap();
     same(&after, &fresh);
     assert!(!Arc::ptr_eq(
         &after.blocks[0].tokens,
@@ -352,7 +352,7 @@ fn smoothed_tree_finish_follows_the_terminal_searches() {
     assert!(compact.is_none());
     // R15 may then split blocks of a whole sweep.
     let smoothed_blocks = |candidate: &Candidate, strict: bool, cut: bool| {
-        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity, &[]).unwrap();
         assert_eq!(candidate.bits, reparsed.meaningful_bits);
         if cut {
             assert!(reparsed.blocks.len() >= 9);
@@ -508,7 +508,7 @@ fn terminal_merges_follow_the_settled_finish() {
         replaced_parents: Vec::new(),
     };
     let merged_blocks = |candidate: &Candidate| {
-        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        let reparsed = parse_validated_rewrite(&candidate.data, 1 << 20, identity, &[]).unwrap();
         assert_eq!(candidate.bits, reparsed.meaningful_bits);
         assert!(candidate.bits < parent.bits);
         reparsed.blocks.len()
@@ -1355,7 +1355,7 @@ fn source_max_replays_keep_each_replaced_parent() {
         }
         assert!(candidate.is_strictly_smaller_than(parents.last().unwrap()));
         for parent in parents {
-            let reparsed = parse_validated_rewrite(&parent.data, 86, source.identity).unwrap();
+            let reparsed = parse_validated_rewrite(&parent.data, 86, source.identity, &[]).unwrap();
             assert_eq!(parent.bits, reparsed.meaningful_bits);
             assert_eq!(parent.output_max_distance, Some(reparsed.max_distance));
         }
@@ -1998,12 +1998,12 @@ fn replay_validation_is_enforced_in_release_builds() {
         adler32: 1,
     };
     assert!(validate_replayed_stream(&parsed, 2, empty).is_ok());
-    assert!(parse_validated_rewrite(&[0x03, 0x00], 1, empty).is_ok());
+    assert!(parse_validated_rewrite(&[0x03, 0x00], 1, empty, &[]).is_ok());
 
     // A complete stream followed by another byte is not a valid rewrite
     // of the exact candidate byte range.
     assert_eq!(
-        parse_validated_rewrite(&[0x03, 0x00, 0x00], 1, empty)
+        parse_validated_rewrite(&[0x03, 0x00, 0x00], 1, empty, &[])
             .unwrap_err()
             .message(),
         "internal error: rewritten Deflate stream changed decoded data"
@@ -2188,7 +2188,7 @@ fn default_sweep_finishes_with_the_distance_ladder() {
         },
     );
     let only_distance_four = |candidate: &Candidate| {
-        let check = parse_validated_rewrite(&candidate.data, 1 << 20, identity).unwrap();
+        let check = parse_validated_rewrite(&candidate.data, 1 << 20, identity, &[]).unwrap();
         assert_eq!(candidate.bits, check.meaningful_bits);
         assert!(check
             .blocks

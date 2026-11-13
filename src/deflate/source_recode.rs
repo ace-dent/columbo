@@ -29,14 +29,14 @@ use super::model::{
     count_frequencies, same_tokens, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock,
     Representation, SourceBlockType, Token,
 };
-use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
+use super::parse::{parsed_model_bytes, BASE_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
 
 type StateId = usize;
 
 /// One memory limit for all of this route's own allocations (states and merged
 /// blocks), so many blocks cannot multiply memory use.
-const MAX_SOURCE_ROUTE_BYTES: usize = MAX_PARSED_MODEL_BYTES / 2;
+const MAX_SOURCE_ROUTE_BYTES: usize = BASE_PARSED_MODEL_BYTES / 2;
 const MAX_SOURCE_ARENA_BYTES: usize = MAX_SOURCE_ROUTE_BYTES;
 const SOURCE_STATE_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -869,7 +869,7 @@ fn expand_marked(
     let output_bytes = token_payload_bytes(output_count)?;
     if output_bytes > max_token_payload_bytes
         || decoded_count != plain.len()
-        || parsed_model_bytes(plain.len(), output_count, 1)? > MAX_PARSED_MODEL_BYTES
+        || parsed_model_bytes(plain.len(), output_count, 1)? > BASE_PARSED_MODEL_BYTES
     {
         return None;
     }
@@ -1794,7 +1794,7 @@ fn merge_blocks(
         ))?;
     let token_payload_bytes = token_payload_bytes(token_count)?;
     let model_bytes = parsed_model_bytes(plain_count, token_count, 1)?;
-    if model_bytes > MAX_PARSED_MODEL_BYTES {
+    if model_bytes > BASE_PARSED_MODEL_BYTES {
         return None;
     }
     let split_bytes = split_count.checked_mul(size_of::<usize>())?;

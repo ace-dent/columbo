@@ -27,7 +27,7 @@ use super::model::{
     canonical_length_encoding, count_frequencies, same_tokens, try_clone_slice, ParsedBlock,
     PlannedBlock, Representation, Token,
 };
-use super::parse::{parsed_model_bytes, MAX_PARSED_MODEL_BYTES};
+use super::parse::{parsed_model_bytes, BASE_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
 
 mod deft4j_prune;
@@ -62,7 +62,7 @@ pub(crate) use terminal::{
 
 /// Byte limit for one temporary token candidate: expanding one match can
 /// produce up to 258 literal tokens.
-const MAX_TOKEN_CANDIDATE_BYTES: usize = MAX_PARSED_MODEL_BYTES;
+const MAX_TOKEN_CANDIDATE_BYTES: usize = BASE_PARSED_MODEL_BYTES;
 const MANDATORY_FLOOR_MAX_TOKENS: usize = 50_000;
 const MANDATORY_FLOOR_MAX_PLAIN: usize = 10_000_000;
 const SHORT_FAMILY_MAX_TOKENS: usize = 250_000;
@@ -1429,39 +1429,53 @@ impl LiteralByteCosts {
     }
 }
 
+/// Respell every length-258 match with Defluff's alias (symbol 284) or with
+/// symbol 285, as an optional candidate within the candidate limit.
 pub(crate) fn rewrite_258_symbols(
     tokens: &[Token],
     decoded_bytes: usize,
     use_alias: bool,
 ) -> Option<Vec<Token>> {
     let mut rewritten = new_token_candidate(tokens.len(), decoded_bytes)?;
-    for token in tokens.iter().copied() {
-        rewritten.push(match token {
+    rewritten.extend(tokens.iter().map(|&token| spell_258(token, use_alias)));
+    Some(rewritten)
+}
+
+/// Strict mode's mandatory respelling of every alias as symbol 285. The copy
+/// is exactly as large as the source block the parser admitted, which may
+/// exceed the limit for optional candidates, so only allocation can fail.
+pub(crate) fn normalize_258_symbols(tokens: &[Token]) -> Option<Vec<Token>> {
+    let mut normalized = Vec::new();
+    normalized.try_reserve_exact(tokens.len()).ok()?;
+    normalized.extend(tokens.iter().map(|&token| spell_258(token, false)));
+    Some(normalized)
+}
+
+fn spell_258(token: Token, use_alias: bool) -> Token {
+    match token {
+        Token::Match {
+            length: 258,
+            distance,
+            length_symbol,
+            distance_symbol,
+            length_extra: _,
+            distance_extra,
+            length_extra_bits: _,
+            distance_extra_bits,
+        } if (use_alias && length_symbol == 285) || (!use_alias && length_symbol == 284) => {
             Token::Match {
                 length: 258,
                 distance,
-                length_symbol,
+                length_symbol: if use_alias { 284 } else { 285 },
                 distance_symbol,
-                length_extra: _,
+                length_extra: if use_alias { 31 } else { 0 },
                 distance_extra,
-                length_extra_bits: _,
+                length_extra_bits: if use_alias { 5 } else { 0 },
                 distance_extra_bits,
-            } if (use_alias && length_symbol == 285) || (!use_alias && length_symbol == 284) => {
-                Token::Match {
-                    length: 258,
-                    distance,
-                    length_symbol: if use_alias { 284 } else { 285 },
-                    distance_symbol,
-                    length_extra: if use_alias { 31 } else { 0 },
-                    distance_extra,
-                    length_extra_bits: if use_alias { 5 } else { 0 },
-                    distance_extra_bits,
-                }
             }
-            _ => token,
-        });
+        }
+        _ => token,
     }
-    Some(rewritten)
 }
 
 fn individual_prune_search(

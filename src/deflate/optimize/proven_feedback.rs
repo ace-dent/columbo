@@ -31,7 +31,8 @@ pub(super) fn refine_with_compact_proven_feedback(
     decoded_limit: u64,
     identity: StreamIdentity,
 ) -> Result<Option<Candidate>> {
-    let stream = parse_validated_rewrite(&candidate.data, decoded_limit, identity)?;
+    let stream =
+        parse_validated_rewrite(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     let source = rewritten_input(candidate, &stream, decoded_limit, identity);
     let mut never_expires = SearchStop::never();
     build_compact_proven_feedback_candidate(source, options, &mut never_expires)

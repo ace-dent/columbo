@@ -62,7 +62,7 @@ fn prepare_compact_source_split_seed_with_limits(
     data.try_reserve_exact(candidate.data.len())
         .map_err(|_| Error::allocation("compact route seed"))?;
     data.extend_from_slice(&candidate.data);
-    let stream = parse_validated_rewrite(&data, decoded_limit, identity)?;
+    let stream = parse_validated_rewrite(&data, decoded_limit, identity, &candidate.plans)?;
     if !compact_source_split_floor_eligible_with_limits(
         identity.decoded_size,
         &stream.blocks,

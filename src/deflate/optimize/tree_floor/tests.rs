@@ -49,7 +49,7 @@ fn smoothed_tree_floor_rebuilds_multiple_huffman_blocks_exactly() {
             .unwrap();
 
     assert!(refined.bits < candidate.bits);
-    let reparsed = parse_validated_rewrite(&refined.data, 1 << 20, identity).unwrap();
+    let reparsed = parse_validated_rewrite(&refined.data, 1 << 20, identity, &[]).unwrap();
     assert_eq!(reparsed.blocks.len(), 2);
     assert!(reparsed
         .blocks

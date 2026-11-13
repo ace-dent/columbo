@@ -97,8 +97,12 @@ fn refine_with_original_match_restoration(
     if stop.reached() {
         return Ok(None);
     }
-    let selected =
-        parse_validated_rewrite(&candidate.data, original.decoded_limit, original.identity)?;
+    let selected = parse_validated_rewrite(
+        &candidate.data,
+        original.decoded_limit,
+        original.identity,
+        &candidate.plans,
+    )?;
     // Parsing drops redundant empty blocks; this pass needs the parent's exact
     // block layout.
     if selected.source_block_count != selected.blocks.len() {
@@ -818,6 +822,7 @@ impl TerminalParseCache {
         data: &[u8],
         decoded_limit: u64,
         identity: StreamIdentity,
+        plans: &[PlannedBlock],
     ) -> Result<TerminalParse<'_>> {
         let hit = matches!(&self.entry, Some((bytes, _)) if bytes.as_slice() == data);
         if hit {
@@ -826,7 +831,7 @@ impl TerminalParseCache {
         }
         // Release a stale model before building its replacement.
         self.entry = None;
-        let stream = parse_validated_rewrite(data, decoded_limit, identity)?;
+        let stream = parse_validated_rewrite(data, decoded_limit, identity, plans)?;
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(data.len()).is_err() {
             return Ok(TerminalParse::Owned(stream));
@@ -918,7 +923,7 @@ pub(super) fn refine_with_terminal_header_search_cached(
     {
         return Ok(None);
     }
-    let selected = parse_cache.parse(&candidate.data, decoded_limit, identity)?;
+    let selected = parse_cache.parse(&candidate.data, decoded_limit, identity, &candidate.plans)?;
     // Parsing drops redundant empty blocks; these methods need the exact
     // layout.
     if selected.source_block_count != selected.blocks.len()

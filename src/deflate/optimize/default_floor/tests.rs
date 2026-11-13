@@ -74,7 +74,7 @@ fn strict_completion_competes_only_after_max_searches_its_parent() {
     let competitor = floors.slid.expect("R1b wins on this block");
     assert_eq!(competitor.data, ordinary.data);
     assert_eq!(competitor.bits, ordinary.info.deflate_bits);
-    let completed = parse_validated_rewrite(&competitor.data, 1024, source.identity).unwrap();
+    let completed = parse_validated_rewrite(&competitor.data, 1024, source.identity, &[]).unwrap();
     assert_ne!(
         &completed.blocks[0]
             .original_dynamic
@@ -84,7 +84,8 @@ fn strict_completion_competes_only_after_max_searches_its_parent() {
         &[1, 1]
     );
     // Max's parent is searched without it and keeps the planned completion.
-    let parent = parse_validated_rewrite(&floors.complete.data, 1024, source.identity).unwrap();
+    let parent =
+        parse_validated_rewrite(&floors.complete.data, 1024, source.identity, &[]).unwrap();
     assert_eq!(
         &parent.blocks[0]
             .original_dynamic
