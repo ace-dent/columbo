@@ -52,6 +52,7 @@ fn verbose_mode_prints_the_detailed_start_summary() {
         bytes: 1_000,
         bits_saved: 192,
         removed_data_bytes: 0,
+        replaces: true,
     };
     print_detailed_result(
         &mut result,
@@ -86,6 +87,7 @@ fn default_result_prefixes_the_quoted_input_filename() {
         bytes: 90,
         bits_saved: 80,
         removed_data_bytes: 0,
+        replaces: true,
     };
     print_default_result(
         &mut result,
@@ -114,6 +116,7 @@ fn default_result_describes_equal_sized_wrapper_normalization() {
         bytes: 100,
         bits_saved: 0,
         removed_data_bytes: 0,
+        replaces: true,
     };
     print_default_result(
         &mut result,
@@ -130,6 +133,85 @@ fn default_result_describes_equal_sized_wrapper_normalization() {
 }
 
 #[test]
+fn a_rejected_candidate_is_reported_at_the_input_size() {
+    // Strict output can be larger than a source that uses codes strict mode
+    // must complete. The input is then kept, and is the result.
+    let input = InputReport {
+        path: Path::new("input.zip"),
+        index: 0,
+        count: 1,
+        bytes: 100,
+    };
+    let default_line = |action: &OutputAction, bytes: usize| {
+        let optimized = OptimizationReport {
+            bytes,
+            bits_saved: 0,
+            removed_data_bytes: 0,
+            replaces: false,
+        };
+        let mut result = Vec::new();
+        print_default_result(&mut result, &input, action, &optimized).unwrap();
+        String::from_utf8(result).unwrap()
+    };
+
+    assert_eq!(
+        default_line(&OutputAction::DryRun, 104),
+        "\"input.zip\" 100 -> 100 bytes \
+         (dry run; no savings; strict output is 4 bytes larger; no output written)\n"
+    );
+    assert_eq!(
+        default_line(&OutputAction::DryRun, 100),
+        "\"input.zip\" 100 -> 100 bytes (dry run; no savings; no output written)\n"
+    );
+    assert_eq!(
+        default_line(&OutputAction::Preserved(PathBuf::from("input.zip")), 101),
+        "\"input.zip\" 100 -> 100 bytes \
+         (no savings; strict output is 1 byte larger; left \"input.zip\" unchanged)\n"
+    );
+    assert_eq!(
+        default_line(&OutputAction::CopiedOriginal(PathBuf::from("out.zip")), 104),
+        "\"input.zip\" 100 -> 100 bytes \
+         (no savings; strict output is 4 bytes larger; copied original to \"out.zip\")\n"
+    );
+    assert_eq!(
+        default_line(&OutputAction::Preserved(PathBuf::from("input.zip")), 100),
+        "\"input.zip\" 100 -> 100 bytes (no savings; left \"input.zip\" unchanged)\n"
+    );
+
+    let timings = ExecutionTimings {
+        read: Duration::ZERO,
+        optimize: Duration::ZERO,
+        write: Duration::ZERO,
+        total: Duration::ZERO,
+    };
+    for (bytes, size) in [
+        (
+            104,
+            "Size    100 → 100 bytes · no savings; strict output is 4 bytes larger\n",
+        ),
+        (100, "Size    100 → 100 bytes · no savings\n"),
+    ] {
+        let optimized = OptimizationReport {
+            bytes,
+            bits_saved: 0,
+            removed_data_bytes: 0,
+            replaces: false,
+        };
+        let mut result = Vec::new();
+        print_detailed_result(
+            &mut result,
+            &input,
+            &OutputAction::DryRun,
+            &optimized,
+            &timings,
+        )
+        .unwrap();
+        let result = String::from_utf8(result).unwrap();
+        assert!(result.contains(size), "{result}");
+    }
+}
+
+#[test]
 fn verbose_mode_uses_the_detailed_result_renderer() {
     let input = InputReport {
         path: Path::new("directory/abc.file"),
@@ -141,6 +223,7 @@ fn verbose_mode_uses_the_detailed_result_renderer() {
         bytes: 90,
         bits_saved: 80,
         removed_data_bytes: 0,
+        replaces: true,
     };
     let timings = ExecutionTimings {
         read: Duration::from_millis(1),
@@ -254,4 +337,40 @@ fn verbose_measurements_use_readable_units_and_change_wording() {
     assert_eq!(describe_byte_change(100, 100), "unchanged");
     assert_eq!(describe_byte_change(100, 101), "added 1 byte");
     assert_eq!(describe_byte_change(100, 111), "added 11 bytes");
+
+    assert_eq!(describe_optimization_change(100, 100, 1), "saved 1 bit");
+    assert_eq!(describe_optimization_change(100, 100, 3), "saved 3 bits");
+    assert_eq!(
+        describe_optimization_change(100, 99, 8),
+        "saved 1 byte (1.00%)"
+    );
+}
+
+#[test]
+fn default_result_reports_a_same_size_bit_saving() {
+    let mut result = Vec::new();
+    let input = InputReport {
+        path: Path::new("input.deflate"),
+        index: 0,
+        count: 1,
+        bytes: 100,
+    };
+    let optimized = OptimizationReport {
+        bytes: 100,
+        bits_saved: 3,
+        removed_data_bytes: 0,
+        replaces: true,
+    };
+    print_default_result(
+        &mut result,
+        &input,
+        &OutputAction::WrittenOptimized(PathBuf::from("input.deflate")),
+        &optimized,
+    )
+    .unwrap();
+
+    assert_eq!(
+        String::from_utf8(result).unwrap(),
+        "\"input.deflate\" 100 -> 100 bytes (saved 3 bits)\n"
+    );
 }

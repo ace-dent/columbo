@@ -314,6 +314,7 @@ fn execute_file(
         bytes: optimized.data.len(),
         bits_saved: optimized.bits_saved,
         removed_data_bytes: optimized.removed_data_bytes,
+        replaces: optimized.should_replace(),
     };
     OutputChannel::reports().write(|output| {
         print_result(

@@ -29,6 +29,13 @@ fn stored_run() -> Vec<u8> {
     stream
 }
 
+/// A dynamic block of 24 literals with no distance codes: 160 bits. Strict
+/// output must send two distance codes, which takes 164 bits and a 21st byte.
+const EMPTY_DISTANCE_CODE: &[u8] = &[
+    0x05, 0x80, 0x01, 0x0d, 0x00, 0x00, 0x00, 0xc1, 0xb2, 0xfe, 0xe8, 0x5f, 0xc1, 0x64, 0x20, 0xa0,
+    0x06, 0x95, 0x14, 0xf1,
+];
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -165,6 +172,53 @@ fn redirected_reports_use_stdout_in_every_mode() {
         );
         directory.assert_entries(&["input.deflate"]);
     }
+}
+
+#[test]
+fn a_larger_strict_candidate_is_reported_as_no_savings() {
+    // A run that writes keeps the input, so no report may give the rejected
+    // candidate's size as the result.
+    let directory = TestDirectory::new();
+    let input = directory.0.join("input.deflate");
+    fs::write(&input, EMPTY_DISTANCE_CODE).unwrap();
+
+    let result = directory.run_report(&[], &["input.deflate"]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "\"input.deflate\" 20 -> 20 bytes \
+         (dry run; no savings; strict output is 1 byte larger; no output written)\n"
+    );
+
+    let result = directory.run_report(&["--verbose"], &["input.deflate"]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        stdout.contains("Size    20 → 20 bytes · no savings; strict output is 1 byte larger\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("20 → 21"), "{stdout}");
+
+    let result = Command::new(env!("CARGO_BIN_EXE_columbo"))
+        .current_dir(&directory.0)
+        .args(["--raw", "input.deflate"])
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "\"input.deflate\" 20 -> 20 bytes \
+         (no savings; strict output is 1 byte larger; left \"input.deflate\" unchanged)\n"
+    );
+    assert_eq!(fs::read(&input).unwrap(), EMPTY_DISTANCE_CODE);
+
+    // Relaxed mode keeps the source, so there is no larger candidate to name.
+    let result = directory.run_report(&["--strict", "0"], &["input.deflate"]);
+    assert_eq!(result.status.code(), Some(0), "{result:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&result.stdout),
+        "\"input.deflate\" 20 -> 20 bytes (dry run; no savings; no output written)\n"
+    );
 }
 
 #[test]

@@ -774,6 +774,12 @@ Completing a code or replacing the alias can cost bits. Strict mode may
 therefore emit a larger standards-compatible stream when the source uses the
 length-258 alias or a Huffman code that is not strictly compatible.
 
+The command-line program does not write that larger stream over a file unless
+`--strip` asks for the rewrite. It keeps the input and reports the input's size
+with `no savings; strict output is N bytes larger`, in a dry run and in the
+verbose result too. The stream's own verbose lines still give the strict
+candidate's size. `--strict 0` may save bytes on such a file.
+
 **Relaxed source fallback.** In relaxed mode, after every route has finished,
 Columbo keeps the exact source bytes, including their original padding bits and
 whatever their Huffman codes, unless the selected candidate is strictly smaller
