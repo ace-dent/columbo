@@ -11,7 +11,7 @@
 //! until no block moves.
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::Options;
 
@@ -126,11 +126,18 @@ pub(crate) struct SlideStream {
 /// under its blocks' trees. [`cheaper_cut`] depends only on the two blocks'
 /// tokens, decoded bytes and trees, so a later slide that finds the same
 /// tokens and trees at the same offset need not walk the boundary again.
+///
+/// The tokens are held weakly, so the memo never keeps the moved blocks of a
+/// discarded candidate alive. A boundary whose buffers were freed is walked
+/// again, which finds the same cut.
 struct SettledBoundary {
     /// The left block's decoded offset.
     offset: usize,
-    left: Arc<Vec<Token>>,
-    right: Arc<Vec<Token>>,
+    /// The blocks' tokens and their token counts.
+    left: Weak<Vec<Token>>,
+    right: Weak<Vec<Token>>,
+    left_len: usize,
+    right_len: usize,
     /// The left block's literal/length and distance code lengths, then the
     /// right block's, with where the first three end.
     trees: Vec<u8>,
@@ -161,8 +168,10 @@ impl SettledBoundary {
         trees.extend_from_slice(right_distance);
         Some(Self {
             offset,
-            left: Arc::clone(&left.tokens),
-            right: Arc::clone(&right.tokens),
+            left: Arc::downgrade(&left.tokens),
+            right: Arc::downgrade(&right.tokens),
+            left_len: left.tokens.len(),
+            right_len: right.tokens.len(),
             trees,
             ends,
         })
@@ -175,8 +184,8 @@ impl SettledBoundary {
             return false;
         };
         let [a, b, c] = self.ends;
-        self.left.len() == left.tokens.len()
-            && self.right.len() == right.tokens.len()
+        self.left_len == left.tokens.len()
+            && self.right_len == right.tokens.len()
             && self.trees[..a] == *left_trees.0
             && self.trees[a..b] == *left_trees.1
             && self.trees[b..c] == *right_trees.0
@@ -186,8 +195,10 @@ impl SettledBoundary {
     }
 }
 
-fn same_tokens(stored: &Arc<Vec<Token>>, tokens: &Arc<Vec<Token>>) -> bool {
-    Arc::ptr_eq(stored, tokens) || stored[..] == tokens[..]
+fn same_tokens(stored: &Weak<Vec<Token>>, tokens: &Arc<Vec<Token>>) -> bool {
+    stored
+        .upgrade()
+        .is_some_and(|stored| Arc::ptr_eq(&stored, tokens) || stored[..] == tokens[..])
 }
 
 /// The boundaries the stream's last slide on this thread left settled, in
@@ -199,7 +210,8 @@ struct SlideMemo {
 
 thread_local! {
     /// Settled boundaries kept from one slide of a stream to the next. A
-    /// stream's later finishing steps change few blocks, so a slide after
+    /// stream's later finishing steps change few blocks, and its later
+    /// candidates share the kept candidate's token buffers, so a slide after
     /// them meets most boundaries an earlier slide settled.
     static SLIDE_MEMO: RefCell<Option<SlideMemo>> = const { RefCell::new(None) };
 }

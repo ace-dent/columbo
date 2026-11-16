@@ -5535,7 +5535,9 @@ token cut against the selected trees.
    a pair at the same offset with the same tokens and trees, compared in full,
    starts settled. Every candidate of a stream decodes to the same bytes, so
    the offset fixes both blocks' decoded bytes; the memo belongs to the stream's
-   identity and is released after the stream.
+   identity and is released after the stream. It refers to the tokens weakly,
+   so a discarded candidate's moved blocks are freed with it, and a pair whose
+   tokens were freed is searched again.
 6. Assemble at real alignments: unchanged blocks reuse their original bits,
    stored blocks are repriced for their new padding, and each moved block is
    re-planned from its new counts with the run's own options (so Max uses its
@@ -5614,10 +5616,10 @@ Max at 60 seconds the results depended on timing; the one steady gain was
   blocks, and blocks re-planned as stored, keep theirs.
 - **Bounds:** at most 16 sweeps per round and 16 rounds, each sweep linear in
   tokens; unchanged pairs, and pairs the stream's previous slide left settled,
-  are skipped. The memo holds one slide's settled boundaries, sharing their
-  blocks' token buffers. The stop (the hard stop in timed work) is
-  polled before each boundary, every 65,536 cut positions and before each
-  re-plan; completed moves are kept.
+  are skipped. The memo holds one slide's settled boundaries, with weak
+  references to their blocks' token buffers, so it keeps none alive. The stop
+  (the hard stop in timed work) is polled before each boundary, every 65,536
+  cut positions and before each re-plan; completed moves are kept.
 - **After a win:** the sweep continues with R13; in Max, the strict improvement
   lets sweep repetition (R12) run another sweep. Candidates that R1c replaces
   are not kept for [M14](#m14-replaced-candidate-close).

@@ -551,6 +551,45 @@ fn settled_boundary_memo_leaves_every_slide_unchanged() {
 }
 
 #[test]
+fn the_memo_frees_the_moved_blocks_of_a_dropped_slide() {
+    // The memo records the moved blocks' settled boundary, but once the
+    // slide's plans are dropped, nothing keeps their tokens alive.
+    let mut left = vec![b'a'; 733];
+    left.extend(std::iter::repeat(b'z').take(291));
+    let (_, source) = planned_stream(&[literals(&left), literals(&[b'z'; 1_024])]);
+    let stream = SlideStream {
+        decoded_size: source.decoded_size,
+        crc32: source.crc32,
+        adler32: source.adler32,
+    };
+    release_thread_slide_memo();
+    let plans = plan_slide_with_memo(
+        &source.blocks,
+        &Options::default(),
+        true,
+        MAX_ROUNDS,
+        Some(stream),
+        &mut SearchStop::never(),
+    )
+    .expect("the z run is cheaper under the right-hand tree");
+    let moved = plans
+        .iter()
+        .zip(&source.blocks)
+        .map(|(plan, block)| {
+            assert!(!Arc::ptr_eq(&plan.tokens, &block.tokens));
+            Arc::downgrade(&plan.tokens)
+        })
+        .collect::<Vec<_>>();
+    assert!(SLIDE_MEMO.with(|memo| memo
+        .borrow()
+        .as_ref()
+        .is_some_and(|memo| memo.boundaries.len() == 1)));
+    drop(plans);
+    assert!(moved.iter().all(|tokens| tokens.upgrade().is_none()));
+    release_thread_slide_memo();
+}
+
+#[test]
 fn early_stopping_joining_price_matches_the_full_sum() {
     let reference =
         |token: Token, bytes: &[u8], trees: Trees<'_>, joining: bool| -> Option<(u64, bool)> {

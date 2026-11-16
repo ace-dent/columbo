@@ -97,6 +97,7 @@ gains where established.
 | 4 Nov 2026 | [`7d4e44c`](#7d4e44c-4-november-2026) | Max swap-trial costs and header-plan store (`header.rs`, `header/swap_costs.rs`) | Swap-trial costs in 8-byte slots, eight to a cache line, up to 2^22; trials' plans kept out of the header-plan store; 64 MiB store budget once a thread plans a Max block | Completing Max runs of three small PNGs 48.0%, 32.1% and 28.1% fewer instructions (1.85×, 1.44×, 1.39×); 177 completing sprites 1.34% fewer; Default unchanged; one of ten Max inputs at 20 seconds peaked 46–51 MiB higher | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 4 long and 177 completing Max runs; 58 Max runs at 10 seconds; 66 Default timing runs; 684 Rust, 7 Python tests |
 | 4 Nov 2026 | [`9a3f174`](#9a3f174-4-november-2026) | Header planning: tree values, runs, shape checks, buffers and the store's hash (`header.rs`) | Cached code-length trees keep their shape, order, HCLEN and RLE cost; runs found eight lengths at a time; known shapes not checked again; the planner's buffers borrowed in place; the store indexed by its fingerprints | Completing Max runs of three small PNGs 9.7%, 7.9% and 11.0% fewer instructions (1.10×, 1.07×, 1.13×); 177 completing sprites 7.24% fewer (1.062×); replayed swap searches 15.6% fewer; APNG 1.31% and Default 1.04% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 58 Max runs at 10 seconds; 124 APNG runs at 4,000 seconds; 66 Default timing runs; three replays; 20,000 run-finder comparisons; 686 Rust, 7 Python tests |
 | 6 Nov 2026 | [`b35e8ee`](#b35e8ee-6-november-2026) | Boundary slide across finishing steps (`slide.rs`) | Each thread keeps the boundaries a stream's last slide left settled, with the left block's offset, both blocks' token buffers and trees; a later slide of the stream starts a pair settled when it matches one in full | Default CPU 1.012× (33 inputs, 2.11% fewer instructions, 1.42% fewer cycles); Partnership card 1.045× (5.87% fewer instructions); peak memory median unchanged, +6.2 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 900 slides through the memo compared with fresh slides; 688 Rust, 7 Python tests |
+| 16 Nov 2026 | [`d366e34`](#d366e34-16-november-2026) | Boundary-slide memo (`slide.rs`) | The settled-boundary memo refers to its blocks' token buffers weakly, so a discarded slide's moved blocks are freed with its candidate | Peak footprint of a reported ZIP with a 68.9 MB member 17.5% lower (1,753 → 1,447 MB), and of one with a 788.9 MB member 11.7% lower (14,557 → 12,851 MB); Partnership card 1.3% lower; 367 corpus files 1.5% lower in sum; instructions unchanged, 1.37% fewer on the larger ZIP | 360 completing Default corpus runs; 30 repeated and 16 large-input runs; 2 completing Max runs; 1 new test; 767 Rust, 7 Python tests |
 
 ## Entries
 
@@ -493,6 +494,92 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `d366e34`, 16 November 2026
+
+Batches: the 367-file corpus in Default at a 30-second timeout, baseline and
+candidate run side by side, one round (output, instructions and peak memory
+footprint from `time -l`); the corpus files with the largest instruction or
+memory differences, three alternating runs of each build, one run at a time;
+two alternating runs of each build on the reported 9.9 MB ZIP, the
+Partnership card and `kzipmix-20200115-linux-static.tar.gz`, and one on the
+reported 99.3 MB ZIP; two alternating runs of each completing Max run. Both
+builds are distribution executables, the baseline built from an immutable Git
+archive of its commit.
+
+The reported 9.9 MB ZIP holds one member, the decimal integers 0 to 9,999,999
+written end to end (68.9 MB), whose parsed model is 334 MiB. Live-heap
+snapshots of a symbolized build, taken at each new resident high with
+`MallocStackLogging=lite` and `MallocLargeCache=0` and grouped by allocating
+frame, put 702 MiB at its peak in boundary-slide (R1c) blocks, beside 331 MiB
+in a merged candidate's ranges and 465 MiB in the source parse. The slide's
+share was two copies of the moved blocks: the running slide's, and those of
+the stream's previous slide, whose candidate had been discarded but whose
+settled boundaries the memo of [`b35e8ee`](#b35e8ee-6-november-2026) still
+held.
+
+- **Settled boundaries held weakly.** The memo keeps weak references to the
+  two blocks' token buffers, with their token counts for the quick
+  comparison, so a discarded candidate's moved blocks are freed with it. A
+  later slide upgrades a reference before comparing tokens; a boundary whose
+  buffers were freed is searched again and finds the same cut. The stream's
+  later candidates share the kept candidate's buffers through validated
+  reparses, so their boundaries still match.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Reported 9.9 MB ZIP, peak memory footprint, two runs | 1,753 MB | 1,447 MB | −17.5% |
+| Same input, footprint with `MallocLargeCache=0` | 1,214 MB | 970 MB | −20.1% |
+| Same input, instructions retired | 230.3 billion | 230.2 billion | −0.05% |
+| Reported 99.3 MB ZIP (788.9 MB member), peak memory footprint | 14,557 MB | 12,851 MB | −11.7% |
+| Same input, instructions retired | 2,635.4 billion | 2,599.2 billion | −1.37% |
+| Partnership card, peak memory footprint, two runs | 508 MB | 501 MB | −1.3% |
+| Same input, instructions retired | 115.5 billion | 115.5 billion | 0.00% |
+| 360 completing corpus runs, instructions retired | 4,068.6 billion | 4,058.8 billion | −0.24% |
+| 367 corpus files, summed peak memory footprint | 24.21 GB | 23.84 GB | −1.5% |
+
+Per-file instruction ratios in the side-by-side corpus run spread from 0.946
+to 1.059, on multi-frame APNGs, whose parallel image jobs and raced lineage do
+timing-dependent work, and on ZIPs of under 0.1 billion instructions. Run one
+at a time, the five files repeated averaged within 0.04% of the baseline's
+instructions, inside their 0.03–0.27% spread between runs. The 16
+files whose peak rose by more than 5%, all parallel APNGs or the multi-member
+`sample-10mb.zip`, varied as much between runs of one build:
+`782330_80063_3a81d985….png` peaked at 145–189 MB before and 137–182 MB
+after, and `sample-10mb.zip` at 133 MB in every run. On the 99.3 MB ZIP,
+system time fell from 20.5 to 7.4 seconds and wall time from 174 to 158
+seconds. In the memo's own test, which drops each slide's plans before it
+slides their reparsed output, 424 of the 974 memo hits remain.
+
+Equivalence: all 360 corpus runs that finished before the deadline in both
+builds gave identical output; the 5 that reached the 30-second deadline
+under the side-by-side load differ by timing (112 bytes in all), and two
+deft4j ZIPs with an unsupported layout fail in both builds. The large-input
+runs, the repeated runs and the two completing Max runs matched byte for byte.
+A new test drops a slide's plans and checks that its moved blocks are freed
+while the memo still records their boundary; it fails when the memo holds
+strong references. Rust tests, including the private corpus and the ignored
+large-ZIP regression, passed in release and debug modes, with documentation
+and Python tests, a locked build, formatting and all-feature Clippy with
+warnings denied. The shipped executable keeps its 1,024,448 bytes.
+
+Measured and rejected in the same review:
+
+- Dropping the previous slide round's plans at the next sweep's first move,
+  since that round's result is then replaced: no change in peak (1,214 →
+  1,213 MB on the 9.9 MB ZIP with `MallocLargeCache=0`), since the memo, not
+  the plans, held the second copy.
+
+Not changed in the same review:
+
+- At the new peak of the 9.9 MB ZIP, the running slide's moved blocks hold
+  370 MiB, a merged candidate's ranges 331 MiB and the source parse 465 MiB:
+  a moved boundary or a merge copies whole blocks. Sharing them needs the
+  slice-view token model noted under [`b35e8ee`](#b35e8ee-6-november-2026).
+- A token takes 14 bytes, four of them extra-bit counts and values that
+  follow from its length, distance and symbols.
+
+Artifacts: `work/efficiency-review-memory-20261116/`.
 
 ### `b35e8ee`, 6 November 2026
 
