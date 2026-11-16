@@ -13,6 +13,7 @@ fn padding_normalization_includes_discarded_empty_stored_blocks() {
     assert_eq!(parsed.consumed, input.len());
 }
 use crate::deflate::bitstream::BitWriter;
+use crate::deflate::test_support::counting_stream;
 
 #[test]
 fn bulk_match_expansion_matches_bytewise_overlap_semantics() {
@@ -653,6 +654,50 @@ fn a_long_block_earns_the_scaled_model_limit_from_its_own_bytes() {
         let error = parse_stream_with_model_limits(&input, 1024, limits).unwrap_err();
         assert!(error.message().contains("memory safety limit"));
     }
+}
+
+#[test]
+fn a_counting_stream_like_the_reported_one_earns_the_scaled_model_limit() {
+    // The reported stream of 10 million integers has a 334 MiB model, over
+    // the 256 MiB base limit. Here the same shape at a thirtieth of the size
+    // meets a base limit of half its model: the base alone rejects it, as the
+    // fixed limit rejected the reported stream, while its block records are
+    // proportionate to its bytes and earn the scaled limit up to the byte.
+    const COUNT: u32 = 300_000;
+    let (input, decoded) = counting_stream(COUNT);
+    let limit = decoded.len() as u64;
+    let parsed = parse_stream(&input, limit).unwrap();
+    assert_eq!(parsed.consumed, input.len());
+    assert!(parsed.blocks.len() > 1);
+    let plain = parsed
+        .blocks
+        .iter()
+        .flat_map(|block| block.plain.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(plain, decoded);
+    let tokens = parsed
+        .blocks
+        .iter()
+        .map(|block| block.tokens.len())
+        .sum::<usize>();
+    let model = parsed_model_bytes(decoded.len(), tokens, parsed.blocks.len()).unwrap();
+
+    let error = parse_stream_with_model_limit(&input, limit, model / 2).unwrap_err();
+    assert!(error.message().contains("memory safety limit"));
+    let limits = ModelLimits {
+        base: model / 2,
+        scaled: model,
+    };
+    assert_same_parse(
+        &parse_stream_with_model_limits(&input, limit, limits).unwrap(),
+        &parsed,
+    );
+    let limits = ModelLimits {
+        scaled: model - 1,
+        ..limits
+    };
+    let error = parse_stream_with_model_limits(&input, limit, limits).unwrap_err();
+    assert!(error.message().contains("memory safety limit"));
 }
 
 /// A plan holding its own copy of `block`'s buffers.

@@ -42,3 +42,6 @@ pub(crate) use parse::{
     decoded_bytes_for_comparison, decoded_bytes_for_storage, raw_stream_decodes_to,
 };
 pub(crate) use stop::timeout_grace;
+
+#[cfg(test)]
+pub(crate) mod test_support;

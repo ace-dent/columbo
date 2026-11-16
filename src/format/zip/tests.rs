@@ -4,7 +4,10 @@
 use std::time::Duration;
 
 use super::*;
+use crate::deflate::raw_stream_decodes_to;
+use crate::deflate::test_support::counting_stream;
 use crate::format::test_support::SAME_BYTE_BIT_WIN_RAW;
+use crate::Format;
 
 fn optimize(input: &[u8], options: &Options) -> Result<Optimization> {
     let parsed = preflight(input, options.strip_metadata, options.max_decoded_bytes)?;
@@ -749,6 +752,42 @@ fn deflated_member_reports_same_byte_bit_savings() {
 
     assert_eq!(optimized.data.len(), input.len());
     assert_eq!(optimized.bits_saved, 1);
+}
+
+#[test]
+#[ignore = "slow: optimizes a generated 69 MB stream; run with --release"]
+fn optimizes_a_zip_like_the_reported_one_beyond_the_base_model_limit() {
+    // A reported 9.9 MB ZIP of the integers 0..10,000,000 (68.9 MB decoded)
+    // failed with "Deflate structure exceeds internal memory safety limit":
+    // its 334 MiB parsed model was over the old fixed 256 MiB limit. This
+    // member holds the same data in the same token shape. Release builds
+    // finish Default well within the timeout, which bounds debug builds.
+    let (stream, decoded) = counting_stream(10_000_000);
+    let input = single_entry_archive(
+        8,
+        &stream,
+        crc32_update(0, &decoded),
+        decoded.len() as u32,
+        false,
+        false,
+    );
+    let options = Options {
+        timeout: Duration::from_secs(60),
+        ..Options::default()
+    };
+    let optimized = crate::optimize(&input, Format::Zip, &options).unwrap();
+
+    assert!(cfg!(debug_assertions) || !optimized.timed_out);
+    assert!(optimized.data.len() <= input.len());
+    let rebuilt = preflight(&optimized.data, false, u64::MAX).unwrap();
+    let entry = &rebuilt.entries[0];
+    assert_eq!(entry.method, 8);
+    let layout = local_entry_layout(&optimized.data, rebuilt.central_offset, entry).unwrap();
+    assert!(raw_stream_decodes_to(
+        &optimized.data[layout.data_offset..layout.data_end],
+        decoded.len() as u64,
+        &decoded,
+    ));
 }
 
 #[test]

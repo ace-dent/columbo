@@ -81,6 +81,18 @@ test run with `--ignored` or `--include-ignored` fails if its fixture is missing
 rather than passing silently. The relative fixture names in these tests describe
 the expected local layout under `tests/fixtures/`.
 
+One generated regression is also ignored, because it is slow rather than
+private: `optimizes_a_zip_like_the_reported_one_beyond_the_base_model_limit` in
+`src/format/zip/tests.rs` builds a ZIP like one from a bug report, whose 68.9 MB
+member has a parsed model over the 256 MiB base limit, and optimizes it. A
+release build runs it in about 12 seconds and 2.4 GB; a debug build, as under
+`--include-ignored`, stops at its 60-second timeout and takes nearly two
+minutes:
+
+```sh
+cargo test --release --lib -- --ignored optimizes_a_zip_like
+```
+
 Corpus files may be copyrighted and must not be added to the public repository.
 Keep `tests/fixtures/`, `work/`, `target/`, and `benchmark-results/` local; Git
 ignores them and the Cargo package allowlist excludes them. Do not embed private
