@@ -27,12 +27,11 @@ fi
 TARGET="$1"
 cd "$PROJECT_ROOT"
 
-# Release names use the package's major.minor version. Patch releases stay
-# reproducible through Cargo.lock and the pinned toolchain.
+# Release names use the package's full version, so each archive names the
+# exact release it contains.
 VERSION=$(awk -F '"' '
     /^version = "/ {
-        split($2, parts, ".")
-        print parts[1] "." parts[2]
+        print $2
         exit
     }
 ' Cargo.toml)

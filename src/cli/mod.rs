@@ -29,11 +29,7 @@ use report::{
 };
 
 const PROGRAM_NAME: &str = "columbo";
-const PROGRAM_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION_MAJOR"),
-    ".",
-    env!("CARGO_PKG_VERSION_MINOR")
-);
+const PROGRAM_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROGRAM_STAGE: &str = "Beta";
 /// Names for the pipes in reports and diagnostics.
 const STDIN_NAME: &str = "<stdin>";
