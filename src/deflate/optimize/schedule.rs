@@ -45,14 +45,15 @@ use super::{
     refine_bounded_deft4j_lineage, refine_with_compact_balanced_tree_floor,
     refine_with_compact_proven_feedback, refine_with_compact_source_split_floor,
     refine_with_compact_source_split_floor_until, refine_with_max_planner,
-    refine_with_no_split_route, refine_with_terminal_source_split_floor_until,
-    release_kept_validated_parse, replace_optional_if_smaller, replace_optional_keeping_parent,
-    source_run_match_count_exceeds, spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates,
-    BoundedPngMaxPolicy, BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed,
-    CompleteDefaultFloor, ContinuationSourceMax, DefaultEndpoint, DefaultFloor, DefaultFloorWork,
-    HeaderFit, RawInfo, RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache,
-    TerminalShare, COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT,
-    MAX_RAW_REPLAY_LIMIT, WEAK_DEFT4J_GAIN_BASIS_POINTS,
+    refine_with_no_split_route, refine_with_relaxed_distance_codes,
+    refine_with_terminal_source_split_floor_until, release_kept_validated_parse,
+    replace_optional_if_smaller, replace_optional_keeping_parent, source_run_match_count_exceeds,
+    spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy,
+    BoundedRoutes, Candidate, CandidateInput, CompactSplitSeed, CompleteDefaultFloor,
+    ContinuationSourceMax, DefaultEndpoint, DefaultFloor, DefaultFloorWork, HeaderFit, RawInfo,
+    RawOptimization, ReplayPlanner, StreamIdentity, TerminalParseCache, TerminalShare,
+    COMPACT_SPLIT_FLOOR_MAX_COMPRESSED, DEFAULT_RAW_REPLAY_LIMIT, MAX_RAW_REPLAY_LIMIT,
+    WEAK_DEFT4J_GAIN_BASIS_POINTS,
 };
 use crate::deflate::block::release_thread_block_plans;
 use crate::deflate::header::{balanced_tree_opportunities, BalancedTreeOpportunities};
@@ -151,20 +152,15 @@ fn optimize_stream(
     } else {
         candidate.bits
     };
-    let final_report = if keep_original {
+    let mut final_report = if keep_original {
         capture_source_block_report(&blocks, parsed.source_block_count, reporting)
     } else {
         candidate.block_report.take()
     };
-    let selected_route = if keep_original {
+    let mut selected_route = if keep_original {
         "Original source"
     } else {
         candidate.route
-    };
-    let output_bytes = if keep_original {
-        original.len()
-    } else {
-        candidate.data.len()
     };
     let output_max_distance = if keep_original {
         parsed.max_distance
@@ -179,14 +175,6 @@ fn optimize_stream(
     debug_assert!(output_max_distance <= parsed.max_distance);
     let timed_out = default_floor != DefaultFloor::MandatoryComplete
         && deadlines.terminal_work().was_triggered();
-    progress.blocks(final_report);
-    progress.finish(
-        selected_route,
-        output_bytes,
-        deflate_bits,
-        parsed.meaningful_bits,
-        timed_out,
-    );
 
     // Drop the model and reuse the output allocation, so keeping the source
     // never holds two source-sized outputs plus the parsed model at once.
@@ -231,7 +219,7 @@ fn optimize_stream(
         None => None,
     };
 
-    Ok(RawOptimization {
+    let mut optimized = RawOptimization {
         data,
         consumed: parsed.consumed,
         info: RawInfo {
@@ -247,7 +235,154 @@ fn optimize_stream(
         output_max_distance,
         timed_out,
         default_endpoint,
-    })
+    };
+    // The model is gone by now, so the strict run does not raise the peak
+    // memory.
+    if !options.strict && default_floor.strict_floor_may_start(options, started) {
+        let step = progress.start("Strict floor");
+        let (floor, floor_won) = keep_strict_floor(
+            &mut optimized,
+            input,
+            options,
+            decoded_limit,
+            default_floor,
+            started,
+            grace,
+        )?;
+        step.finish(Some(floor));
+        if floor_won {
+            selected_route = "Strict floor";
+            final_report = None;
+        }
+    }
+    progress.blocks(final_report);
+    progress.finish(
+        selected_route,
+        optimized.data.len(),
+        optimized.info.deflate_bits,
+        parsed.meaningful_bits,
+        optimized.timed_out,
+    );
+    Ok(optimized)
+}
+
+/// Relaxed mode's strict floor: build the stream strict mode returns for the
+/// same input and policy, apply R19 to it, and keep it in `optimized` when it
+/// is strictly smaller. Returns the floor's report, and whether it won.
+///
+/// Every strict stream is valid relaxed output, but the relaxed routes do not
+/// search a superset of the strict ones: an empty distance alphabet costs
+/// them almost nothing, so they can turn every match of a block into literals
+/// where strict mode keeps the matches and ends smaller.
+///
+/// The strict run reports nothing and has only the time the relaxed run
+/// left, up to the same hard stop ([`DefaultFloor::strict_floor_may_start`]).
+// Out of line: one cold call per relaxed stream.
+#[inline(never)]
+fn keep_strict_floor(
+    optimized: &mut RawOptimization,
+    input: &[u8],
+    options: &Options,
+    decoded_limit: u64,
+    default_floor: DefaultFloor,
+    started: Instant,
+    grace: Duration,
+) -> Result<(CandidateProgress, bool)> {
+    // The relaxed run's plans and parses are of no use to the strict run.
+    release_thread_block_plans();
+    release_kept_validated_parse();
+    crate::deflate::slide::release_thread_slide_memo();
+
+    let elapsed = started.elapsed();
+    let timeout = options.timeout.saturating_sub(elapsed);
+    let hard_stop = options
+        .timeout
+        .saturating_add(grace)
+        .saturating_sub(elapsed);
+    let strict_options = Options {
+        strict: true,
+        verbose: false,
+        timeout,
+        ..options.clone()
+    };
+    let mut floor = optimize_raw_prefix_with_floor_and_grace(
+        input,
+        &strict_options,
+        decoded_limit,
+        default_floor,
+        hard_stop.saturating_sub(timeout),
+    )?;
+    let identity = StreamIdentity {
+        decoded_size: floor.info.size,
+        crc32: floor.info.crc32,
+        adler32: floor.info.adler32,
+    };
+    relax_stream_distance_codes(
+        &mut floor.data,
+        &mut floor.info.deflate_bits,
+        options,
+        decoded_limit,
+        identity,
+    )?;
+    let report = CandidateProgress {
+        bytes: floor.data.len(),
+        bits: floor.info.deflate_bits,
+        reference_bits: floor.info.source_deflate_bits,
+        profitable: is_strictly_better(
+            floor.data.len(),
+            floor.info.deflate_bits,
+            floor.consumed,
+            floor.info.source_deflate_bits,
+        ),
+    };
+    let won = is_strictly_better(
+        floor.data.len(),
+        floor.info.deflate_bits,
+        optimized.data.len(),
+        optimized.info.deflate_bits,
+    );
+    optimized.timed_out |= floor.timed_out;
+    if won {
+        optimized.data = floor.data;
+        optimized.info.deflate_bits = floor.info.deflate_bits;
+        optimized.output_max_distance = floor.output_max_distance;
+    }
+    if let (Some(endpoint), Some(mut strict)) =
+        (optimized.default_endpoint.as_mut(), floor.default_endpoint)
+    {
+        relax_stream_distance_codes(
+            &mut strict.data,
+            &mut strict.deflate_bits,
+            options,
+            decoded_limit,
+            identity,
+        )?;
+        if is_strictly_better(
+            strict.data.len(),
+            strict.deflate_bits,
+            endpoint.data.len(),
+            endpoint.deflate_bits,
+        ) {
+            *endpoint = strict;
+        }
+    }
+    Ok((report, won))
+}
+
+/// R19 on a complete stream held as bytes.
+fn relax_stream_distance_codes(
+    data: &mut Vec<u8>,
+    bits: &mut u64,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<()> {
+    let candidate = Candidate::from_bytes(std::mem::take(data), *bits, "Strict floor");
+    let relaxed = refine_with_relaxed_distance_codes(&candidate, options, decoded_limit, identity)?
+        .unwrap_or(candidate);
+    *bits = relaxed.bits;
+    *data = relaxed.data;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -586,7 +721,11 @@ fn select_candidate(
     // redirect the rewritten-seed refinement. The comparison runs whatever the
     // deadline, so no shorter run finishes what it replaces, and Max keeps
     // nothing here.
+    // Default's own result has R19 applied to it, so Max keeps that form of
+    // each endpoint as a competitor too.
+    let mut relaxed_default = None;
     if let Some(complete_default) = state.default.complete.take() {
+        relaxed_default = relax_distance_codes(context, &complete_default, false)?;
         candidate.replace_if_smaller(complete_default);
     }
     if let Some(parent) = deferred_split_parent {
@@ -599,9 +738,51 @@ fn select_candidate(
         candidate.replace_if_smaller(finished);
     }
     if let Some(slid_default) = state.default.slid.take() {
+        if let Some(relaxed) = relax_distance_codes(context, &slid_default, false)? {
+            relaxed_default = Some(relaxed);
+        }
         candidate.replace_if_smaller(slid_default);
     }
-    Ok((candidate, state.default.exact))
+    if let Some(relaxed) = relax_distance_codes(context, &candidate, true)? {
+        candidate = relaxed;
+    }
+    if let Some(relaxed_default) = relaxed_default {
+        candidate.replace_if_smaller(relaxed_default);
+    }
+    let mut exact = state.default.exact;
+    if let Some(endpoint) = exact.as_mut() {
+        relax_stream_distance_codes(
+            &mut endpoint.data,
+            &mut endpoint.deflate_bits,
+            context.options,
+            context.source.decoded_limit,
+            context.source.identity,
+        )?;
+    }
+    Ok((candidate, exact))
+}
+
+/// R19 on one finished candidate: `None` in strict mode, or when no block
+/// gets a cheaper distance code.
+fn relax_distance_codes(
+    context: &RouteContext<'_>,
+    candidate: &Candidate,
+    report: bool,
+) -> Result<Option<Candidate>> {
+    if context.options.strict {
+        return Ok(None);
+    }
+    let step = report.then(|| context.progress.start("Relaxed distance code"));
+    let relaxed = refine_with_relaxed_distance_codes(
+        candidate,
+        context.options,
+        context.source.decoded_limit,
+        context.source.identity,
+    )?;
+    if let Some(step) = step {
+        step.finish(context.report_optional(relaxed.as_ref()));
+    }
+    Ok(relaxed)
 }
 
 /// Build Default's source topology (D4), returned only when it is already

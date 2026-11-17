@@ -80,7 +80,10 @@ use source_routes::{
     build_source_family_candidate, build_source_max_candidate, candidate_exposes_new_parent,
     changed_narrow_parent_should_continue, refine_with_max_planner, refine_with_no_split_route,
 };
-use terminal::{improve_with_final_header_fit, improve_with_terminal_searches, TerminalParseCache};
+use terminal::{
+    improve_with_final_header_fit, improve_with_terminal_searches,
+    refine_with_relaxed_distance_codes, TerminalParseCache,
+};
 use tree_floor::{improve_with_terminal_tree_floors, refine_with_compact_balanced_tree_floor};
 
 /// One round groups adjacent source blocks; two more settle the new layout's
@@ -210,6 +213,25 @@ impl DefaultFloor {
 
     fn owns_terminal_stream_time(self) -> bool {
         matches!(self, Self::Complete | Self::CompleteThenBounded)
+    }
+
+    /// Whether relaxed mode's strict floor may start once the relaxed run has
+    /// ended. A stream that shares a container's time, or refines a floor its
+    /// caller already keeps, needs time left: with its allowance spent it
+    /// keeps its source in relaxed mode and must not take time from later
+    /// streams. Every other policy finishes Default's result whatever the
+    /// clock, and the floor is part of that result.
+    fn strict_floor_may_start(self, options: &Options, started: Instant) -> bool {
+        match self {
+            Self::Shared | Self::ApngDefault | Self::Established => {
+                started.elapsed() < options.timeout
+            }
+            Self::Complete
+            | Self::CompleteThenBounded
+            | Self::SharedExact
+            | Self::ApngMax
+            | Self::MandatoryComplete => true,
+        }
     }
 
     /// How much of a Max stream's allowance to reserve for terminal methods
@@ -406,6 +428,21 @@ struct Candidate {
 }
 
 impl Candidate {
+    /// A complete stream known only by its bytes, which a method parses when
+    /// it needs the blocks.
+    fn from_bytes(data: Vec<u8>, bits: u64, route: &'static str) -> Self {
+        Self {
+            data,
+            bits,
+            output_max_distance: None,
+            plans: Vec::new(),
+            block_report: None,
+            route,
+            max_planner_is_stable: false,
+            replaced_parents: Vec::new(),
+        }
+    }
+
     fn named(mut self, route: &'static str) -> Self {
         self.route = route;
         self

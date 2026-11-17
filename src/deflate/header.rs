@@ -63,7 +63,8 @@ pub(super) use shortest_rle::shortest_rle;
 use shortest_rle::{shortest_rle_from_runs_into, ShortestRleScratch};
 use swap_costs::release_swap_trials;
 pub(crate) use terminal::{
-    plan_literal_span, plan_payload_header_tradeoff, plan_strict_distance_completion,
+    plan_literal_span, plan_payload_header_tradeoff, plan_relaxed_distance_code,
+    plan_strict_distance_completion,
 };
 pub(crate) use tree::{plan_header_tree, HeaderTreeBudget};
 

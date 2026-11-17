@@ -17,7 +17,7 @@ changes, why that saves bits, and how to price, verify and schedule the result.
 For Columbo itself, it is the authority on production routing: the format,
 topology, work, memory, mode and deadline gates that decide which optional
 routes build complete candidates. Code comments and other documents cite its
-labels (R1–R18, D1–D4, M0–M14, G0, G0t, S0) and its anchors.
+labels (R1–R19, D1–D4, M0–M14, G0, G0t, S0) and its anchors.
 
 The code under [`src/`](../src/) is the ground truth. Where this document and
 the code disagree, the code is right and the document needs fixing.
@@ -56,7 +56,7 @@ Reading notes:
   15-bit and 7-bit code-length limits. Every other bound is one Columbo chose to
   limit work, memory or time, not a format limit.
 - Each exact gate or bound is written in one place, and other sections link to
-  it. R1–R18 and D1–D4 keep theirs in their Part 2 entry, under "Columbo's gates
+  it. R1–R19 and D1–D4 keep theirs in their Part 2 entry, under "Columbo's gates
   and bounds", except R12, whose rule is in
   [Sweep repetition (R12)](#sweep-repetition-r12). G0, G0t, M0–M14, S0 and the
   replay limits are in the [route-gate reference](#route-gate-reference), and
@@ -356,8 +356,10 @@ Routes and modes:
   route (M2), source max and compact proven feedback (M3). `Complete` and
   `MandatoryComplete` have no bounded phase
   ([Raw-stream route tree](#raw-stream-route-tree)).
-- **Terminal methods**: R1–R18, bounded passes applied to a complete incumbent
-  after the main search.
+- **Terminal methods**: R1–R19, bounded passes applied to a complete incumbent
+  after the main search. R19 is outside the finish: relaxed mode runs it once,
+  on the candidate that every route has finished
+  ([Relaxed distance code (R19)](#relaxed-distance-code-r19)).
 - **Sweep**: one ordered pass of the terminal methods R1, R1b, R2–R11 (Default
   skips R6–R11), R1c, R13, R14 and R15. R12 is the rule that repeats the sweep
   in Max, not a member of it ([Sweep repetition (R12)](#sweep-repetition-r12)).
@@ -749,6 +751,12 @@ bits: a single or empty code shortens the header, and the alias can remove
 symbol 285 from the tree. The CLI prints a caution once per batch in relaxed
 mode.
 
+Relaxed mode adds two steps of its own after the routes. The
+[relaxed distance code (R19)](#relaxed-distance-code-r19) gives each block that
+uses at most one distance symbol its cheapest distance code, and the strict
+floor, described below, keeps relaxed output from ending larger than strict
+output.
+
 Strict mode acts at three points:
 
 - **Normalization before scheduling.** In every block that contains a length-258
@@ -791,6 +799,52 @@ in bytes, then in meaningful bits. Strict mode has no whole-source fallback: it
 returns the generated candidate even when that is larger. Planners in either
 mode may still copy individual source blocks verbatim when the mode allows their
 codes.
+
+**Relaxed strict floor.** Every strict stream is valid relaxed output, but the
+relaxed routes do not search a superset of the strict ones. An empty distance
+alphabet costs them almost nothing, so they turn a block's few matches into
+literals, and the terminal methods do not bring the matches back. Strict mode
+pays for two distance codes either way, keeps the matches, and can end smaller:
+on one 310-byte stream strict Default ended at 494 bits and relaxed Default at
+514, with [original-match restoration (R1)](#original-match-restoration-r1)
+finding nothing to restore. On 6,000 synthetic streams of 8–900 bytes,
+relaxed Default was larger than strict Default on 152, by up to 21 bits, and on
+10 of 892 corpus files of at most 24 KB, by 1–6 bytes.
+
+So after its own routes and the source fallback, relaxed mode runs the strict
+pipeline on the same stream, under the same floor policy, applies R19 to the
+result, and keeps it when it is strictly smaller in bytes, then in meaningful
+bits. The verbose report shows it as `Strict floor`; when it wins, the final
+block plan is not listed.
+
+- **Time.** The strict run starts when the relaxed run ends and has what is
+  left of the stream's allowance, up to the same hard stop. Given time for both
+  runs, relaxed mode is never larger than strict mode in the same search mode,
+  and a relaxed run takes up to twice as long.
+- **Spent allowance.** Under `Shared`, `ApngDefault` and `Established` the
+  strict run starts only with time left: such a stream shares a container's
+  time or refines a floor its caller already keeps, so with its allowance spent
+  it keeps its source in relaxed mode and takes no time from later streams.
+  Every other policy finishes Default's result whatever the clock, and the
+  floor is part of that result. There the strict run always starts, and with
+  no time left it builds what strict mode never skips, so Max does not end
+  above Default.
+- **Memory.** The relaxed run's model and caches are released first, so the
+  peak is that of one run plus the relaxed output.
+- **Max and Default.** Under the exact policies the strict run returns its
+  Default endpoint too, and the smaller of the two endpoints, after R19, is the
+  relaxed Default endpoint.
+- **Pitfall.** Running the strict run only when the relaxed result has a
+  dynamic block with fewer than two distance symbols cut the added Default CPU
+  from 62% to 15%, but left 6 of the 10 corpus files larger than strict, so it
+  runs on every relaxed stream.
+
+Measured against `1b246bc`, with R19: relaxed Default on the 892 corpus files
+saved 64 bytes on 27 files, none larger and none above strict, for 1.62 times
+the CPU and a peak of 185 MB against 180 MB; the 6,000 synthetic streams came
+out 472 bytes smaller in total, none larger and none above strict. Relaxed Max: 22 of 2,000
+synthetic streams were above strict before, none after; 60 corpus files of at
+most 6 KB at 10 seconds did not change, for 1.45 times the CPU.
 
 Otherwise the source joins the candidate pool in only two cases:
 
@@ -1814,7 +1868,7 @@ Columbo's earlier C implementation, and **Columbo Rust** behavior added in the
 Rust version. "As labeled in source" means the code names each primitive's
 origin where it is defined.
 
-The terminal methods R1–R18 close the second table in label order; the
+The terminal methods R1–R19 close the second table in label order; the
 [terminal sweep order](#terminal-sweep-order) gives the order in which they run.
 
 ### Speed legend
@@ -1920,6 +1974,7 @@ The terminal methods R1–R18 close the second table in label order; the
 | [Terminal merges (R16)](#terminal-merges-r16) | Once the sweeps settle, merges neighbors that price strictly smaller as one block than as encoded; a win re-slides and re-cuts. | Both | 🟡 | **Columbo** |
 | [Terminal token replay (R17)](#terminal-token-replay-r17) | Replays the Default extended token floor on finished dynamic blocks with their final codes, so re-cut or merged blocks get token search. | Both | 🟡 | **DeflOpt**-style table replay; **Columbo** floor and placement |
 | [Late tree floor (R18)](#late-tree-floor-r18) | Runs the terminal tree floors once more after R17, so blocks the finish cut, merged or re-spelled, and APNG Default frames, get them. | Both | 🟡 | **Columbo** placement of the existing tree floors |
+| [Relaxed distance code (R19)](#relaxed-distance-code-r19) | Gives each dynamic block that uses at most one distance symbol the cheapest of no codes, one 1-bit code and the strict completions, on the selected candidate. | Both; Relaxed | 🟢 | RFC 1951 forms; **Columbo** |
 
 ### Structural and max routes
 
@@ -2607,6 +2662,75 @@ sample of 25 PNGs at 60 seconds saved 244 bytes on 7 files; two files grew by
 
 Validation: [late tree floor](research/late-tree-floor-validation.md).
 Provenance: **Columbo** placement of the existing tree floors.
+
+### Relaxed distance code (R19)
+
+🟢 Default and Max, relaxed mode only · terminal method ·
+[`src/deflate/header/terminal.rs`](../src/deflate/header/terminal.rs),
+[`src/deflate/optimize/terminal.rs`](../src/deflate/optimize/terminal.rs)
+
+A dynamic block that uses at most one distance symbol can send its distance
+code in several ways, and all of them decode the same payload. RFC 1951 allows
+no codes at all (one code length of zero) when no distance is used, and a
+single 1-bit code. Planning gives an empty distance alphabet no codes and a
+one-symbol alphabet its 1-bit code, and a block copied from the source keeps
+the source's code. Which form is cheapest depends on the code-length values the
+rest of the header already sends:
+
+- No codes sends code-length value 0. A literal-only block whose zero runs all
+  use symbols 17 and 18 does not have value 0 in its code-length code.
+- One unused 1-bit code on distance symbol 0 sends value 1 instead. It is
+  cheaper when a literal takes over half the block, so that its 1-bit code has
+  already put value 1 in the header.
+- A strict completion ([R1b](#strict-distance-completion-r1b)) sends a run of
+  one value from 1 to 4, and wins when that value is cheap and the others are
+  not in the header.
+
+**How it works**
+
+1. For each dynamic block whose tokens use at most one distance symbol, list
+   R1b's four uniform complete codes, then a single 1-bit code on the used
+   symbol, or on symbol 0 when none is used, then, when none is used, no codes.
+2. Re-price the payload as R1b does: only the used symbol's length changes.
+3. Price each with the exhaustive header search, keeping the literal/length
+   lengths. Keep the cheapest that is strictly below the block's bits as
+   encoded. The strict completions are listed first, so on a tie the block
+   stays strict.
+
+**Acceptance.** Kept only if the whole stream is strictly smaller.
+
+**Pitfalls and lessons.**
+
+- Adding these codes to the central planner saved the same bits but made 15 of
+  6,000 synthetic streams larger, by up to 18 bits: a cheaper
+  literal-only block led the planner to give up more matches, which no later
+  method restores. R19 runs after every route, so it redirects none.
+- The reported case was a 16 MiB stream of decimal digits whose second block
+  holds 300 literals, 120 of them `3`. The source sent the strict pair of 1-bit
+  codes, no codes cost the same, and one unused code saved 2 bits; alone, that
+  block went from 129 to 128 bytes.
+
+**Measured.** With the strict floor, under
+[Strict and relaxed output](#strict-and-relaxed-output). Alone, as a planner
+candidate: 1–2 bits on 27% of the 6,000 synthetic streams, 6 bytes on one of
+892 corpus files.
+
+**Columbo's gates and bounds**
+
+- **Runs:** relaxed mode only, in both modes, once, on the candidate selected
+  after every route and comparison, before the relaxed source fallback. In
+  Max it also runs on Default's complete and slid endpoints, and each result
+  stays a final competitor, so Max does not trail the Default result that R19
+  finished. The exact Default endpoint and the strict floor get it as well.
+- **Eligible:** a candidate whose plans show a dynamic block, planned or
+  copied, with fewer than two distance symbols; a candidate without plans is
+  parsed to tell. No size or block limit: it is one pass over the blocks.
+- **Bounds:** 1,024 header prices per stream, shared across blocks, at most 6
+  per block. It is linear finalization that no deadline skips.
+- **After a win:** nothing.
+
+Provenance: RFC 1951's single and empty distance codes; **Columbo** selection
+and placement.
 
 ### Dynamic header encoding
 
@@ -8523,8 +8647,10 @@ the relaxed-mode check in step 15 do work; every other step runs only in Max.
     tree floors, and afterward M14's finishes of its kept candidates and the
     closes of sweep-replaced candidates. Default then finishes the D4 lineage.
 15. Max's exact policies compare Default's slid final competitor, or its
-    first-route cut when smaller; in relaxed mode the source is kept unless the
-    result is strictly smaller.
+    first-route cut when smaller. Relaxed mode then runs R19 on the result, and
+    in Max on Default's endpoints too; the source is kept unless the result is
+    strictly smaller; and the strict floor competes last
+    ([Strict and relaxed output](#strict-and-relaxed-output)).
 
 The diagrams below show these phases as decisions.
 [Default and standalone max](#default-and-standalone-max) draws Default's steps
@@ -9233,6 +9359,7 @@ terminal methods and S for the source-max state order
 | R16 | Terminal merges | Both modes | Once the sweeps settle | [Terminal merges (R16)](#terminal-merges-r16) |
 | R17 | Terminal token replay | Both modes | After R16; under `ApngDefault` also after R14 following a late R5 win | [Terminal token replay (R17)](#terminal-token-replay-r17) |
 | R18 | Late tree floor | Both modes | Last in every finish, except that `ApngDefault` runs R2–R5 after it | [Late tree floor (R18)](#late-tree-floor-r18) |
+| R19 | Relaxed distance code | Both modes; relaxed only | Once, on the candidate every route has finished | [Relaxed distance code (R19)](#relaxed-distance-code-r19) |
 | S0 | Source-max state order | Max, `CompleteThenBounded` | Set after M3; read by later source-max starts | [S0](#s0-source-max-state-order); [method](#source-max-route) |
 
 ### Shared terminal rules

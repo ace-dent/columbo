@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: 2026 Andrew C.E. Dent <https://github.com/ace-dent>
 
 //! Terminal header methods on a finished block that Default and Max both run:
-//! strict distance completion (R1b), the payload/header tradeoff (R2) and the
-//! literal/length span (R3). Each keeps the tokens and prices complete
-//! headers.
+//! strict distance completion (R1b), its relaxed counterpart (R19), the
+//! payload/header tradeoff (R2) and the literal/length span (R3). Each keeps
+//! the tokens and prices complete headers.
 
 use super::{
     dynamic_bits, length_swap_delta, plan_for_trimmed_lengths_uncached, token_bits,
@@ -39,6 +39,30 @@ fn strict_distance_completions(frequencies: &[u32; 30]) -> Vec<Vec<u8>> {
             lengths
         })
         .collect()
+}
+
+/// Distance codes for a relaxed block that uses at most one distance symbol:
+/// every strict completion, then the forms RFC 1951 allows.
+///
+/// With one symbol in use, the RFC form is a 1-bit code on it. With none, the
+/// RFC forms are one unused 1-bit code on symbol 0 and no codes at all. The
+/// first sends code-length symbol 1 and the second symbol 0, and either may
+/// already be in the header. A strict completion can still be the cheapest of
+/// them, when its code-length value is the cheaper one; listed first, it also
+/// wins a tie, which keeps the block strict at no cost.
+fn relaxed_distance_codes(frequencies: &[u32; 30]) -> Vec<Vec<u8>> {
+    let mut codes = strict_distance_completions(frequencies);
+    if codes.is_empty() {
+        return codes;
+    }
+    let only = frequencies.iter().position(|&frequency| frequency != 0);
+    let mut single = vec![0_u8; frequencies.len()];
+    single[only.unwrap_or(0)] = 1;
+    codes.push(single);
+    if only.is_none() {
+        codes.push(vec![0_u8; frequencies.len()]);
+    }
+    codes
 }
 
 /// Most payload bits a trade-off swap (R2) may add to shorten the header.
@@ -108,12 +132,51 @@ pub(crate) fn plan_strict_distance_completion(
     prices_left: &mut usize,
     stop: &mut SearchStop<'_>,
 ) -> Option<DynamicPlan> {
-    if !strict || *prices_left == 0 || stop.reached() {
+    if !strict {
+        return None;
+    }
+    plan_degenerate_distance_code(block, true, prices_left, stop)
+}
+
+/// Choose a finished relaxed block's degenerate distance code (R19).
+///
+/// Planning gives an empty distance alphabet no codes and a singleton one
+/// 1-bit code, and a block copied from the source keeps the source's code.
+/// Which of [`relaxed_distance_codes`] is cheapest depends on the code-length
+/// values the rest of the header already sends, so each is priced with the
+/// block's literal/length code.
+pub(crate) fn plan_relaxed_distance_code(
+    block: &crate::deflate::model::ParsedBlock,
+    strict: bool,
+    prices_left: &mut usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    if strict {
+        return None;
+    }
+    plan_degenerate_distance_code(block, false, prices_left, stop)
+}
+
+/// Reprice a finished block that uses at most one distance symbol with each
+/// distance code its mode allows, keeping the literal/length code.
+// Out of line: both modes' methods share the one copy.
+#[inline(never)]
+fn plan_degenerate_distance_code(
+    block: &crate::deflate::model::ParsedBlock,
+    strict: bool,
+    prices_left: &mut usize,
+    stop: &mut SearchStop<'_>,
+) -> Option<DynamicPlan> {
+    if *prices_left == 0 || stop.reached() {
         return None;
     }
     let original = block.original_dynamic.as_ref()?;
-    let completions = strict_distance_completions(&block.distance_frequencies);
-    if completions.is_empty() || !original.has_strictly_compatible_huffman_codes() {
+    let completions = if strict {
+        strict_distance_completions(&block.distance_frequencies)
+    } else {
+        relaxed_distance_codes(&block.distance_frequencies)
+    };
+    if completions.is_empty() || (strict && !original.has_strictly_compatible_huffman_codes()) {
         return None;
     }
     let literal = &original.literal_lengths[..trim_literal(&original.literal_lengths)];
@@ -139,7 +202,7 @@ pub(crate) fn plan_strict_distance_completion(
         if let Some(plan) =
             plan_for_trimmed_lengths_uncached(literal, completion, data_bits, true, 0xff)
         {
-            if plan.bits < best_bits && plan.has_strictly_compatible_huffman_codes() {
+            if plan.bits < best_bits && (!strict || plan.has_strictly_compatible_huffman_codes()) {
                 best_bits = plan.bits;
                 best = Some(plan);
             }

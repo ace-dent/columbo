@@ -1185,6 +1185,103 @@ fn strict_mode_repairs_alias_and_single_distance_code_inputs() {
     // cheaper canonical fixed or dynamic representation.
 }
 
+/// zlib's level-9 stream for 310 bytes of four values, which ends in a run:
+/// 43 tokens, 13 of them matches.
+const LITERAL_CLIFF_RAW: &[u8] = &[
+    0x7d, 0x8f, 0xc9, 0x0d, 0x80, 0x40, 0x0c, 0x03, 0x7b, 0x9a, 0x6f, 0x0a, 0x4a, 0x0d, 0xe9, 0x1e,
+    0x58, 0x22, 0xb0, 0x1c, 0x58, 0x7f, 0x72, 0xc8, 0x87, 0x5c, 0xf5, 0x02, 0x6a, 0x07, 0x26, 0x29,
+    0x3f, 0xd4, 0xdc, 0x44, 0x7a, 0x0a, 0x53, 0x3e, 0x9e, 0x14, 0x58, 0x94, 0x30, 0x4f, 0xa7, 0x50,
+    0x05, 0xae, 0xa6, 0xfe, 0xee, 0x6b, 0x8b, 0x21, 0xc4, 0xda, 0x74, 0x78, 0x5a, 0xad, 0xd5, 0x00,
+    0x71, 0xe2, 0xc1, 0x01,
+];
+
+#[test]
+fn relaxed_output_is_never_larger_than_strict_output() {
+    // An empty distance alphabet costs the relaxed routes almost nothing, so
+    // they turn every match into literals, and no later method can pay for
+    // the first match alone: they end 20 bits above strict mode, which keeps
+    // five matches. The strict floor is what brings relaxed mode level.
+    for exhaustive in [false, true] {
+        let strict_options = Options {
+            exhaustive,
+            ..Options::default()
+        };
+        let strict = optimize_raw(LITERAL_CLIFF_RAW, &strict_options).unwrap();
+        let relaxed_options = Options {
+            strict: false,
+            ..strict_options
+        };
+        let relaxed = optimize_raw(LITERAL_CLIFF_RAW, &relaxed_options).unwrap();
+        assert!(strict.data.len() < LITERAL_CLIFF_RAW.len());
+        assert!(
+            !is_strictly_better(
+                strict.data.len(),
+                strict.info.deflate_bits,
+                relaxed.data.len(),
+                relaxed.info.deflate_bits,
+            ),
+            "strict {} bits, relaxed {} bits",
+            strict.info.deflate_bits,
+            relaxed.info.deflate_bits
+        );
+        let stream = parse_stream(&relaxed.data, 310).unwrap();
+        assert_eq!(stream.crc32, strict.info.crc32);
+        assert_eq!(stream.meaningful_bits, relaxed.info.deflate_bits);
+        // R19 halves the completed distance code that the floor arrives with.
+        assert!(relaxed.info.deflate_bits < strict.info.deflate_bits);
+    }
+}
+
+#[test]
+fn relaxed_mode_sends_one_unused_distance_code_when_it_is_cheapest() {
+    // 300 digits, 120 of them `3`, as one literal-only block whose distance
+    // code is the strict pair of 1-bit codes: 1,025 bits, 129 bytes. Byte `3`
+    // has a 1-bit code, so code-length symbol 1 is in the header and symbol 0
+    // is not. One unused 1-bit code then saves 2 bits and the 129th byte,
+    // where no codes at all would save nothing.
+    let input = [
+        0x05, 0xc1, 0x07, 0x01, 0x00, 0x20, 0x0c, 0x00, 0xa0, 0x4a, 0x2a, 0xbb, 0xfd, 0x8b, 0x09,
+        0xce, 0x71, 0xae, 0xf3, 0x1c, 0x4e, 0x38, 0xe9, 0x94, 0xd3, 0xce, 0x38, 0xeb, 0x1e, 0xf7,
+        0xba, 0xcf, 0xe5, 0x86, 0x9b, 0x6e, 0xb9, 0xed, 0x8e, 0xbb, 0xde, 0xf1, 0xae, 0xf7, 0x3c,
+        0x5e, 0x78, 0xe9, 0x95, 0xd7, 0xde, 0x78, 0xcb, 0xe1, 0xf2, 0x40, 0x90, 0x14, 0xcd, 0xb0,
+        0xe2, 0x88, 0x2b, 0x9e, 0x20, 0x42, 0xa4, 0x28, 0xd1, 0x62, 0xc4, 0xca, 0x23, 0xaf, 0x7c,
+        0x92, 0x0c, 0x99, 0xb2, 0x64, 0xcb, 0x91, 0xab, 0x8e, 0xba, 0xea, 0x29, 0x2a, 0x54, 0xaa,
+        0x52, 0xad, 0x46, 0xad, 0x3e, 0xfa, 0xea, 0xa7, 0xe9, 0xd0, 0xa9, 0x4b, 0xb7, 0x1e, 0xbd,
+        0xe6, 0x98, 0x6b, 0x9e, 0x61, 0xc2, 0xa4, 0x29, 0xd3, 0x66, 0xcc, 0xda, 0x63, 0xaf, 0x7d,
+        0x96, 0x0d, 0x9b, 0xb6, 0x6c, 0xdb, 0xb1, 0xfb, 0x01,
+    ];
+    let source = parse_stream(&input, 300).unwrap();
+    assert_eq!(source.meaningful_bits, 1_025);
+    let source_header = source.blocks[0].original_dynamic.as_ref().unwrap();
+    assert!(source_header.has_strictly_compatible_huffman_codes());
+
+    let strict = optimize_raw(&input, &Options::default()).unwrap();
+    assert_eq!(strict.data.len(), 129);
+
+    for exhaustive in [false, true] {
+        let options = Options {
+            exhaustive,
+            strict: false,
+            ..Options::default()
+        };
+        let relaxed = optimize_raw(&input, &options).unwrap();
+        assert_eq!(relaxed.data.len(), 128);
+        let stream = parse_stream(&relaxed.data, 300).unwrap();
+        assert_eq!(stream.crc32, source.crc32);
+        assert_eq!(stream.meaningful_bits, 1_023);
+        let header = stream.blocks[0].original_dynamic.as_ref().unwrap();
+        assert_eq!(
+            header
+                .distance_lengths
+                .iter()
+                .filter(|&&length| length != 0)
+                .count(),
+            1
+        );
+        assert_eq!(header.distance_lengths[0], 1);
+    }
+}
+
 fn stream_uses_258_alias(stream: &ParsedStream) -> bool {
     stream.blocks.iter().any(|block| {
         block.tokens.iter().any(|token| {

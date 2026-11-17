@@ -36,7 +36,7 @@ The format of each input is detected automatically, and several inputs are proce
 | `--out <file>` | Write a single input to `file` instead of replacing it. |
 | `--stdout` | Write a single input's output to standard output. Reports then go to standard error. |
 | `-t`, `--timeout <seconds>` | Stop starting new searches after this long on each input. Default 180; range 10–4000. Searches already running get a grace period of 10% plus one second. |
-| `--strict <n>` | `1` (default) emits conservative Deflate that strict and older decoders accept. `0` permits a few more compact encodings that [some decoders reject](docs/routes-and-methods.md#strict-and-relaxed-output). |
+| `--strict <n>` | `1` (default) emits conservative Deflate that strict and older decoders accept. `0` permits a few more compact encodings that [some decoders reject](docs/routes-and-methods.md#strict-and-relaxed-output); it also builds the strict result and keeps the smaller, so it takes up to twice as long. |
 | `--strip` | Remove metadata, credentials, signatures, and extraneous data such as trailing bytes, and merge concatenated GZIP members. |
 | `--raw` | Treat the input as a headerless RFC 1951 Deflate stream instead of detecting its format. |
 | `-v`, `--verbose` | Show a report for each stream: search timings, bit gains, and final block choices. |

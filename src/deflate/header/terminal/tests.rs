@@ -227,6 +227,107 @@ fn strict_distance_completion_replaces_a_costly_one_bit_pair() {
 }
 
 #[test]
+fn relaxed_distance_codes_add_the_rfc_forms_to_the_strict_completions() {
+    let empty = relaxed_distance_codes(&[0; 30]);
+    assert_eq!(empty[..4], strict_distance_completions(&[0; 30])[..]);
+    // One unused 1-bit code on symbol 0, then no codes at all.
+    assert_eq!(empty.len(), 6);
+    assert_eq!(empty[4][..2], [1, 0]);
+    assert!(empty[4][2..].iter().all(|&length| length == 0));
+    assert!(empty[5].iter().all(|&length| length == 0));
+
+    let mut one_used = [0_u32; 30];
+    one_used[7] = 5;
+    let single = relaxed_distance_codes(&one_used);
+    assert_eq!(single[..4], strict_distance_completions(&one_used)[..]);
+    assert_eq!(single.len(), 5);
+    assert_eq!(single[4][7], 1);
+    assert_eq!(single[4].iter().filter(|&&length| length != 0).count(), 1);
+
+    let mut two_used = [0_u32; 30];
+    two_used[3] = 1;
+    two_used[4] = 1;
+    assert!(relaxed_distance_codes(&two_used).is_empty());
+}
+
+/// A literal-only block with the given distance code. Byte `3` takes over
+/// half the block, so its literal code is one bit long and code-length symbol
+/// 1 is in the header whatever the distance code sends.
+fn half_one_literal_block(distance_lengths: &[u8]) -> crate::deflate::model::ParsedBlock {
+    let mut block = payload_tradeoff_test_block();
+    let plain: Vec<u8> = (b'0'..=b'9')
+        .flat_map(|byte| std::iter::repeat(byte).take(if byte == b'3' { 120 } else { 20 }))
+        .collect();
+    let tokens: Vec<Token> = plain.iter().copied().map(Token::Literal).collect();
+    let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
+    let literal_lengths = make_lengths(&literal_frequencies, 15, 0);
+    assert_eq!(literal_lengths[usize::from(b'3')], 1);
+    block.original_dynamic =
+        Some(plan_for_explicit_lengths(&tokens, &literal_lengths, distance_lengths, true).unwrap());
+    block.tokens = tokens.into();
+    block.plain = plain.into();
+    block.literal_frequencies = literal_frequencies;
+    block.distance_frequencies = distance_frequencies;
+    block
+}
+
+#[test]
+fn relaxed_distance_code_sends_one_unused_code_where_length_one_is_cheaper() {
+    // Code-length symbol 1 is in the header and symbol 0 is not, so one
+    // unused 1-bit code costs one code fewer than the strict pair, and no
+    // codes at all would add a code-length symbol.
+    let block = half_one_literal_block(&[1, 1]);
+    let original = block.original_dynamic.as_ref().unwrap();
+    assert_eq!(original.code_length_lengths[0], 0);
+    let one_code = u64::from(original.code_length_lengths[1]);
+
+    let mut prices = 6;
+    let relaxed =
+        plan_relaxed_distance_code(&block, false, &mut prices, &mut SearchStop::never()).unwrap();
+    assert_eq!(prices, 0);
+    assert_eq!(
+        relaxed.distance_lengths[..trim_distance(&relaxed.distance_lengths)],
+        [1]
+    );
+    assert_eq!(relaxed.literal_lengths, original.literal_lengths);
+    assert_eq!(relaxed.bits + one_code, original.bits);
+    assert!(!relaxed.has_strictly_compatible_huffman_codes());
+
+    // The single code is already the cheapest form.
+    let single = half_one_literal_block(&[1]);
+    assert_eq!(single.original_dynamic.as_ref().unwrap().bits, relaxed.bits);
+    let mut prices = 6;
+    assert!(
+        plan_relaxed_distance_code(&single, false, &mut prices, &mut SearchStop::never()).is_none()
+    );
+
+    // Strict mode leaves the method to R1b.
+    let mut prices = 6;
+    assert!(
+        plan_relaxed_distance_code(&block, true, &mut prices, &mut SearchStop::never()).is_none()
+    );
+    assert_eq!(prices, 6);
+}
+
+#[test]
+fn relaxed_distance_code_is_no_dearer_than_the_strict_completion() {
+    // The strict completions are relaxed candidates too, so the relaxed
+    // choice for a block cannot cost more than R1b's.
+    let block = payload_tradeoff_test_block();
+    let original = block.original_dynamic.as_ref().unwrap();
+    let mut prices = 4;
+    let strict =
+        plan_strict_distance_completion(&block, true, &mut prices, &mut SearchStop::never())
+            .unwrap();
+    let mut prices = 6;
+    let relaxed =
+        plan_relaxed_distance_code(&block, false, &mut prices, &mut SearchStop::never()).unwrap();
+    assert!(relaxed.bits <= strict.bits);
+    assert!(relaxed.bits < original.bits);
+    assert_eq!(relaxed.literal_lengths, original.literal_lengths);
+}
+
+#[test]
 fn strict_completion_payload_adjustment_matches_a_full_token_scan() {
     let mut tokens: Vec<Token> = (0..40_u8).map(|byte| Token::Literal(byte % 7)).collect();
     tokens.extend(

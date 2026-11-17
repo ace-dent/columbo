@@ -60,6 +60,10 @@ pub struct Options {
     /// or single-code distance alphabets that RFC 1951 allows, single-code
     /// literal/length alphabets accepted by common decoders, and defluff's
     /// non-standard symbol-284 spelling of length 258.
+    ///
+    /// Relaxed mode also builds each stream as strict mode would and keeps
+    /// the smaller result, so within the same time it is never larger than
+    /// strict output. A relaxed run takes up to twice as long.
     pub strict: bool,
     /// Soft wall-clock scheduling budget for the whole input file.
     ///

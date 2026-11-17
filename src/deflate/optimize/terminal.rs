@@ -4,8 +4,8 @@
 //! The terminal sweep on a complete candidate: original-match restoration
 //! (R1), the terminal methods R1b–R11, the boundary slide (R1c) and the
 //! finishing steps R13–R17. Max repeats the sweep while it improves (R12).
-//! Also the final header fit (R2–R5 after R18) and the parse cache that the
-//! methods share.
+//! Also the final header fit (R2–R5 after R18), the relaxed distance code
+//! (R19) and the parse cache that the methods share.
 
 use crate::progress::Progress;
 use crate::{Options, Result};
@@ -21,7 +21,7 @@ use crate::deflate::header::{
     plan_literal_span, plan_payload_header_tradeoff, plan_rle_smoothed_tree_candidate,
 };
 use crate::deflate::model::{
-    DynamicPlan, ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType,
+    DynamicPlan, ParsedBlock, ParsedStream, PlannedBlock, Representation, SourceBlockType, Token,
 };
 use crate::deflate::restore::{
     plan_original_match_restoration, MAX_RESTORATION_BLOCKS, MAX_RESTORATION_BYTES,
@@ -130,9 +130,11 @@ fn refine_with_original_match_restoration(
 
 /// Terminal methods R1b–R11, R1c and R13–R15, run in that order after R1 by
 /// [`improve_with_terminal_searches`], and R16 and R17 once the sweep settles.
+/// R19 runs outside the sweep, on the candidate every route has finished.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TerminalHeaderSearch {
     StrictDistanceCompletion,
+    RelaxedDistanceCode,
     PayloadTradeoff,
     LiteralSpan,
     JointTreeRle,
@@ -167,6 +169,7 @@ impl TerminalHeaderSearch {
     fn name(self) -> &'static str {
         match self {
             Self::StrictDistanceCompletion => "Strict distance completion",
+            Self::RelaxedDistanceCode => "Relaxed distance code",
             Self::PayloadTradeoff => "Payload/header tradeoff",
             Self::LiteralSpan => "Literal/length span",
             Self::JointTreeRle => "Joint tree/RLE",
@@ -187,9 +190,9 @@ impl TerminalHeaderSearch {
     }
 
     fn max_bytes(self, exhaustive: bool) -> usize {
-        // R1c and R13–R17 are linear and parse one candidate, costing no more
-        // than a replay round, so they have no size limit.
-        if self == Self::BoundarySlide || self.is_tree_finish() {
+        // R1c, R13–R17 and R19 are linear and parse one candidate, costing no
+        // more than a replay round, so they have no size limit.
+        if self.is_linear() {
             return usize::MAX;
         }
         if exhaustive {
@@ -208,9 +211,15 @@ impl TerminalHeaderSearch {
 
     fn max_blocks(self) -> usize {
         match self {
-            _ if self == Self::BoundarySlide || self.is_tree_finish() => usize::MAX,
+            _ if self.is_linear() => usize::MAX,
             _ => TERMINAL_HEADER_MAX_BLOCKS,
         }
+    }
+
+    /// R1c, R13–R17 and R19: one pass over the blocks, with bounded work in
+    /// each.
+    fn is_linear(self) -> bool {
+        self == Self::BoundarySlide || self == Self::RelaxedDistanceCode || self.is_tree_finish()
     }
 
     /// Max methods that run only when no earlier method in the sweep changed
@@ -314,6 +323,14 @@ impl TerminalHeaderSearch {
                 let dynamic = match self {
                     Self::StrictDistanceCompletion => {
                         crate::deflate::header::plan_strict_distance_completion(
+                            block,
+                            options.strict,
+                            &mut budget.header_prices,
+                            stop,
+                        )
+                    }
+                    Self::RelaxedDistanceCode => {
+                        crate::deflate::header::plan_relaxed_distance_code(
                             block,
                             options.strict,
                             &mut budget.header_prices,
@@ -1022,6 +1039,57 @@ pub(super) fn improve_with_final_header_fit(
         }
     }
     Ok(candidate)
+}
+
+/// R19: in relaxed mode, give each block that uses at most one distance
+/// symbol the cheapest distance code its header allows. Returns the rewrite
+/// only when it is strictly smaller.
+///
+/// It runs on a candidate that every route has finished, so it redirects no
+/// search, and it is linear finalization that no deadline skips: Default and
+/// Max then apply it alike, and Max can compare its result with Default's.
+pub(super) fn refine_with_relaxed_distance_codes(
+    candidate: &Candidate,
+    options: &Options,
+    decoded_limit: u64,
+    identity: StreamIdentity,
+) -> Result<Option<Candidate>> {
+    if options.strict || !may_use_degenerate_distance_code(&candidate.plans) {
+        return Ok(None);
+    }
+    refine_with_terminal_header_search_cached(
+        TerminalHeaderSearch::RelaxedDistanceCode,
+        candidate,
+        options,
+        decoded_limit,
+        identity,
+        &mut SearchStop::never(),
+        &mut TerminalParseCache::default(),
+    )
+}
+
+/// Whether some dynamic block may use fewer than two distance symbols, so
+/// that R19 need not parse a candidate it cannot change. A candidate without
+/// its plans has to be parsed to tell.
+fn may_use_degenerate_distance_code(plans: &[PlannedBlock]) -> bool {
+    plans.is_empty()
+        || plans.iter().any(|plan| {
+            let dynamic = match plan.representation {
+                Representation::Dynamic(_) => true,
+                Representation::Original(_) => plan.source_type == SourceBlockType::Dynamic,
+                Representation::Stored | Representation::Fixed => false,
+            };
+            if !dynamic {
+                return false;
+            }
+            let mut first = None;
+            !plan.tokens.iter().any(|token| match *token {
+                Token::Literal(_) => false,
+                Token::Match {
+                    distance_symbol, ..
+                } => *first.get_or_insert(distance_symbol) != distance_symbol,
+            })
+        })
 }
 
 #[cfg(test)]
