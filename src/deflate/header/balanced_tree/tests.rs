@@ -108,10 +108,6 @@ fn columbo_pair_move_also_optimizes_the_distance_tree() {
             distance: u16::from(symbol) + 1,
             length_symbol: 257,
             distance_symbol: symbol,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         }));
     }
     let mut literal_frequencies = [0_u32; 286];

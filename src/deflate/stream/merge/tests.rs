@@ -134,7 +134,7 @@ fn merges_chain_and_stop_at_stored_blocks() {
 fn completed_merges_survive_an_exhausted_budget() {
     let part = regime(0..8, 300);
     let blocks = parsed_blocks(&[(&part, false), (&part, false), (&part, false)], true);
-    let pair_work = 2 * (300 * std::mem::size_of::<Token>() + 300);
+    let pair_work = 2 * (300 * TOKEN_CHARGE_BYTES + 300);
     let plans = plan_terminal_merges_with_work(
         &blocks,
         &Options::default(),

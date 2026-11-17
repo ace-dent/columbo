@@ -73,10 +73,6 @@ fn token_bits_counts_huffman_codes_and_match_extras_together() {
             distance: 5,
             length_symbol: 265,
             distance_symbol: 4,
-            length_extra: 1,
-            distance_extra: 0,
-            length_extra_bits: 1,
-            distance_extra_bits: 1,
         },
     ];
     let mut literal_lengths = [0_u8; 286];
@@ -348,10 +344,6 @@ fn swap_searches_with_kept_trial_costs_match_cold_searches() {
             distance: 1,
             length_symbol,
             distance_symbol,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: (distance_symbol / 2).saturating_sub(1),
         });
     }
     let (literal, distance) = count_frequencies(&base);

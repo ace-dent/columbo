@@ -317,8 +317,6 @@ fn accepts_the_defluff_258_alias_as_an_input_compatibility_extension() {
                 Token::Match {
                     length: 258,
                     length_symbol: 284,
-                    length_extra: 31,
-                    length_extra_bits: 5,
                     ..
                 }
             )
@@ -478,7 +476,7 @@ fn bounds_many_nonempty_source_blocks() {
 
 #[test]
 fn parser_limit_check_matches_the_model_and_block_limits() {
-    let token = std::mem::size_of::<Token>();
+    let token = TOKEN_CHARGE_BYTES;
     // Retained blocks reach the model limit long before the source-block
     // limit, which also counts empty blocks.
     let blocks = BASE_PARSED_MODEL_BYTES / PARSED_BLOCK_MODEL_BYTES;
@@ -510,7 +508,7 @@ fn scaled_model_limit_covers_the_decoded_and_source_block_limits() {
         assert!(parsed_model_bytes(0, 0, MAX_SOURCE_BLOCKS).unwrap() <= MAX_PARSED_MODEL_BYTES);
     }
     // Token counts stay below the `u32` symbol counts.
-    let token = std::mem::size_of::<Token>();
+    let token = TOKEN_CHARGE_BYTES;
     assert!(MAX_PARSED_MODEL_BYTES / (token + 1) < u32::MAX as usize);
 }
 

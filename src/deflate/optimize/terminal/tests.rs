@@ -666,10 +666,6 @@ fn alphabet_boundaries_preserve_history_and_reprice_later_stored_padding() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         }]
         .into(),
         plain: vec![0; 3].into(),
@@ -786,10 +782,6 @@ fn header_tree_search_preserves_payload_and_stored_alignment() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         }]
         .into(),
         plain: vec![*block.plain.last().unwrap(); 3].into(),
@@ -888,10 +880,6 @@ fn code_length_rotations_preserve_tokens_and_stored_alignment() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         }]
         .into(),
         plain: vec![*block.plain.last().unwrap(); 3].into(),
@@ -1003,10 +991,6 @@ fn coupled_swaps_preserve_tokens_histograms_and_stored_alignment() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         }]
         .into(),
         plain: vec![*block.plain.last().unwrap(); 3].into(),

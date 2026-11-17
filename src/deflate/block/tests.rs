@@ -182,7 +182,7 @@ fn canonical_cache_hits_for_equal_tokens_with_distinct_arcs() {
             inserts: 1,
             collision_checks: 1,
             saturated: 0,
-            retained_token_bytes: first.tokens.capacity() * std::mem::size_of::<Token>(),
+            retained_token_bytes: first.tokens.capacity() * TOKEN_CHARGE_BYTES,
         }
     );
 }

@@ -4,8 +4,7 @@
 use super::terminal::has_dearer_match;
 use super::*;
 use crate::deflate::model::{
-    OriginalBits, SourceBlockType, DISTANCE_BASE, DISTANCE_EXTRA_BITS, LENGTH_BASE,
-    LENGTH_EXTRA_BITS,
+    OriginalBits, SourceBlockType, DISTANCE_BASE, LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 use crate::deflate::search::test_support::{
     mixed_short_family_block, short_family_test_block, test_match,
@@ -32,10 +31,6 @@ fn the_258_alias_rewrite_is_bidirectional_but_explicit() {
         distance: 1,
         length_symbol: 285,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     };
 
     let aliased =
@@ -44,8 +39,6 @@ fn the_258_alias_rewrite_is_bidirectional_but_explicit() {
         aliased.as_slice(),
         [Token::Match {
             length_symbol: 284,
-            length_extra: 31,
-            length_extra_bits: 5,
             ..
         }]
     ));
@@ -79,7 +72,7 @@ fn generated_match_lengths_are_canonical() {
 #[test]
 fn all_literal_endpoint_preflights_large_marginal_matches() {
     let mut tokens = vec![Token::Literal(b'a'); 39_997];
-    tokens.push(test_match(3, 32_768, 29, 8_191, 13));
+    tokens.push(test_match(3, 32_768, 29));
     let block = short_family_test_block(tokens, vec![b'a'; 40_000]);
     let options = Options::default();
     let base = plan_block(&block, 0, &options, &mut SearchStop::never());
@@ -161,10 +154,6 @@ fn expansion_budget_counts_tokens_and_decoded_bytes() {
         distance: 1,
         length_symbol: 258,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     }];
     let plain = b"aaaa";
     let exact_limit = parsed_model_bytes(plain.len(), plain.len(), 1).unwrap();
@@ -191,10 +180,6 @@ fn table_replay_preflights_its_per_pass_token_cap() {
         distance: 1,
         length_symbol: 257,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     };
     let tokens = [one_match, one_match];
     let plain = b"aaaaaa";
@@ -233,20 +218,12 @@ fn strict_expansion_preserves_zero_delta_matches() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         },
         Token::Match {
             length: 4,
             distance: 1,
             length_symbol: 258,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         },
     ];
     let plain = b"aaabbbb";
@@ -286,10 +263,6 @@ fn individual_prune_uses_source_tree_when_original_bits_are_best() {
             distance: 1,
             length_symbol: 257,
             distance_symbol: 0,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         },
     ];
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
@@ -350,13 +323,7 @@ fn random_literal_sum_case(
             let length = [3, 4, 9, 18, 67, 130, 258][(next() % 7) as usize];
             let distance_symbol = (next() % 30) as u8;
             let distance = DISTANCE_BASE[usize::from(distance_symbol)];
-            tokens.push(test_match(
-                length,
-                distance,
-                distance_symbol,
-                0,
-                DISTANCE_EXTRA_BITS[usize::from(distance_symbol)],
-            ));
+            tokens.push(test_match(length, distance, distance_symbol));
             plain.extend((0..length).map(|_| (next() % 8) as u8));
         }
     }
@@ -387,14 +354,11 @@ fn early_stopping_literal_sums_match_full_sums() {
     };
     for case in 0..20_000 {
         let (tokens, plain, literal_lengths, distance_lengths) = random_literal_sum_case(&mut next);
-        let match_bits = |length_symbol: u16,
-                          distance_symbol: u8,
-                          length_extra_bits: u8,
-                          distance_extra_bits: u8| {
+        let match_bits = |length_symbol: u16, distance_symbol: u8| {
             estimated_length(&literal_lengths, usize::from(length_symbol))
-                + u64::from(length_extra_bits)
+                + u64::from(length_extra_bits(length_symbol))
                 + estimated_length(&distance_lengths, usize::from(distance_symbol))
-                + u64::from(distance_extra_bits)
+                + u64::from(distance_extra_bits(distance_symbol))
         };
         let full_literal_bits = |decoded: &[u8]| -> u64 {
             decoded
@@ -412,20 +376,13 @@ fn early_stopping_literal_sums_match_full_sums() {
                     let Token::Match {
                         length_symbol,
                         distance_symbol,
-                        length_extra_bits,
-                        distance_extra_bits,
                         ..
                     } = token
                     else {
                         return false;
                     };
                     let literal_bits = full_literal_bits(decoded);
-                    let match_bits = match_bits(
-                        length_symbol,
-                        distance_symbol,
-                        length_extra_bits,
-                        distance_extra_bits,
-                    );
+                    let match_bits = match_bits(length_symbol, distance_symbol);
                     literal_bits < match_bits || (include_equal && literal_bits == match_bits)
                 },
             );
@@ -450,19 +407,12 @@ fn early_stopping_literal_sums_match_full_sums() {
                 length,
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } = token
             {
                 let decoded = &plain[offset..offset + usize::from(length)];
-                expected_dearer |= full_literal_bits(decoded)
-                    < match_bits(
-                        length_symbol,
-                        distance_symbol,
-                        length_extra_bits,
-                        distance_extra_bits,
-                    );
+                expected_dearer |=
+                    full_literal_bits(decoded) < match_bits(length_symbol, distance_symbol);
             }
             offset += token.decoded_len();
         }
@@ -476,8 +426,6 @@ fn early_stopping_literal_sums_match_full_sums() {
             let Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } = token
             else {
@@ -506,9 +454,9 @@ fn early_stopping_literal_sums_match_full_sums() {
                 .sum();
             literal_bits
                 < u64::from(match_literal_length)
-                    + u64::from(length_extra_bits)
+                    + u64::from(length_extra_bits(length_symbol))
                     + u64::from(match_distance_length)
-                    + u64::from(distance_extra_bits)
+                    + u64::from(distance_extra_bits(distance_symbol))
         });
         assert_eq!(
             expand_defluff_matches(&tokens, &plain, &literal_lengths, &distance_lengths),

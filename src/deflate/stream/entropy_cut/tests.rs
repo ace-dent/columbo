@@ -148,10 +148,6 @@ fn random_tokens(next: &mut impl FnMut() -> u64, count: usize) -> Vec<Token> {
                     distance: 1,
                     length_symbol,
                     distance_symbol,
-                    length_extra: 0,
-                    distance_extra: 0,
-                    length_extra_bits: 0,
-                    distance_extra_bits: 0,
                 }
             }
         })

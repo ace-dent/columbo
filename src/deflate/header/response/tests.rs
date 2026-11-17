@@ -9,11 +9,7 @@ fn seed(length: usize) -> Token {
             length: 3,
             distance: 1,
             length_symbol: 257,
-            length_extra: 0,
-            length_extra_bits: 0,
             distance_symbol: 0,
-            distance_extra: 0,
-            distance_extra_bits: 0,
         },
         length,
     )
@@ -112,16 +108,8 @@ fn family_minima_preserve_exact_spellings_budgets_and_stops() {
             let plain: Vec<_> = (0..n).map(|i| ((i * 13 + profile) % 7) as u8).collect();
             let mut source = seed(n);
             if n == 258 && profile & 1 != 0 {
-                if let Token::Match {
-                    length_symbol,
-                    length_extra,
-                    length_extra_bits,
-                    ..
-                } = &mut source
-                {
+                if let Token::Match { length_symbol, .. } = &mut source {
                     *length_symbol = 284;
-                    *length_extra = 31;
-                    *length_extra_bits = 5;
                 }
             }
             let distance = [profile as u8];
@@ -238,7 +226,6 @@ fn absent_literals_source_ties_canonical_258_and_interval_stops() {
         out[0],
         Token::Match {
             length_symbol: 285,
-            length_extra_bits: 0,
             ..
         }
     ));

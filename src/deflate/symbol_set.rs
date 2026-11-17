@@ -14,8 +14,8 @@ use super::header::{
     plan_rle_smoothed_tree_candidate,
 };
 use super::model::{
-    count_frequencies, same_tokens, token_extra_bits, try_clone_slice, ParsedBlock, PlannedBlock,
-    Representation, Token,
+    count_frequencies, distance_extra_bits, length_extra_bits, same_tokens, token_extra_bits,
+    try_clone_slice, ParsedBlock, PlannedBlock, Representation, Token,
 };
 use super::search::{solve_proven_submatch_avoiding, try_transformed_block};
 use super::stop::SearchStop;
@@ -228,13 +228,12 @@ impl Rewrite {
             Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } => {
                 step(&mut self.literal_frequencies[usize::from(length_symbol)]);
                 step(&mut self.distance_frequencies[usize::from(distance_symbol)]);
-                let extra = u64::from(length_extra_bits) + u64::from(distance_extra_bits);
+                let extra = u64::from(length_extra_bits(length_symbol))
+                    + u64::from(distance_extra_bits(distance_symbol));
                 self.extra_bits = if added {
                     self.extra_bits + extra
                 } else {

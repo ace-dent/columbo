@@ -650,11 +650,15 @@ parse:
   64 MiB). The ratio defaults to 512, and `None` disables the ratio limit. It is
   applied once per input, so container members share one allowance
   ([`src/format/mod.rs`](../src/format/mod.rs)).
-- The parsed model is charged as tokens × token size + decoded bytes + blocks ×
-  (block size + 4 KiB). Any stream may use 256 MiB of it, and a stream may use
-  up to 4 GiB while its block records (the last term) take at most 512 bytes
-  for each compressed byte read so far, the current block's included, the
-  ratio that also limits decoded data. A stream holds at most 262,144 source blocks, empty blocks included.
+- The parsed model is charged as tokens × 14 bytes + decoded bytes + blocks ×
+  (block size + 4 KiB). A token took 14 bytes when these limits and the routes'
+  work charges were set; it now takes 8, since its extra-bit counts and values
+  follow from its symbols, but every charge keeps 14 so that no limit or route
+  choice moves (`TOKEN_CHARGE_BYTES` in
+  [`src/deflate/model.rs`](../src/deflate/model.rs)). Any stream may use 256 MiB
+  of the model, and a stream may use up to 4 GiB while its block records (the
+  last term) take at most 512 bytes for each compressed byte read so far, the
+  current block's included, the ratio that also limits decoded data. A stream holds at most 262,144 source blocks, empty blocks included.
   These limits are not configurable. Block records are the part of the model
   that a small stream can inflate: a one-literal fixed block charges a whole
   record for 18 bits, whereas decoded bytes have their own limit and a token
@@ -5704,8 +5708,8 @@ outputs.
 - **Bounds:** per invocation, one pass over the stream, so each repeated sweep
   (R12) starts afresh: 2^26 work units and 4,096 exact range prices. A block's
   scan charges its token count, each new range estimate 2 × 256 + 316 units, and
-  each new exact range price its token upper bound × the token size plus its
-  decoded bytes, and one price. Each block search keeps its own range-plan map
+  each new exact range price its token upper bound × 14 plus its decoded
+  bytes, and one price. Each block search keeps its own range-plan map
   and a 512-entry header-plan cache. Per block: at most 8 direct pairs (24 range
   prices), 80 cuts and 3,160 edges. The stop is polled every 256 tokens of the
   support scan and before each estimate, range price and graph edge.
@@ -5810,7 +5814,7 @@ files and 2,198 on 11 relaxed inputs.
 - **Bounds:** per pass over the stream, shared by all its blocks: 64 work units
   per token and decoded byte of the stream, at least 2^28, and 4,096 exact range
   prices. Each range scan charges twice its token count, and each new segment
-  price charges its token upper bound × the token size plus its decoded bytes,
+  price charges its token upper bound × 14 plus its decoded bytes,
   and one price. Cuts are token boundaries only. The stop is polled every 65,536
   scanned tokens and before each new segment price.
 - **After a win:** R1c runs once more; in Max, sweep repetition (R12) runs
@@ -5893,7 +5897,7 @@ larger in all, losses that did not reproduce.
   keep its original bits at its alignment, or the pass yields nothing.
 - **Bounds:** one pass per invocation, with 64 work units per token and decoded
   byte of the stream, at least 2^28. Each attempted pair is charged both blocks'
-  tokens × the token size plus both blocks' decoded bytes. The stop is polled
+  tokens × 14 plus both blocks' decoded bytes. The stop is polled
   before each pair.
 - **After a win:** R1c runs once more, then R15 once more with its own R1c; R17
   follows whether or not R16 won. In Max, a win counts as an improvement for

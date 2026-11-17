@@ -122,7 +122,7 @@ fn plan_terminal_merges_with_work(
             .tokens
             .len()
             .checked_add(next.block.tokens.len())?
-            .checked_mul(std::mem::size_of::<Token>())?
+            .checked_mul(TOKEN_CHARGE_BYTES)?
             .checked_add(left.block.plain.len())?
             .checked_add(next.block.plain.len())?;
         if left.block.source_type != SourceBlockType::Stored
@@ -224,7 +224,7 @@ pub(crate) fn plan_boundary_merges(
                     .tokens
                     .len()
                     .checked_add(right.block.tokens.len())?
-                    .checked_mul(std::mem::size_of::<Token>())?
+                    .checked_mul(TOKEN_CHARGE_BYTES)?
                     .checked_add(left.block.plain.len())?
                     .checked_add(right.block.plain.len())?;
                 if left.block.source_type != SourceBlockType::Stored

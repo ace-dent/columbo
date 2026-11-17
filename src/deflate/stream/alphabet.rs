@@ -194,7 +194,7 @@ impl EdgeCache<'_> {
             }
             let work = composite
                 .range_token_count_upper_bound(start, end)?
-                .checked_mul(std::mem::size_of::<Token>())?
+                .checked_mul(TOKEN_CHARGE_BYTES)?
                 .checked_add(end.plain.checked_sub(start.plain)?)?;
             self.budget.spend(work)?;
             self.budget.prices_left -= 1;

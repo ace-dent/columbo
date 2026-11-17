@@ -9,24 +9,13 @@ use crate::deflate::model::{
     SourceBlockType, Token,
 };
 
-pub(crate) fn test_match(
-    length: u16,
-    distance: u16,
-    distance_symbol: u8,
-    distance_extra: u16,
-    distance_extra_bits: u8,
-) -> Token {
-    let (length_symbol, length_extra, length_extra_bits) =
-        canonical_length_encoding(length).expect("test length is legal");
+pub(crate) fn test_match(length: u16, distance: u16, distance_symbol: u8) -> Token {
+    let (length_symbol, _, _) = canonical_length_encoding(length).expect("test length is legal");
     Token::Match {
         length,
         distance,
         length_symbol,
         distance_symbol,
-        length_extra,
-        distance_extra,
-        length_extra_bits,
-        distance_extra_bits,
     }
 }
 
@@ -76,22 +65,18 @@ pub(crate) fn short_family_test_block(tokens: Vec<Token>, plain: Vec<u8>) -> Par
 pub(crate) fn mixed_short_family_block() -> ParsedBlock {
     let mut tokens = vec![Token::Literal(b'z')];
     let mut plain = vec![b'z'];
-    for (length, length_symbol, distance, distance_symbol, distance_extra_bits, byte) in [
-        (6, 260, 1, 0, 0, b'a'),
-        (7, 261, 5, 4, 1, b'b'),
-        (8, 262, 9, 6, 2, b'c'),
-        (9, 263, 17, 8, 3, b'd'),
-        (10, 264, 33, 10, 4, b'e'),
+    for (length, length_symbol, distance, distance_symbol, byte) in [
+        (6, 260, 1, 0, b'a'),
+        (7, 261, 5, 4, b'b'),
+        (8, 262, 9, 6, b'c'),
+        (9, 263, 17, 8, b'd'),
+        (10, 264, 33, 10, b'e'),
     ] {
         tokens.push(Token::Match {
             length,
             distance,
             length_symbol,
             distance_symbol,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits,
         });
         plain.extend(std::iter::repeat(byte).take(usize::from(length)));
     }
@@ -107,10 +92,6 @@ pub(crate) fn aba_match() -> Token {
         distance: 2,
         length_symbol: 257,
         distance_symbol: 1,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     }
 }
 

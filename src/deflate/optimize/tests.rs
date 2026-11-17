@@ -878,7 +878,6 @@ fn strict_mode_never_creates_the_non_rfc_258_alias() {
                 token,
                 Token::Match {
                     length_symbol: 284,
-                    length_extra: 31,
                     ..
                 }
             )
@@ -970,8 +969,6 @@ fn default_route_coalesces_adjacent_same_distance_matches() {
                     Token::Match {
                         length: 258,
                         length_symbol: 285,
-                        length_extra: 0,
-                        length_extra_bits: 0,
                         ..
                     }
                 ]
@@ -1124,11 +1121,7 @@ fn default_route_exact_prices_a_nonhighest_source_symbol_tie() {
                         length: 16,
                         distance: 1,
                         length_symbol: 267,
-                        length_extra: 1,
-                        length_extra_bits: 1,
                         distance_symbol: 0,
-                        distance_extra: 0,
-                        distance_extra_bits: 0,
                     }
                 )
             })
@@ -1200,8 +1193,6 @@ fn stream_uses_258_alias(stream: &ParsedStream) -> bool {
                 Token::Match {
                     length: 258,
                     length_symbol: 284,
-                    length_extra: 31,
-                    length_extra_bits: 5,
                     ..
                 }
             )

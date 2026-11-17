@@ -4,7 +4,7 @@
 use super::*;
 use crate::deflate::bitstream::BitWriter;
 use crate::deflate::block::emit_block;
-use crate::deflate::model::{ParsedStream, DISTANCE_BASE, DISTANCE_EXTRA_BITS};
+use crate::deflate::model::{ParsedStream, DISTANCE_BASE};
 use crate::deflate::parse::parse_stream;
 
 fn matched(length: u16, distance: u16) -> Token {
@@ -17,11 +17,7 @@ fn matched(length: u16, distance: u16) -> Token {
             length,
             distance,
             length_symbol: 0,
-            length_extra: 0,
-            length_extra_bits: 0,
             distance_symbol: symbol as u8,
-            distance_extra: distance - DISTANCE_BASE[symbol],
-            distance_extra_bits: DISTANCE_EXTRA_BITS[symbol],
         },
         length,
     )
@@ -189,16 +185,8 @@ fn compare_interval(n: usize, mixed: bool, literal: &[u8], remaining: usize, cut
         let length = (n / 2).min(258);
         let mut token = matched(length as u16, 1);
         if length == 258 {
-            if let Token::Match {
-                length_symbol,
-                length_extra,
-                length_extra_bits,
-                ..
-            } = &mut token
-            {
+            if let Token::Match { length_symbol, .. } = &mut token {
                 *length_symbol = 284;
-                *length_extra = 31;
-                *length_extra_bits = 5;
             }
         }
         current.splice(1..=length, [token]);

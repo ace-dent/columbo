@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use crate::deflate::minima::SuffixMinima;
 use crate::deflate::model::{
-    count_frequencies, same_tokens, ParsedBlock, PlannedBlock, Token,
-    LENGTH_BASE as DEFLATE_LENGTH_BASE,
+    count_frequencies, distance_extra_bits, length_extra_bits, same_tokens, ParsedBlock,
+    PlannedBlock, Token, LENGTH_BASE as DEFLATE_LENGTH_BASE,
 };
 use crate::deflate::stop::SearchStop;
 use crate::sort::SortShared;
@@ -816,20 +816,18 @@ fn estimated_match_token_bits(
     let Token::Match {
         length_symbol,
         distance_symbol,
-        length_extra_bits,
-        distance_extra_bits,
         ..
     } = token
     else {
         return None;
     };
     estimated_length(literal_lengths, usize::from(length_symbol))
-        .checked_add(u64::from(length_extra_bits))?
+        .checked_add(u64::from(length_extra_bits(length_symbol)))?
         .checked_add(estimated_length(
             distance_lengths,
             usize::from(distance_symbol),
         ))?
-        .checked_add(u64::from(distance_extra_bits))
+        .checked_add(u64::from(distance_extra_bits(distance_symbol)))
 }
 
 fn estimated_tokens_bits(

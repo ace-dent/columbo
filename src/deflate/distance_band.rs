@@ -15,7 +15,10 @@
 
 use super::block::plan_owned_block;
 use super::header::estimate_boundary_block_bits;
-use super::model::{token_extra_bits, ParsedBlock, PlannedBlock, SourceBlockType, Token};
+use super::model::{
+    distance_extra_bits, length_extra_bits, token_extra_bits, ParsedBlock, PlannedBlock,
+    SourceBlockType, Token,
+};
 use super::search::{expand_selected_matches, try_transformed_block};
 use super::stop::SearchStop;
 use crate::sort::SortShared;
@@ -52,8 +55,6 @@ impl Removals {
             if let Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } = token
             {
@@ -63,8 +64,10 @@ impl Removals {
                     .get_mut(symbol)?
                     .get_mut(usize::from(length_symbol.checked_sub(257)?))?;
                 *length = length.checked_add(1)?;
-                removals.extra_bits[symbol] = removals.extra_bits[symbol]
-                    .checked_add(u64::from(length_extra_bits) + u64::from(distance_extra_bits))?;
+                removals.extra_bits[symbol] = removals.extra_bits[symbol].checked_add(
+                    u64::from(length_extra_bits(length_symbol))
+                        + u64::from(distance_extra_bits(distance_symbol)),
+                )?;
                 let literals = &mut removals.literals[symbol];
                 for &byte in block.plain.get(position..end)? {
                     let frequency = &mut literals[usize::from(byte)];

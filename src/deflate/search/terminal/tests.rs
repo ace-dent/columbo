@@ -14,10 +14,6 @@ fn bounded_replays_return_only_strict_huffman_improvements() {
         distance: 1,
         length_symbol: 257,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     });
     let block = short_family_test_block(tokens, vec![b'a'; 1_003]);
     let mut selected = plan_block(&block, 0, &Options::default(), &mut SearchStop::never());

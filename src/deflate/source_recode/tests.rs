@@ -31,10 +31,6 @@ fn costly_match_block() -> ParsedBlock {
         distance: 24_577,
         length_symbol: 257,
         distance_symbol: 29,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 13,
     }];
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
     ParsedBlock {
@@ -57,10 +53,6 @@ fn match_token(length: u16, length_symbol: u16, distance_symbol: u8) -> Token {
         distance: if distance_symbol == 29 { 24_577 } else { 1 },
         length_symbol,
         distance_symbol,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: if distance_symbol == 29 { 13 } else { 0 },
     }
 }
 

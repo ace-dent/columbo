@@ -33,10 +33,6 @@ fn parallel_bounded_grouping_matches_the_serial_candidate() {
                 distance: 1,
                 length_symbol: 265,
                 distance_symbol: 0,
-                length_extra: 0,
-                distance_extra: 0,
-                length_extra_bits: 1,
-                distance_extra_bits: 0,
             }));
             let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
             ParsedBlock {

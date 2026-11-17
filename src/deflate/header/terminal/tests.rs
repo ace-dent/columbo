@@ -235,10 +235,6 @@ fn strict_completion_payload_adjustment_matches_a_full_token_scan() {
             distance: 4,
             length_symbol: 257,
             distance_symbol: 3,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 0,
         })
         .take(5),
     );

@@ -10,8 +10,8 @@
 use super::block::{reusable_original_bits, stored_block_bits};
 use super::huffman::{FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS};
 use super::model::{
-    canonical_length_encoding, ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token,
-    LENGTH_BASE, LENGTH_EXTRA_BITS,
+    canonical_length_encoding, distance_extra_bits, length_extra_bits, ParsedBlock, PlannedBlock,
+    Representation, SourceBlockType, Token, LENGTH_BASE, LENGTH_EXTRA_BITS,
 };
 use super::stop::SearchStop;
 
@@ -138,14 +138,12 @@ pub(super) fn token_cost(token: Token, literal: &[u8], distances: &[u8]) -> Opti
         Token::Match {
             length_symbol,
             distance_symbol,
-            length_extra_bits,
-            distance_extra_bits,
             ..
         } => Some(
             code_cost(literal, usize::from(length_symbol))?
                 + code_cost(distances, usize::from(distance_symbol))?
-                + u64::from(length_extra_bits)
-                + u64::from(distance_extra_bits),
+                + u64::from(length_extra_bits(length_symbol))
+                + u64::from(distance_extra_bits(distance_symbol)),
         ),
     }
 }
@@ -154,23 +152,17 @@ fn submatch(seed: Token, length: u16) -> Option<Token> {
     let Token::Match {
         distance,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
         ..
     } = seed
     else {
         return None;
     };
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(length)?;
+    let (length_symbol, _, _) = canonical_length_encoding(length)?;
     Some(Token::Match {
         length,
         distance,
         length_symbol,
-        length_extra,
-        length_extra_bits,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
     })
 }
 
@@ -247,10 +239,11 @@ fn restore_interval(
 
     let distance_bits = match seed {
         Token::Match {
-            distance_symbol,
-            distance_extra_bits,
-            ..
-        } => code_cost(distances, usize::from(distance_symbol))? + u64::from(distance_extra_bits),
+            distance_symbol, ..
+        } => {
+            code_cost(distances, usize::from(distance_symbol))?
+                + u64::from(distance_extra_bits(distance_symbol))
+        }
         Token::Literal(_) => return None,
     };
     let mut families = [MatchFamily::default(); LENGTH_BASE.len()];

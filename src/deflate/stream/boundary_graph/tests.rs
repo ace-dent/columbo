@@ -9,7 +9,7 @@ use crate::deflate::stream::plan_stream;
 use crate::deflate::stream::test_support::{literal_block, overlapping_match_block};
 
 fn seven_inside_eighths_block() -> ParsedBlock {
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(15).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(15).unwrap();
     let mut tokens = vec![Token::Literal(b'a'), Token::Literal(b'a')];
     for match_index in 0..7 {
         tokens.push(Token::Match {
@@ -17,10 +17,6 @@ fn seven_inside_eighths_block() -> ParsedBlock {
             distance: 1,
             length_symbol,
             distance_symbol: 0,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         });
         if match_index != 6 {
             tokens.push(Token::Literal(b'a'));
@@ -127,7 +123,7 @@ fn source_aligned_floor_prices_short_huffman_groups_before_search() {
 }
 
 fn boundary_priority_block(run_count: usize) -> ParsedBlock {
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(257).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(257).unwrap();
     let mut tokens = Vec::new();
     for _ in 0..run_count {
         tokens.push(Token::Literal(b'a'));
@@ -136,10 +132,6 @@ fn boundary_priority_block(run_count: usize) -> ParsedBlock {
             distance: 1,
             length_symbol,
             distance_symbol: 0,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         }));
     }
     let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();

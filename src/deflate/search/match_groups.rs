@@ -15,7 +15,9 @@ use std::collections::HashSet;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::deflate::block::plan_block;
-use crate::deflate::model::{ParsedBlock, PlannedBlock, Token};
+use crate::deflate::model::{
+    distance_extra_bits, length_extra_bits, ParsedBlock, PlannedBlock, Token,
+};
 use crate::deflate::stop::SearchStop;
 use crate::sort::SortShared;
 use crate::Options;
@@ -292,8 +294,6 @@ fn collect_match_groups(
             length,
             length_symbol,
             distance_symbol,
-            length_extra_bits,
-            distance_extra_bits,
             ..
         } = token
         {
@@ -320,9 +320,9 @@ fn collect_match_groups(
                     .map(|&byte| i64::from(literal_lengths[usize::from(byte)]))
                     .sum();
                 let match_bits = i64::from(literal_lengths[usize::from(length_symbol)])
-                    + i64::from(length_extra_bits)
+                    + i64::from(length_extra_bits(length_symbol))
                     + i64::from(distance_lengths[distance_index])
-                    + i64::from(distance_extra_bits);
+                    + i64::from(distance_extra_bits(distance_symbol));
                 let delta = literal_bits - match_bits;
                 length_delta[length_index] += delta;
                 distance_delta[distance_index] += delta;

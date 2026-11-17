@@ -45,8 +45,6 @@ pub(crate) fn assert_proven_rewrite(source: &ParsedBlock, tokens: &[Token]) {
                 distance,
                 length,
                 length_symbol,
-                length_extra,
-                length_extra_bits,
                 ..
             } => {
                 assert!(end <= source_end);
@@ -54,8 +52,8 @@ pub(crate) fn assert_proven_rewrite(source: &ParsedBlock, tokens: &[Token]) {
                     matches!(source.tokens[source_index], Token::Match { distance: original, .. } if original == distance)
                 );
                 assert_eq!(
-                    canonical_length_encoding(length),
-                    Some((length_symbol, length_extra, length_extra_bits))
+                    canonical_length_encoding(length).map(|(symbol, ..)| symbol),
+                    Some(length_symbol)
                 );
             }
         }

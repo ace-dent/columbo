@@ -10,11 +10,7 @@ fn seed(length: usize) -> Token {
             length: 3,
             distance: 1,
             length_symbol: 257,
-            length_extra: 0,
-            length_extra_bits: 0,
             distance_symbol: 0,
-            distance_extra: 0,
-            distance_extra_bits: 0,
         },
         length,
     )
@@ -96,12 +92,8 @@ fn bound_includes_the_exact_relaxed_258_edge_and_detects_no_edges() {
     let source = Token::Match {
         length: 258,
         length_symbol: 284,
-        length_extra: 31,
-        length_extra_bits: 5,
         distance: 1,
         distance_symbol: 0,
-        distance_extra: 0,
-        distance_extra_bits: 0,
     };
     let interval = Interval {
         seed: source,

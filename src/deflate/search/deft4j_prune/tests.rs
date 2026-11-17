@@ -15,10 +15,6 @@ fn least_expensive_length_symbol_totals_each_family() {
         distance: 2,
         length_symbol: 258,
         distance_symbol: 1,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     };
     // The length-3 match costs 4 + 1 bits against literals a, b, a at 4; the
     // length-4 match 4 + 1 against b, a, b, a at 6.

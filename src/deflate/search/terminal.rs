@@ -14,7 +14,10 @@
 //! the whole-stream merged replay.
 
 use crate::deflate::block::{plan_block, reusable_original_bits};
-use crate::deflate::model::{count_frequencies, ParsedBlock, PlannedBlock, Representation, Token};
+use crate::deflate::model::{
+    count_frequencies, distance_extra_bits, length_extra_bits, ParsedBlock, PlannedBlock,
+    Representation, Token,
+};
 use crate::deflate::stop::SearchStop;
 use crate::Options;
 
@@ -253,8 +256,6 @@ pub(super) fn has_dearer_match(
                 length,
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } => {
                 let end = offset + usize::from(length);
@@ -262,9 +263,9 @@ pub(super) fn has_dearer_match(
                     return false;
                 };
                 let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
-                    + u64::from(length_extra_bits)
+                    + u64::from(length_extra_bits(length_symbol))
                     + estimated_length(distance_lengths, usize::from(distance_symbol))
-                    + u64::from(distance_extra_bits);
+                    + u64::from(distance_extra_bits(distance_symbol));
                 if byte_costs
                     .up_to(decoded, match_bits)
                     .is_some_and(|literal_bits| literal_bits < match_bits)

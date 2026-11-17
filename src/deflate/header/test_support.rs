@@ -125,7 +125,7 @@ pub(crate) fn coupled_swap_test_stream() -> Vec<u8> {
     use crate::deflate::bitstream::BitWriter;
     use crate::deflate::block::emit_block;
     use crate::deflate::model::{
-        canonical_length_encoding, PlannedBlock, Representation, DISTANCE_BASE, DISTANCE_EXTRA_BITS,
+        canonical_length_encoding, PlannedBlock, Representation, DISTANCE_BASE,
     };
     use crate::deflate::stop::SearchStop;
 
@@ -153,18 +153,13 @@ pub(crate) fn coupled_swap_test_stream() -> Vec<u8> {
     for (symbol, count) in matches.into_iter().enumerate() {
         let distance = DISTANCE_BASE[symbol];
         let length = 3 + ((symbol + 20) % 24) as u16;
-        let (length_symbol, length_extra, length_extra_bits) =
-            canonical_length_encoding(length).unwrap();
+        let (length_symbol, _, _) = canonical_length_encoding(length).unwrap();
         for _ in 0..count {
             tokens.push(Token::Match {
                 length,
                 distance,
                 length_symbol,
                 distance_symbol: symbol as u8,
-                length_extra,
-                distance_extra: 0,
-                length_extra_bits,
-                distance_extra_bits: DISTANCE_EXTRA_BITS[symbol],
             });
             for _ in 0..length {
                 plain.push(plain[plain.len() - usize::from(distance)]);

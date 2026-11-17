@@ -18,8 +18,9 @@ use super::huffman::{
     fixed_trees, Huffman, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    frequency_extra_bits, same_tokens, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock,
-    PlannedBlock, Representation, SourceBlockType, Token, CODE_LENGTH_ORDER,
+    distance_extra, distance_extra_bits, frequency_extra_bits, length_extra, length_extra_bits,
+    same_tokens, token_extra_bits, DynamicPlan, OriginalBits, ParsedBlock, PlannedBlock,
+    Representation, SourceBlockType, Token, CODE_LENGTH_ORDER, TOKEN_CHARGE_BYTES,
 };
 use super::plan_store::{Charged, PlanStore};
 use super::stop::SearchStop;
@@ -583,11 +584,7 @@ impl CanonicalPlanCache {
         fingerprint: u64,
         plan: &ReusableBlockPlan,
     ) {
-        let Some(token_bytes) = block
-            .tokens
-            .capacity()
-            .checked_mul(std::mem::size_of::<Token>())
-        else {
+        let Some(token_bytes) = block.tokens.capacity().checked_mul(TOKEN_CHARGE_BYTES) else {
             self.stats.saturated = self.stats.saturated.saturating_add(1);
             return;
         };
@@ -911,27 +908,24 @@ fn emit_tokens(
         match *token {
             Token::Literal(value) => emit_symbol(writer, literal, usize::from(value))?,
             Token::Match {
+                length,
+                distance: match_distance,
                 length_symbol,
                 distance_symbol,
-                length_extra,
-                distance_extra,
-                length_extra_bits,
-                distance_extra_bits,
-                ..
             } => {
                 emit_symbol_with_extra(
                     writer,
                     literal,
                     usize::from(length_symbol),
-                    length_extra,
-                    length_extra_bits,
+                    length_extra(length, length_symbol),
+                    length_extra_bits(length_symbol),
                 )?;
                 emit_symbol_with_extra(
                     writer,
                     distance,
                     usize::from(distance_symbol),
-                    distance_extra,
-                    distance_extra_bits,
+                    distance_extra(match_distance, distance_symbol),
+                    distance_extra_bits(distance_symbol),
                 )?;
             }
         }

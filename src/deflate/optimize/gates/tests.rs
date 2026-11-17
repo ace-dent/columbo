@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::super::StreamIdentity;
 use super::*;
-use crate::deflate::model::{Representation, Token};
+use crate::deflate::model::{Representation, Token, TOKEN_CHARGE_BYTES};
 use crate::deflate::parse::parse_stream;
 use crate::deflate::search::PROVEN_SUBMATCH_FULL_MATCH_LIMIT;
 
@@ -97,7 +97,7 @@ fn parallel_routes_require_small_input_and_model_sizes() {
         1,
     ));
 
-    let oversized_token_count = PARALLEL_ROUTE_MAX_MODEL / std::mem::size_of::<Token>() + 1;
+    let oversized_token_count = PARALLEL_ROUTE_MAX_MODEL / TOKEN_CHARGE_BYTES + 1;
     assert!(!parallel_route_sizes_are_bounded(
         1,
         1,
@@ -131,10 +131,6 @@ fn bounded_floor_prebuild_uses_topology_and_route_work() {
         distance: 1,
         length_symbol: 257,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     };
     let block = ParsedBlock {
         tokens: Arc::new(vec![source_match; PROVEN_SUBMATCH_FULL_MATCH_LIMIT + 1]),
@@ -461,10 +457,6 @@ fn compact_max_scheduling_follows_dependency_topology() {
         distance: 1,
         length_symbol: 281,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 5,
-        distance_extra_bits: 0,
     };
     let mut repartition_tokens = vec![Token::Literal(0); 2_049];
     repartition_tokens.extend([

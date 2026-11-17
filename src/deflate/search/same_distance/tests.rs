@@ -93,15 +93,15 @@ fn reference_partition_choices(
 fn same_distance_stats_count_maximal_runs() {
     let tokens = vec![
         Token::Literal(b'x'),
-        test_match(3, 1, 0, 0, 0),
-        test_match(4, 1, 0, 0, 0),
-        test_match(5, 2, 1, 0, 0),
+        test_match(3, 1, 0),
+        test_match(4, 1, 0),
+        test_match(5, 2, 1),
         Token::Literal(b'y'),
-        test_match(130, 3, 2, 0, 0),
-        test_match(130, 3, 2, 0, 0),
+        test_match(130, 3, 2),
+        test_match(130, 3, 2),
         // Distances five and six share symbol four, but are not one run.
-        test_match(3, 5, 4, 0, 1),
-        test_match(3, 6, 4, 1, 1),
+        test_match(3, 5, 4),
+        test_match(3, 6, 4),
     ];
     let plain_len: usize = tokens.iter().map(|token| token.decoded_len()).sum();
     let block = short_family_test_block(tokens, vec![0; plain_len]);
@@ -121,14 +121,14 @@ fn same_distance_stats_count_maximal_runs() {
 
 #[test]
 fn same_distance_stats_join_source_blocks_but_skip_unchanged_minimum_runs() {
-    let first = short_family_test_block(vec![test_match(100, 1, 0, 0, 0)], vec![0; 100]);
+    let first = short_family_test_block(vec![test_match(100, 1, 0)], vec![0; 100]);
     let empty = short_family_test_block(Vec::new(), Vec::new());
     let last = short_family_test_block(
         vec![
-            test_match(158, 1, 0, 0, 0),
+            test_match(158, 1, 0),
             Token::Literal(b'x'),
-            test_match(258, 2, 1, 0, 0),
-            test_match(258, 2, 1, 0, 0),
+            test_match(258, 2, 1),
+            test_match(258, 2, 1),
         ],
         vec![0; 675],
     );
@@ -148,7 +148,7 @@ fn same_distance_stats_join_source_blocks_but_skip_unchanged_minimum_runs() {
 
 #[test]
 fn same_distance_repacking_coalesces_a_short_run() {
-    let source = [test_match(3, 5, 4, 0, 1), test_match(4, 5, 4, 0, 1)];
+    let source = [test_match(3, 5, 4), test_match(4, 5, 4)];
     let repacked = test_repack(&source, 7, &FIXED_LITERAL_CODE_LENGTHS, false).unwrap();
     assert_eq!(
         repacked,
@@ -157,14 +157,10 @@ fn same_distance_repacking_coalesces_a_short_run() {
             distance: 5,
             length_symbol: 261,
             distance_symbol: 4,
-            length_extra: 0,
-            distance_extra: 0,
-            length_extra_bits: 0,
-            distance_extra_bits: 1,
         }]
     );
 
-    let canonical_258 = [test_match(100, 1, 0, 0, 0), test_match(158, 1, 0, 0, 0)];
+    let canonical_258 = [test_match(100, 1, 0), test_match(158, 1, 0)];
     assert!(matches!(
         test_repack(&canonical_258, 258, &FIXED_LITERAL_CODE_LENGTHS, false,)
             .unwrap()
@@ -172,8 +168,6 @@ fn same_distance_repacking_coalesces_a_short_run() {
         [Token::Match {
             length: 258,
             length_symbol: 285,
-            length_extra: 0,
-            length_extra_bits: 0,
             ..
         }]
     ));
@@ -181,7 +175,7 @@ fn same_distance_repacking_coalesces_a_short_run() {
 
 #[test]
 fn direct_same_distance_coalescing_does_not_enter_the_dp() {
-    let source = [test_match(100, 1, 0, 0, 0), test_match(158, 1, 0, 0, 0)];
+    let source = [test_match(100, 1, 0), test_match(158, 1, 0)];
     let mut dp_must_not_poll = || -> bool { panic!("direct coalescing entered the DP") };
     let mut stop = SearchStop::callback(&mut dp_must_not_poll);
     let repacked =
@@ -192,7 +186,7 @@ fn direct_same_distance_coalescing_does_not_enter_the_dp() {
 
 #[test]
 fn default_repacking_bounds_pathological_dp_depth_and_max_polls_deadline() {
-    let source = vec![test_match(257, 1, 0, 0, 0); 257];
+    let source = vec![test_match(257, 1, 0); 257];
     let decoded_bytes = 257 * 257;
     let mut default_must_not_poll = || -> bool { panic!("default fallback entered the DP") };
     let mut default_stop = SearchStop::callback(&mut default_must_not_poll);
@@ -299,8 +293,8 @@ fn same_distance_partitioning_handles_small_remainders() {
     for total in [259_usize, 260] {
         let left = total / 2;
         let source = [
-            test_match(left as u16, 1, 0, 0, 0),
-            test_match((total - left) as u16, 1, 0, 0, 0),
+            test_match(left as u16, 1, 0),
+            test_match((total - left) as u16, 1, 0),
         ];
         let repacked = test_repack(&source, total, &FIXED_LITERAL_CODE_LENGTHS, false).unwrap();
         assert_eq!(repacked.len(), 2);
@@ -367,20 +361,20 @@ fn same_distance_partitioning_uses_huffman_costs() {
 fn same_distance_repacking_respects_barriers_and_strict_comparison() {
     let tokens = vec![
         Token::Literal(b'a'),
-        test_match(3, 1, 0, 0, 0),
-        test_match(4, 2, 1, 0, 0),
+        test_match(3, 1, 0),
+        test_match(4, 2, 1),
         Token::Literal(b'b'),
-        test_match(3, 1, 0, 0, 0),
+        test_match(3, 1, 0),
     ];
     assert!(test_repack(&tokens, 12, &FIXED_LITERAL_CODE_LENGTHS, false).is_none());
 
-    let already_minimal = [test_match(258, 1, 0, 0, 0); 2];
+    let already_minimal = [test_match(258, 1, 0); 2];
     assert!(test_repack(&already_minimal, 516, &FIXED_LITERAL_CODE_LENGTHS, false,).is_none());
 
     let redundant_exact_multiple = [
-        test_match(100, 1, 0, 0, 0),
-        test_match(158, 1, 0, 0, 0),
-        test_match(258, 1, 0, 0, 0),
+        test_match(100, 1, 0),
+        test_match(158, 1, 0),
+        test_match(258, 1, 0),
     ];
     assert_eq!(
         test_repack(
@@ -390,13 +384,13 @@ fn same_distance_repacking_respects_barriers_and_strict_comparison() {
             false,
         )
         .unwrap(),
-        [test_match(258, 1, 0, 0, 0); 2]
+        [test_match(258, 1, 0); 2]
     );
 
     let source = vec![
         Token::Literal(b'a'),
-        test_match(3, 1, 0, 0, 0),
-        test_match(4, 1, 0, 0, 0),
+        test_match(3, 1, 0),
+        test_match(4, 1, 0),
     ];
     let block = short_family_test_block(source.clone(), vec![b'a'; 8]);
     let incumbent = PlannedBlock {

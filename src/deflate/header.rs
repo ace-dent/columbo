@@ -11,8 +11,8 @@ use super::huffman::{
     FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    count_frequencies, token_extra_bits, DynamicPlan, RleToken, Token, CODE_LENGTH_ORDER,
-    MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
+    count_frequencies, distance_extra_bits, length_extra_bits, token_extra_bits, DynamicPlan,
+    RleToken, Token, CODE_LENGTH_ORDER, MAX_DYNAMIC_CODE_LENGTH_COUNT, RFC_DISTANCE_CODE_COUNT,
 };
 use super::stop::SearchStop;
 
@@ -111,8 +111,6 @@ pub(crate) fn token_bits(
             Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } => {
                 let literal = *literal_lengths.get(usize::from(length_symbol))?;
@@ -122,8 +120,8 @@ pub(crate) fn token_bits(
                 }
                 let token_bits = u64::from(literal)
                     + u64::from(distance)
-                    + u64::from(length_extra_bits)
-                    + u64::from(distance_extra_bits);
+                    + u64::from(length_extra_bits(length_symbol))
+                    + u64::from(distance_extra_bits(distance_symbol));
                 bits = bits.checked_add(token_bits)?;
             }
         }

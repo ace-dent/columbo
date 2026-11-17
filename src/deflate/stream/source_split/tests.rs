@@ -31,10 +31,6 @@ fn midpoint_refinement_keeps_snap_and_adds_exact_inside_match_cut() {
         distance: 1,
         length_symbol: 279,
         distance_symbol: 0,
-        length_extra: 1,
-        distance_extra: 0,
-        length_extra_bits: 4,
-        distance_extra_bits: 0,
     });
     Arc::make_mut(&mut block.tokens).extend((0..18).map(|_| Token::Literal(0)));
     block.recount_frequencies();

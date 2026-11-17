@@ -32,10 +32,6 @@ fn short_match_block() -> ParsedBlock {
         distance: 1,
         length_symbol: 260,
         distance_symbol: 0,
-        length_extra: 0,
-        distance_extra: 0,
-        length_extra_bits: 0,
-        distance_extra_bits: 0,
     }));
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
     ParsedBlock {
@@ -53,7 +49,7 @@ fn short_match_block() -> ParsedBlock {
 }
 
 fn periodic_distance_three_block() -> ParsedBlock {
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(258).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(258).unwrap();
     let tokens = vec![
         Token::Literal(b'a'),
         Token::Literal(b'b'),
@@ -63,10 +59,6 @@ fn periodic_distance_three_block() -> ParsedBlock {
             distance: 3,
             length_symbol,
             distance_symbol: 2,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         },
     ];
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
@@ -138,18 +130,12 @@ fn every_inside_match_cut_uses_canonical_same_distance_fragments() {
                     distance,
                     length_symbol,
                     distance_symbol,
-                    length_extra,
-                    distance_extra,
-                    length_extra_bits,
-                    distance_extra_bits,
                 } => {
                     assert_eq!(distance, 1, "offset {offset}");
                     assert_eq!(distance_symbol, 0, "offset {offset}");
-                    assert_eq!(distance_extra, 0, "offset {offset}");
-                    assert_eq!(distance_extra_bits, 0, "offset {offset}");
                     assert_eq!(
-                        (length_symbol, length_extra, length_extra_bits),
-                        canonical_length_encoding(length).unwrap(),
+                        length_symbol,
+                        canonical_length_encoding(length).unwrap().0,
                         "offset {offset}"
                     );
                 }
@@ -302,17 +288,13 @@ fn inside_cuts_preserve_a_nonuniform_overlapping_distance() {
 #[test]
 fn partial_multi_source_ranges_keep_relative_source_splits() {
     let left = overlapping_match_block(20);
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(10).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(10).unwrap();
     let right_tokens = vec![
         Token::Match {
             length: 10,
             distance: 1,
             length_symbol,
             distance_symbol: 0,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         },
         Token::Literal(b'a'),
     ];
@@ -386,10 +368,6 @@ fn strided_range_histograms_match_direct_recounting() {
                     distance: 5,
                     length_symbol: 265,
                     distance_symbol: 4,
-                    length_extra: 0,
-                    distance_extra: 0,
-                    length_extra_bits: 1,
-                    distance_extra_bits: 1,
                 }
             } else {
                 Token::Literal((index % 251) as u8)
@@ -831,10 +809,6 @@ fn eighth_target_keeps_snap_and_adds_exact_inside_match_cut() {
             distance: 1,
             length_symbol: 276,
             distance_symbol: 0,
-            length_extra: 1,
-            distance_extra: 0,
-            length_extra_bits: 4,
-            distance_extra_bits: 0,
         },
     ]
     .into();

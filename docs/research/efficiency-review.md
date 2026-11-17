@@ -98,6 +98,7 @@ gains where established.
 | 4 Nov 2026 | [`9a3f174`](#9a3f174-4-november-2026) | Header planning: tree values, runs, shape checks, buffers and the store's hash (`header.rs`) | Cached code-length trees keep their shape, order, HCLEN and RLE cost; runs found eight lengths at a time; known shapes not checked again; the planner's buffers borrowed in place; the store indexed by its fingerprints | Completing Max runs of three small PNGs 9.7%, 7.9% and 11.0% fewer instructions (1.10×, 1.07×, 1.13×); 177 completing sprites 7.24% fewer (1.062×); replayed swap searches 15.6% fewer; APNG 1.31% and Default 1.04% fewer | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 3 long and 177 completing Max runs; 58 Max runs at 10 seconds; 124 APNG runs at 4,000 seconds; 66 Default timing runs; three replays; 20,000 run-finder comparisons; 686 Rust, 7 Python tests |
 | 6 Nov 2026 | [`b35e8ee`](#b35e8ee-6-november-2026) | Boundary slide across finishing steps (`slide.rs`) | Each thread keeps the boundaries a stream's last slide left settled, with the left block's offset, both blocks' token buffers and trees; a later slide of the stream starts a pair settled when it matches one in full | Default CPU 1.012× (33 inputs, 2.11% fewer instructions, 1.42% fewer cycles); Partnership card 1.045× (5.87% fewer instructions); peak memory median unchanged, +6.2 MiB largest | 104 API (52 inputs; Default at the 180-second budget and zero-budget Max); 66 Default timing runs; 2 completing Max runs; 900 slides through the memo compared with fresh slides; 688 Rust, 7 Python tests |
 | 16 Nov 2026 | [`d366e34`](#d366e34-16-november-2026) | Boundary-slide memo (`slide.rs`) | The settled-boundary memo refers to its blocks' token buffers weakly, so a discarded slide's moved blocks are freed with its candidate | Peak footprint of a reported ZIP with a 68.9 MB member 17.5% lower (1,753 → 1,447 MB), and of one with a 788.9 MB member 11.7% lower (14,557 → 12,851 MB); Partnership card 1.3% lower; 367 corpus files 1.5% lower in sum; instructions unchanged, 1.37% fewer on the larger ZIP | 360 completing Default corpus runs; 30 repeated and 16 large-input runs; 2 completing Max runs; 1 new test; 767 Rust, 7 Python tests |
+| 16 Nov 2026 | [`f759457`](#f759457-16-november-2026) | Token model (`model.rs` and its users) | A match keeps its length, distance and two symbols; extra-bit counts and values are derived through 256-entry byte-indexed tables, so a token takes 8 bytes instead of 14; every limit, budget and gate still charges 14 bytes a token | Peak footprint 24.0% lower on the reported ZIP with a 68.9 MB member (1,447 → 1,100 MB), 20.2% on the one with a 788.9 MB member (12,470 → 9,951 MB), 34.0% on the Partnership card; 367 corpus files 8.2% lower in sum; 33 Default inputs 0.52% more instructions, 0.25% fewer cycles; large streams 0.4–1.8% more cycles | 363 completing Default corpus runs; 957 DeflOpt benchmark pairs in Default, and none worse in Max than Default; 33 Default inputs over two rounds; 16 large-input and 12 repeated runs; 2 completing Max runs; 767 Rust, 7 Python tests |
 
 ## Entries
 
@@ -494,6 +495,102 @@ all-feature Clippy with warnings denied.
 
 Artifacts: `work/efficiency-review-header-plan-store/`,
 `target/efficiency-review-header-plan-store-baseline/`.
+
+### `f759457`, 16 November 2026
+
+Batches: retired instructions and cycles from `time -l` over the 33 stratified
+Default inputs, two alternating rounds, for each of two lookup forms; the
+367-file corpus in Default at a 30-second timeout, baseline and candidate side
+by side at two lanes, one round; two alternating runs of each build on the
+reported 9.9 MB ZIP, the Partnership card and
+`kzipmix-20200115-linux-static.tar.gz`, one with `MallocLargeCache=0` on the
+9.9 MB ZIP and one on the reported 99.3 MB ZIP; three alternating runs on two
+APNGs whose peak rose most; two alternating runs of each completing Max run;
+the DeflOpt benchmark in Default and Max with the candidate, one run, against
+its last full run; three alternating runs of each build on eight of its Max
+rows. Both builds are distribution executables, the baseline built from an
+immutable Git archive of its commit.
+
+A token took 14 bytes: a match's length, distance, both symbols, both extra
+values and both extra-bit counts. The last four follow from the others: each
+symbol fixes its extra-bit count, and the extra value is the length or
+distance less the symbol's base, including for the length-258 alias (symbol
+284 with extra value 31). At the peak of the 9.9 MB ZIP after
+[`d366e34`](#d366e34-16-november-2026), token buffers held about 70% of the
+live heap.
+
+- **8-byte tokens.** A match keeps its length, distance and two symbols. Its
+  extra-bit counts come from 256-entry tables indexed by the length symbol's
+  low byte, which tells symbols 257–285 apart, and by the distance symbol, so
+  the index needs neither a mask nor a bounds check; the emitter subtracts
+  the symbol's base for the extra value. Every model limit, memory and work
+  budget and route gate still charges 14 bytes a token
+  (`TOKEN_CHARGE_BYTES`), so no limit or route choice moves, and the source
+  recode route mixes the same derived values into its state fingerprints, so
+  its queue order is unchanged.
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Reported 9.9 MB ZIP, peak memory footprint, two runs | 1,447 MB | 1,100 MB | −24.0% |
+| Same input, footprint with `MallocLargeCache=0` | 971 MB | 651 MB | −33.0% |
+| Same input, instructions retired | 230.0 billion | 233.5 billion | +1.5% |
+| Same input, cycles | 41.0 billion | 41.8 billion | +1.8% |
+| Reported 99.3 MB ZIP (788.9 MB member), peak memory footprint | 12,470 MB | 9,951 MB | −20.2% |
+| Same input, instructions retired | 2,615.4 billion | 2,613.8 billion | −0.06% |
+| Same input, wall time (system time) | 161.5 s (12.2 s) | 151.0 s (2.3 s) | −6.5% |
+| Partnership card, peak memory footprint | 503 MB | 332 MB | −34.0% |
+| Same input, instructions and cycles | | | +1.3%, +0.4% |
+| `kzipmix-20200115-linux-static.tar.gz`, peak memory footprint | 172 MB | 129 MB | −25.0% |
+| Same input, instructions and cycles | | | +0.8%, +1.0% |
+| 33 Default inputs, instructions over two rounds | 933.3 billion | 938.2 billion | +0.52% |
+| Same inputs, cycles over two rounds | 230.5 billion | 229.9 billion | −0.25% |
+| 367 corpus files, summed peak memory footprint | 23.54 GB | 21.60 GB | −8.2% |
+
+On the 33 Default inputs the median file took 0.14% more cycles, from 4.6%
+fewer (`Banana512.png`) to 3.3% more. Long streams of matches pay for the
+lookups: about 3.5 billion more instructions on the 9.9 MB ZIP's 20 million
+tokens, emitted and priced many times over. The 99.3 MB ZIP, at ten times the
+size, saved more in paging than the lookups cost. `sample-50mb.zip` peaked at
+514 instead of 699 MB. Of the 19 corpus files whose peak rose by more than
+5%, 18 were parallel APNGs and one a multi-member ZIP that rose from 60 to
+64 MB; repeated one at a time, the two APNGs that rose most peaked at 93–133
+and 162–209 MB before and 90–130 and 170–175 MB after.
+
+Equivalence: all 363 corpus runs that finished before the deadline in both
+builds gave identical output; the 2 that reached it differ by timing, and two
+deft4j ZIPs with an unsupported layout fail in both builds. The 33 Default
+inputs in both rounds, the large-input and repeated runs and the two
+completing Max runs matched byte for byte, and all 957 Default pairs of the
+[DeflOpt benchmark](../deflopt-benchmark.md) gave the same file bytes and
+meaningful bits as its last full run, from a build of 10 November. In its Max
+mode no row was worse than Default and 920 rows matched that run. The other 37
+all ran for at least 9.8 seconds of a 10-second timeout, 36 of them past it:
+10 came out smaller and 27 larger, 67 bytes in all, or 397 bytes smaller
+without `IMG_8555.png` (+464). In three alternating runs of each build on
+eight of them, one at a time, the two builds gave the same outputs on seven
+and overlapping ones on the eighth (`Sock.png`: 85,856–85,915 bytes before,
+85,912 after). Six reproduced the last run's value, and `file09.png` and
+`IMG_8555.png` came out 177 and 105–106 bytes smaller than in it with both
+builds. Rust tests, including the private corpus and the ignored large-ZIP
+regression, passed in release and debug modes, with documentation and Python
+tests, a locked build, formatting and all-feature Clippy with warnings
+denied. The shipped executable grew from 1,024,448 to 1,024,464 bytes, within
+its page.
+
+Measured and rejected in the same review:
+
+- 512- and 32-entry tables indexed by the masked symbol: 0.75% more
+  instructions and 0.09% fewer cycles on the 33 inputs, but 2.9% more
+  instructions on the 9.9 MB ZIP, against 1.5% with byte-indexed tables.
+
+Not changed in the same review:
+
+- Charging 8 bytes a token would let each model limit hold up to 75% more
+  tokens and would move the memory gates and the work budgets measured in
+  bytes, and so which routes run on large streams: a separate change of
+  behavior, not of storage.
+
+Artifacts: `work/efficiency-review-tokens-20261116/`.
 
 ### `d366e34`, 16 November 2026
 

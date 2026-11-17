@@ -7,7 +7,7 @@ use crate::deflate::bitstream::BitWriter;
 use crate::deflate::block::{emit_block, plan_block};
 use crate::deflate::model::{
     canonical_length_encoding, count_frequencies, ParsedBlock, SourceBlockType, Token,
-    DISTANCE_BASE, DISTANCE_EXTRA_BITS,
+    DISTANCE_BASE,
 };
 use crate::deflate::stop::SearchStop;
 use crate::Options;
@@ -18,17 +18,12 @@ pub(crate) fn matched(length: u16, distance: u16) -> Token {
         .iter()
         .rposition(|&base| base <= distance)
         .unwrap();
-    let (length_symbol, length_extra, length_extra_bits) =
-        canonical_length_encoding(length).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(length).unwrap();
     Token::Match {
         length,
         distance,
         length_symbol,
-        length_extra,
-        length_extra_bits,
         distance_symbol: symbol as u8,
-        distance_extra: distance - DISTANCE_BASE[symbol],
-        distance_extra_bits: DISTANCE_EXTRA_BITS[symbol],
     }
 }
 

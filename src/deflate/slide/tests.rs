@@ -5,7 +5,7 @@ use super::*;
 use crate::deflate::bitstream::BitWriter;
 use crate::deflate::block::{emit_block, plan_block};
 use crate::deflate::model::{
-    canonical_length_encoding, count_frequencies, ParsedStream, DISTANCE_BASE, DISTANCE_EXTRA_BITS,
+    canonical_length_encoding, count_frequencies, ParsedStream, DISTANCE_BASE,
 };
 use crate::deflate::parse::parse_stream;
 use crate::Options;
@@ -15,17 +15,12 @@ fn matched(length: u16, distance: u16) -> Token {
         .iter()
         .rposition(|&base| base <= distance)
         .unwrap();
-    let (length_symbol, length_extra, length_extra_bits) =
-        canonical_length_encoding(length).unwrap();
+    let (length_symbol, _, _) = canonical_length_encoding(length).unwrap();
     Token::Match {
         length,
         distance,
         length_symbol,
-        length_extra,
-        length_extra_bits,
         distance_symbol: symbol as u8,
-        distance_extra: distance - DISTANCE_BASE[symbol],
-        distance_extra_bits: DISTANCE_EXTRA_BITS[symbol],
     }
 }
 

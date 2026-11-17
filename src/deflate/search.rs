@@ -24,8 +24,8 @@ use super::huffman::{
     FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    canonical_length_encoding, count_frequencies, same_tokens, try_clone_slice, ParsedBlock,
-    PlannedBlock, Representation, Token,
+    canonical_length_encoding, count_frequencies, distance_extra_bits, length_extra_bits,
+    same_tokens, try_clone_slice, ParsedBlock, PlannedBlock, Representation, Token,
 };
 use super::parse::{parsed_model_bytes, BASE_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -78,23 +78,17 @@ fn repacked_match(source: Token, length: u16) -> Option<Token> {
     let Token::Match {
         distance,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
         ..
     } = source
     else {
         return None;
     };
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(length)?;
+    let (length_symbol, _, _) = canonical_length_encoding(length)?;
     Some(Token::Match {
         length,
         distance,
         length_symbol,
         distance_symbol,
-        length_extra,
-        distance_extra,
-        length_extra_bits,
-        distance_extra_bits,
     })
 }
 
@@ -894,8 +888,6 @@ fn expand_defluff_matches(
             length,
             length_symbol,
             distance_symbol,
-            length_extra_bits,
-            distance_extra_bits,
             ..
         } = token
         else {
@@ -916,9 +908,9 @@ fn expand_defluff_matches(
         }
 
         let match_bits = u64::from(match_literal_length)
-            + u64::from(length_extra_bits)
+            + u64::from(length_extra_bits(length_symbol))
             + u64::from(match_distance_length)
-            + u64::from(distance_extra_bits);
+            + u64::from(distance_extra_bits(distance_symbol));
         // An unavailable literal or a sum reaching the match both keep it, so
         // the scan can stop at either.
         let mut literal_bits = 0_u64;
@@ -1311,17 +1303,15 @@ fn literals_against_match(
     let Token::Match {
         length_symbol,
         distance_symbol,
-        length_extra_bits,
-        distance_extra_bits,
         ..
     } = token
     else {
         return None;
     };
     let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
-        + u64::from(length_extra_bits)
+        + u64::from(length_extra_bits(length_symbol))
         + estimated_length(distance_lengths, usize::from(distance_symbol))
-        + u64::from(distance_extra_bits);
+        + u64::from(distance_extra_bits(distance_symbol));
     let literal_bits = byte_costs.up_to(decoded, match_bits)?;
     Some(literal_bits.cmp(&match_bits))
 }
@@ -1458,20 +1448,12 @@ fn spell_258(token: Token, use_alias: bool) -> Token {
             distance,
             length_symbol,
             distance_symbol,
-            length_extra: _,
-            distance_extra,
-            length_extra_bits: _,
-            distance_extra_bits,
         } if (use_alias && length_symbol == 285) || (!use_alias && length_symbol == 284) => {
             Token::Match {
                 length: 258,
                 distance,
                 length_symbol: if use_alias { 284 } else { 285 },
                 distance_symbol,
-                length_extra: if use_alias { 31 } else { 0 },
-                distance_extra,
-                length_extra_bits: if use_alias { 5 } else { 0 },
-                distance_extra_bits,
             }
         }
         _ => token,
@@ -1527,8 +1509,6 @@ fn individual_prune_from_lengths(
             length,
             length_symbol,
             distance_symbol,
-            length_extra_bits,
-            distance_extra_bits,
             ..
         } = token
         {
@@ -1538,9 +1518,9 @@ fn individual_prune_from_lengths(
                 .map(|&byte| estimated_length(literal_lengths, usize::from(byte)) as i64)
                 .sum();
             let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
-                + u64::from(length_extra_bits)
+                + u64::from(length_extra_bits(length_symbol))
                 + estimated_length(distance_lengths, usize::from(distance_symbol))
-                + u64::from(distance_extra_bits);
+                + u64::from(distance_extra_bits(distance_symbol));
             let trial = (literal_bits - match_bits as i64, index);
             let position = trials.partition_point(|candidate| *candidate <= trial);
             if trials.len() < trial_limit {

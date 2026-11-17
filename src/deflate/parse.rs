@@ -21,7 +21,7 @@ use super::huffman::{
 use super::model::{
     DynamicPlan, OriginalBits, ParsedBlock, ParsedStream, PlannedBlock, RleToken, SourceBlockType,
     Token, CODE_LENGTH_ORDER, DISTANCE_BASE, DISTANCE_EXTRA_BITS, LENGTH_BASE, LENGTH_EXTRA_BITS,
-    RFC_DISTANCE_CODE_COUNT, USABLE_DISTANCE_CODE_COUNT,
+    RFC_DISTANCE_CODE_COUNT, TOKEN_CHARGE_BYTES, USABLE_DISTANCE_CODE_COUNT,
 };
 
 struct BlockPayload {
@@ -158,7 +158,7 @@ pub(crate) fn parsed_model_bytes(
     block_count: usize,
 ) -> Option<usize> {
     token_count
-        .checked_mul(std::mem::size_of::<Token>())
+        .checked_mul(TOKEN_CHARGE_BYTES)
         .and_then(|bytes| bytes.checked_add(decoded_bytes))
         .and_then(|bytes| {
             block_count
@@ -646,10 +646,6 @@ impl<'a> Parser<'a> {
                         distance,
                         length_symbol: symbol,
                         distance_symbol: distance_symbol as u8,
-                        length_extra: decoded.extra,
-                        distance_extra: decoded_distance.extra,
-                        length_extra_bits: decoded.extra_bits,
-                        distance_extra_bits: decoded_distance.extra_bits,
                     };
 
                     let expanded = expand_match(
@@ -685,7 +681,7 @@ impl<'a> Parser<'a> {
             .ok()
             .and_then(|decoded| {
                 token_count
-                    .checked_mul(std::mem::size_of::<Token>())
+                    .checked_mul(TOKEN_CHARGE_BYTES)
                     .and_then(|tokens| decoded.checked_add(tokens))
             })
             .ok_or_else(model_limit_error)?;

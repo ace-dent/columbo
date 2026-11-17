@@ -26,8 +26,9 @@ use super::huffman::{
     make_lengths_deft4j_java_heap, FIXED_DISTANCE_CODE_LENGTHS, FIXED_LITERAL_CODE_LENGTHS,
 };
 use super::model::{
-    count_frequencies, same_tokens, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock,
-    Representation, SourceBlockType, Token,
+    count_frequencies, distance_extra, distance_extra_bits, length_extra, length_extra_bits,
+    same_tokens, token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation,
+    SourceBlockType, Token, TOKEN_CHARGE_BYTES,
 };
 use super::parse::{parsed_model_bytes, BASE_PARSED_MODEL_BYTES};
 use super::stop::SearchStop;
@@ -41,7 +42,7 @@ const MAX_SOURCE_ARENA_BYTES: usize = MAX_SOURCE_ROUTE_BYTES;
 const SOURCE_STATE_FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
 fn token_payload_bytes(token_count: usize) -> Option<usize> {
-    token_count.checked_mul(size_of::<Token>())
+    token_count.checked_mul(TOKEN_CHARGE_BYTES)
 }
 
 /// Tracks memory held beyond the parser's shared buffers. Buffers are charged
@@ -241,7 +242,7 @@ impl SourceStateQueue {
 
         let payload_bytes = match token_payload_charge {
             TokenPayloadCharge::Shared => 0,
-            TokenPayloadCharge::NewlyAllocated => tokens.len().checked_mul(size_of::<Token>())?,
+            TokenPayloadCharge::NewlyAllocated => tokens.len().checked_mul(TOKEN_CHARGE_BYTES)?,
         };
         // Limit the queue by bytes rather than state count, so Max can run
         // long pruning chains with bounded peak memory.
@@ -554,6 +555,9 @@ fn begin_token_fingerprint(token_count: usize) -> u64 {
     fingerprint
 }
 
+/// Mix one token into a state fingerprint. A match's extra-bit counts and
+/// values are mixed as they were when tokens stored them, so fingerprints, and
+/// the order of the states they index, stay the same.
 #[inline]
 fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
     match token {
@@ -565,10 +569,6 @@ fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
             distance,
             length_symbol,
             distance_symbol,
-            length_extra,
-            distance_extra,
-            length_extra_bits,
-            distance_extra_bits,
         } => {
             mix_state_fingerprint(
                 fingerprint,
@@ -577,13 +577,13 @@ fn mix_token_fingerprint(fingerprint: &mut u64, token: Token) {
                     | (u64::from(distance) << 16)
                     | (u64::from(length_symbol) << 32)
                     | (u64::from(distance_symbol) << 48)
-                    | (u64::from(length_extra_bits) << 56),
+                    | (u64::from(length_extra_bits(length_symbol)) << 56),
             );
             mix_state_fingerprint(
                 fingerprint,
-                u64::from(length_extra)
-                    | (u64::from(distance_extra) << 16)
-                    | (u64::from(distance_extra_bits) << 32),
+                u64::from(length_extra(length, length_symbol))
+                    | (u64::from(distance_extra(distance, distance_symbol)) << 16)
+                    | (u64::from(distance_extra_bits(distance_symbol)) << 32),
             );
         }
     }
@@ -695,8 +695,6 @@ fn expansion_pays(
     let Token::Match {
         length_symbol,
         distance_symbol,
-        length_extra_bits,
-        distance_extra_bits,
         ..
     } = token
     else {
@@ -713,8 +711,8 @@ fn expansion_pays(
     }
     let match_bits = u64::from(match_literal)
         + u64::from(match_distance)
-        + u64::from(length_extra_bits)
-        + u64::from(distance_extra_bits);
+        + u64::from(length_extra_bits(length_symbol))
+        + u64::from(distance_extra_bits(distance_symbol));
     let mut literal_bits = 0_u64;
     for &byte in decoded {
         let length = literal_lengths[usize::from(byte)];
@@ -738,8 +736,6 @@ fn match_expansion_delta(
     let Token::Match {
         length_symbol,
         distance_symbol,
-        length_extra_bits,
-        distance_extra_bits,
         ..
     } = token
     else {
@@ -762,8 +758,8 @@ fn match_expansion_delta(
     }
     let match_bits = u64::from(match_literal)
         .checked_add(u64::from(match_distance))?
-        .checked_add(u64::from(length_extra_bits))?
-        .checked_add(u64::from(distance_extra_bits))?;
+        .checked_add(u64::from(length_extra_bits(length_symbol)))?
+        .checked_add(u64::from(distance_extra_bits(distance_symbol)))?;
     Some(literal_bits as i64 - match_bits as i64)
 }
 
@@ -902,8 +898,6 @@ fn expand_marked(
                 Token::Match {
                     length_symbol,
                     distance_symbol,
-                    length_extra_bits,
-                    distance_extra_bits,
                     ..
                 } => {
                     literal_frequencies[usize::from(length_symbol)] =
@@ -911,8 +905,8 @@ fn expand_marked(
                     distance_frequencies[usize::from(distance_symbol)] =
                         distance_frequencies[usize::from(distance_symbol)].checked_add(1)?;
                     extra_bits = extra_bits
-                        .checked_add(u64::from(length_extra_bits))?
-                        .checked_add(u64::from(distance_extra_bits))?;
+                        .checked_add(u64::from(length_extra_bits(length_symbol)))?
+                        .checked_add(u64::from(distance_extra_bits(distance_symbol)))?;
                 }
             }
             output.push(token);

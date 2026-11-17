@@ -72,6 +72,89 @@ pub(crate) const CODE_LENGTH_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
+/// [`LENGTH_BASE`] and [`LENGTH_EXTRA_BITS`] indexed by the low byte of the
+/// length symbol, which tells symbols 257–285 apart. With 256 entries, a byte
+/// index needs neither a mask nor a bounds check.
+const LENGTH_SYMBOL_BASE: [u16; 256] = {
+    let mut bases = [0; 256];
+    let mut index = 0;
+    while index < LENGTH_BASE.len() {
+        bases[1 + index] = LENGTH_BASE[index];
+        index += 1;
+    }
+    bases
+};
+const LENGTH_SYMBOL_EXTRA_BITS: [u8; 256] = {
+    let mut bits = [0; 256];
+    let mut index = 0;
+    while index < LENGTH_EXTRA_BITS.len() {
+        bits[1 + index] = LENGTH_EXTRA_BITS[index];
+        index += 1;
+    }
+    bits
+};
+
+/// [`DISTANCE_BASE`] and [`DISTANCE_EXTRA_BITS`] indexed by the distance
+/// symbol, padded to 256 entries for the same reason.
+const DISTANCE_SYMBOL_BASE: [u16; 256] = {
+    let mut bases = [0; 256];
+    let mut index = 0;
+    while index < DISTANCE_BASE.len() {
+        bases[index] = DISTANCE_BASE[index];
+        index += 1;
+    }
+    bases
+};
+const DISTANCE_SYMBOL_EXTRA_BITS: [u8; 256] = {
+    let mut bits = [0; 256];
+    let mut index = 0;
+    while index < DISTANCE_EXTRA_BITS.len() {
+        bits[index] = DISTANCE_EXTRA_BITS[index];
+        index += 1;
+    }
+    bits
+};
+
+/// Extra-bit count of a length symbol (257–285).
+#[inline]
+pub(crate) fn length_extra_bits(symbol: u16) -> u8 {
+    LENGTH_SYMBOL_EXTRA_BITS[usize::from(symbol as u8)]
+}
+
+/// Extra-bit count of a distance symbol (0–29).
+#[inline]
+pub(crate) fn distance_extra_bits(symbol: u8) -> u8 {
+    DISTANCE_SYMBOL_EXTRA_BITS[usize::from(symbol)]
+}
+
+/// Extra bits of a match's length and distance symbols together.
+#[inline]
+pub(crate) fn match_extra_bits(length_symbol: u16, distance_symbol: u8) -> u8 {
+    length_extra_bits(length_symbol) + distance_extra_bits(distance_symbol)
+}
+
+/// Extra-bits value that spells `length` with `symbol`.
+pub(crate) fn length_extra(length: u16, symbol: u16) -> u16 {
+    length - LENGTH_SYMBOL_BASE[usize::from(symbol as u8)]
+}
+
+/// Extra-bits value that spells `distance` with `symbol`.
+pub(crate) fn distance_extra(distance: u16, symbol: u8) -> u16 {
+    distance - DISTANCE_SYMBOL_BASE[usize::from(symbol)]
+}
+
+/// Bytes charged for each token by the parsed-model limit, the memory and work
+/// budgets and the route gates. A token took 14 bytes when those limits were
+/// set, so charging the same keeps every limit and route choice unchanged.
+pub(crate) const TOKEN_CHARGE_BYTES: usize = 14;
+
+/// A literal, or a match with its length and distance symbols.
+///
+/// The symbols keep the source's spelling, including the length-258 alias
+/// (symbol 284 with extra value 31). Each symbol's extra-bit count and the
+/// extra value that completes the length or distance follow from it
+/// ([`length_extra_bits`], [`length_extra`] and their distance forms), so a
+/// token stores neither and takes 8 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Token {
     Literal(u8),
@@ -80,18 +163,29 @@ pub(crate) enum Token {
         distance: u16,
         length_symbol: u16,
         distance_symbol: u8,
-        length_extra: u16,
-        distance_extra: u16,
-        length_extra_bits: u8,
-        distance_extra_bits: u8,
     },
 }
+
+const _: () = assert!(std::mem::size_of::<Token>() == 8);
 
 impl Token {
     pub(crate) fn decoded_len(self) -> usize {
         match self {
             Self::Literal(_) => 1,
             Self::Match { length, .. } => usize::from(length),
+        }
+    }
+
+    /// The extra bits the token carries: none for a literal.
+    #[inline]
+    pub(crate) fn extra_bits(self) -> u8 {
+        match self {
+            Self::Literal(_) => 0,
+            Self::Match {
+                length_symbol,
+                distance_symbol,
+                ..
+            } => match_extra_bits(length_symbol, distance_symbol),
         }
     }
 }
@@ -349,14 +443,7 @@ pub(crate) fn count_frequencies(tokens: &[Token]) -> ([u32; 286], [u32; 30]) {
 pub(crate) fn token_extra_bits(tokens: &[Token]) -> u64 {
     tokens
         .iter()
-        .map(|token| match token {
-            Token::Literal(_) => 0,
-            Token::Match {
-                length_extra_bits,
-                distance_extra_bits,
-                ..
-            } => u64::from(*length_extra_bits) + u64::from(*distance_extra_bits),
-        })
+        .map(|token| u64::from(token.extra_bits()))
         .sum()
 }
 

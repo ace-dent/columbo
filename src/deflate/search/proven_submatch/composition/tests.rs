@@ -11,7 +11,7 @@ use crate::deflate::search::test_support::{
 
 #[test]
 fn proven_composition_frequency_state_matches_materialized_tokens() {
-    let source_match = test_match(6, 6, 4, 1, 1);
+    let source_match = test_match(6, 6, 4);
     let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
     source.extend([source_match, source_match]);
     let decoded = b"abcdefabcdefabcdef";
@@ -87,7 +87,7 @@ fn proven_composition_frequency_state_matches_materialized_tokens() {
 
 #[test]
 fn proven_composition_forward_and_reverse_moves_restore_the_exact_state() {
-    let source_match = test_match(6, 6, 4, 1, 1);
+    let source_match = test_match(6, 6, 4);
     let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
     source.extend([source_match, source_match, source_match]);
     let decoded = b"abcdefabcdefabcdefabcdef";
@@ -174,7 +174,7 @@ fn proven_composition_forward_and_reverse_moves_restore_the_exact_state() {
 
 #[test]
 fn closed_loop_proven_composition_retains_a_complete_strict_incumbent() {
-    let source_match = test_match(6, 6, 4, 1, 1);
+    let source_match = test_match(6, 6, 4);
     let mut source: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
     source.extend([source_match, source_match, source_match]);
     let plain = decode_test_tokens(&source).expect("the source token stream is valid");
@@ -209,7 +209,7 @@ fn proven_composition_deduplicates_header_equivalent_spellings() {
     assert_ne!(left, right);
     assert!(same_proven_composition_spelling_cost(&left, &right));
 
-    let source = test_match(6, 6, 4, 1, 1);
+    let source = test_match(6, 6, 4);
     let mut alternatives = Vec::new();
     let rank = ProvenSubmatchRank {
         highest: true,

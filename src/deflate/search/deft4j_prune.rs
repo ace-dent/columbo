@@ -16,7 +16,8 @@ use crate::deflate::block::plan_owned_block;
 use crate::deflate::header::plan_for_explicit_lengths;
 use crate::deflate::huffman::make_lengths_deft4j_java_heap;
 use crate::deflate::model::{
-    count_frequencies, same_tokens, ParsedBlock, PlannedBlock, Representation, Token,
+    count_frequencies, distance_extra_bits, length_extra_bits, same_tokens, ParsedBlock,
+    PlannedBlock, Representation, Token,
 };
 use crate::deflate::stop::SearchStop;
 use crate::Options;
@@ -339,8 +340,6 @@ fn least_expensive_length_symbol(
         if let Token::Match {
             length_symbol,
             distance_symbol,
-            length_extra_bits,
-            distance_extra_bits,
             ..
         } = token
         {
@@ -351,9 +350,9 @@ fn least_expensive_length_symbol(
                 .map(|&byte| estimated_length(literal_lengths, usize::from(byte)))
                 .sum();
             let match_bits = estimated_length(literal_lengths, usize::from(length_symbol))
-                + u64::from(length_extra_bits)
+                + u64::from(length_extra_bits(length_symbol))
                 + estimated_length(distance_lengths, usize::from(distance_symbol))
-                + u64::from(distance_extra_bits);
+                + u64::from(distance_extra_bits(distance_symbol));
             *deltas.get_mut(family)? += literal_bits as i64 - match_bits as i64;
             counts[family] += 1;
         }

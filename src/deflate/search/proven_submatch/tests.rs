@@ -23,8 +23,6 @@ fn assert_proven_submatch_rewrite(source: Token, replacement: &[Token], expected
     let Token::Match {
         distance,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
         ..
     } = source
     else {
@@ -36,29 +34,12 @@ fn assert_proven_submatch_rewrite(source: Token, replacement: &[Token], expected
             distance: rewritten_distance,
             length_symbol,
             distance_symbol: rewritten_distance_symbol,
-            length_extra,
-            distance_extra: rewritten_distance_extra,
-            length_extra_bits,
-            distance_extra_bits: rewritten_distance_extra_bits,
         } = *token
         {
+            assert_eq!(length_symbol, canonical_length_encoding(length).unwrap().0);
             assert_eq!(
-                (length_symbol, length_extra, length_extra_bits),
-                canonical_length_encoding(length).unwrap()
-            );
-            assert_eq!(
-                (
-                    rewritten_distance,
-                    rewritten_distance_symbol,
-                    rewritten_distance_extra,
-                    rewritten_distance_extra_bits,
-                ),
-                (
-                    distance,
-                    distance_symbol,
-                    distance_extra,
-                    distance_extra_bits,
-                )
+                (rewritten_distance, rewritten_distance_symbol),
+                (distance, distance_symbol)
             );
         }
     }
@@ -75,7 +56,7 @@ fn proven_submatch_prices_match_exhaustive_spellings() {
         enumerate(&plain[1..], prefix, all);
         prefix.pop();
         for length in 3..=plain.len() {
-            prefix.push(test_match(length as u16, 6, 4, 1, 1));
+            prefix.push(test_match(length as u16, 6, 4));
             enumerate(&plain[length..], prefix, all);
             prefix.pop();
         }
@@ -83,7 +64,7 @@ fn proven_submatch_prices_match_exhaustive_spellings() {
 
     for length in 3..=10 {
         let decoded = &b"abcdefabcd"[..length];
-        let source = test_match(length as u16, 6, 4, 1, 1);
+        let source = test_match(length as u16, 6, 4);
         // Source wins a whole-span tie; other paths retain literal-first,
         // then ascending match-length order at each position.
         let mut spellings = vec![vec![source]];
@@ -134,7 +115,7 @@ fn forbidden_symbol_sets_match_exhaustive_spellings() {
         enumerate(&plain[1..], prefix, all);
         prefix.pop();
         for length in 3..=plain.len() {
-            prefix.push(test_match(length as u16, 6, 4, 1, 1));
+            prefix.push(test_match(length as u16, 6, 4));
             enumerate(&plain[length..], prefix, all);
             prefix.pop();
         }
@@ -142,7 +123,7 @@ fn forbidden_symbol_sets_match_exhaustive_spellings() {
 
     for length in 3..=10 {
         let decoded = &b"abcdefabcd"[..length];
-        let source = test_match(length as u16, 6, 4, 1, 1);
+        let source = test_match(length as u16, 6, 4);
         let mut spellings = vec![vec![source]];
         enumerate(decoded, &mut Vec::new(), &mut spellings);
         for profile in 0..8 {
@@ -254,7 +235,7 @@ fn long_submatch_families_match_the_direct_recurrence() {
             *bits = 1 + (next() % span) as u8;
         }
         let distances = [1 + (next() % 15) as u8; 30];
-        let source = test_match(length as u16, distance as u16, 0, 0, 0);
+        let source = test_match(length as u16, distance as u16, 0);
         let ban = match round % 4 {
             0 => 0,
             1 => 1 << (next() % 29),
@@ -284,7 +265,7 @@ fn long_submatch_families_match_the_direct_recurrence() {
 
 #[test]
 fn proven_submatch_graph_can_keep_a_literal_prefix_and_suffix_match() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let decoded = b"abcdefabcdefabcde";
     let mut literal_lengths = [0_u8; 286];
     literal_lengths[usize::from(b'a')] = 1;
@@ -308,13 +289,13 @@ fn proven_submatch_graph_can_keep_a_literal_prefix_and_suffix_match() {
     assert_proven_submatch_rewrite(
         source,
         &replacement,
-        &[Token::Literal(b'a'), test_match(16, 6, 4, 1, 1)],
+        &[Token::Literal(b'a'), test_match(16, 6, 4)],
     );
 }
 
 #[test]
 fn proven_submatch_graph_can_keep_a_prefix_match_and_literal_suffix() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let decoded = b"abcdefabcdefabcde";
     let mut literal_lengths = [0_u8; 286];
     for &byte in b"abcdf" {
@@ -338,13 +319,13 @@ fn proven_submatch_graph_can_keep_a_prefix_match_and_literal_suffix() {
     assert_proven_submatch_rewrite(
         source,
         &replacement,
-        &[test_match(16, 6, 4, 1, 1), Token::Literal(b'e')],
+        &[test_match(16, 6, 4), Token::Literal(b'e')],
     );
 }
 
 #[test]
 fn proven_submatch_graph_can_emit_multiple_matches_at_the_proven_distance() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let decoded = b"abcdefabcdefabcde";
     let mut literal_lengths = [0_u8; 286];
     literal_lengths.fill(15);
@@ -366,13 +347,13 @@ fn proven_submatch_graph_can_emit_multiple_matches_at_the_proven_distance() {
     assert_proven_submatch_rewrite(
         source,
         &replacement,
-        &[test_match(8, 6, 4, 1, 1), test_match(9, 6, 4, 1, 1)],
+        &[test_match(8, 6, 4), test_match(9, 6, 4)],
     );
 }
 
 #[test]
 fn proven_submatch_source_symbol_free_path_exposes_payload_ties() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let decoded = b"abcdefabcdefabcde";
     let mut literal_lengths = [0_u8; 286];
     literal_lengths.fill(15);
@@ -406,13 +387,13 @@ fn proven_submatch_source_symbol_free_path_exposes_payload_ties() {
     assert_proven_submatch_rewrite(
         source,
         &replacement,
-        &[Token::Literal(b'a'), test_match(16, 6, 4, 1, 1)],
+        &[Token::Literal(b'a'), test_match(16, 6, 4)],
     );
 }
 
 #[test]
 fn proven_submatch_graph_handles_overlap_and_deadline_expiry() {
-    let source = test_match(258, 1, 0, 0, 0);
+    let source = test_match(258, 1, 0);
     let decoded = [b'A'; 258];
     let mut literal_lengths = [0_u8; 286];
     literal_lengths[usize::from(b'A')] = 1;
@@ -457,7 +438,7 @@ fn proven_submatch_graph_handles_overlap_and_deadline_expiry() {
 
 #[test]
 fn compact_proven_feedback_uses_token_and_plain_work_bounds() {
-    let matching = [test_match(4, 1, 0, 0, 0)];
+    let matching = [test_match(4, 1, 0)];
     assert!(compact_proven_submatch_route_eligible(&matching, 4));
     assert!(!compact_proven_submatch_route_eligible(
         &[Token::Literal(0)],
@@ -475,8 +456,8 @@ fn compact_proven_feedback_uses_token_and_plain_work_bounds() {
 
 #[test]
 fn proven_submatch_default_selection_is_ranked_and_bounded() {
-    let common = test_match(39, 1, 0, 0, 0);
-    let highest = test_match(258, 1, 0, 0, 0);
+    let common = test_match(39, 1, 0);
+    let highest = test_match(258, 1, 0);
     let mut tokens = vec![common; 12];
     tokens.push(highest);
     let decoded_bytes: usize = tokens.iter().map(|token| token.decoded_len()).sum();
@@ -520,7 +501,7 @@ fn proven_submatch_default_selection_is_ranked_and_bounded() {
 
 #[test]
 fn proven_submatch_transition_targeting_checks_both_code_edges() {
-    let symbol = match test_match(39, 1, 0, 0, 0) {
+    let symbol = match test_match(39, 1, 0) {
         Token::Match { length_symbol, .. } => length_symbol,
         Token::Literal(_) => unreachable!(),
     };
@@ -532,8 +513,8 @@ fn proven_submatch_transition_targeting_checks_both_code_edges() {
 
 #[test]
 fn proven_submatch_selection_reserves_space_across_length_symbols() {
-    let common_highest = test_match(258, 1, 0, 0, 0);
-    let rare_lower = test_match(17, 1, 0, 0, 0);
+    let common_highest = test_match(258, 1, 0);
+    let rare_lower = test_match(17, 1, 0);
     let mut tokens = vec![common_highest; 12];
     tokens.push(rare_lower);
     let decoded_bytes: usize = tokens.iter().map(|token| token.decoded_len()).sum();
@@ -580,7 +561,7 @@ fn proven_submatch_single_rewrite_skips_a_duplicate_combined_price() {
 
 #[test]
 fn proven_submatch_materialization_rejects_invalid_rewrite_sets() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let tokens = [source, source];
     let rank = ProvenSubmatchRank {
         highest: false,
@@ -608,7 +589,7 @@ fn proven_submatch_materialization_rejects_invalid_rewrite_sets() {
 
     let wrong_length = ProvenSubmatchRewrite {
         token_index: 0,
-        replacement: vec![test_match(16, 6, 4, 1, 1)],
+        replacement: vec![test_match(16, 6, 4)],
         estimated_saving: 0,
         rank,
     };
@@ -617,7 +598,7 @@ fn proven_submatch_materialization_rejects_invalid_rewrite_sets() {
 
 #[test]
 fn proven_submatch_adoption_requires_a_strict_exact_bit_win() {
-    let source = test_match(17, 6, 4, 1, 1);
+    let source = test_match(17, 6, 4);
     let mut source_tokens: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
     source_tokens.push(source);
     let plain = decode_test_tokens(&source_tokens).unwrap();
@@ -625,7 +606,7 @@ fn proven_submatch_adoption_requires_a_strict_exact_bit_win() {
 
     let mut candidate_tokens: Vec<_> = b"abcdef".iter().copied().map(Token::Literal).collect();
     candidate_tokens.push(Token::Literal(b'a'));
-    candidate_tokens.push(test_match(16, 6, 4, 1, 1));
+    candidate_tokens.push(test_match(16, 6, 4));
     assert_eq!(
         decode_test_tokens(&source_tokens),
         decode_test_tokens(&candidate_tokens)

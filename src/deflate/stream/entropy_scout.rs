@@ -11,7 +11,7 @@
 //! decides.
 
 use crate::deflate::huffman::make_lengths_deflopt_heap_into;
-use crate::deflate::model::{SourceBlockType, Token};
+use crate::deflate::model::{distance_extra_bits, length_extra_bits, SourceBlockType, Token};
 use crate::deflate::stop::SearchStop;
 use crate::sort::SortShared;
 
@@ -103,8 +103,6 @@ impl EntropyScoutCode {
             Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } => {
                 u64::from(code_or_unseen(
@@ -115,8 +113,8 @@ impl EntropyScoutCode {
                     &self.distance_lengths,
                     usize::from(distance_symbol),
                     self.unseen_distance_bits,
-                )) + u64::from(length_extra_bits)
-                    + u64::from(distance_extra_bits)
+                )) + u64::from(length_extra_bits(length_symbol))
+                    + u64::from(distance_extra_bits(distance_symbol))
             }
         }
     }

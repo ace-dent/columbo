@@ -88,8 +88,8 @@ use super::block::{
     CanonicalPlanCache,
 };
 use super::model::{
-    canonical_length_encoding, count_frequencies, ParsedBlock, PlannedBlock, Representation,
-    SourceBlockType, Token,
+    canonical_length_encoding, count_frequencies, distance_extra_bits, length_extra_bits,
+    ParsedBlock, PlannedBlock, Representation, SourceBlockType, Token, TOKEN_CHARGE_BYTES,
 };
 use super::search::{
     improve_plan_with_floor, improve_plan_with_integrated_proven_floor,
@@ -843,10 +843,7 @@ fn prepare_blocks(blocks: &[ParsedBlock]) -> Option<Vec<ParsedBlock>> {
 
 fn payload_storage_bytes(blocks: &[ParsedBlock]) -> Option<usize> {
     blocks.iter().try_fold(0_usize, |total, block| {
-        let tokens = block
-            .tokens
-            .capacity()
-            .checked_mul(std::mem::size_of::<Token>())?;
+        let tokens = block.tokens.capacity().checked_mul(TOKEN_CHARGE_BYTES)?;
         total
             .checked_add(tokens)?
             .checked_add(block.plain.capacity())
@@ -1015,17 +1012,16 @@ impl FrequencyCheckpoint {
             Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } => {
                 let literal = &mut self.literal[usize::from(length_symbol)];
                 *literal = literal.checked_add(1)?;
                 let distance = &mut self.distance[usize::from(distance_symbol)];
                 *distance = distance.checked_add(1)?;
-                self.extra_bits = self
-                    .extra_bits
-                    .checked_add(u64::from(length_extra_bits) + u64::from(distance_extra_bits))?;
+                self.extra_bits = self.extra_bits.checked_add(
+                    u64::from(length_extra_bits(length_symbol))
+                        + u64::from(distance_extra_bits(distance_symbol)),
+                )?;
             }
         }
         Some(())
@@ -1081,7 +1077,7 @@ impl<'a> Composite<'a> {
         // Budget three payload copies: the composite, the DP edge and range
         // plans, and the reconstructed winner.
         let payload_bytes = token_count
-            .checked_mul(std::mem::size_of::<Token>())?
+            .checked_mul(TOKEN_CHARGE_BYTES)?
             .checked_add(plain_count)?;
         let offset_bytes = token_count
             .checked_add(1)?
@@ -1367,8 +1363,6 @@ fn append_proven_match_fragment(
     let Token::Match {
         distance,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
         ..
     } = source
     else {
@@ -1379,16 +1373,12 @@ fn append_proven_match_fragment(
         return Some(());
     }
     let length: u16 = decoded.len().try_into().ok()?;
-    let (length_symbol, length_extra, length_extra_bits) = canonical_length_encoding(length)?;
+    let (length_symbol, _, _) = canonical_length_encoding(length)?;
     output.push(Token::Match {
         length,
         distance,
         length_symbol,
         distance_symbol,
-        length_extra,
-        distance_extra,
-        length_extra_bits,
-        distance_extra_bits,
     });
     Some(())
 }

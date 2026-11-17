@@ -15,8 +15,8 @@
 use crate::deflate::header::{plan_for_explicit_lengths_with_cost, token_bits_from_frequencies};
 use crate::deflate::huffman::{make_lengths_deflopt_heap_into_with_scratch, TreeBuildScratch};
 use crate::deflate::model::{
-    count_frequencies, frequency_extra_bits, token_extra_bits, DynamicPlan, ParsedBlock,
-    PlannedBlock, Representation, Token,
+    count_frequencies, distance_extra_bits, frequency_extra_bits, length_extra_bits,
+    token_extra_bits, DynamicPlan, ParsedBlock, PlannedBlock, Representation, Token,
 };
 use crate::deflate::parse::parsed_model_bytes;
 use crate::deflate::stop::SearchStop;
@@ -189,8 +189,6 @@ impl ShortFamilyStats {
             if let Token::Match {
                 length_symbol,
                 distance_symbol,
-                length_extra_bits,
-                distance_extra_bits,
                 ..
             } = token
             {
@@ -202,7 +200,8 @@ impl ShortFamilyStats {
                     *frequency = frequency.checked_add(1)?;
                     stats.extra_bits_removed[family] = stats.extra_bits_removed[family]
                         .checked_add(
-                            u64::from(length_extra_bits) + u64::from(distance_extra_bits),
+                            u64::from(length_extra_bits(length_symbol))
+                                + u64::from(distance_extra_bits(distance_symbol)),
                         )?;
                     for &byte in decoded {
                         let frequency = &mut stats.literal_additions[family][usize::from(byte)];

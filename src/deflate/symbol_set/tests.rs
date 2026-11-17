@@ -13,17 +13,12 @@ fn rewrite_limits_are_inclusive_and_rejections_keep_the_scan_charge() {
         (32, 257, false),
         (0, 3, false),
     ] {
-        let (length_symbol, length_extra, length_extra_bits) =
-            super::super::model::canonical_length_encoding(length).unwrap();
+        let (length_symbol, _, _) = super::super::model::canonical_length_encoding(length).unwrap();
         let token = Token::Match {
             length,
             distance: 1,
             length_symbol,
             distance_symbol: 0,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         };
         let mut tokens = vec![Token::Literal(b'a')];
         tokens.extend(std::iter::repeat(token).take(count));
@@ -231,17 +226,13 @@ fn remembered_submatch_spellings_match_fresh_rewrites() {
                 continue;
             }
             let length = 3 + (next() % if case % 2 == 0 { 256 } else { 40 }) as u16;
-            let (length_symbol, length_extra, length_extra_bits) =
+            let (length_symbol, _, _) =
                 super::super::model::canonical_length_encoding(length).unwrap();
             tokens.push(Token::Match {
                 length,
                 distance: 1,
                 length_symbol,
                 distance_symbol: 0,
-                length_extra,
-                distance_extra: 0,
-                length_extra_bits,
-                distance_extra_bits: 0,
             });
         }
         let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();
@@ -422,21 +413,16 @@ fn match_only_rewrites_match_full_token_reference() {
                 continue;
             }
             let length = 3 + (next() % if case % 2 == 0 { 120 } else { 20 }) as u16;
-            let (length_symbol, length_extra, length_extra_bits) =
+            let (length_symbol, _, _) =
                 super::super::model::canonical_length_encoding(length).unwrap();
             // Distances 1-4 are codes 0-3, without extra bits.
             let distance_symbol = (next() % 4) as u8;
-            let (distance, distance_extra, distance_extra_bits) =
-                (u16::from(distance_symbol) + 1, 0, 0);
+            let distance = u16::from(distance_symbol) + 1;
             tokens.push(Token::Match {
                 length,
                 distance,
                 length_symbol,
                 distance_symbol,
-                length_extra,
-                distance_extra,
-                length_extra_bits,
-                distance_extra_bits,
             });
         }
         let plain_len = tokens.iter().map(|token| token.decoded_len()).sum();

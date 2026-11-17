@@ -8,8 +8,9 @@
 use super::{plan_for_advertised_lengths, token_bits, transitions_removed};
 use crate::deflate::minima::SuffixMinima;
 use crate::deflate::model::{
-    canonical_length_encoding, same_tokens, ParsedBlock, PlannedBlock, Representation, Token,
-    LENGTH_BASE, LENGTH_EXTRA_BITS, MAX_DYNAMIC_CODE_LENGTH_COUNT,
+    canonical_length_encoding, distance_extra_bits, length_extra_bits, same_tokens, ParsedBlock,
+    PlannedBlock, Representation, Token, LENGTH_BASE, LENGTH_EXTRA_BITS,
+    MAX_DYNAMIC_CODE_LENGTH_COUNT,
 };
 use crate::deflate::stop::SearchStop;
 
@@ -60,8 +61,6 @@ fn match_price(token: Token, literal: &[u8], distance: &[u8]) -> Option<u64> {
     let Token::Match {
         length_symbol,
         distance_symbol,
-        length_extra_bits,
-        distance_extra_bits,
         ..
     } = token
     else {
@@ -70,8 +69,8 @@ fn match_price(token: Token, literal: &[u8], distance: &[u8]) -> Option<u64> {
     Some(
         price(literal, usize::from(length_symbol))?
             + price(distance, usize::from(distance_symbol))?
-            + u64::from(length_extra_bits)
-            + u64::from(distance_extra_bits),
+            + u64::from(length_extra_bits(length_symbol))
+            + u64::from(distance_extra_bits(distance_symbol)),
     )
 }
 
@@ -79,24 +78,17 @@ fn submatch(seed: Token, length: usize) -> Option<Token> {
     let Token::Match {
         distance,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
         ..
     } = seed
     else {
         return None;
     };
-    let (length_symbol, length_extra, length_extra_bits) =
-        canonical_length_encoding(u16::try_from(length).ok()?)?;
+    let (length_symbol, _, _) = canonical_length_encoding(u16::try_from(length).ok()?)?;
     Some(Token::Match {
         length: length as u16,
         distance,
         length_symbol,
-        length_extra,
-        length_extra_bits,
         distance_symbol,
-        distance_extra,
-        distance_extra_bits,
     })
 }
 
@@ -117,11 +109,9 @@ fn match_families<'a>(
 ) -> impl Iterator<Item = MatchFamily> + 'a {
     let distance_bits = match seed {
         Token::Match {
-            distance_symbol,
-            distance_extra_bits,
-            ..
+            distance_symbol, ..
         } => price(distance, usize::from(distance_symbol))
-            .map(|bits| bits + u64::from(distance_extra_bits)),
+            .map(|bits| bits + u64::from(distance_extra_bits(distance_symbol))),
         _ => None,
     };
     let n = seed.decoded_len();

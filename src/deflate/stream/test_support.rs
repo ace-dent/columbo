@@ -54,7 +54,7 @@ pub(super) fn literal_block(bytes: &[u8], source_type: SourceBlockType) -> Parse
 }
 
 pub(super) fn overlapping_match_block(length: u16) -> ParsedBlock {
-    let (length_symbol, length_extra, length_extra_bits) =
+    let (length_symbol, _, _) =
         canonical_length_encoding(length).expect("a legal Deflate match length");
     let tokens = vec![
         Token::Literal(b'a'),
@@ -63,10 +63,6 @@ pub(super) fn overlapping_match_block(length: u16) -> ParsedBlock {
             distance: 1,
             length_symbol,
             distance_symbol: 0,
-            length_extra,
-            distance_extra: 0,
-            length_extra_bits,
-            distance_extra_bits: 0,
         },
     ];
     let (literal_frequencies, distance_frequencies) = count_frequencies(&tokens);
