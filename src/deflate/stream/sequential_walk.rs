@@ -26,7 +26,7 @@ use crate::deflate::stop::SearchStop;
 use crate::progress::RouteProgress;
 use crate::Options;
 
-use super::source_split::plan_source_with_splits;
+use super::source_split::{plan_source_with_splits, DeferredSplits};
 use super::{
     append_output_plans, is_fixed_plan, total_bits, try_merge_parsed_blocks, AdjacentMergeSearch,
     PendingBlock, SourceBlockSearch, MAX_MERGED_PLAIN, MAX_MERGED_TOKENS,
@@ -60,6 +60,12 @@ pub(super) fn sequential_plan_with_compact_policy(
     )
 }
 
+/// Walk the blocks in order. A Max walk with full per-source search over two
+/// or more blocks walks twice: the first walk gives every block its
+/// whole-block search and its first split refinements, and the second resumes
+/// each block's remaining refinements ([`DeferredSplits`]), so a deadline
+/// cuts the least valuable work instead of leaving later blocks unsearched.
+/// The second walk replaces the first only with strictly fewer bits.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sequential_plan_with_source_search(
     blocks: &[ParsedBlock],
@@ -68,6 +74,52 @@ pub(super) fn sequential_plan_with_source_search(
     merge_search: AdjacentMergeSearch,
     source_search: SourceBlockSearch,
     plan_cache: &mut CanonicalPlanCache,
+    stop: &mut SearchStop<'_>,
+    progress: Option<&RouteProgress>,
+) -> Option<Vec<PlannedBlock>> {
+    let defers = options.exhaustive
+        && blocks.len() >= 2
+        && matches!(source_search, SourceBlockSearch::Full { .. });
+    let mut deferred = DeferredSplits::default();
+    let mut best: Option<Vec<PlannedBlock>> = None;
+    loop {
+        let walked = walk_source_blocks(
+            blocks,
+            start_alignment,
+            options,
+            merge_search,
+            source_search,
+            plan_cache,
+            defers.then_some(&mut deferred),
+            stop,
+            progress,
+        );
+        let Some(first) = best.take() else {
+            let first = walked?;
+            if !defers || stop.reached() || !deferred.has_unrefined() {
+                return Some(first);
+            }
+            deferred.resume();
+            best = Some(first);
+            continue;
+        };
+        return Some(match walked {
+            Some(second) if total_bits(&second) < total_bits(&first) => second,
+            _ => first,
+        });
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn walk_source_blocks(
+    blocks: &[ParsedBlock],
+    start_alignment: u8,
+    options: &Options,
+    merge_search: AdjacentMergeSearch,
+    source_search: SourceBlockSearch,
+    plan_cache: &mut CanonicalPlanCache,
+    mut deferred: Option<&mut DeferredSplits>,
     stop: &mut SearchStop<'_>,
     progress: Option<&RouteProgress>,
 ) -> Option<Vec<PlannedBlock>> {
@@ -95,6 +147,7 @@ pub(super) fn sequential_plan_with_source_search(
                 options,
                 source_search,
                 plan_cache,
+                deferred.as_deref_mut(),
                 stop,
             ),
         };
@@ -110,6 +163,7 @@ pub(super) fn sequential_plan_with_source_search(
             options,
             source_search,
             plan_cache,
+            deferred.as_deref_mut(),
             stop,
         );
         let separate_bits = pending_bits + total_bits(&current_plans);
@@ -164,6 +218,7 @@ pub(super) fn sequential_plan_with_source_search(
                 options,
                 source_search,
                 plan_cache,
+                deferred.as_deref_mut(),
                 stop,
             );
             if total_bits(&candidate) < separate_bits
@@ -227,6 +282,7 @@ pub(super) fn sequential_plan_with_source_search(
             options,
             source_search,
             plan_cache,
+            deferred,
             stop,
         ),
     };
@@ -240,6 +296,7 @@ fn plan_source_with_search(
     options: &Options,
     search: SourceBlockSearch,
     plan_cache: &mut CanonicalPlanCache,
+    deferred: Option<&mut DeferredSplits>,
     stop: &mut SearchStop<'_>,
 ) -> Vec<PlannedBlock> {
     match search {
@@ -251,6 +308,7 @@ fn plan_source_with_search(
             options,
             integrated_compact_proven,
             plan_cache,
+            deferred,
             stop,
         ),
         SourceBlockSearch::Narrow { individual_prune } => {

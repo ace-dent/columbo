@@ -5227,9 +5227,31 @@ split can add a second cut.
 6. Max, split first: when the best structural split beats the unsplit base,
    token-search both of its children before the whole-block search.
 7. Max: run the whole-block Max token search, then token-search the children of
-   the remaining ranked splits, cheapest first, while time remains.
+   the remaining ranked splits, cheapest first, while time remains. A walk over
+   two or more source blocks defers all but the first two refinements
+   (**Deferred split refinements** below).
 8. Default instead tries the nested split below; its split children never get
    token search.
+
+**Deferred split refinements.** Each block's search may use all the time that
+is left, and refining a block's ranked cuts takes most of it for little: on the
+24 frames of one APNG at a 33-second allowance, the whole-block searches gained
+3,200 bits in 27 thread-seconds, and the refinements 757 bits in 321, 690 of
+them from the first two cuts. Run in block order, the first block's refinements
+used up each frame's slice, and whether the second block was searched at all
+depended on where the slice ended: the file's size varied by 170 bytes between
+runs. A Max walk with full per-source search over two or more blocks therefore
+walks twice. The first walk gives every block its searches and its first two
+refinements and records the block's result and unrefined cuts; the second
+resumes each block from its record and replaces the first walk only with
+strictly fewer bits. A record made at another bit alignment is reused only when
+none of its plans is stored or original bits. With time for both walks, a block
+ends with the same candidates as before; a deadline now cuts the refinements
+last. That APNG went from 367,262–367,431 bytes over 8 runs to 367,156–367,160
+over 3. On 30 files of the deft4j APNG benchmark, each run twice with each
+build, 9 were smaller in both runs, 2 larger by 1–9 bytes, and 19 overlapped,
+for about 930 bytes less in total; the spread between repeat runs stayed about
+the same there (124 against 143 bytes).
 
 The best of these replaces the block only with strictly fewer bits, and the walk
 plans the next block at the new running alignment. The eighth and 32-token
@@ -6574,8 +6596,9 @@ comparison floor:
    pass runs them.
 3. The full search of the selected grouped layout, then the priority boundary
    graph when eligible.
-4. The source-order walk with full per-source splits and token search. In Max,
-   with regrouping on, this walk keeps only exact fixed/fixed joins; merges come
+4. The source-order walk with full per-source splits and token search, which
+   defers each block's later split refinements until every block has been
+   searched ([Splitting blocks](#splitting-blocks)). In Max, with regrouping on, this walk keeps only exact fixed/fixed joins; merges come
    from the layouts, the source-aligned floor, the selected-plan merge cleanup
    after a winning source order, and the boundary graph's multi-source edges.
 5. With more than 8 prepared blocks, the collected-layout replay, unless step 3

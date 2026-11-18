@@ -7,12 +7,15 @@
 //! decoded-eighth cuts, and the cuts' inside-match siblings, structurally
 //! first, because the whole-block Max search can use up the deadline before a
 //! useful split is reached. Max adds 32-token cuts on compact blocks and the
-//! adaptive probe's cut, then token-searches the split children; Default may
-//! split the larger child of a near-tied runner-up split again. A split
-//! replaces the block only with strictly fewer bits.
+//! adaptive probe's cut, then token-searches the split children, which a walk
+//! over several blocks defers after the first cuts ([`DeferredSplits`]);
+//! Default may split the larger child of a near-tied runner-up split again. A
+//! split replaces the block only with strictly fewer bits.
+
+use std::sync::Arc;
 
 use crate::deflate::block::{lookup_block_cached, plan_block, CanonicalPlanCache};
-use crate::deflate::model::{ParsedBlock, PlannedBlock};
+use crate::deflate::model::{ParsedBlock, PlannedBlock, Representation, Token};
 use crate::deflate::search::{
     improve_plan_with_integrated_proven_floor, improve_plan_with_short_family_floor,
     plan_block_with_complete_base_search, plan_block_with_complete_integrated_proven_search,
@@ -41,6 +44,89 @@ const ADAPTIVE_SPLIT_MIN_EXACT_SAVINGS_BITS: u64 = 32;
 /// mode; one added header rarely recovers a wider gap.
 const NESTED_RUNNER_UP_MARGIN_BITS: u64 = 64;
 
+/// Split refinements a block's own search runs in a walk that defers the rest
+/// ([`DeferredSplits`]). On 24 APNG frames at a 33-second allowance the first
+/// two ranked cuts gave 690 of the 757 bits that refinement found.
+const HEAD_SPLIT_REFINEMENTS: usize = 2;
+
+/// The split refinements a Max walk has put off until every source block has
+/// had its whole-block search.
+///
+/// Refining a block's ranked cuts takes most of a source block's search time
+/// and finds little after the first cuts, while each block's own search may
+/// use all the time left. Run in block order, the first blocks' refinements
+/// therefore used up a short allowance, and later blocks kept their unsearched
+/// plans. A first walk records each block's result and its unrefined cuts
+/// here; a second walk resumes from them.
+#[derive(Default)]
+pub(super) struct DeferredSplits {
+    resume: bool,
+    blocks: Vec<DeferredSplit>,
+}
+
+struct DeferredSplit {
+    /// Identifies the source block: both walks plan the same parsed blocks.
+    tokens: Arc<Vec<Token>>,
+    alignment: u8,
+    best: Vec<PlannedBlock>,
+    /// The ranked cuts not yet refined, in ranked order.
+    unrefined: Vec<(u64, Cut)>,
+}
+
+impl DeferredSplits {
+    /// Whether the first walk left any cut unrefined.
+    pub(super) fn has_unrefined(&self) -> bool {
+        self.blocks.iter().any(|block| !block.unrefined.is_empty())
+    }
+
+    /// Make the next walk resume from the recorded blocks.
+    pub(super) fn resume(&mut self) {
+        self.resume = true;
+    }
+
+    /// Take the record of `block`. A record made at another alignment is
+    /// reused only when none of its plans is stored or original bits, whose
+    /// cost or validity depends on the alignment.
+    fn take(&mut self, block: &ParsedBlock, alignment: u8) -> Option<DeferredSplit> {
+        let index = self.blocks.iter().position(|recorded| {
+            Arc::ptr_eq(&recorded.tokens, &block.tokens)
+                && (recorded.alignment == alignment
+                    || recorded.best.iter().all(|plan| {
+                        matches!(
+                            plan.representation,
+                            Representation::Fixed | Representation::Dynamic(_)
+                        )
+                    }))
+        })?;
+        Some(self.blocks.swap_remove(index))
+    }
+
+    fn record(
+        &mut self,
+        block: &ParsedBlock,
+        alignment: u8,
+        best: &[PlannedBlock],
+        unrefined: Vec<(u64, Cut)>,
+    ) {
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(best.len()).is_err() || self.blocks.try_reserve(1).is_err() {
+            return;
+        }
+        for plan in best {
+            let Some(plan) = try_clone_planned_block(plan) else {
+                return;
+            };
+            copy.push(plan);
+        }
+        self.blocks.push(DeferredSplit {
+            tokens: Arc::clone(&block.tokens),
+            alignment,
+            best: copy,
+            unrefined,
+        });
+    }
+}
+
 fn search_split_before_whole_block(
     exhaustive: bool,
     best_split_bits: Option<u64>,
@@ -60,8 +146,36 @@ pub(super) fn plan_source_with_splits(
     options: &Options,
     integrated_compact_proven: bool,
     plan_cache: &mut CanonicalPlanCache,
+    mut deferred: Option<&mut DeferredSplits>,
     stop: &mut SearchStop<'_>,
 ) -> Vec<PlannedBlock> {
+    if let Some(recorded) = deferred
+        .as_deref_mut()
+        .filter(|deferred| deferred.resume)
+        .and_then(|deferred| deferred.take(block, alignment))
+    {
+        let mut best = recorded.best;
+        if recorded.unrefined.is_empty() || stop.reached() {
+            return best;
+        }
+        let Some(composite) = Composite::new(std::slice::from_ref(block)) else {
+            return best;
+        };
+        let end = Cut {
+            token: block.tokens.len(),
+            plain: block.plain.len(),
+        };
+        refine_ranked_splits(
+            &composite,
+            end,
+            alignment,
+            options,
+            &recorded.unrefined,
+            &mut best,
+            stop,
+        );
+        return best;
+    }
     if block.tokens.len() < 16
         || block.plain.len() < 128
         || (!options.exhaustive && block.plain.len() < 32_768)
@@ -297,22 +411,58 @@ pub(super) fn plan_source_with_splits(
 
     // Refine split children while time remains, cheapest direct price first;
     // the ranking keeps Max mode deterministic.
-    for (_, split) in ranked_splits.into_iter().skip(refined_splits) {
+    let unrefined = ranked_splits.get(refined_splits..).unwrap_or_default();
+    let Some(deferred) = deferred.filter(|deferred| !deferred.resume) else {
+        refine_ranked_splits(
+            &composite, end, alignment, options, unrefined, &mut best, stop,
+        );
+        return best;
+    };
+    let (head, rest) = unrefined.split_at(
+        HEAD_SPLIT_REFINEMENTS
+            .saturating_sub(refined_splits)
+            .min(unrefined.len()),
+    );
+    refine_ranked_splits(&composite, end, alignment, options, head, &mut best, stop);
+    if !stop.reached() {
+        let mut unrefined = Vec::new();
+        if unrefined.try_reserve_exact(rest.len()).is_ok() {
+            unrefined.extend_from_slice(rest);
+            deferred.record(block, alignment, &best, unrefined);
+        }
+    }
+    best
+}
+
+/// Token-search the children of each ranked cut in turn, keeping a split that
+/// is strictly smaller than `best`.
+#[inline(never)]
+fn refine_ranked_splits(
+    composite: &Composite<'_>,
+    end: Cut,
+    alignment: u8,
+    options: &Options,
+    ranked_splits: &[(u64, Cut)],
+    best: &mut Vec<PlannedBlock>,
+    stop: &mut SearchStop<'_>,
+) {
+    let start = Cut { token: 0, plain: 0 };
+    let mut best_bits = total_bits(best);
+    for &(_, split) in ranked_splits {
         if stop.reached() {
             break;
         }
         let Some(candidate) =
-            plan_searched_split(&composite, start, split, end, alignment, options, stop)
+            plan_searched_split(composite, start, split, end, alignment, options, stop)
         else {
             continue;
         };
         let candidate_bits = total_bits(&candidate);
         if candidate_bits < best_bits {
             best_bits = candidate_bits;
-            best = candidate;
+            *best = candidate;
         }
     }
-    best
 }
 
 fn plan_searched_split(
