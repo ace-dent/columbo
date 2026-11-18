@@ -179,7 +179,9 @@ pub(super) fn slid_default_endpoint(
         progress,
         slid,
     )?;
-    if header_fit == HeaderFit::AfterTreeFloors {
+    // `complete` ends with R2–R5 in the sweep, so Default's closing header fit
+    // runs when the finish changed it.
+    if header_fit == HeaderFit::AfterTreeFloors || slid.is_strictly_smaller_than(complete) {
         slid = improve_with_final_header_fit(
             source,
             floor_options,

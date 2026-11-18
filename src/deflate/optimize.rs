@@ -81,8 +81,9 @@ use source_routes::{
     changed_narrow_parent_should_continue, refine_with_max_planner, refine_with_no_split_route,
 };
 use terminal::{
-    improve_with_final_header_fit, improve_with_terminal_searches,
-    refine_with_relaxed_distance_codes, TerminalParseCache,
+    improve_with_closing_header_fit, improve_with_final_header_fit,
+    improve_with_terminal_searches_noting_fit, refine_with_relaxed_distance_codes,
+    TerminalParseCache,
 };
 use tree_floor::{improve_with_terminal_tree_floors, refine_with_compact_balanced_tree_floor};
 
@@ -159,7 +160,8 @@ pub(crate) struct DefaultEndpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeaderFit {
     /// In the sweep, after R1b: the floor phase has already run the terminal
-    /// tree floors.
+    /// tree floors. Default fits once more after R18 when the finish changed
+    /// the stream after this fit.
     InSweep,
     /// After R18: `ApngDefault` skips the first tree floors, so the finishing
     /// steps (R1c, R13–R17) and R18 still replace its codes, and a fit made

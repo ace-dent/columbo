@@ -44,6 +44,10 @@ pub enum Format {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Enable the slower block-boundary and token-spelling search (`--max`).
+    ///
+    /// Max also runs the whole file again from its own output while a pass
+    /// makes it smaller and time remains, so a run that ends before its
+    /// timeout returns a file that another Max run leaves unchanged.
     pub exhaustive: bool,
     /// Report route timings, bit gains, and final block choices to standard
     /// output.

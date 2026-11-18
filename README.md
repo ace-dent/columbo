@@ -31,7 +31,7 @@ The format of each input is detected automatically, and several inputs are proce
 
 | Option | Description |
 | --- | --- |
-| `-m`, `--max` | Enable slower block-boundary and token-spelling searches for potentially smaller output. |
+| `-m`, `--max` | Enable slower block-boundary and token-spelling searches for potentially smaller output. It repeats processing while a pass still saves bytes and time remains. |
 | `-d`, `--dry-run` | Run the complete optimization and report savings without writing anything. `--out` and `--stdout` are ignored. |
 | `--out <file>` | Write a single input to `file` instead of replacing it. |
 | `--stdout` | Write a single input's output to standard output. Reports then go to standard error. |
@@ -73,7 +73,7 @@ Columbo combines methods and concepts from the following work:
 - [deft4j](https://github.com/NeRdTheNed/deft4j) v1.0.0-beta-17 (12-Nov-2023) by Ned Loynd.
 - [turtledeflate](https://github.com/rwillenbacher/turtledeflate) (as at 25-Jul-2026) by Ralf Willenbacher.
 
-Thanks to all contributors, including @Enivex, @TPS and @YadeWira. 
+Thanks to all contributors, including @Enivex, @TPS and @YadeWira.
 
 🤖 The code and reverse engineering in this project were completed extensively with AI.
 

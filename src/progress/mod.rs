@@ -91,6 +91,15 @@ pub(crate) fn format_detected(options: &Options, format: Format, deflate_streams
     coordinator::begin_file(deflate_streams.unwrap_or(0), options.timeout);
 }
 
+/// Announce a later Max pass over the previous pass's output of `bytes`
+/// bytes. The pass then reports its format and streams like the first.
+pub(crate) fn pass_started(options: &Options, pass: usize, bytes: usize) {
+    if !reports_enabled(options) {
+        return;
+    }
+    terminal::write_report(&mut |output| writeln!(output, "\nPass     {pass} · {bytes} bytes"));
+}
+
 /// Print any remaining stream reports once container work has finished.
 /// Force-sealing keeps the reports of a container that returned early on an
 /// error.

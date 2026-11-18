@@ -417,8 +417,38 @@ pub(super) fn improve_with_terminal_searches(
     progress: Progress,
     header_fit: HeaderFit,
     keep_replaced: bool,
+    candidate: Candidate,
+) -> Result<Candidate> {
+    improve_with_terminal_searches_noting_fit(
+        source,
+        options,
+        default_work,
+        max_work,
+        progress,
+        header_fit,
+        keep_replaced,
+        &mut (0, 0),
+        candidate,
+    )
+}
+
+/// [`improve_with_terminal_searches`], setting `fitted` to the candidate's
+/// score when R2–R5 last saw it: on entry, then after each of them. Default's
+/// closing header fit ([`improve_with_closing_header_fit`]) runs only when
+/// the finish ends on another score.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn improve_with_terminal_searches_noting_fit(
+    source: CandidateInput<'_>,
+    options: &Options,
+    default_work: DefaultFloorWork<'_>,
+    max_work: DefaultFloorWork<'_>,
+    progress: Progress,
+    header_fit: HeaderFit,
+    keep_replaced: bool,
+    fitted: &mut (usize, u64),
     mut candidate: Candidate,
 ) -> Result<Candidate> {
+    *fitted = (candidate.data.len(), candidate.bits);
     // Moved here after each method, so a later replacement that keeps
     // nothing cannot drop them.
     let mut kept = Vec::new();
@@ -527,6 +557,9 @@ pub(super) fn improve_with_terminal_searches(
             };
             if keep_replaced {
                 kept.append(&mut candidate.replaced_parents);
+            }
+            if search.fits_codes() {
+                *fitted = (candidate.data.len(), candidate.bits);
             }
             // A win re-slides the blocks, which can expose another R13, R14 or
             // R15 win; repeat here when no later sweep can revisit them.
@@ -991,7 +1024,8 @@ pub(super) fn refine_with_terminal_header_search_cached(
     Ok(Some(refined.named(search.name())))
 }
 
-/// R2–R5 after R18, for [`HeaderFit::AfterTreeFloors`]. R5 rewrites tokens,
+/// R2–R5 after R18, for [`HeaderFit::AfterTreeFloors`] and for Default's
+/// closing header fit. R5 rewrites tokens,
 /// which in every other order the tree finish and the token replay then see;
 /// here, after an R5 win, R14 chooses trees for the new counts and R17 replays
 /// the token floor under them, each sliding once more after a win.
@@ -1039,6 +1073,26 @@ pub(super) fn improve_with_final_header_fit(
         }
     }
     Ok(candidate)
+}
+
+/// Default's closing header fit: R2–R5 once more, when the finish changed the
+/// stream after the sweep's fit, so `fitted`, the score R2–R5 last saw, is no
+/// longer the candidate's. R1c and R13–R18 move boundaries and replace trees,
+/// and the sweep's fit was made to the codes before them. A stream the finish
+/// left alone pays nothing.
+pub(super) fn improve_with_closing_header_fit(
+    source: CandidateInput<'_>,
+    options: &Options,
+    work: DefaultFloorWork<'_>,
+    progress: Progress,
+    parse_cache: &mut TerminalParseCache,
+    fitted: (usize, u64),
+    candidate: Candidate,
+) -> Result<Candidate> {
+    if (candidate.data.len(), candidate.bits) == fitted {
+        return Ok(candidate);
+    }
+    improve_with_final_header_fit(source, options, work, progress, parse_cache, candidate)
 }
 
 /// R19: in relaxed mode, give each block that uses at most one distance

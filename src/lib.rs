@@ -111,6 +111,35 @@ impl Optimization {
         self.rewrite_required = true;
     }
 
+    /// Take the result of a later pass over this result's data when it is
+    /// strictly smaller, in bytes and then in meaningful bits, and return
+    /// whether it was. `source_bytes` is the length of the input this result
+    /// was made from; the later pass's own savings are against this result.
+    pub(crate) fn replace_with_later_pass(&mut self, source_bytes: usize, later: Self) -> bool {
+        self.timed_out |= later.timed_out;
+        let bytes = self.data.len();
+        let smaller =
+            later.data.len() < bytes || (later.data.len() == bytes && later.bits_saved != 0);
+        if !smaller {
+            return false;
+        }
+        self.bits_saved = match source_bytes.cmp(&later.data.len()) {
+            std::cmp::Ordering::Greater => u64::try_from(source_bytes - later.data.len())
+                .map_or(u64::MAX, |bytes| bytes.saturating_mul(8)),
+            // Both passes kept the source's length, so their bits add up.
+            std::cmp::Ordering::Equal if bytes == source_bytes => {
+                self.bits_saved.saturating_add(later.bits_saved)
+            }
+            _ => 0,
+        };
+        self.removed_data_bytes = self
+            .removed_data_bytes
+            .saturating_add(later.removed_data_bytes);
+        self.rewrite_required |= later.rewrite_required;
+        self.data = later.data;
+        true
+    }
+
     pub(crate) fn with_removed_data(mut self, bytes: usize) -> Self {
         self.removed_data_bytes = bytes as u64;
         self

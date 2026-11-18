@@ -98,7 +98,8 @@ Code comments and the route documentation rely on these project terms.
   R1b in strict mode, R2–R5, R6–R11 in Max only, the fixed-tree boundary slide
   (R1c), then R13–R15. Max repeats the sweep (R12) while it improves and time
   remains. R16 and R17 follow the settled sweeps, and the late tree floor (R18)
-  ends the finish. In relaxed mode the relaxed distance code (R19) then runs
+  ends the finish; Default then fits headers once more (R2–R5) if the stream
+  changed after the sweep's fit. In relaxed mode the relaxed distance code (R19) then runs
   once on the selected candidate
   ([terminal sweep order](routes-and-methods.md#terminal-sweep-order)).
 - **Default / Max**: the two search modes. Max (`--max`, `Options::exhaustive`)
@@ -108,7 +109,7 @@ Code comments and the route documentation rely on these project terms.
 - **Deadline and grace**: the soft deadline stops new routes from starting;
   active work may continue for a grace of 10% of the timeout plus one second,
   until the hard stop.
-- **Route labels**: D1–D4, G0, G0t, M0–M14, R1–R19, S0, and their suffixed
+- **Route labels**: D1–D4, G0, G0t, M0–M15, R1–R19, S0, and their suffixed
   variants such as R1b, M2c and M10a name gates and routes; the
   [label index](routes-and-methods.md#label-index) lists every label, and the
   [route-gate reference](routes-and-methods.md#route-gate-reference) gives

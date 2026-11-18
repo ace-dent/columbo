@@ -11,7 +11,7 @@ use super::compact_split::{
 };
 use super::default_floor::slid_default_endpoint;
 use super::gates::compact_strict_literal_tree_eligible;
-use super::terminal::TerminalHeaderSearch;
+use super::terminal::{improve_with_terminal_searches, TerminalHeaderSearch};
 use super::test_support::{
     comparison_candidate, corpus_file, deadline_with_grace, png_raw_deflate,
     refine_with_terminal_header_search,

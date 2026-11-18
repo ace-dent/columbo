@@ -37,15 +37,15 @@ use super::{
     continuation_source_max, default_source_topology_eligible, deft4j_source_route_eligible,
     established_floor_candidate, floor_exposes_new_search_states,
     floor_seeded_priority_with_structural_sibling, gain_is_below, has_multiple_nonempty_blocks,
-    improve_default_floor_with_feedback, improve_with_final_header_fit,
-    improve_with_terminal_searches, improve_with_terminal_tree_floors,
-    independent_deft4j_refinement_can_overlap, is_strictly_better, join_route,
-    narrow_source_route_eligible, normalize_258_aliases, parallel_route_is_bounded,
-    parse_validated_rewrite, prebuild_bounded_floor, prepare_compact_source_split_seed,
-    refine_bounded_deft4j_lineage, refine_with_compact_balanced_tree_floor,
-    refine_with_compact_proven_feedback, refine_with_compact_source_split_floor,
-    refine_with_compact_source_split_floor_until, refine_with_max_planner,
-    refine_with_no_split_route, refine_with_relaxed_distance_codes,
+    improve_default_floor_with_feedback, improve_with_closing_header_fit,
+    improve_with_final_header_fit, improve_with_terminal_searches_noting_fit,
+    improve_with_terminal_tree_floors, independent_deft4j_refinement_can_overlap,
+    is_strictly_better, join_route, narrow_source_route_eligible, normalize_258_aliases,
+    parallel_route_is_bounded, parse_validated_rewrite, prebuild_bounded_floor,
+    prepare_compact_source_split_seed, refine_bounded_deft4j_lineage,
+    refine_with_compact_balanced_tree_floor, refine_with_compact_proven_feedback,
+    refine_with_compact_source_split_floor, refine_with_compact_source_split_floor_until,
+    refine_with_max_planner, refine_with_no_split_route, refine_with_relaxed_distance_codes,
     refine_with_terminal_source_split_floor_until, release_kept_validated_parse,
     replace_optional_if_smaller, replace_optional_keeping_parent, source_run_match_count_exceeds,
     spawn_route, BoundedFollowUpCandidates, BoundedPhaseCandidates, BoundedPngMaxPolicy,
@@ -2473,7 +2473,8 @@ fn finish_candidate_by(
         HeaderFit::InSweep
     };
     // Max keeps what the sweeps replace for `finish_terminal_searches`.
-    let candidate = improve_with_terminal_searches(
+    let mut fitted = (0, 0);
+    let candidate = improve_with_terminal_searches_noting_fit(
         source,
         options,
         restoration_work,
@@ -2481,6 +2482,7 @@ fn finish_candidate_by(
         progress,
         header_fit,
         options.exhaustive,
+        &mut fitted,
         candidate,
     )?;
     // R18: the blocks R13–R17 cut, merged or re-spelled have not had the
@@ -2488,15 +2490,28 @@ fn finish_candidate_by(
     // which skip the first floors.
     let candidate =
         improve_with_terminal_tree_floors(source, options, terminal_work, progress, candidate)?;
-    if header_fit == HeaderFit::InSweep {
+    // Max repeats its sweeps (R12) and the whole file (M15) instead.
+    if options.exhaustive {
         return Ok(candidate);
+    }
+    let mut parse_cache = TerminalParseCache::default();
+    if header_fit == HeaderFit::InSweep {
+        return improve_with_closing_header_fit(
+            source,
+            options,
+            restoration_work,
+            progress,
+            &mut parse_cache,
+            fitted,
+            candidate,
+        );
     }
     improve_with_final_header_fit(
         source,
         options,
         restoration_work,
         progress,
-        &mut TerminalParseCache::default(),
+        &mut parse_cache,
         candidate,
     )
 }

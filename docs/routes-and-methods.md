@@ -17,7 +17,7 @@ changes, why that saves bits, and how to price, verify and schedule the result.
 For Columbo itself, it is the authority on production routing: the format,
 topology, work, memory, mode and deadline gates that decide which optional
 routes build complete candidates. Code comments and other documents cite its
-labels (R1–R19, D1–D4, M0–M14, G0, G0t, S0) and its anchors.
+labels (R1–R19, D1–D4, M0–M15, G0, G0t, S0) and its anchors.
 
 The code under [`src/`](../src/) is the ground truth. Where this document and
 the code disagree, the code is right and the document needs fixing.
@@ -43,7 +43,7 @@ explains each method. Part 3, from
 | Support PNG, ZIP, GZIP or zlib | [Container methods](#container-methods) |
 | Make the search fast | [Candidate reuse and duplicate-work control](#candidate-reuse-and-duplicate-work-control), [Multithreading](#multithreading) |
 | Add time limits and a slower mode | [Default and Max](#default-and-max), [Time limits](#time-limits), [Floors and the Max guarantee](#floors-and-the-max-guarantee) |
-| Find when Columbo runs a route, and its limits | [Routing decision tree](#routing-decision-tree); [Route-gate reference](#route-gate-reference) for G0, G0t, M0–M14 and S0; each R or D method entry's gates list; [Inner stream-planner gates](#inner-stream-planner-gates) |
+| Find when Columbo runs a route, and its limits | [Routing decision tree](#routing-decision-tree); [Route-gate reference](#route-gate-reference) for G0, G0t, M0–M15 and S0; each R or D method entry's gates list; [Inner stream-planner gates](#inner-stream-planner-gates) |
 | Look up a label such as R13 or M7a | [Label index](#label-index) |
 | Read verbose reports | [Scheduling and observability](#scheduling-and-observability) |
 | Find a method's code or its credits | [Source map](#source-map), [Attribution](#attribution) |
@@ -58,7 +58,7 @@ Reading notes:
 - Each exact gate or bound is written in one place, and other sections link to
   it. R1–R19 and D1–D4 keep theirs in their Part 2 entry, under "Columbo's gates
   and bounds", except R12, whose rule is in
-  [Sweep repetition (R12)](#sweep-repetition-r12). G0, G0t, M0–M14, S0 and the
+  [Sweep repetition (R12)](#sweep-repetition-r12). G0, G0t, M0–M15, S0 and the
   replay limits are in the [route-gate reference](#route-gate-reference), and
   the planner's inner gates are in
   [Inner stream-planner gates](#inner-stream-planner-gates).
@@ -363,8 +363,10 @@ Routes and modes:
 - **Sweep**: one ordered pass of the terminal methods R1, R1b, R2–R11 (Default
   skips R6–R11), R1c, R13, R14 and R15. R12 is the rule that repeats the sweep
   in Max, not a member of it ([Sweep repetition (R12)](#sweep-repetition-r12)).
-  R16 and R17 follow once the sweeps settle, and R18 runs last
-  ([Terminal sweep order](#terminal-sweep-order)).
+  R16 and R17 follow once the sweeps settle, and R18 runs last, except that
+  Default fits headers once more (R2–R5) when those steps changed the stream
+  ([Terminal sweep order](#terminal-sweep-order),
+  [Late tree floor (R18)](#late-tree-floor-r18)).
 - **Finish**: taking a candidate through R1–R18.
 - **Terminal tree floors**: the
   [compact payload-tree floor](#compact-payload-tree-floor) and the
@@ -405,7 +407,7 @@ integrated
 and, in strict mode only, the
 [balanced-tree cleanup (D3)](#tree-lengthening-and-balanced-tree-cleanup-d3).
 The [source topology (D4)](#source-topology-d4) is a separate lineage. M labels
-name Max routes and the rules that schedule them (M0–M14), G0 and G0t the timing
+name Max routes and the rules that schedule them (M0–M15), G0 and G0t the timing
 gates, and S0 the source-max state order. Suffixed labels such as R1b, M2c and
 M10a–M10d are variants. The [label index](#label-index) lists them all.
 
@@ -1441,7 +1443,7 @@ Default therefore:
 - runs one terminal sweep without R6–R11, with one extra R13–R15 pass after a
   win and no sweep repetition (R12)
   ([Terminal sweep order](#terminal-sweep-order));
-- runs none of the Max routes M0–M14
+- runs none of the Max routes M0–M15, so it makes one pass over a file
   ([Route-gate reference](#route-gate-reference));
 - under `ApngDefault`, runs each frame's initial planner once without replay and
   skips D1–D3 and the first tree floors, so APNG cost does not grow with every
@@ -2630,6 +2632,21 @@ candidate. A result is kept only if strictly smaller.
   R18 does not run again after a late R5 win: R14 and R17 alone saved 0.0009%
   for 0.5% more CPU, and R1c, R13–R17 and R18 together saved 0.0012% for 1.2%,
   a lower ratio.
+- **Closing header fit.** In every other Default finish, R2–R5 run in the
+  sweep, before R1c and R13–R18 move boundaries and replace trees, so their fit
+  is to codes that the finish then changes. A second Default run over Default's
+  own output saved 2,102 bytes on 378 of 892 corpus files, two thirds of it in
+  R4 and R2. Default therefore runs R2–R5 once more after R18, as `ApngDefault`
+  does, when the candidate's score is no longer the one R2–R5 last saw; a
+  stream the finish left alone pays nothing. Max's slid Default endpoint does
+  the same, so Max still never ends above Default. Max's own finish does not:
+  it repeats its sweeps (R12) and the whole file
+  ([M15](#m15-repeated-passes)). Measured against `25155a1` on the 892 corpus
+  files: 985 bytes on 130 files for 8.9% more CPU, and one file 6 bytes larger
+  in the loaded batch that was identical alone. Running it on every stream
+  saved 1,180 bytes for 13% in a prototype, repeating it until it stopped
+  saving 1,669 bytes for 39%, and a whole second pass 2,076 bytes for 57%; the
+  gated single fit has the best ratio, and the rest is left to Max.
 
 **Measured.** Against `4af8ff1`, Default at the 180-second allowance: 96 bytes
 on 18 of 365 raw streams, 2,768 bytes on 174 of 1,052 PNGs, 2,091 bytes on 71 of
@@ -2950,7 +2967,10 @@ improved, 4 bytes / 35 bits.
   R3, in both modes. Needs G0, except in Max's mandatory Default floors and in
   Default's sweep under `MandatoryComplete`, where it runs to completion. Under
   `ApngDefault`, and for the exact APNG Default endpoint that `ApngMax` keeps,
-  it runs once after R18 instead of in the sweep. In Max it also runs in every
+  it runs once after R18 instead of in the sweep. Every other Default finish
+  runs it in the sweep and, when R1c or R13–R18 then changed the stream, once
+  more after R18 with R3–R5, the closing header fit
+  ([Late tree floor (R18)](#late-tree-floor-r18)). In Max it also runs in every
   sweep on Max's own incumbent, while the mandatory Default endpoint is kept
   separately ([Floors and the Max guarantee](#floors-and-the-max-guarantee)). In
   Max's own sweeps, a candidate it replaces is kept for the
@@ -4389,7 +4409,8 @@ streams and 12.3% on containers.
 
 - **Runs:** after R4 in each sweep, in Default and Max. Under `ApngDefault` it
   runs once after R18, with R2–R4, and a win there is followed by R14 and R17
-  ([Terminal sweep order](#terminal-sweep-order)). It needs
+  ([Terminal sweep order](#terminal-sweep-order)); so it does in Default's
+  closing header fit ([Late tree floor (R18)](#late-tree-floor-r18)). It needs
   [G0](#g0-timed-route-start), except in Max's mandatory Default endpoints and
   in the first sweep under `MandatoryComplete`. In Max, a candidate it replaces
   is kept for the
@@ -8222,7 +8243,8 @@ allowance, or a shorter part of it when the stream reserves a G0t terminal share
 **What each Max policy enables.** "Class" here means at most 1 MiB compressed
 and decoded and at most 128 source wire blocks. The single-image PNG route
 families are M2, M2c, M3, M4, M6, M8, M9, M10a, M10c and the late M2 route. M1
-and M11–M14 run under every Max policy.
+and M11–M14 run under every Max policy. M15 is not a stream policy: it repeats
+the whole file ([M15](#m15-repeated-passes)).
 
 | Policy | M0 prebuild | Bounded phase (M5, M7, M7a, M10b) | Single-image PNG families | Source-max worker beside M10b | M10d | G0t share |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -8651,6 +8673,9 @@ the relaxed-mode check in step 15 do work; every other step runs only in Max.
     in Max on Default's endpoints too; the source is kept unless the result is
     strictly smaller; and the strict floor competes last
     ([Strict and relaxed output](#strict-and-relaxed-output)).
+16. Max only, above every container: while the pass changed the file and time
+    remains, the whole file runs again from its own output
+    ([M15](#m15-repeated-passes)).
 
 The diagrams below show these phases as decisions.
 [Default and standalone max](#default-and-standalone-max) draws Default's steps
@@ -9260,7 +9285,7 @@ Provenance: Columbo.
 
 This section holds the exact gates that the other sections link to: the two
 timing gates (G0, G0t), the rules every terminal method shares, the Max routes
-(M0–M14) with the source-max state order (S0), and the replay limits. Each R and
+(M0–M15) with the source-max state order (S0), and the replay limits. Each R and
 D label keeps its own gates in its Part 2 entry, under "Columbo's gates and
 bounds", and R12's are under [Sweep repetition (R12)](#sweep-repetition-r12).
 The planner's inner gates are in
@@ -9339,6 +9364,7 @@ terminal methods and S for the source-max state order
 | M12 | Later source max | Max, every policy | After M11, before M13 | [M12](#m12-later-source-max); [method](#source-max-route) |
 | M13 | Rewritten-seed refinement | Max, every policy | After M12, before M2 late | [M13](#m13-rewritten-seed-refinement); [method](#floor-seeded-and-rewritten-seed-refinement-m7-m7a-m13) |
 | M14 | Replaced-candidate close | Max, every policy | Terminal stage, after the incumbent's R1–R18 finish | [M14](#m14-replaced-candidate-close) |
+| M15 | Repeated passes | Max, the whole file | After a pass that changed the file, while time remains | [M15](#m15-repeated-passes) |
 | R1 | Original-match restoration | Both modes | First in every sweep | [Original-match restoration (R1)](#original-match-restoration-r1) |
 | R1b | Strict distance completion | Both modes; strict only | After R1 | [Strict distance completion (R1b)](#strict-distance-completion-r1b) |
 | R1c | Fixed-tree boundary slide | Both modes | After R5 (Default; R1b under `ApngDefault`) or R11 (Max); again after each R13–R17 win | [Fixed-tree boundary slide (R1c)](#fixed-tree-boundary-slide-r1c) |
@@ -10264,6 +10290,45 @@ which deadline applies. The diagrams in [Bounded max](#bounded-max) and
     streams.
 - **See:** [Floors and the Max guarantee](#floors-and-the-max-guarantee),
   [Late max sequence](#late-max-sequence).
+
+#### M15: repeated passes
+
+- **Runs:** Max only, on the whole file, above every container
+  ([`src/format/mod.rs`](../src/format/mod.rs)). Default makes one pass.
+- **Why:** no route re-plans the stream it finished. The planner, the feedback
+  routes and the source topology (D4) never see the blocks and trees that the
+  terminal stage leaves, and in Max nothing fits headers again after the late
+  tree floor (R18). A second Max run over Max's own output therefore still saved:
+  on 15 of 128 corpus files of at most 4 KB that finished inside 20 seconds,
+  and on 2 of 600 synthetic streams.
+- **Eligible:** the previous pass changed the file, it did not time out, and
+  the file's allowance has time left.
+- **Effect:** run the file again from the previous pass's output, in the same
+  format and options, with the time left as its allowance. Keep the result when
+  it is strictly smaller in bytes, then in meaningful bits, and repeat; stop at
+  the first pass that is not. Savings are reported against the original input.
+- **What it guarantees:** a run whose last pass ends before the deadline
+  returns a file that Max, given the same time, leaves unchanged. Each pass is
+  a complete run, so the result is never above the first pass's: Max still
+  never ends above Default, nor relaxed mode above strict mode.
+- **What it does not:** a deadline can cut any pass, and then a later run can
+  still save. Max is also not compared with repeated Default runs: on one
+  synthetic stream two Default passes end 1 bit below Max's fixed point.
+- **Bounds:** the file's allowance and hard stop. A later pass's mandatory
+  work can run past them as the first pass's can
+  ([Floors and the Max guarantee](#floors-and-the-max-guarantee)). A pass that
+  fails, for example on a parser limit that the rewritten file meets, leaves
+  the previous pass's result.
+- **Cost:** the last pass always finds nothing, so a run that finishes makes
+  at least two passes. On the 16 MiB digits stream of the relaxed-mode report,
+  Max went from 23 to 43 seconds for the same 2,511,120 bytes.
+- **Reports:** each later pass prints `Pass     N · bytes` and then reports its
+  format and streams like the first.
+- **Measured** against `25155a1`: on 70 corpus files of at most 4 KB at 20
+  seconds, 4 files smaller by 4 bytes in total and none larger (one was a byte
+  larger in the loaded batch and equal when rerun alone), for 1.17 times the
+  CPU; a second Max run then saved nothing on any of the 70, nor on any of the
+  600 synthetic streams.
 
 #### S0: source-max state order
 

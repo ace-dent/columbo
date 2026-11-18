@@ -29,6 +29,37 @@ fn write_savings_are_byte_first_then_meaningful_bits() {
 }
 
 #[test]
+fn a_later_pass_adds_its_savings_to_the_first() {
+    // Passes that keep the source's length add their bits.
+    let mut result = Optimization::from_metrics(10, vec![0; 10], 80, 77, false);
+    let later = Optimization::from_metrics(10, vec![1; 10], 77, 75, true);
+    assert!(result.replace_with_later_pass(10, later));
+    assert_eq!(result.bits_saved, 5);
+    assert_eq!(result.data, [1; 10]);
+    assert!(result.timed_out);
+
+    // A shorter file counts bytes against the first input.
+    let later = Optimization::from_metrics(10, vec![2; 8], 75, 60, false);
+    assert!(result.replace_with_later_pass(10, later));
+    assert_eq!(result.bits_saved, 16);
+    assert!(result.timed_out);
+
+    // A pass that saves nothing leaves the result alone.
+    let later = Optimization::from_metrics(8, vec![3; 8], 60, 60, false);
+    assert!(!result.replace_with_later_pass(10, later));
+    assert_eq!(result.data, [2; 8]);
+    assert_eq!(result.bits_saved, 16);
+
+    // After a strict repair that grew the file, a pass back to the source's
+    // length saves bytes against that repair only: nothing against the source.
+    let mut repaired = Optimization::from_metrics(10, vec![0; 12], 80, 90, false);
+    let later = Optimization::from_metrics(12, vec![1; 10], 90, 79, false);
+    assert!(repaired.replace_with_later_pass(10, later));
+    assert_eq!(repaired.data, [1; 10]);
+    assert_eq!(repaired.bits_saved, 0);
+}
+
+#[test]
 fn deterministic_malformed_corpus_never_panics_or_grows_output() {
     let options = Options {
         strict: false,

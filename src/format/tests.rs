@@ -21,6 +21,87 @@ fn prefixed_empty_zip(prefix: &[u8]) -> Vec<u8> {
     input
 }
 
+/// zlib's stream for 95 bytes of six values. Max's first pass ends at 309
+/// bits, and a pass over that output saves one more.
+const SECOND_PASS_RAW: &[u8] = &[
+    0x85, 0x8b, 0xc9, 0x09, 0x00, 0x30, 0x10, 0x02, 0x8b, 0x4a, 0x2d, 0x8b, 0x25, 0x84, 0x69, 0xc1,
+    0xea, 0x33, 0x8f, 0xfd, 0x47, 0x50, 0xc1, 0x83, 0x54, 0x04, 0x52, 0xc2, 0x1d, 0x05, 0xca, 0x18,
+    0x60, 0x41, 0x93, 0x8e, 0x01, 0xbb, 0xfb, 0x18, 0x7b, 0x51, 0x8e, 0xe4, 0x01,
+];
+
+#[test]
+fn max_repeats_passes_until_one_changes_nothing() {
+    let max = Options {
+        exhaustive: true,
+        ..Options::default()
+    };
+    let first = optimize_pass(SECOND_PASS_RAW, Format::Raw, Format::Raw, &max, 1).unwrap();
+    let second = optimize_pass(&first.data, Format::Raw, Format::Raw, &max, 1).unwrap();
+    assert!(
+        second.bits_saved != 0,
+        "a second pass no longer improves this stream; the test needs another"
+    );
+
+    let repeated = optimize(SECOND_PASS_RAW, Format::Raw, &max).unwrap();
+    assert!(repeated.data.len() <= second.data.len());
+    assert_eq!(
+        repeated.bits_saved,
+        8 * (SECOND_PASS_RAW.len() - repeated.data.len()) as u64
+    );
+    assert!(!repeated.timed_out);
+    // Max, run again on its own output, has nothing left to save.
+    let again = optimize(&repeated.data, Format::Raw, &max).unwrap();
+    assert_eq!(again.data, repeated.data);
+    assert_eq!(again.bits_saved, 0);
+
+    // Only Max repeats, and only with time left.
+    let default = Options::default();
+    assert_eq!(
+        optimize(SECOND_PASS_RAW, Format::Raw, &default)
+            .unwrap()
+            .data,
+        optimize_pass(SECOND_PASS_RAW, Format::Raw, Format::Raw, &default, 1)
+            .unwrap()
+            .data
+    );
+    let no_time = Options {
+        timeout: std::time::Duration::ZERO,
+        ..max.clone()
+    };
+    assert_eq!(
+        optimize(SECOND_PASS_RAW, Format::Raw, &no_time)
+            .unwrap()
+            .data,
+        optimize_pass(SECOND_PASS_RAW, Format::Raw, Format::Raw, &no_time, 1)
+            .unwrap()
+            .data
+    );
+}
+
+/// A 62-byte stream whose Default finish changes the block after the sweep's
+/// header fit: the distance ladder and the smoothed trees end at 475 bits,
+/// and symbol set removal (R5) then saves 4 more.
+const CLOSING_FIT_RAW: &[u8] = &[
+    0x8b, 0xf6, 0xc5, 0x06, 0xa2, 0xc1, 0xc8, 0xd7, 0x37, 0x04, 0xc6, 0x8d, 0x86, 0x09, 0x43, 0x59,
+    0x98, 0xea, 0xe1, 0x54, 0x34, 0x0e, 0x35, 0x78, 0x40, 0x74, 0x34, 0x18, 0xa1, 0x18, 0x17, 0x8d,
+    0x69, 0x32, 0x8a, 0xd3, 0xa0, 0x6e, 0x0b, 0xc1, 0x74, 0x05, 0x90, 0x11, 0x82, 0x45, 0x10, 0x85,
+    0x17, 0x8d, 0x64, 0x07, 0xb2, 0x6a, 0xac, 0x9a, 0xe0, 0x4e, 0x22, 0x19, 0x00, 0x00,
+];
+
+#[test]
+fn default_fits_headers_again_after_the_finish_changes_the_stream() {
+    let default = optimize(CLOSING_FIT_RAW, Format::Raw, &Options::default()).unwrap();
+    // 60 bytes without the closing header fit.
+    assert_eq!(default.data.len(), 59);
+    // Max's Default endpoint runs it too, so Max does not trail Default.
+    let max = Options {
+        exhaustive: true,
+        ..Options::default()
+    };
+    let max = optimize(CLOSING_FIT_RAW, Format::Raw, &max).unwrap();
+    assert!(max.data.len() <= default.data.len());
+}
+
 #[test]
 fn custom_input_limit_uses_a_truthful_diagnostic() {
     let options = Options {

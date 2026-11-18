@@ -9,6 +9,8 @@ mod png;
 mod zip;
 mod zlib;
 
+use std::time::Instant;
+
 use deadline::{scale_duration, SearchDeadline};
 
 use crate::{Error, ErrorKind, Format, Optimization, Options, Result};
@@ -53,17 +55,77 @@ pub(crate) fn optimize(input: &[u8], requested: Format, options: &Options) -> Re
         ));
     }
 
+    // The expansion limit follows the caller's input, so a later pass over
+    // the smaller output keeps the first pass's limit.
     let effective_options = options_with_input_expansion_limit(input.len(), options);
     let options = &effective_options;
+    let detected = match requested {
+        Format::Auto => detect(input).format(),
+        explicit => explicit,
+    };
+    let started = Instant::now();
+    let mut optimized = optimize_pass(input, requested, detected, options, 1)?;
+    if options.exhaustive {
+        repeat_max_passes(input, detected, options, started, &mut optimized);
+    }
+    Ok(optimized)
+}
+
+/// Repeated passes (M15): run the whole file again on Max's own output, while
+/// the last pass made the file smaller and time remains.
+///
+/// No route re-plans the stream it finished: the planner, the feedback routes
+/// and the source topology never see the blocks and trees the terminal stage
+/// leaves. A pass over the output is that re-plan, with every container rule
+/// applied as on a first run. It ends at a file that Max, run again with time
+/// to finish, leaves unchanged.
+///
+/// A later pass has the time the earlier ones left, so the file's allowance
+/// and hard stop hold. One that fails leaves the result of the pass before it.
+// Out of line: one cold call per Max file.
+#[inline(never)]
+fn repeat_max_passes(
+    input: &[u8],
+    format: Format,
+    options: &Options,
+    started: Instant,
+    optimized: &mut Optimization,
+) {
+    // A pass that changed nothing would only be repeated.
+    let mut changed = optimized.data != input;
+    let mut pass = 1_usize;
+    while changed && !optimized.timed_out {
+        let remaining = options.timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        pass += 1;
+        let pass_options = Options {
+            timeout: remaining,
+            ..options.clone()
+        };
+        let Ok(next) = optimize_pass(&optimized.data, format, format, &pass_options, pass) else {
+            break;
+        };
+        changed = optimized.replace_with_later_pass(input.len(), next);
+    }
+}
+
+/// One pass over a file in the `detected` format. A pass after the first,
+/// over an earlier pass's output, announces itself in the report.
+fn optimize_pass(
+    input: &[u8],
+    requested: Format,
+    detected: Format,
+    options: &Options,
+    pass: usize,
+) -> Result<Optimization> {
     let reporting = options.verbose;
     // Held until this call's report is finished, after `finish_file`.
     let _report_session = crate::progress::begin_report_session(options);
-
-    let detection = match requested {
-        Format::Auto => detect(input),
-        explicit => Detection::Confirmed(explicit),
-    };
-    let detected = detection.format();
+    if pass > 1 {
+        crate::progress::pass_started(options, pass, input.len());
+    }
 
     let result = match detected {
         Format::Auto | Format::Raw => {
