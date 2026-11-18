@@ -101,6 +101,9 @@ struct CompressedBodyOptimization {
     source_deflate_bits: u64,
     output_deflate_bits: u64,
     decoded_size: Option<u64>,
+    /// The stream's search reached its time slice, so a later pass can still
+    /// improve it.
+    timed_out: bool,
 }
 
 fn compressed_body_len(candidate: &CompressedBodyOptimization, source_len: usize) -> usize {
@@ -689,6 +692,11 @@ fn precompute_max_metadata_floors(
 /// Search Max candidates from a cached metadata floor. The floor already
 /// charged the decoded-size budget, so decoding is limited to the known size
 /// without charging it again.
+///
+/// In Default the floor is a winning probe. One whose search reached its
+/// slice may have skipped work a complete pass does, and how much depends on
+/// the machine and its load, so the stream gets its normal pass after all and
+/// the probe's result stays as the floor. A probe that finished is final.
 fn refine_cached_compressed_body(
     kind: [u8; 4],
     source_data: &[u8],
@@ -700,9 +708,12 @@ fn refine_cached_compressed_body(
         return try_clone_compressed_body(floor)
             .ok_or_else(|| Error::allocation("PNG metadata result"));
     };
-    if !options.exhaustive || budget.deadline.remaining().is_zero() {
+    if budget.deadline.remaining().is_zero() || (!options.exhaustive && !floor.timed_out) {
         return try_clone_compressed_body(floor)
             .ok_or_else(|| Error::allocation("PNG metadata result"));
+    }
+    if !options.exhaustive {
+        return rerun_cut_metadata_probe(kind, source_data, floor, decoded_size, options, budget);
     }
 
     let floor_data = floor.replacement.as_deref().unwrap_or(source_data);
@@ -725,6 +736,7 @@ fn refine_cached_compressed_body(
             source_data,
             decoded_size,
             &direct_options,
+            DefaultFloor::Established,
             grace,
         )?;
         direct.source_deflate_bits = floor.source_deflate_bits;
@@ -741,6 +753,7 @@ fn refine_cached_compressed_body(
             floor_data,
             decoded_size,
             &call_options,
+            DefaultFloor::Established,
             grace,
         )?;
         refined.source_deflate_bits = floor.source_deflate_bits;
@@ -752,11 +765,40 @@ fn refine_cached_compressed_body(
     Ok(best)
 }
 
+/// Default's normal pass for a metadata stream whose probe was cut, kept only
+/// when it strictly dominates the probe's result.
+#[inline(never)]
+fn rerun_cut_metadata_probe(
+    kind: [u8; 4],
+    source_data: &[u8],
+    probe: &CompressedBodyOptimization,
+    decoded_size: u64,
+    options: &Options,
+    budget: &DecodeBudget,
+) -> Result<CompressedBodyOptimization> {
+    let call_options = budget.deadline.options_for_call(options);
+    let grace = budget.deadline.grace_for_call(call_options.timeout);
+    let mut complete = optimize_cached_compressed_parent(
+        kind,
+        source_data,
+        decoded_size,
+        &call_options,
+        metadata_default_floor(false),
+        grace,
+    )?;
+    complete.source_deflate_bits = probe.source_deflate_bits;
+    if compressed_body_strictly_dominates(&complete, probe, source_data.len()) {
+        return Ok(complete);
+    }
+    try_clone_compressed_body(probe).ok_or_else(|| Error::allocation("PNG metadata result"))
+}
+
 fn optimize_cached_compressed_parent(
     kind: [u8; 4],
     parent_data: &[u8],
     decoded_size: u64,
     options: &Options,
+    default_floor: DefaultFloor,
     grace: Duration,
 ) -> Result<CompressedBodyOptimization> {
     let zlib_offset = compressed_zlib_offset(kind, parent_data)
@@ -766,7 +808,7 @@ fn optimize_cached_compressed_parent(
         options,
         decoded_size,
         true,
-        DefaultFloor::Established,
+        default_floor,
         grace,
     )?;
     let info = optimized
@@ -791,6 +833,7 @@ fn optimize_cached_compressed_parent(
         source_deflate_bits: info.source_deflate_bits,
         output_deflate_bits: info.deflate_bits,
         decoded_size: Some(decoded_size),
+        timed_out: optimized.timed_out,
     })
 }
 
@@ -1526,6 +1569,7 @@ fn try_clone_compressed_body(
         source_deflate_bits: optimized.source_deflate_bits,
         output_deflate_bits: optimized.output_deflate_bits,
         decoded_size: optimized.decoded_size,
+        timed_out: optimized.timed_out,
     })
 }
 
@@ -2057,6 +2101,7 @@ fn optimize_compressed_body(
         .map_or(0, |info| info.source_deflate_bits);
     let output_deflate_bits = optimized.info.as_ref().map_or(0, |info| info.deflate_bits);
     let decoded_size = optimized.info.as_ref().map(|info| info.size);
+    let timed_out = optimized.timed_out;
     let body_len = zlib_offset
         .checked_add(optimized.data.len())
         .ok_or_else(|| Error::new("PNG compressed metadata too large"))?;
@@ -2073,6 +2118,7 @@ fn optimize_compressed_body(
             source_deflate_bits,
             output_deflate_bits: source_deflate_bits,
             decoded_size,
+            timed_out,
         }));
     }
     let mut body = Vec::new();
@@ -2085,6 +2131,7 @@ fn optimize_compressed_body(
         source_deflate_bits,
         output_deflate_bits,
         decoded_size,
+        timed_out,
     }))
 }
 

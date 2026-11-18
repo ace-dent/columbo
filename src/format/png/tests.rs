@@ -765,6 +765,7 @@ fn cached_metadata_max_requires_byte_and_bit_dominance() {
         source_deflate_bits: 120,
         output_deflate_bits: bits,
         decoded_size: Some(1),
+        timed_out: false,
     };
     let floor = candidate(9, 100);
 
@@ -1654,6 +1655,71 @@ fn metadata_probe_counts_decoded_bytes_only_once() {
     let result = optimize(&input, &options).unwrap();
     assert!(!result.timed_out);
     parse(&result.data, false).unwrap();
+}
+
+#[test]
+fn a_cut_metadata_probe_gets_its_normal_pass_and_stays_the_floor() {
+    // A zTXt body whose zlib stream stores 300 compressible bytes.
+    let text: Vec<u8> = b"abc".iter().copied().cycle().take(300).collect();
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for &byte in &text {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    let mut source = b"Comment\0\0".to_vec();
+    source.extend_from_slice(&[0x78, 0x01, 0x01, 0x2c, 0x01, 0xd3, 0xfe]);
+    source.extend_from_slice(&text);
+    source.extend_from_slice(&((b << 16) | a).to_be_bytes());
+
+    let options = Options::default();
+    let budget = || DecodeBudget {
+        remaining: options.max_decoded_bytes,
+        deadline: SearchDeadline::new(&options),
+    };
+    let complete = optimize_compressed_body(
+        *b"zTXt",
+        &source,
+        &options,
+        DefaultFloor::Shared,
+        &mut budget(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!complete.timed_out);
+    let complete_body = complete.replacement.clone().unwrap();
+    assert!(complete_body.len() < source.len());
+
+    // A probe that was cut before it found anything: the source itself.
+    let probe = |timed_out| CompressedBodyOptimization {
+        replacement: Some(source.clone()),
+        source_deflate_bits: complete.source_deflate_bits,
+        output_deflate_bits: complete.source_deflate_bits,
+        decoded_size: complete.decoded_size,
+        timed_out,
+    };
+    let rerun =
+        refine_cached_compressed_body(*b"zTXt", &source, &probe(true), &options, &mut budget())
+            .unwrap();
+    assert_eq!(rerun.replacement.as_deref(), Some(complete_body.as_slice()));
+    assert_eq!(rerun.output_deflate_bits, complete.output_deflate_bits);
+
+    // A probe that finished is final, and so is a cut one once the file's
+    // time is spent.
+    let finished =
+        refine_cached_compressed_body(*b"zTXt", &source, &probe(false), &options, &mut budget())
+            .unwrap();
+    assert_eq!(finished.replacement.as_deref(), Some(source.as_slice()));
+    let no_time = Options {
+        timeout: Duration::ZERO,
+        ..Options::default()
+    };
+    let mut spent = DecodeBudget {
+        remaining: no_time.max_decoded_bytes,
+        deadline: SearchDeadline::new(&no_time),
+    };
+    let kept = refine_cached_compressed_body(*b"zTXt", &source, &probe(true), &no_time, &mut spent)
+        .unwrap();
+    assert_eq!(kept.replacement.as_deref(), Some(source.as_slice()));
 }
 
 #[test]

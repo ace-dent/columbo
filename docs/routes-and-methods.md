@@ -8487,6 +8487,14 @@ input while `--raw` keeps trailing data.
   again later. A winning probe is kept and charged to the decoded budget; every
   other stream gets a `Shared` pass during reconstruction with the remaining
   file time. A probe never reports a file timeout.
+- A winning probe whose search reached its 100 ms is not final: how much of the
+  pass it skipped depends on the machine and its load. Its stream gets the
+  `Shared` pass during reconstruction too, from the original stream and with
+  the remaining file time, and the probe's result stays as the floor: the pass
+  replaces it only when no larger in bytes and bits and smaller in one. A
+  331-byte iCCP stream that takes about 100 ms ended at 305 bytes alone and at
+  314 with eight runs at once, because R1–R5 never started; it now ends at 305
+  either way, as does the corpus's other such file.
 - Default, image side: when the file keeps any unstripped compressed metadata
   stream, including one a probe has already improved, image jobs schedule from
   90% of the remaining time, and the image reclaim pass also keeps 10% back, so
